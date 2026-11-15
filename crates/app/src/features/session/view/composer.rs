@@ -12,6 +12,7 @@ const KISSES_MAX: usize = 10;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{InputToken, Textarea};
+use gpui_kit::component::notification::Notification;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Disableable as _, Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -20,10 +21,14 @@ use gpui_kit::*;
 use super::activity::chip_popover;
 use super::dialogs::checkbox_box;
 use super::{NARROW, TINY, image_tile, number_badge};
+use crate::features::dictation::{self, Phase};
+use crate::features::session::SessionEvent;
 use crate::features::session::SessionView;
 use crate::features::session::attachments::PastedText;
 use crate::shared::kisses::{HEART, LIPS, noise, paint_sprite};
 use crate::shared::ui;
+use gentle_core::dictation as rules;
+use gentle_core::dictation::Mode;
 use gentle_core::transcript::format_tokens;
 
 impl SessionView {
@@ -506,6 +511,11 @@ impl SessionView {
                         .child(format!("${:.2}", self.usage.cost)),
                 )
             })
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .child(self.render_dictation_button(cx)),
+            )
             .child(div().flex_shrink_0().child(action_button));
 
         let content = v_flex()
@@ -536,6 +546,9 @@ impl SessionView {
             .children(self.render_dialog(cx))
             .child(self.render_activity(cx))
             .child(self.render_context_line(cx))
+            .when(!self.dictation.idle(), |this| {
+                this.child(self.render_dictation_status())
+            })
             .child(composer_box)
             .children(self.render_kisses())
             .when(width >= TINY, |this| {
@@ -647,4 +660,368 @@ fn pasted_card(n: usize, paste: &PastedText) -> Div {
                         .child(lines),
                 ),
         )
+}
+
+// ── Voice dictation ─────────────────────────────────────────────────────────
+//
+// The mic records on demand (opened off the GUI thread), the transcription
+// runs as cancellable jobs on the background executor, and the text lands
+// in the composer as an editable draft. It is never submitted on its own,
+// and cancelling leaves the draft as it was.
+
+impl SessionView {
+    /// The mic button: record, stop and transcribe, or wait for the answer.
+    fn render_dictation_button(&self, cx: &mut Context<Self>) -> Button {
+        let phase = self.dictation.phase();
+        // Right next to Send, with a text label: the control must be found.
+        // "Recording" never shows before audio is actually flowing.
+        let label = match phase {
+            Phase::Idle => "Dictate",
+            Phase::Opening => "Starting…",
+            Phase::Recording if self.dictation.capped() => "Transcribe",
+            Phase::Recording => "Stop recording",
+            Phase::Transcribing => "Transcribing…",
+        };
+        Button::new("dictate")
+            .small()
+            .icon(Icon::new(IconName::Mic))
+            .label(label)
+            .text_color(match phase {
+                Phase::Recording => ui::petal(),
+                Phase::Opening | Phase::Transcribing => ui::muted(),
+                Phase::Idle => ui::fg(),
+            })
+            .tooltip(match phase {
+                Phase::Recording if self.dictation.capped() => {
+                    "Transcribe the recording (it stopped at the two-minute limit)"
+                }
+                Phase::Recording => "Stop and transcribe what you said",
+                Phase::Opening => "Opening the microphone… (Esc cancels)",
+                Phase::Transcribing => "Transcribing… (Esc cancels)",
+                Phase::Idle => "Record your voice and turn it into an editable draft",
+            })
+            .disabled(matches!(phase, Phase::Opening | Phase::Transcribing))
+            .on_click(cx.listener(|this, _, window, cx| this.toggle_dictation(window, cx)))
+    }
+
+    /// What dictation is doing right now, and where the audio will go.
+    fn render_dictation_status(&self) -> Div {
+        let (color, text, hint) = match self.dictation.phase() {
+            Phase::Opening => (ui::muted(), "Opening microphone…", "· esc cancels"),
+            Phase::Recording if self.dictation.capped() => (
+                ui::warning(),
+                "Recording stopped at the two-minute limit",
+                "· the mic transcribes · esc discards",
+            ),
+            Phase::Recording if self.dictation.provider_recording() => (
+                ui::petal(),
+                "Recording — speak now",
+                "· stopping sends the audio to your configured provider · esc cancels",
+            ),
+            Phase::Recording => (
+                ui::petal(),
+                "Recording — speak now",
+                "· the mic stops and transcribes · esc cancels",
+            ),
+            Phase::Transcribing => (
+                ui::info(),
+                "Transcribing…",
+                "· the text lands here to review and edit · esc cancels",
+            ),
+            Phase::Idle => (ui::muted(), "", ""),
+        };
+        h_flex()
+            .gap_2()
+            .text_size(px(11.))
+            .text_color(ui::muted())
+            .child(Icon::new(IconName::Mic).xsmall().text_color(color))
+            .child(div().text_color(ui::fg()).child(text))
+            .child(div().child(hint))
+    }
+
+    pub(super) fn toggle_dictation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.dictation.phase() {
+            Phase::Idle => self.start_dictation(window, cx),
+            Phase::Recording => self.finish_dictation(window, cx),
+            // While the microphone opens, or a transcription runs, further
+            // clicks do nothing: no duplicate device openings.
+            Phase::Opening | Phase::Transcribing => {}
+        }
+    }
+
+    /// Esc, a tab close or a backend restart: stop the microphone, cancel
+    /// the transcription for real (the child is killed and reaped, the
+    /// request's transport shuts down) and leave the draft as it is. The
+    /// transport can only stop what has not been sent yet: audio already
+    /// on its way to a provider cannot be recalled, and the toast says so.
+    pub(in crate::features::session) fn cancel_dictation(&mut self, cx: &mut Context<Self>) {
+        if self.dictation.idle() {
+            return;
+        }
+        let honest = self.dictation.phase() == Phase::Transcribing
+            && self
+                .dictation
+                .config()
+                .is_some_and(|config| config.mode == Mode::Provider);
+        self.dictation.cancel();
+        if honest {
+            self.toast(
+                Notification::info("Upload cancelled. Audio already sent cannot be recalled."),
+                cx,
+            );
+        }
+        cx.notify();
+    }
+
+    /// Start recording: read and validate the configuration once, snapshot
+    /// it into the state, and open the microphone off the GUI thread.
+    /// Start recording: read and validate the configuration once, reserve
+    /// it into the state (so a cancel during opening can never open a
+    /// microphone nobody wants), and open the microphone off the GUI
+    /// thread. Duplicate clicks while a start is under way do nothing.
+    fn start_dictation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.dictation.idle() {
+            return;
+        }
+        // Nothing may open the microphone until dictation is ready: a
+        // configured mode, local files that exist, the provider key in the
+        // environment. Every failure opens Configuration directly at the
+        // Dictation section (the user sees the actual controls); provider
+        // transcription is its own setup and never routes to the chat
+        // sign-in screen.
+        let config = match dictation::read_config() {
+            Ok(config) => config,
+            Err(message) => {
+                self.warn(message, window, cx);
+                cx.emit(SessionEvent::OpenDictation);
+                return;
+            }
+        };
+        if let Err(message) = dictation::ensure_ready(&config) {
+            self.warn(message, window, cx);
+            cx.emit(SessionEvent::OpenDictation);
+            return;
+        }
+        // The reservation happens before the spawn: its generation is what
+        // the opening must still match to matter.
+        let epoch = match self.dictation.reserve_opening(config) {
+            Ok(epoch) => epoch,
+            Err(message) => {
+                self.warn(message, window, cx);
+                return;
+            }
+        };
+        cx.notify();
+        // The opening's cancel handle is attached synchronously with the
+        // opening's start (no await in between), so any user-visible cancel
+        // lands; the spawn-to-attach window is covered by the keeper's own
+        // pre-open/post-open token checks.
+        let (opening, ready) = match dictation::start_capture_opening() {
+            Ok(pair) => pair,
+            Err(message) => {
+                self.warn(message, window, cx);
+                return;
+            }
+        };
+        self.dictation.attach_opening(move || opening.cancel());
+        let job = cx.background_executor().spawn(async move {
+            // ONE coherent startup budget over device open AND first
+            // callback together; on timeout the caller cancels the keeper
+            // through the opening hook.
+            match ready.recv_timeout(dictation::STARTUP_BUDGET) {
+                Ok(result) => result,
+                Err(_) => Err(
+                    "The microphone did not open and deliver audio within 5 seconds.".to_string(),
+                ),
+            }
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = job.await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                match result {
+                    Ok(live) => {
+                        // A superseded opening drops `live` inside `begin`,
+                        // which closes the device unused.
+                        if this.dictation.begin(epoch, live) {
+                            this.watch_dictation_cap(cx);
+                        }
+                    }
+                    Err(message) => {
+                        if let Some(message) = this.dictation.opening_failed(epoch, message) {
+                            this.warn(message, window, cx);
+                        }
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// While recording, repaint when the cap stops the microphone, so the
+    /// status says so instead of silently keeping a dead "Recording…".
+    fn watch_dictation_cap(&mut self, cx: &mut Context<Self>) {
+        self._dictation_ticker = cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(250))
+                    .await;
+                let (recording, capped) = match this.update(cx, |this, _| {
+                    (
+                        this.dictation.phase() == Phase::Recording,
+                        this.dictation.capped(),
+                    )
+                }) {
+                    Ok(pair) => pair,
+                    Err(_) => return,
+                };
+                if !recording || capped {
+                    let _ = this.update(cx, |_, cx| cx.notify());
+                    return;
+                }
+            }
+        });
+    }
+
+    fn finish_dictation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // The snapshot taken when the recording started decides where this
+        // audio goes; Configuration cannot re-route it now, and a change
+        // since (even to Off) cannot strand the recording.
+        let Some(config) = self.dictation.config().cloned() else {
+            self.cancel_dictation(cx);
+            return;
+        };
+        let (mono, hit_limit) = match self.dictation.stop_recording() {
+            Ok(audio) => audio,
+            Err(message) => {
+                self.warn(message, window, cx);
+                return;
+            }
+        };
+        if hit_limit {
+            self.warn(
+                "The recording was cut at the two-minute limit.".into(),
+                window,
+                cx,
+            );
+        }
+        if mono.len() < rules::MIN_SAMPLES {
+            self.dictation.cancel();
+            self.warn("Nothing was recorded yet.".into(), window, cx);
+            return;
+        }
+        let generation = self.dictation.generation();
+        match config.mode {
+            Mode::Local => {
+                let local = config.local.clone();
+                let job = match dictation::LocalJob::start(&local, &rules::wav_16k(&mono)) {
+                    Ok(job) => job,
+                    Err(message) => {
+                        self.dictation.cancel();
+                        self.warn(message, window, cx);
+                        return;
+                    }
+                };
+                self.dictation.transcribing({
+                    let cancel = job.clone();
+                    move || cancel.cancel()
+                });
+                self.dictation_job = cx.spawn_in(window, async move |this, cx| {
+                    let result = cx
+                        .background_executor()
+                        .spawn(async move { job.wait(dictation::LOCAL_TIMEOUT) })
+                        .await;
+                    let _ = this.update_in(cx, |this, window, cx| {
+                        this.dictation_result(generation, result, window, cx)
+                    });
+                });
+            }
+            Mode::Provider => {
+                let provider = config.provider.clone();
+                // The key is read from the environment now, for this one
+                // request; it is never stored, shown or sent anywhere else.
+                let key = std::env::var(&provider.api_key_env)
+                    .ok()
+                    .map(|key| key.trim().to_string())
+                    .filter(|key| !key.is_empty());
+                let Some(key) = key else {
+                    self.dictation.cancel();
+                    self.warn(
+                        format!(
+                            "The API key environment variable {} is not set.",
+                            provider.api_key_env
+                        ),
+                        window,
+                        cx,
+                    );
+                    return;
+                };
+                let job = match dictation::ProviderJob::start(
+                    &provider.endpoint,
+                    &provider.model,
+                    &key,
+                    &rules::wav_16k(&mono),
+                ) {
+                    Ok(job) => job,
+                    Err(message) => {
+                        self.dictation.cancel();
+                        self.warn(message, window, cx);
+                        return;
+                    }
+                };
+                self.dictation.transcribing({
+                    let cancel = job.clone();
+                    move || cancel.cancel()
+                });
+                self.dictation_job = cx.spawn_in(window, async move |this, cx| {
+                    let result = cx
+                        .background_executor()
+                        .spawn(async move { job.wait(dictation::PROVIDER_TIMEOUT) })
+                        .await;
+                    let _ = this.update_in(cx, |this, window, cx| {
+                        this.dictation_result(generation, result, window, cx)
+                    });
+                });
+            }
+            // Snapshotted configurations are never Off (begin refuses it).
+            Mode::Off => self.dictation.cancel(),
+        }
+        cx.notify();
+    }
+
+    /// A finished transcription: a stale generation (superseded or
+    /// cancelled) is dropped; the rest lands in the composer as a draft.
+    fn dictation_result(
+        &mut self,
+        generation: u64,
+        result: Result<String, String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.dictation.accepts(generation) || self.dictation.phase() != Phase::Transcribing {
+            return;
+        }
+        self.dictation.settle();
+        match result {
+            Ok(text) => self.insert_dictated(&text, window, cx),
+            Err(message) => self.warn(message, window, cx),
+        }
+        cx.notify();
+    }
+
+    /// Put the transcript at the cursor, spaced from a word, and focus the
+    /// composer: the user reviews and edits it before sending, as with any
+    /// other draft.
+    fn insert_dictated(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(text) = rules::transcript_from_text(text) else {
+            self.toast(Notification::info("The recording had no speech in it."), cx);
+            return;
+        };
+        self.composer.update(cx, |state, cx| {
+            let value = state.value();
+            let before = value[..state.cursor().min(value.len())].chars().next_back();
+            state.insert(rules::draft_insertion(before, &text), window, cx);
+            state.focus(window, cx);
+        });
+    }
 }
