@@ -27,8 +27,18 @@ regex.workspace = true
 sha2 = "0.10"
 alacritty_terminal = "0.26"
 ignore = "0.4"
+# Voice dictation: microphone capture (cpal), per-run private temp folders,
+# provider endpoint parsing, and a cancellable provider upload: tokio drives
+# a single request future on its own thread; aborting it drops the socket.
 ureq = "3"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots"] }
+tokio = { version = "1", features = ["rt", "time", "macros"] }
 trash = "5"
+# Voice dictation: microphone capture (cpal), per-run private temp folders,
+# provider endpoint parsing.
+cpal = "0.15"
+tempfile = "3"
+url = "2"
 # Self-update: release archives (macOS/Windows zip, Linux tar.gz).
 zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
 flate2 = "1"
