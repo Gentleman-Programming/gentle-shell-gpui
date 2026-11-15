@@ -92,7 +92,7 @@ fn user_home() -> PathBuf {
 
 /// `<data dir>/gentle-shell-gpui/toolchain`.
 fn toolchain_dir() -> Option<PathBuf> {
-    dirs::data_dir().map(|dir| dir.join("gentle-shell-gpui").join("toolchain"))
+    crate::shared::themes::data_root().map(|dir| dir.join("gentle-shell-gpui").join("toolchain"))
 }
 
 /// Where an npm prefix (or a Node install) keeps its executables.
