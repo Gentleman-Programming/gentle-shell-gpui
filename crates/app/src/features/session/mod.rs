@@ -32,6 +32,11 @@ pub const CONTEXT: &str = "GentleSession";
 /// Requests a tab makes of its window.
 pub enum SessionEvent {
     OpenProviders,
+    /// The mic cannot start because dictation is not ready (Off, missing
+    /// local files, or a missing provider key): open Configuration
+    /// directly at the Dictation section. Provider transcription is its
+    /// own setup and has nothing to do with the chat sign-in screen.
+    OpenDictation,
     /// An extension's `notify`, for the window's notification center.
     /// Warnings and errors are also toasted by the tab itself.
     Notice {
@@ -147,6 +152,14 @@ pub struct SessionView {
     capture: Option<builtins::Capture>,
     /// Numbers [`builtins::Capture`]s, to match Pi's replies.
     capture_seq: u64,
+    /// Voice dictation: its phase, recorder and generation (see
+    /// [`crate::features::dictation`]). Its results land in the composer as
+    /// an editable draft; nothing is ever sent on its own.
+    dictation: crate::features::dictation::State,
+    /// The transcription running from this tab's last recording.
+    dictation_job: Task<()>,
+    /// Repaints when the recording cap stops the microphone.
+    _dictation_ticker: Task<()>,
     /// This tab's window, for work that finishes outside a window update.
     window_handle: AnyWindowHandle,
 }
@@ -175,6 +188,8 @@ impl SessionView {
         // GPUI keeps decoded images until told to drop them.
         cx.on_release(|this, cx| {
             this.image_cache.release_all(cx);
+            // The microphone never outlives the tab.
+            this.dictation.cancel();
             for attachment in this.attachments.drain(..) {
                 attachment.image.remove_asset(cx);
             }
@@ -291,6 +306,9 @@ impl SessionView {
             model_search,
             capture: None,
             capture_seq: 0,
+            dictation: crate::features::dictation::State::default(),
+            dictation_job: Task::ready(()),
+            _dictation_ticker: Task::ready(()),
             window_handle: window.window_handle(),
         };
         if start_now {
@@ -453,10 +471,17 @@ impl SessionView {
         }
     }
 
-    /// Esc: close what's open (the Agents panel, then a dialog). It never
-    /// stops the turn: a few Esc presses to close things used to abort the
-    /// agent once nothing was left open. Stopping is ⌘. or the Stop button.
+    /// Esc: close what's open (a recording, the Agents panel, then a
+    /// dialog). It never stops the turn: a few Esc presses to close things
+    /// used to abort the agent once nothing was left open. Stopping is ⌘.
+    /// or the Stop button. Cancelling a recording leaves the draft alone.
     fn abort(&mut self, _: &Abort, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.dictation.idle() {
+            // A real cancel: the microphone stops, the transcription job is
+            // killed or shut down, and the draft stays as it is.
+            self.cancel_dictation(cx);
+            return;
+        }
         if self.agents_panel.open {
             self.close_agents(cx);
             return;
