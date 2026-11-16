@@ -19,6 +19,7 @@ mod app;
 mod background;
 mod claude;
 mod devices;
+mod dictation;
 mod hydration;
 mod layout;
 mod maestro;
@@ -89,16 +90,37 @@ pub struct SettingsView {
     music: music::Music,
     /// Devices: the switches, what this machine has, an install running.
     devices: devices::Devices,
+    /// Dictation: the mode and its fields, saved as they change.
+    dictation: dictation::Dictation,
     /// Engram's own update.
     engram: upgrade::EngramUpdate,
     /// Theme: importing and sharing themes.
     theme_share: theme::ThemeShare,
+    /// Opened for the mic (SessionEvent::OpenDictation): the Dictation
+    /// section renders first, so its controls are visible without scrolling.
+    focus_dictation: bool,
 }
 
 impl EventEmitter<SettingsEvent> for SettingsView {}
 
 impl SettingsView {
     pub fn new(cwd: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        Self::construct(cwd, false, window, cx)
+    }
+
+    /// Configuration opened for the mic (SessionEvent::OpenDictation): the
+    /// Dictation section leads the screen. The existing
+    /// [`SettingsEvent`] wiring is unchanged.
+    pub fn for_dictation(cwd: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        Self::construct(cwd, true, window, cx)
+    }
+
+    fn construct(
+        cwd: PathBuf,
+        focus_dictation: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let package_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("npm:package-name, git:github.com/…, or a local path")
@@ -137,7 +159,8 @@ impl SettingsView {
             cx.emit(SettingsEvent::Setup(event.clone()));
         });
         let mut this = Self {
-            cwd,
+            cwd: cwd.clone(),
+            focus_dictation,
             snapshot: None,
             package_input,
             running: None,
@@ -159,6 +182,7 @@ impl SettingsView {
             maestro: maestro::Maestro::default(),
             music: music::Music::default(),
             devices: devices::Devices::default(),
+            dictation: dictation::Dictation::new(cwd.clone(), window, cx),
             engram: upgrade::EngramUpdate::default(),
             theme_share: theme::ThemeShare::new(window, cx),
         };
@@ -278,9 +302,15 @@ impl Render for SettingsView {
                         section(IconName::CircleCheck, "Setup & requirements")
                             .child(self.setup.clone()),
                     )
+                    .when(self.focus_dictation, |d| {
+                        d.child(self.dictation_section(cx))
+                    })
                     .child(self.devices_section(cx))
                     .child(self.maestro_section(cx))
                     .child(self.music_section(cx))
+                    .when(!self.focus_dictation, |d| {
+                        d.child(self.dictation_section(cx))
+                    })
                     .child(self.hydration_section(cx))
                     .child(
                         div()

@@ -274,6 +274,9 @@ impl SessionView {
 
     fn start(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.shutdown_backend();
+        // A restart never takes the microphone or a transcription along; the
+        // composer's draft stays as it is.
+        self.dictation.cancel();
         self.backend.started = true;
         self.backend.status = BackendStatus::Starting;
         self.models.loaded = false;
