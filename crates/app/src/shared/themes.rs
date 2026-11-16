@@ -1060,9 +1060,7 @@ mod tests {
     /// The isolated-launch override relocates every app-owned location.
     #[test]
     fn data_root_honors_an_absolute_override() {
-        let sandbox = std::path::PathBuf::from(
-            "G:/Proyectos/gentle-shell-main/repo/.local/voice/tmp/data-root-ok",
-        );
+        let sandbox = std::env::temp_dir().join("gentle-shell-gpui-data-root-ok");
         unsafe {
             std::env::set_var(super::DATA_ROOT_ENV, &sandbox);
         }
