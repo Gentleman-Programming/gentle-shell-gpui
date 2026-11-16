@@ -266,7 +266,8 @@ impl Workspace {
                 reasoning,
             })
             .collect();
-        let view = cx.new(|cx| ProfilesView::new(cwd, models, window, cx));
+        let session = self.active_session();
+        let view = cx.new(|cx| ProfilesView::new(cwd, models, session, window, cx));
         let subscription = cx.subscribe_in(&view, window, |this, _, event: &ProfilesEvent, window, cx| {
             let tab = this.active_session();
             match event {
@@ -291,10 +292,11 @@ impl Workspace {
                 }
                 ProfilesEvent::UseInSession { profile, model, thinking } => {
                     if let Some(tab) = tab {
-                        let (model, thinking) = (model.clone(), thinking.clone());
+                        let (profile, model, thinking) = (profile.clone(), model.clone(), thinking.clone());
                         let note = format!("Profile \u{201c}{profile}\u{201d} applied to this session's orchestrator; helpers keep the routing this session started with.");
                         tab.update(cx, |s, cx| {
                             s.note(note, cx);
+                            s.set_session_profile(Some(profile), cx);
                             if let Some((provider, id)) = model {
                                 s.send_command(serde_json::json!({"type": "set_model", "provider": provider, "modelId": id}), cx);
                             }
@@ -423,7 +425,11 @@ impl Workspace {
     }
 
     pub(super) fn open_usage(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let view = cx.new(|cx| UsageView::new(window, cx));
+        // The Subscription tab reads through the active agent's RPC slice, so
+        // its backend must be started (probe included) before it is opened.
+        self.start_active_session(window, cx);
+        let session = self.active_session();
+        let view = cx.new(|cx| UsageView::new(window, cx, session));
         let subscription = cx.subscribe_in(
             &view,
             window,

@@ -2182,18 +2182,16 @@ dependencies = [
 
 [[package]]
 name = "gentle-core"
-version = "0.1.17"
+version = "0.1.20"
 dependencies = [
- "hmac",
  "regex",
  "serde",
  "serde_json",
- "sha2 0.10.9",
 ]
 
 [[package]]
 name = "gentle-shell-gpui"
-version = "0.1.17"
+version = "0.1.20"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -5330,11 +5328,12 @@ dependencies = [
 
 [[package]]
 name = "pi-rpc"
-version = "0.1.17"
+version = "0.1.20"
 dependencies = [
  "anyhow",
  "async-channel",
  "dunce",
+ "pollster",
  "serde",
  "serde_json",
  "which",
