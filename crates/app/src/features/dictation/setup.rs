@@ -604,6 +604,13 @@ mod tests {
     impl Fixture {
         fn new() -> Self {
             let dir = tempfile::tempdir().unwrap();
+            // macOS puts temporary folders under `/var`, which is itself a
+            // link, and the guard under test refuses a linked ancestor of the
+            // workspace. Resolve the fixture root first so the fixture is a
+            // plain tree, the way an ordinary workspace path already is.
+            #[cfg(unix)]
+            let root = std::fs::canonicalize(dir.path()).unwrap();
+            #[cfg(not(unix))]
             let root = dir.path().to_path_buf();
             let voice = root.join(".local").join("voice");
             std::fs::create_dir_all(voice.join("models")).unwrap();
@@ -749,7 +756,11 @@ mod tests {
     #[test]
     fn the_main_executable_must_be_a_plain_relative_path() {
         let f = Fixture::new();
-        for hostile in [
+        // Each entry has to be hostile on the platform running it: a
+        // back-slashed Windows path is an ordinary relative file name on
+        // POSIX, and a leading `/` is one on Windows.
+        #[cfg(windows)]
+        let hostile = [
             // Absolute (Windows drive and POSIX root)…
             "C:\\evil\\whisper-cli.exe",
             "/usr/bin/evil",
@@ -758,12 +769,22 @@ mod tests {
             // …and traversal out of the engine directory.
             "..\\..\\evil.exe",
             "Release/../../evil.exe",
-        ] {
-            f.manifest(&f.manifest_with_main_executable(hostile));
+        ];
+        #[cfg(unix)]
+        let hostile = [
+            // Absolute…
+            "/usr/bin/evil",
+            // …and traversal out of the engine directory, in both the bare
+            // and the tucked-after-a-normal-component form.
+            "../../evil",
+            "Release/../../evil",
+        ];
+        for entry in hostile {
+            f.manifest(&f.manifest_with_main_executable(entry));
             let error = verify_prepared(&f.root, &f.pins()).unwrap_err();
             assert!(
                 error.contains("relative path") || error.contains("inside"),
-                "{hostile}: {error}"
+                "{entry}: {error}"
             );
         }
         // No side effects: the traversal target was never touched or created.
@@ -864,6 +885,8 @@ mod tests {
         let outside = tempfile::tempdir().unwrap();
         std::fs::write(outside.path().join("model.bin"), b"model-bytes").unwrap();
         let link = f.root.join(".local/voice/models/ggml-base.bin");
+        // The fixture wrote a real model here; put the link in its place.
+        std::fs::remove_file(&link).unwrap();
         std::os::unix::fs::symlink(outside.path().join("model.bin"), &link).unwrap();
         f.manifest(&f.published());
         assert!(
