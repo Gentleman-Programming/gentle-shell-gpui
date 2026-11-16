@@ -135,7 +135,7 @@ impl RefsView {
                 };
                 if let Some(job) = due {
                     let repo = cx.background_executor().spawn(job).await;
-                    if this.update(cx, |this, cx| this.apply(repo, cx)).is_err() {
+                    if this.update(cx, |this, cx| this.observe(repo, cx)).is_err() {
                         break;
                     }
                 }
@@ -162,7 +162,7 @@ impl RefsView {
         let job = self.refs_job();
         cx.spawn(async move |this, cx| {
             let repo = cx.background_executor().spawn(job).await;
-            let _ = this.update(cx, |this, cx| this.apply(repo, cx));
+            let _ = this.update(cx, |this, cx| this.observe(repo, cx));
         })
         .detach();
     }
@@ -177,9 +177,19 @@ impl RefsView {
         }
     }
 
-    fn apply(&mut self, repo: Option<Repo>, cx: &mut Context<Self>) {
+    /// Refs re-read outside an operation (the poll, showing the tab): when
+    /// they moved, the last operation's error describes a state that is gone.
+    /// Unchanged refs keep it, so a real failure does not vanish on its own.
+    fn observe(&mut self, repo: Option<Repo>, cx: &mut Context<Self>) {
+        if self.apply(repo, cx) {
+            self.error = None;
+        }
+    }
+
+    /// Adopt a snapshot; whether it differed from the one shown.
+    fn apply(&mut self, repo: Option<Repo>, cx: &mut Context<Self>) -> bool {
         if self.repo.as_ref() == Some(&repo) {
-            return;
+            return false;
         }
         let first = self.repo.is_none();
         self.repo = Some(repo);
@@ -188,6 +198,7 @@ impl RefsView {
             cx.emit(RefsEvent::Changed);
         }
         cx.notify();
+        true
     }
 
     /// Rebuild the flat row model: each section with a match gets a header
