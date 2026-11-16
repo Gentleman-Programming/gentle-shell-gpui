@@ -316,6 +316,24 @@ impl Workspace {
         self.start_active_session(window, cx);
         let cwd = self.active_cwd(cx);
         let view = cx.new(|cx| SettingsView::new(cwd, window, cx));
+        self.show_settings_view(view, window, cx);
+    }
+
+    /// Configuration opened for the mic: the Dictation section leads the
+    /// screen, so the controls the user needs are visible without scrolling.
+    pub(super) fn open_dictation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.start_active_session(window, cx);
+        let cwd = self.active_cwd(cx);
+        let view = cx.new(|cx| SettingsView::for_dictation(cwd, window, cx));
+        self.show_settings_view(view, window, cx);
+    }
+
+    fn show_settings_view(
+        &mut self,
+        view: Entity<SettingsView>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let subscription = cx.subscribe_in(
             &view,
             window,
