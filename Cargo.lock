@@ -2291,7 +2291,7 @@ dependencies = [
 
 [[package]]
 name = "gentle-core"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "regex",
  "serde",
@@ -2300,7 +2300,7 @@ dependencies = [
 
 [[package]]
 name = "gentle-shell-gpui"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -2317,6 +2317,7 @@ dependencies = [
  "gtk",
  "ignore",
  "image",
+ "imagesize 0.14.0",
  "lzma-rs",
  "objc2 0.6.5",
  "objc2-app-kit 0.3.2",
@@ -2326,6 +2327,7 @@ dependencies = [
  "raw-window-handle",
  "regex",
  "reqwest",
+ "resvg 0.46.0",
  "rquickjs",
  "serde",
  "serde_json",
@@ -5523,7 +5525,7 @@ dependencies = [
 
 [[package]]
 name = "pi-rpc"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "anyhow",
  "async-channel",
