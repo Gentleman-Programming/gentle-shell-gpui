@@ -1,27 +1,83 @@
 //! Store actions: writing `profiles.json`, Save, Use in this session, Make
 //! default, the repository pin, Publish, Export and Import, and the name and
-//! leave flows.
+//! leave flows. On the RPC path the same actions are whole-store `set_config`
+//! writes guarded by the last `writeRevision`. Make default and Use in this
+//! session are Gentle Shell's `apply_profile` when it advertises it; otherwise
+//! Make default stays on the files.
 
 use gentle_core::profiles::{
     PROFILE_EXPORT_FILE, PinRead, ProfileExport, ProfilesFile, Routing, create_profile,
     delete_profile, duplicate_profile, normalize_routing, parse_model_ref, parse_profile_export,
-    rename_profile, serialize_profile_export, serialize_profiles, update_profile,
+    parse_profiles, rename_profile, serialize_profile_export, serialize_profiles,
+    set_orchestrator_mode, update_profile,
 };
 use gpui_kit::*;
+use pi_rpc::desktop_rpc::{
+    ApplyProfileResult, ConfigStore, ProfileApplyMode, ProfileNote, ProfileNoteLevel,
+};
 
 use super::apply::{make_default, plan_make_default};
-use super::files::{follow_fallbacks, read_orchestrator_settings, write_atomic};
-use super::pins::{clear_pin, follow_renamed_pin, read_pin_status, write_pin};
-use super::{Confirm, Leave, NameMode, ProfilesEvent, ProfilesView, Tone};
+use super::env::{ApplyAnswer, ProfileApply};
+use super::files::{
+    fallbacks_write, files_job_start, follow_fallbacks, profiles_write, read_orchestrator_settings,
+    write_atomic,
+};
+use super::pins::{
+    clear_pin, follow_renamed_pin, local_pin_write, read_pin_status, renamed_pin_write, write_pin,
+};
+use super::{Backend, Confirm, Leave, NameMode, ProfilesEvent, ProfilesView, Tone};
+
+/// The committed declaration, as the RPC path names it.
+const DECLARATION: &str = ".pi/gentle-ai/profile.json";
+
+/// The stores Make default may have written through `apply_profile`.
+const APPLIED_STORES: [ConfigStore; 5] = [
+    ConfigStore::Profiles,
+    ConfigStore::Pins,
+    ConfigStore::Models,
+    ConfigStore::Subagents,
+    ConfigStore::ManagedAssets,
+];
+
+/// Gentle Shell's notes as one status line, in order.
+fn notes_text(notes: &[ProfileNote]) -> String {
+    notes
+        .iter()
+        .map(|note| note.text.trim())
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
 
 impl ProfilesView {
-    /// Write `next` to profiles.json, then adopt it.
+    /// Write `next` to profiles.json (or replace the `profiles` store over
+    /// RPC), then adopt it.
     fn write_store(
         &mut self,
         next: ProfilesFile,
         cx: &mut Context<Self>,
         done: impl FnOnce(&mut Self, &mut Context<Self>) + 'static,
     ) {
+        if self.is_rpc() {
+            let write = match profiles_write(&next) {
+                Ok(write) => write,
+                Err(error) => return self.say(format!("Not saved: {error}"), Tone::Bad),
+            };
+            self.rpc_write(write, cx, move |this, result, cx| {
+                // The Shell's normalized store is the truth; the draft it was
+                // built from stands in only if that cannot be read back.
+                this.file = result
+                    .state
+                    .value
+                    .as_ref()
+                    .and_then(|value| parse_profiles(&value.to_string()))
+                    .map_or(next, |(file, _)| file);
+                done(this, cx);
+                // A pin's evaluation depends on which profiles exist.
+                this.reread(&[ConfigStore::Pins], cx);
+            });
+            return;
+        }
         let Some(env) = self.env.clone() else { return };
         let text = serialize_profiles(&next);
         self.run_io(
@@ -40,8 +96,8 @@ impl ProfilesView {
         );
     }
 
-    /// The draft as the store would hold it (create or update), or `None`
-    /// when it already matches.
+    /// The draft (routing and orchestrator mode) as the store would hold it
+    /// (create or update), or `None` when it already matches.
     fn saved_draft(&self) -> Result<Option<ProfilesFile>, String> {
         let Some(name) = &self.selected else {
             return Ok(None);
@@ -51,14 +107,16 @@ impl ProfilesView {
             .file
             .get(name)
             .map(|r| normalize_routing(&r.to_json()).unwrap_or_default());
-        if stored.as_ref() == Some(&normalized) {
+        let mode_saved = self.file.orchestrator_mode(name) == self.draft_mode;
+        if stored.as_ref() == Some(&normalized) && mode_saved {
             return Ok(None);
         }
-        if self.file.has(name) {
-            update_profile(&self.file, name, self.draft.clone()).map(Some)
+        let next = if self.file.has(name) {
+            update_profile(&self.file, name, self.draft.clone())?
         } else {
-            create_profile(&self.file, name, self.draft.clone()).map(Some)
-        }
+            create_profile(&self.file, name, self.draft.clone())?
+        };
+        set_orchestrator_mode(&next, name, self.draft_mode).map(Some)
     }
 
     /// Save pending edits, then continue with `then` (told whether it saved).
@@ -72,6 +130,7 @@ impl ProfilesView {
             Ok(None) => then(self, false, cx),
             Ok(Some(next)) => self.write_store(next, cx, move |this, cx| {
                 this.stored = this.draft.clone();
+                this.stored_mode = this.draft_mode;
                 then(this, true, cx);
             }),
         }
@@ -101,6 +160,15 @@ impl ProfilesView {
         let Some(name) = self.selected.clone() else {
             return;
         };
+        if self.shell_applies(cx) {
+            self.save_then(cx, move |this, saved, cx| {
+                if saved {
+                    this.say(format!("Saved \"{name}\"."), Tone::Good);
+                }
+                this.shell_apply(ProfileApply::new(name, ProfileApplyMode::Session), cx);
+            });
+            return;
+        }
         self.save_then(cx, move |this, saved, cx| {
             let orchestrator = this.draft.orchestrator();
             let model = orchestrator
@@ -134,6 +202,15 @@ impl ProfilesView {
         let Some(name) = self.selected.clone() else {
             return;
         };
+        if self.shell_applies(cx) {
+            self.save_then(cx, move |this, saved, cx| {
+                if saved {
+                    this.say(format!("Saved \"{name}\"."), Tone::Good);
+                }
+                this.shell_apply(ProfileApply::new(name, ProfileApplyMode::Default), cx);
+            });
+            return;
+        }
         self.save_then(cx, move |this, saved, cx| {
             let Some(env) = this.env.clone() else { return };
             let file = this.file.clone();
@@ -151,7 +228,21 @@ impl ProfilesView {
 
     pub(super) fn make_default(&mut self, name: String, cx: &mut Context<Self>) {
         let Some(env) = self.env.clone() else { return };
-        let file = self.file.clone();
+        // Make default writes profiles.json itself, so on the RPC path it
+        // must not race the Shell's writer in either direction: it starts
+        // only from the freshest store (no write open, no read owed), and
+        // holds every store write until it finishes.
+        let file = match &mut self.backend {
+            Backend::Rpc(remote) => match files_job_start(remote) {
+                Ok(file) => file,
+                Err(error) => {
+                    self.say(error, Tone::Info);
+                    cx.notify();
+                    return;
+                }
+            },
+            _ => self.file.clone(),
+        };
         self.run_io(
             cx,
             move || {
@@ -163,7 +254,24 @@ impl ProfilesView {
                 )
             },
             |this, (outcome, pin, pi_default), cx| {
-                this.pin = pin;
+                if let Backend::Rpc(remote) = &mut this.backend {
+                    remote.release();
+                    // Make default wrote profiles.json and the pin directly:
+                    // re-read them through the Shell so the next RPC write is
+                    // guarded by the revisions it left, never by older ones.
+                    this.reread(
+                        &[
+                            ConfigStore::Profiles,
+                            ConfigStore::Pins,
+                            ConfigStore::Models,
+                            ConfigStore::Subagents,
+                            ConfigStore::ManagedAssets,
+                        ],
+                        cx,
+                    );
+                } else {
+                    this.pin = pin;
+                }
                 this.pi_default = pi_default;
                 match outcome {
                     Ok(outcome) => {
@@ -188,10 +296,112 @@ impl ProfilesView {
         );
     }
 
+    /// Ask Gentle Shell to apply a saved profile (`apply_profile`). Every
+    /// store write waits until it answers.
+    pub(super) fn shell_apply(&mut self, request: ProfileApply, cx: &mut Context<Self>) {
+        let name = request.profile.clone();
+        let sent = self.with_remote(cx, |remote, port| remote.apply(port, request));
+        match sent {
+            Some(Ok(_)) => self.say(format!("Applying \"{name}\" in Gentle Shell…"), Tone::Info),
+            Some(Err(failure)) => self.say(
+                format!("\"{name}\" was not applied: {}", failure.message()),
+                Tone::Bad,
+            ),
+            None => {}
+        }
+        self.sync_busy();
+        cx.notify();
+    }
+
+    /// Gentle Shell answered an apply: ask the human with its exact dialog,
+    /// or show its notes. Nothing is ever confirmed here.
+    pub(super) fn apply_answered(
+        &mut self,
+        request: ProfileApply,
+        result: ApplyProfileResult,
+        cx: &mut Context<Self>,
+    ) {
+        let name = request.profile.clone();
+        let mode = request.mode;
+        match ApplyAnswer::new(&request, result) {
+            ApplyAnswer::Confirm {
+                title,
+                message,
+                retry,
+            } => {
+                self.status = None;
+                self.confirm = Some(super::Confirm::ApplyProfile {
+                    title,
+                    message,
+                    retry,
+                });
+            }
+            ApplyAnswer::Done { applied, notes } => {
+                let text = notes_text(&notes);
+                if applied {
+                    let text = if text.is_empty() {
+                        format!("Applied \"{name}\".")
+                    } else {
+                        text
+                    };
+                    self.say(text, Tone::Good);
+                    cx.emit(ProfilesEvent::Changed);
+                    if mode == ProfileApplyMode::Default {
+                        self.refresh_after_shell_apply(cx);
+                    }
+                } else {
+                    let text = if text.is_empty() {
+                        format!("Gentle Shell did not apply \"{name}\".")
+                    } else {
+                        text
+                    };
+                    let failed = notes
+                        .iter()
+                        .any(|note| note.level != ProfileNoteLevel::Info);
+                    self.say(text, if failed { Tone::Bad } else { Tone::Info });
+                    // A rollback may have restored part of what was written.
+                    if mode == ProfileApplyMode::Default {
+                        self.refresh_after_shell_apply(cx);
+                    }
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// Gentle Shell's Make default wrote the stores and Pi's settings: read
+    /// them again, so the screen and the next write follow what it left.
+    fn refresh_after_shell_apply(&mut self, cx: &mut Context<Self>) {
+        self.reread(&APPLIED_STORES, cx);
+        let Some(env) = self.env.clone() else { return };
+        self.run_io(
+            cx,
+            move || read_orchestrator_settings(&env.settings_path()),
+            |this, pi_default, _| this.pi_default = pi_default,
+        );
+    }
+
     pub(super) fn toggle_repo_pin(&mut self, cx: &mut Context<Self>) {
         let (Some(name), Some(env)) = (self.selected.clone(), self.env.clone()) else {
             return;
         };
+        if self.is_rpc() {
+            self.save_then(cx, move |this, _, cx| {
+                let (write, pinned) = match local_pin_write(this.pin.as_ref(), &name) {
+                    Ok(write) => write,
+                    Err(error) => return this.say(error, Tone::Bad),
+                };
+                let message = if pinned {
+                    "Removed the clone pin. This clone falls back to the repository declaration, then to the global routing.".to_string()
+                } else {
+                    format!(
+                        "Pinned \"{name}\" for this clone. Subagent launches here resolve it; the orchestrator and other repositories keep their global routing."
+                    )
+                };
+                this.rpc_write(write, cx, move |this, _, _| this.say(message, Tone::Good));
+            });
+            return;
+        }
         self.save_then(cx, move |this, _, cx| {
             this.run_io(
                 cx,
@@ -247,6 +457,9 @@ impl ProfilesView {
     }
 
     pub(super) fn clear_session(&mut self, cx: &mut Context<Self>) {
+        if let Some(session) = self.session.clone() {
+            session.update(cx, |session, cx| session.set_session_profile(None, cx));
+        }
         self.say("Sent /gentle:profiles clear.", Tone::Info);
         cx.emit(ProfilesEvent::RunCommand("/gentle:profiles clear".into()));
         cx.notify();
@@ -329,7 +542,9 @@ impl ProfilesView {
                             let keep = this.change_count() > 0;
                             this.select(Some(name.clone()), keep);
                             this.say(format!("Profile \"{from}\" renamed to \"{name}\"."), Tone::Good);
-                            if let Some(env) = this.env.clone() {
+                            if this.is_rpc() {
+                                this.follow_rename_rpc(&from, &name, cx);
+                            } else if let Some(env) = this.env.clone() {
                                 let (old, new) = (from.clone(), name.clone());
                                 this.run_io(
                                     cx,
@@ -408,7 +623,9 @@ impl ProfilesView {
                 let first = this.file.names().next().map(str::to_string);
                 this.select(first, false);
                 this.say(format!("Deleted \"{name}\"."), Tone::Good);
-                if let Some(env) = this.env.clone() {
+                if this.is_rpc() {
+                    this.follow_fallbacks_rpc(&name, None, cx);
+                } else if let Some(env) = this.env.clone() {
                     this.run_io(
                         cx,
                         move || follow_fallbacks(&env.config_home, &name, None),
@@ -549,6 +766,43 @@ impl ProfilesView {
             }),
         }
         cx.notify();
+    }
+
+    /// A rename over RPC: the fallbacks and the clone pin follow it; the
+    /// committed declaration is only reported, like the direct-file path.
+    fn follow_rename_rpc(&mut self, from: &str, to: &str, cx: &mut Context<Self>) {
+        self.follow_fallbacks_rpc(from, Some(to), cx);
+        let mut message = format!("Profile \"{from}\" renamed to \"{to}\".");
+        if self.pin.as_ref().map(|pin| &pin.repo) == Some(&PinRead::Valid(from.to_string())) {
+            message.push_str(&format!(
+                " The committed declaration {DECLARATION} still names \"{from}\"; Publish to repo republishes it."
+            ));
+        }
+        self.say(message.clone(), Tone::Good);
+        if let Some(write) = renamed_pin_write(self.pin.as_ref(), from, to) {
+            self.rpc_write(write, cx, move |this, _, _| {
+                this.say(format!("{message} Updated the clone pin."), Tone::Good);
+            });
+        }
+    }
+
+    /// `profile_fallbacks` follows a rename or delete over RPC, from the
+    /// store as last read; a missing or invalid store is left alone.
+    fn follow_fallbacks_rpc(&mut self, from: &str, to: Option<&str>, cx: &mut Context<Self>) {
+        let write = self
+            .remote()
+            .and_then(|remote| remote.state(ConfigStore::ProfileFallbacks))
+            .and_then(|state| fallbacks_write(state, from, to));
+        match write {
+            None => {}
+            Some(Err(error)) => self.say(
+                format!("The profile fallbacks were not updated: {error}"),
+                Tone::Bad,
+            ),
+            Some(Ok(write)) => {
+                self.rpc_write(write, cx, |_, _, _| {});
+            }
+        }
     }
 
     /// `proceed` for paths that run after async I/O and have no window.
