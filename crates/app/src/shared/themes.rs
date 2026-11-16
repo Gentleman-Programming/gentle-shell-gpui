@@ -6,6 +6,7 @@
 //! `cx`, so the resolved colors of the active theme are mirrored in a
 //! process-wide lock that [`select`] and [`init`] keep in step.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, RwLock};
 
@@ -528,6 +529,11 @@ pub fn example_themes() -> Vec<Theme> {
         .collect()
 }
 
+/// The example themes' files as shipped, for agents to read as references.
+pub fn example_theme_texts() -> &'static [&'static str] {
+    EXAMPLES
+}
+
 /// Gentle Shell's themes (installed files over the embedded copies), then the
 /// user's Pi and app themes, then the example app themes and the popular
 /// schemes. Names are unique, first wins.
@@ -553,7 +559,7 @@ pub fn load_catalog(gentle: Vec<Theme>, user: Vec<Theme>) -> Vec<Theme> {
 
 /// The app's own themes folder: `<data dir>/gentle-shell-gpui/themes/`.
 pub fn app_themes_dir() -> Option<PathBuf> {
-    dirs::data_dir().map(|dir| dir.join("gentle-shell-gpui").join("themes"))
+    data_root().map(|dir| dir.join("gentle-shell-gpui").join("themes"))
 }
 
 /// The user's themes: Pi's folder, then the app's.
@@ -567,7 +573,8 @@ fn read_user_themes(agent: &Path) -> Vec<Theme> {
 
 /// A cheap fingerprint of a themes folder: each file with its size and
 /// modification time, so a poll notices themes (and their scenes and
-/// images) added, edited or removed.
+/// images) added, edited or removed. Folders (the app's `previews` and
+/// `examples`) don't count: no theme lives in them.
 fn dir_stamp(dir: &Path) -> Vec<(PathBuf, u64, Option<std::time::SystemTime>)> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
@@ -575,7 +582,7 @@ fn dir_stamp(dir: &Path) -> Vec<(PathBuf, u64, Option<std::time::SystemTime>)> {
     let mut stamp: Vec<_> = entries
         .flatten()
         .filter_map(|e| {
-            let meta = e.metadata().ok()?;
+            let meta = e.metadata().ok().filter(|m| m.is_file())?;
             Some((e.path(), meta.len(), meta.modified().ok()))
         })
         .collect();
@@ -597,9 +604,54 @@ pub fn pick_default(catalog: &[Theme], persisted: Option<&str>, pi: Option<&str>
         .unwrap_or(0)
 }
 
-/// `dirs::data_dir()/gentle-shell-gpui/settings.json`.
+/// The environment variable that relocates every app-owned data location
+/// (settings, instance registration, workspaces, toolchain, update
+/// caches, themes, the devices tree): used only by isolated launches,
+/// which set it per process. It replaces `dirs::data_dir()`, which on
+/// Windows resolves the real known folder and ignores APPDATA overrides.
+pub const DATA_ROOT_ENV: &str = "GENTLE_SHELL_GPUI_DATA_DIR";
+
+/// The app's data root: [`DATA_ROOT_ENV`] when set — it must be an
+/// absolute, non-empty path, and an invalid override FAILS CLOSED (no
+/// data folders at all) instead of silently touching the real user data —
+/// otherwise the platform's own data dir, exactly as before.
+pub fn data_root() -> Option<PathBuf> {
+    match std::env::var_os(DATA_ROOT_ENV) {
+        None => dirs::data_dir(),
+        Some(value) => {
+            let path = PathBuf::from(&value);
+            if value.is_empty() || !path.is_absolute() {
+                eprintln!(
+                    "gentle-shell-gpui: {DATA_ROOT_ENV} must be an absolute, non-empty                      path; refusing to use any data folder"
+                );
+                None
+            } else {
+                Some(path)
+            }
+        }
+    }
+}
+
+/// The app's cache root: under [`DATA_ROOT_ENV`] when set (so cached
+/// sounds and other temp artifacts land in the sandbox too), otherwise
+/// the platform's own cache dir, exactly as before.
+pub fn cache_root() -> Option<PathBuf> {
+    match std::env::var_os(DATA_ROOT_ENV) {
+        None => dirs::cache_dir(),
+        Some(value) => {
+            let path = PathBuf::from(&value);
+            if value.is_empty() || !path.is_absolute() {
+                None
+            } else {
+                Some(path.join("cache"))
+            }
+        }
+    }
+}
+
+/// `data_root()/gentle-shell-gpui/settings.json`.
 pub fn store_path() -> Option<PathBuf> {
-    dirs::data_dir().map(|dir| dir.join("gentle-shell-gpui").join("settings.json"))
+    data_root().map(|dir| dir.join("gentle-shell-gpui").join("settings.json"))
 }
 
 fn read_settings(path: &Path) -> Option<Value> {
@@ -791,15 +843,36 @@ const THEME_POLL: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Re-read Pi's and the app's theme folders whenever their files change, so
 /// a theme shows up in the picker (and an edited active theme applies)
-/// without a restart.
+/// without a restart, and keep the previews of the app's themes current
+/// (`backdrop::preview`), so the agent that wrote one can look at it.
 fn watch_user_themes(agent: PathBuf, cx: &mut App) {
+    let app_dir = app_themes_dir();
     let dirs: Vec<PathBuf> = std::iter::once(agent.join("themes"))
-        .chain(app_themes_dir())
+        .chain(app_dir.clone())
         .collect();
     cx.spawn(async move |cx| {
         fn stamp(dirs: &[PathBuf]) -> Vec<Vec<(PathBuf, u64, Option<std::time::SystemTime>)>> {
             dirs.iter().map(|d| dir_stamp(d)).collect()
         }
+        // Previews are drawn off the UI thread, after the themes apply.
+        let preview = |user: Vec<Theme>, mut drawn: HashMap<String, Theme>| {
+            let dir = app_dir.clone();
+            async move {
+                if let Some(dir) = dir {
+                    backdrop::preview::refresh(&user, &dir, &mut drawn);
+                }
+                drawn
+            }
+        };
+        let agent_now = agent.clone();
+        let user = cx
+            .background_executor()
+            .spawn(async move { read_user_themes(&agent_now) })
+            .await;
+        let mut drawn = cx
+            .background_executor()
+            .spawn(preview(user, HashMap::new()))
+            .await;
         let mut last = stamp(&dirs);
         loop {
             cx.background_executor().timer(THEME_POLL).await;
@@ -817,7 +890,8 @@ fn watch_user_themes(agent: PathBuf, cx: &mut App) {
                 continue;
             };
             last = now;
-            cx.update(|cx| replace_user_themes(user, cx));
+            cx.update(|cx| replace_user_themes(user.clone(), cx));
+            drawn = cx.background_executor().spawn(preview(user, drawn)).await;
         }
     })
     .detach();
@@ -986,7 +1060,79 @@ pub fn set_transparency(clear: f32, persist: bool, cx: &mut App) {
 
 #[cfg(test)]
 mod tests {
+    /// Runtime probe of the actual `dirs` crate: does overriding APPDATA
+    /// change `dirs::data_dir()` on Windows? Prints both resolutions; run
+    /// with `cargo test -p gentle-shell-gpui probe -- --nocapture`.
+    #[test]
+    #[cfg(windows)]
+    fn probe_directories_data_dir_under_appdata_override() {
+        let sandbox = std::path::PathBuf::from(
+            "G:/Proyectos/gentle-shell-main/repo/.local/voice/tmp/probe-appdata",
+        );
+        let before = dirs::data_dir();
+        unsafe {
+            std::env::set_var("APPDATA", &sandbox);
+        }
+        let after = dirs::data_dir();
+        unsafe {
+            std::env::remove_var("APPDATA");
+        }
+        println!("PROBE dirs::data_dir before={before:?} after={after:?} sandbox={sandbox:?}");
+        // The observed truth, locked: on Windows `dirs` resolves the known
+        // folder (SHGetKnownFolderPath) and IGNORES the APPDATA override.
+        // App-owned data locations must go through data_root() instead.
+        assert_eq!(before, after, "dirs::data_dir ignores APPDATA on Windows");
+    }
+
     use super::*;
+
+    /// The isolated-launch override relocates every app-owned location.
+    #[test]
+    fn data_root_honors_an_absolute_override() {
+        let sandbox = std::env::temp_dir().join("gentle-shell-gpui-data-root-ok");
+        unsafe {
+            std::env::set_var(super::DATA_ROOT_ENV, &sandbox);
+        }
+        let root = data_root();
+        let store = store_path();
+        unsafe {
+            std::env::remove_var(super::DATA_ROOT_ENV);
+        }
+        assert_eq!(root, Some(sandbox.clone()));
+        assert_eq!(
+            store,
+            Some(sandbox.join("gentle-shell-gpui").join("settings.json"))
+        );
+    }
+
+    /// An invalid override fails closed: no data folder at all, never the
+    /// real user data.
+    #[test]
+    fn an_invalid_override_fails_closed() {
+        for hostile in ["", "relative/path"] {
+            unsafe {
+                std::env::set_var(super::DATA_ROOT_ENV, hostile);
+            }
+            let root = data_root();
+            let cache = cache_root();
+            unsafe {
+                std::env::remove_var(super::DATA_ROOT_ENV);
+            }
+            assert_eq!(root, None, "{hostile}");
+            assert_eq!(cache, None, "{hostile}");
+        }
+    }
+
+    /// Without the override, everything behaves exactly as before.
+    #[test]
+    fn the_fallback_keeps_the_platform_behavior() {
+        assert_eq!(data_root(), dirs::data_dir());
+        assert_eq!(cache_root(), dirs::cache_dir());
+        assert_eq!(
+            store_path(),
+            dirs::data_dir().map(|dir| dir.join("gentle-shell-gpui").join("settings.json"))
+        );
+    }
 
     fn scratch(name: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()
