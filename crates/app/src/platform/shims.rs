@@ -43,7 +43,7 @@ fn make_executable(_: &Path) {}
 
 fn shim_dir() -> Option<PathBuf> {
     Some(
-        dirs::data_dir()?
+        crate::shared::themes::data_root()?
             .join("gentle-shell-gpui")
             .join("toolchain")
             .join("bin"),

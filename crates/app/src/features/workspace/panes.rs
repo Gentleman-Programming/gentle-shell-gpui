@@ -153,6 +153,7 @@ impl Workspace {
                     }
                 }
                 SessionEvent::OpenProviders => this.open_providers(window, cx),
+                SessionEvent::OpenDictation => this.open_dictation(window, cx),
                 SessionEvent::OpenScreen(screen) => {
                     this.open_screen(*screen, Some(session.clone()), window, cx)
                 }
