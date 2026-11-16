@@ -7,7 +7,8 @@ use serde_json::Value;
 use super::{SavedPane, SavedState};
 
 fn file_path() -> Option<PathBuf> {
-    dirs::data_dir().map(|dir| dir.join("gentle-shell-gpui").join("workspaces.json"))
+    crate::shared::themes::data_root()
+        .map(|dir| dir.join("gentle-shell-gpui").join("workspaces.json"))
 }
 
 /// The saved list; empty when there is none or it can't be read.
