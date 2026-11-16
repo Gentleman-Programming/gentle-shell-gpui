@@ -47,7 +47,7 @@ pub enum Role {
 
 fn record_path() -> Option<PathBuf> {
     Some(
-        dirs::data_dir()?
+        crate::shared::themes::data_root()?
             .join("gentle-shell-gpui")
             .join("instance.json"),
     )

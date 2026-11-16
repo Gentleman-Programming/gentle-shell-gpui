@@ -559,7 +559,7 @@ pub fn load_catalog(gentle: Vec<Theme>, user: Vec<Theme>) -> Vec<Theme> {
 
 /// The app's own themes folder: `<data dir>/gentle-shell-gpui/themes/`.
 pub fn app_themes_dir() -> Option<PathBuf> {
-    dirs::data_dir().map(|dir| dir.join("gentle-shell-gpui").join("themes"))
+    data_root().map(|dir| dir.join("gentle-shell-gpui").join("themes"))
 }
 
 /// The user's themes: Pi's folder, then the app's.
@@ -604,9 +604,54 @@ pub fn pick_default(catalog: &[Theme], persisted: Option<&str>, pi: Option<&str>
         .unwrap_or(0)
 }
 
-/// `dirs::data_dir()/gentle-shell-gpui/settings.json`.
+/// The environment variable that relocates every app-owned data location
+/// (settings, instance registration, workspaces, toolchain, update
+/// caches, themes, the devices tree): used only by isolated launches,
+/// which set it per process. It replaces `dirs::data_dir()`, which on
+/// Windows resolves the real known folder and ignores APPDATA overrides.
+pub const DATA_ROOT_ENV: &str = "GENTLE_SHELL_GPUI_DATA_DIR";
+
+/// The app's data root: [`DATA_ROOT_ENV`] when set — it must be an
+/// absolute, non-empty path, and an invalid override FAILS CLOSED (no
+/// data folders at all) instead of silently touching the real user data —
+/// otherwise the platform's own data dir, exactly as before.
+pub fn data_root() -> Option<PathBuf> {
+    match std::env::var_os(DATA_ROOT_ENV) {
+        None => dirs::data_dir(),
+        Some(value) => {
+            let path = PathBuf::from(&value);
+            if value.is_empty() || !path.is_absolute() {
+                eprintln!(
+                    "gentle-shell-gpui: {DATA_ROOT_ENV} must be an absolute, non-empty                      path; refusing to use any data folder"
+                );
+                None
+            } else {
+                Some(path)
+            }
+        }
+    }
+}
+
+/// The app's cache root: under [`DATA_ROOT_ENV`] when set (so cached
+/// sounds and other temp artifacts land in the sandbox too), otherwise
+/// the platform's own cache dir, exactly as before.
+pub fn cache_root() -> Option<PathBuf> {
+    match std::env::var_os(DATA_ROOT_ENV) {
+        None => dirs::cache_dir(),
+        Some(value) => {
+            let path = PathBuf::from(&value);
+            if value.is_empty() || !path.is_absolute() {
+                None
+            } else {
+                Some(path.join("cache"))
+            }
+        }
+    }
+}
+
+/// `data_root()/gentle-shell-gpui/settings.json`.
 pub fn store_path() -> Option<PathBuf> {
-    dirs::data_dir().map(|dir| dir.join("gentle-shell-gpui").join("settings.json"))
+    data_root().map(|dir| dir.join("gentle-shell-gpui").join("settings.json"))
 }
 
 fn read_settings(path: &Path) -> Option<Value> {
@@ -1015,7 +1060,79 @@ pub fn set_transparency(clear: f32, persist: bool, cx: &mut App) {
 
 #[cfg(test)]
 mod tests {
+    /// Runtime probe of the actual `dirs` crate: does overriding APPDATA
+    /// change `dirs::data_dir()` on Windows? Prints both resolutions; run
+    /// with `cargo test -p gentle-shell-gpui probe -- --nocapture`.
+    #[test]
+    #[cfg(windows)]
+    fn probe_directories_data_dir_under_appdata_override() {
+        let sandbox = std::path::PathBuf::from(
+            "G:/Proyectos/gentle-shell-main/repo/.local/voice/tmp/probe-appdata",
+        );
+        let before = dirs::data_dir();
+        unsafe {
+            std::env::set_var("APPDATA", &sandbox);
+        }
+        let after = dirs::data_dir();
+        unsafe {
+            std::env::remove_var("APPDATA");
+        }
+        println!("PROBE dirs::data_dir before={before:?} after={after:?} sandbox={sandbox:?}");
+        // The observed truth, locked: on Windows `dirs` resolves the known
+        // folder (SHGetKnownFolderPath) and IGNORES the APPDATA override.
+        // App-owned data locations must go through data_root() instead.
+        assert_eq!(before, after, "dirs::data_dir ignores APPDATA on Windows");
+    }
+
     use super::*;
+
+    /// The isolated-launch override relocates every app-owned location.
+    #[test]
+    fn data_root_honors_an_absolute_override() {
+        let sandbox = std::env::temp_dir().join("gentle-shell-gpui-data-root-ok");
+        unsafe {
+            std::env::set_var(super::DATA_ROOT_ENV, &sandbox);
+        }
+        let root = data_root();
+        let store = store_path();
+        unsafe {
+            std::env::remove_var(super::DATA_ROOT_ENV);
+        }
+        assert_eq!(root, Some(sandbox.clone()));
+        assert_eq!(
+            store,
+            Some(sandbox.join("gentle-shell-gpui").join("settings.json"))
+        );
+    }
+
+    /// An invalid override fails closed: no data folder at all, never the
+    /// real user data.
+    #[test]
+    fn an_invalid_override_fails_closed() {
+        for hostile in ["", "relative/path"] {
+            unsafe {
+                std::env::set_var(super::DATA_ROOT_ENV, hostile);
+            }
+            let root = data_root();
+            let cache = cache_root();
+            unsafe {
+                std::env::remove_var(super::DATA_ROOT_ENV);
+            }
+            assert_eq!(root, None, "{hostile}");
+            assert_eq!(cache, None, "{hostile}");
+        }
+    }
+
+    /// Without the override, everything behaves exactly as before.
+    #[test]
+    fn the_fallback_keeps_the_platform_behavior() {
+        assert_eq!(data_root(), dirs::data_dir());
+        assert_eq!(cache_root(), dirs::cache_dir());
+        assert_eq!(
+            store_path(),
+            dirs::data_dir().map(|dir| dir.join("gentle-shell-gpui").join("settings.json"))
+        );
+    }
 
     fn scratch(name: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()
