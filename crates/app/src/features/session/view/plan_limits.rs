@@ -25,6 +25,8 @@ use crate::shared::ui;
 /// An older Shell keeps its windows out of Desktop RPC: the popover says so
 /// instead of inventing rows.
 const LEGACY_LINE: &str = "Plan limits need Gentle Shell 4.8 or newer";
+/// How often a hidden plan-limits chip asks for the usage again.
+const PLAN_SEED_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
 /// A Shell that offers the methods but has not reported windows yet.
 const NO_DATA_LINE: &str = "No plan usage reported yet.";
 
@@ -131,6 +133,24 @@ impl SessionView {
     /// The plan-limits chip, on the composer's bottom row just before the
     /// model picker. It seeds the session's subscription slice the first
     /// time its card opens (idempotent, like the Usage screen's).
+    /// Ask for the subscription usage outside the render pass, at most once
+    /// per [`PLAN_SEED_EVERY`] while the chip has nothing to show.
+    fn ask_plan_usage(&self, cx: &mut Context<Self>) {
+        let now = std::time::Instant::now();
+        if self
+            .plan_seed_asked
+            .get()
+            .is_some_and(|last| now.duration_since(last) < PLAN_SEED_EVERY)
+        {
+            return;
+        }
+        self.plan_seed_asked.set(Some(now));
+        let weak = cx.entity().downgrade();
+        cx.defer(move |cx| {
+            let _ = weak.update(cx, |this, cx| this.subscription_seed(cx));
+        });
+    }
+
     pub(super) fn render_plan_limits_chip(&self, cx: &mut Context<Self>) -> Option<Popover> {
         let snapshot = self.subscription_snapshot();
         let current = self.models.current.as_ref().map(|m| m.provider.clone());
@@ -141,7 +161,16 @@ impl SessionView {
             current.as_deref(),
             *self.local_offset.get_or_init(local_offset_secs),
             now_ms(),
-        )?;
+        );
+        let Some(chip) = chip else {
+            // Hidden without data, so its card can't open to ask for it: once
+            // the session has a model, ask here (seeding is idempotent and a
+            // no-op on Shells without the method), throttled.
+            if current.is_some() {
+                self.ask_plan_usage(cx);
+            }
+            return None;
+        };
         let weak = cx.entity().downgrade();
         let color = row_color(chip.percent);
         let title: SharedString = match &chip.plan {

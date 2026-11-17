@@ -171,6 +171,10 @@ pub struct SessionView {
     /// The local UTC offset in seconds, read once per tab: the plan-limits
     /// chip's reset clock uses it (never a `date` call per frame).
     local_offset: std::cell::OnceCell<i64>,
+    /// When the plan-limits chip last asked for the subscription usage while
+    /// it had nothing to show: the chip is hidden without data, so it can't
+    /// wait for its card to open (at most once per `PLAN_SEED_EVERY`).
+    plan_seed_asked: std::cell::Cell<Option<std::time::Instant>>,
 }
 
 impl EventEmitter<SessionEvent> for SessionView {}
@@ -320,6 +324,7 @@ impl SessionView {
             capture_seq: 0,
             window_handle: window.window_handle(),
             local_offset: std::cell::OnceCell::new(),
+            plan_seed_asked: std::cell::Cell::new(None),
         };
         if start_now {
             this.ensure_started(window, cx);
