@@ -168,6 +168,9 @@ pub struct SessionView {
     capture_seq: u64,
     /// This tab's window, for work that finishes outside a window update.
     window_handle: AnyWindowHandle,
+    /// The local UTC offset in seconds, read once per tab: the plan-limits
+    /// chip's reset clock uses it (never a `date` call per frame).
+    local_offset: std::cell::OnceCell<i64>,
 }
 
 impl EventEmitter<SessionEvent> for SessionView {}
@@ -316,6 +319,7 @@ impl SessionView {
             capture: None,
             capture_seq: 0,
             window_handle: window.window_handle(),
+            local_offset: std::cell::OnceCell::new(),
         };
         if start_now {
             this.ensure_started(window, cx);

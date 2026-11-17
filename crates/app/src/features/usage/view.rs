@@ -12,7 +12,7 @@ use super::{StatsState, Tab, UsageEvent, UsageState, UsageView};
 use crate::shared::ui;
 
 mod stats;
-mod subscription;
+pub(crate) mod subscription;
 
 /// Segmented toggle frame; children are small ghost buttons, the selected one
 /// `.selected(true)`.

@@ -487,6 +487,9 @@ impl SessionView {
                 })
             })
             .child(div().flex_1().min_w_0())
+            .when_some(self.render_plan_limits_chip(cx), |this, chip| {
+                this.child(chip)
+            })
             .child(
                 div()
                     .min_w_0()

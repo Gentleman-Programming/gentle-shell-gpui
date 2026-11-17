@@ -317,7 +317,7 @@ backdrop.occlude().child(ui::pop_in(
 
 Every new chip uses `chip_popover(id, icon, color, label, title, count, body)`: a `ghost().xsmall()` `Button` with `text_color(color)` that opens a `Popover` anchored `BottomRight`, 360 px wide, with `appearance(false)`, content in `ui::island(cx)` + `ui::popover_in`. The card shows icon and title (`text_sm MEDIUM`), the count in `MONO` and a scrollable list; `body` builds the rows only on open. Chip color: `accent` if something is running, `muted` at rest, `faint` for passive information (token usage). In panels narrower than `TINY`, extension states collapse into a single chip.
 
-The composer keeps only the attach button and the send/stop pill inside its box. Below the box, a quiet row carries the folder path, the branch and the session's cost on the left, and the model and effort pickers as quiet text buttons on the right; their menus open upward from that row (`Anchor::BottomRight`).
+The composer keeps only the attach button and the send/stop pill inside its box. Below the box, a quiet row carries the folder path, the branch and the session's cost on the left, and the model and effort pickers as quiet text buttons on the right, with the plan-limits chip just before the model (the current provider's plan usage: the most-used window's percent as the label, toned muted / warning ≥ 80 / danger ≥ 95; the card lists each window's label, local reset clock, percent and thin bar, plus "See all →" opening Usage & stats, and says "updated Nm ago" / "stale" instead when the data isn't fresh); their menus open upward from that row (`Anchor::BottomRight`).
 
 ### Conversation cards
 

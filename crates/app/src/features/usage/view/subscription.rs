@@ -13,20 +13,23 @@ use crate::features::usage::credentials::{CardState, ProviderCard};
 use crate::features::usage::{UsageState, UsageView, now_ms};
 use crate::shared::ui;
 
-/// Meter fill by how much of the window is spent.
+/// Meter fill by how much of the window is spent. The 80/95 thresholds are
+/// gentle-core's `limit_tone`, shared with the plan-limits chip and the
+/// legacy limit chips.
 fn bar_color(percent: f64) -> Hsla {
-    if percent >= 95.0 {
-        ui::danger()
-    } else if percent >= 80.0 {
-        ui::warning()
-    } else if percent >= 50.0 {
-        ui::accent()
-    } else {
-        ui::success()
+    use gentle_core::usage::subscription::LimitTone;
+    match gentle_core::usage::subscription::limit_tone(percent) {
+        LimitTone::Danger => ui::danger(),
+        LimitTone::Warning => ui::warning(),
+        // The calm band splits at 50: a half-spent window takes the accent.
+        LimitTone::Calm if percent >= 50.0 => ui::accent(),
+        LimitTone::Calm => ui::success(),
     }
 }
 
-fn updated_ago(fetched_at: i64, now: i64) -> String {
+/// The Usage screen's "updated Nm ago" line, shared with the session's
+/// plan-limits chip.
+pub(crate) fn updated_ago(fetched_at: i64, now: i64) -> String {
     let minutes = (now - fetched_at) / 60_000;
     if minutes < 1 {
         "updated just now".into()

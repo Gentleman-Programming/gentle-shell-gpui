@@ -30,6 +30,7 @@ mod effort;
 mod live;
 mod model_picker;
 mod permissions;
+mod plan_limits;
 mod rail;
 mod review;
 mod session_changes;

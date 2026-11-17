@@ -27,7 +27,12 @@ mod view;
 
 use credentials::{CardState, ProviderCard, discover, read_auth};
 use fetch::run_fetch;
-use stats::{MAX_SESSION_BYTES, StatsData, forget_sessions, load_sessions, local_offset_secs};
+use stats::{MAX_SESSION_BYTES, StatsData, forget_sessions, load_sessions};
+pub(crate) use view::subscription::updated_ago;
+
+/// The local UTC offset in seconds, for views outside this feature that
+/// render local times (the session's plan-limits chip).
+pub(crate) use stats::local_offset_secs;
 
 pub enum UsageEvent {
     Close,
@@ -131,7 +136,9 @@ fn rpc_limit_to_core(limit: &RpcUsageLimit) -> UsageLimit {
     }
 }
 
-fn rpc_provider_to_core(provider: &RpcProviderUsage, now: i64) -> ProviderUsage {
+/// The wire provider → core usage, reused by the Usage screen's cards and
+/// the session's plan-limits chip (the fetched time falls back to `now`).
+pub(crate) fn rpc_provider_to_core(provider: &RpcProviderUsage, now: i64) -> ProviderUsage {
     ProviderUsage {
         provider: provider.provider.clone(),
         plan: provider.plan.clone(),

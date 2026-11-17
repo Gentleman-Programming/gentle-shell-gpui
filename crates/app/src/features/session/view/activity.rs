@@ -188,12 +188,13 @@ impl SessionView {
             })
             .children(self.extension.rate_limits.iter().filter(|_| !collapse).map(
                 |(window, limit)| {
-                    let color = if limit.percent >= 95 {
-                        ui::danger()
-                    } else if limit.percent >= 80 {
-                        ui::warning()
-                    } else {
-                        ui::muted()
+                    use gentle_core::usage::subscription::LimitTone;
+                    let color = match gentle_core::usage::subscription::limit_tone(f64::from(
+                        limit.percent,
+                    )) {
+                        LimitTone::Danger => ui::danger(),
+                        LimitTone::Warning => ui::warning(),
+                        LimitTone::Calm => ui::muted(),
                     };
                     let tip = limit.text.clone();
                     div()

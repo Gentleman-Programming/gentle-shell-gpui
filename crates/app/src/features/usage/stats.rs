@@ -182,7 +182,7 @@ fn load_sessions_in(
 
 /// The local UTC offset in seconds right now (DST drift across a 30-day
 /// chart is ignored). Falls back to UTC when it cannot be determined.
-pub(super) fn local_offset_secs() -> i64 {
+pub(crate) fn local_offset_secs() -> i64 {
     #[cfg(not(windows))]
     {
         let output = pi_rpc::command("date").arg("+%z").output();
