@@ -94,12 +94,23 @@ pub struct SettingsView {
     engram: upgrade::EngramUpdate,
     /// Theme: importing and sharing themes.
     theme_share: theme::ThemeShare,
+    /// The window's active agent tab: its Gentle Shell reports update status
+    /// when it offers `get_update_status`.
+    session: Option<Entity<crate::features::session::SessionView>>,
+    _session_sub: Option<Subscription>,
+    /// Gentle Shell's own update status, when it reports one.
+    shell_updates: upgrade::ShellUpdates,
 }
 
 impl EventEmitter<SettingsEvent> for SettingsView {}
 
 impl SettingsView {
-    pub fn new(cwd: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        cwd: PathBuf,
+        session: Option<Entity<crate::features::session::SessionView>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let package_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("npm:package-name, git:github.com/…, or a local path")
@@ -162,6 +173,11 @@ impl SettingsView {
             devices: devices::Devices::default(),
             engram: upgrade::EngramUpdate::default(),
             theme_share: theme::ThemeShare::new(window, cx),
+            _session_sub: session
+                .as_ref()
+                .map(|session| cx.observe(session, |this, _, cx| this.update_status_changed(cx))),
+            session,
+            shell_updates: upgrade::ShellUpdates::default(),
         };
         this.reload(cx);
         this.refresh_maestro(cx);
@@ -176,6 +192,17 @@ impl SettingsView {
     }
 
     fn reload(&mut self, cx: &mut Context<Self>) {
+        self.reload_with(false, cx);
+    }
+
+    /// Re-read the configuration. Update status comes from the active agent
+    /// tab's Gentle Shell when it reports it (`refresh_updates` looks it up,
+    /// as a manual check); otherwise the npm path below runs, as before.
+    fn reload_with(&mut self, refresh_updates: bool, cx: &mut Context<Self>) {
+        let shell_updates = self.ask_update_status(refresh_updates, cx);
+        if !shell_updates {
+            self.shell_updates.status = None;
+        }
         let cwd = self.cwd.clone();
         self._load = cx.spawn(async move |this, cx| {
             let snapshot = cx
@@ -187,13 +214,15 @@ impl SettingsView {
                     if let Some(spec) = &spec {
                         probe(spec, &mut snapshot);
                     }
-                    // Cached for a day in the launcher config, so reopening
-                    // Configuration stays off the network. gentle-ai updates
-                    // its managed install, and its launcher config, itself.
-                    if !spec
+                    // gentle-ai updates its managed install, and its
+                    // launcher config, itself.
+                    snapshot.managed = spec
                         .as_ref()
-                        .is_some_and(pi_rpc::LaunchSpec::managed_by_gentle_ai)
-                    {
+                        .is_some_and(pi_rpc::LaunchSpec::managed_by_gentle_ai);
+                    snapshot.skipped_release = crate::features::updates::skipped();
+                    // Cached for a day in the launcher config, so reopening
+                    // Configuration stays off the network.
+                    if !snapshot.managed && !shell_updates {
                         snapshot.update =
                             crate::features::updates::current_from_versions(&snapshot.versions)
                                 .and_then(crate::features::updates::check);
@@ -248,7 +277,18 @@ impl Render for SettingsView {
                                     .unwrap_or_else(|| "not found".into()),
                             ))
                             .child(row("Versions", s.versions.join(" · ")))
-                            .when_some(s.update.clone(), |d, offer| {
+                            .children(
+                                self.shell_updates
+                                    .status
+                                    .iter()
+                                    .flat_map(|status| {
+                                        crate::features::updates::status::status_notes(
+                                            status, s.managed,
+                                        )
+                                    })
+                                    .map(|(label, text)| row(label, text)),
+                            )
+                            .when_some(self.update_offer(s), |d, offer| {
                                 d.child(self.render_update(offer, cx))
                             })
                             .children(self.upgrade.as_ref().map(upgrade::upgrade_result))
@@ -346,8 +386,8 @@ impl Render for SettingsView {
                                 .ghost()
                                 .xsmall()
                                 .icon(Icon::new(IconName::RefreshCw))
-                                .tooltip("Reload")
-                                .on_click(cx.listener(|this, _, _, cx| this.reload(cx))),
+                                .tooltip("Reload and check for updates")
+                                .on_click(cx.listener(|this, _, _, cx| this.reload_with(true, cx))),
                         )
                         .child(
                             Button::new("settings-close")

@@ -31,8 +31,13 @@ pub struct Snapshot {
     pub banner: Option<String>,
     pub bridge_plan: Option<String>,
     pub claude_code: Option<String>,
-    /// A newer Gentle Shell release, checked as the launcher's startup does.
+    /// A newer Gentle Shell release, checked as the launcher's startup does
+    /// (only when the active tab's Shell does not report its update status).
     pub update: Option<crate::features::updates::UpdateOffer>,
+    /// gentle-ai manages this install, and updates it itself.
+    pub managed: bool,
+    /// The release "Skip this version" set aside.
+    pub skipped_release: Option<String>,
     /// A newer Engram release than the one the app runs.
     pub engram_update: Option<crate::features::updates::UpdateOffer>,
 }
@@ -171,6 +176,8 @@ pub fn read_snapshot(agent: &Path, config: &Path, cwd: &Path) -> Snapshot {
             .and_then(|v| str_of(&v["provider"]["plan"])),
         claude_code: None,
         update: None,
+        managed: false,
+        skipped_release: None,
         engram_update: None,
     }
 }

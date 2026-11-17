@@ -1,10 +1,13 @@
 //! Usage: native `/gentle:usage` (provider subscription windows) and
-//! `/gentle:stats` (local token and cost totals from session files).
+//! `/gentle:stats` (token and cost totals: from Gentle Shell's own
+//! `get_usage_stats` when the active agent tab's Shell offers it, otherwise
+//! from the session files).
 //!
 //! Parsing mirrors gentle-pi's `lib/shell-usage.ts` and `lib/stats-collector.ts`.
 //! Tokens and API keys only ever travel from `auth.json` into the HTTP request
 //! header; they are never stored in view state, logged, or rendered.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -14,14 +17,17 @@ use gpui_kit::*;
 use gentle_core::usage::stats::{StatsRange, StatsSummary, aggregate_stats};
 use gentle_core::usage::subscription::{ProviderUsage, UsageLimit, UsageWindow};
 use pi_rpc::desktop_rpc::{
-    ProviderUsage as RpcProviderUsage, UsageLimit as RpcUsageLimit, UsageResetAt, UsageStatus,
-    UsageWindow as RpcUsageWindow,
+    DesktopMethod, ProviderUsage as RpcProviderUsage, StatsScope, UsageLimit as RpcUsageLimit,
+    UsageResetAt, UsageStats, UsageStatus, UsageWindow as RpcUsageWindow,
 };
 
-use crate::features::session::SessionView;
+use crate::features::session::{
+    READ_DECIDE_WAIT, ReadOutcome, ReadRequest, ReadSupport, ReadTicket, SessionView,
+};
 
 mod credentials;
 mod fetch;
+mod shell_stats;
 mod stats;
 mod view;
 
@@ -88,10 +94,40 @@ enum StatsState {
     Idle,
     Loading,
     Loaded {
-        data: Arc<StatsData>,
-        offset: i64,
+        source: StatsSource,
         summary: StatsSummary,
     },
+}
+
+/// What a loaded Local stats tab was computed from.
+enum StatsSource {
+    /// The app's own scan of the session files, re-aggregated per range.
+    Files { data: Arc<StatsData>, offset: i64 },
+    /// Gentle Shell's own aggregation for the range shown, with what it left
+    /// out. It has no cost per day.
+    Shell { notes: Vec<String> },
+}
+
+/// Where Local stats come from.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum StatsMode {
+    /// The tab's Shell is still probing: wait, bounded, before deciding.
+    Undecided,
+    /// Gentle Shell over `get_usage_stats` (every project, per range).
+    Shell,
+    /// The session files (also before the tab is first shown: nothing is
+    /// read either way until then).
+    Files,
+}
+
+/// Local stats read from Gentle Shell: one answer per range (switching back
+/// re-asks nothing), the read in flight, and the local UTC offset the chart
+/// days are counted in.
+struct ShellStats {
+    mode: StatsMode,
+    pending: Option<(ReadTicket, StatsRange)>,
+    answers: HashMap<StatsRange, UsageStats>,
+    offset: Option<i64>,
 }
 
 /// Where the Subscription tab gets its data: the session's subscription RPC
@@ -235,11 +271,14 @@ pub struct UsageView {
     stats: StatsState,
     range: StatsRange,
     metric: Metric,
-    /// The agent tab whose subscription RPC slice feeds the Subscription tab;
-    /// `None` when the window has no agent (the legacy path runs instead).
+    /// The agent tab whose subscription RPC slice feeds the Subscription tab
+    /// and whose Shell answers Local stats when it offers them; `None` when
+    /// the window has no agent (the legacy paths run instead).
     session: Option<Entity<SessionView>>,
     /// How the Subscription tab currently reads its data.
     mode: UsageMode,
+    /// Local stats from Gentle Shell, when that is their source.
+    shell_stats: ShellStats,
     _session_sub: Option<Subscription>,
     _usage_task: Task<()>,
     _stats_task: Task<()>,
@@ -269,6 +308,12 @@ impl UsageView {
             metric: Metric::Tokens,
             session: session.clone(),
             mode: UsageMode::Legacy,
+            shell_stats: ShellStats {
+                mode: StatsMode::Files,
+                pending: None,
+                answers: HashMap::new(),
+                offset: None,
+            },
             _session_sub: None,
             _usage_task: Task::ready(()),
             _stats_task: Task::ready(()),
@@ -330,6 +375,7 @@ impl UsageView {
     /// the RPC path. The legacy path never runs from here once it is active,
     /// so a turn never re-reads `auth.json`.
     fn session_changed(&mut self, cx: &mut Context<Self>) {
+        self.shell_stats_changed(cx);
         let legacy = match &self.session {
             Some(session) => session.read(cx).subscription_snapshot().legacy,
             None => true,
@@ -435,7 +481,154 @@ impl UsageView {
         });
     }
 
+    /// Load Local stats afresh (first shown, or the refresh button): from
+    /// Gentle Shell when the active agent tab's Shell offers
+    /// `get_usage_stats`, from the session files otherwise. A tab still
+    /// probing its Shell is waited for, at most [`READ_DECIDE_WAIT`].
     fn refresh_stats(&mut self, cx: &mut Context<Self>) {
+        self.shell_stats.pending = None;
+        self.shell_stats.answers.clear();
+        self.shell_stats.mode = self.stats_mode(cx);
+        match self.shell_stats.mode {
+            StatsMode::Files => self.refresh_stats_files(cx),
+            StatsMode::Shell => self.ask_shell_stats(cx),
+            StatsMode::Undecided => {
+                self.stats = StatsState::Loading;
+                self._stats_task = cx.spawn(async move |this, cx| {
+                    cx.background_executor().timer(READ_DECIDE_WAIT).await;
+                    let _ = this.update(cx, |this, cx| {
+                        if this.shell_stats.mode == StatsMode::Undecided {
+                            this.shell_stats.mode = StatsMode::Files;
+                            this.refresh_stats_files(cx);
+                        }
+                    });
+                });
+                cx.notify();
+            }
+        }
+    }
+
+    fn stats_mode(&self, cx: &App) -> StatsMode {
+        let Some(session) = &self.session else {
+            return StatsMode::Files;
+        };
+        match session.read(cx).read_support(DesktopMethod::GetUsageStats) {
+            ReadSupport::Rpc => StatsMode::Shell,
+            ReadSupport::Legacy => StatsMode::Files,
+            ReadSupport::NotReady => StatsMode::Undecided,
+        }
+    }
+
+    /// The tab changed: a probe that just answered decides where stats come
+    /// from, and an answer to the read in flight is taken.
+    fn shell_stats_changed(&mut self, cx: &mut Context<Self>) {
+        match self.shell_stats.mode {
+            StatsMode::Undecided => {
+                let mode = self.stats_mode(cx);
+                if mode == StatsMode::Undecided {
+                    return;
+                }
+                self.shell_stats.mode = mode;
+                if mode == StatsMode::Shell {
+                    self.ask_shell_stats(cx);
+                } else {
+                    self.refresh_stats_files(cx);
+                }
+            }
+            StatsMode::Shell => self.take_shell_stats(cx),
+            StatsMode::Files => {}
+        }
+    }
+
+    /// Show the range from Gentle Shell: its answer when already read, or
+    /// one `get_usage_stats` for every project. One read at a time: a range
+    /// picked while another is in flight is asked once that one lands. A
+    /// read the tab cannot queue falls back to the session files.
+    fn ask_shell_stats(&mut self, cx: &mut Context<Self>) {
+        if self.shell_stats.answers.contains_key(&self.range) {
+            self.show_shell_stats(cx);
+            return;
+        }
+        self.stats = StatsState::Loading;
+        cx.notify();
+        if self.shell_stats.pending.is_some() {
+            return;
+        }
+        let Some(session) = self.session.clone() else {
+            return self.stats_fallback(cx);
+        };
+        let range = self.range;
+        let request = ReadRequest::UsageStats {
+            range: shell_stats::rpc_range(range),
+            scope: StatsScope::All,
+        };
+        match session.update(cx, |session, cx| session.read(request, cx)) {
+            Ok(ticket) => self.shell_stats.pending = Some((ticket, range)),
+            Err(_) => self.stats_fallback(cx),
+        }
+    }
+
+    /// The answer to the read in flight, if it arrived. Any failure (a Shell
+    /// that refused or stopped answering) falls back to the session files.
+    fn take_shell_stats(&mut self, cx: &mut Context<Self>) {
+        let (Some((ticket, range)), Some(session)) =
+            (self.shell_stats.pending, self.session.clone())
+        else {
+            return;
+        };
+        let Some(outcome) = session.update(cx, |session, _| session.take_read(ticket)) else {
+            return;
+        };
+        self.shell_stats.pending = None;
+        match outcome {
+            ReadOutcome::UsageStats(stats) => {
+                self.shell_stats.answers.insert(range, stats);
+                self.ask_shell_stats(cx);
+            }
+            _ => self.stats_fallback(cx),
+        }
+    }
+
+    fn stats_fallback(&mut self, cx: &mut Context<Self>) {
+        self.shell_stats.mode = StatsMode::Files;
+        self.shell_stats.pending = None;
+        self.refresh_stats_files(cx);
+    }
+
+    /// Map the shown range's answer onto the summary, off the UI thread (the
+    /// local offset is read once, from `date`).
+    fn show_shell_stats(&mut self, cx: &mut Context<Self>) {
+        let range = self.range;
+        let Some(stats) = self.shell_stats.answers.get(&range).cloned() else {
+            return;
+        };
+        let offset = self.shell_stats.offset;
+        self._stats_task = cx.spawn(async move |this, cx| {
+            let (summary, notes, offset) = cx
+                .background_executor()
+                .spawn(async move {
+                    let offset = offset.unwrap_or_else(local_offset_secs);
+                    let summary = shell_stats::shell_summary(&stats, range, now_ms(), offset);
+                    (summary, shell_stats::shell_notes(&stats), offset)
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.shell_stats.offset = Some(offset);
+                if this.range != range || this.shell_stats.mode != StatsMode::Shell {
+                    return;
+                }
+                this.stats = StatsState::Loaded {
+                    source: StatsSource::Shell { notes },
+                    summary,
+                };
+                // Gentle Shell's days carry no cost: the chart shows tokens.
+                this.metric = Metric::Tokens;
+                cx.notify();
+            });
+        });
+    }
+
+    fn refresh_stats_files(&mut self, cx: &mut Context<Self>) {
         self.stats = StatsState::Loading;
         cx.notify();
         let root = pi_rpc::resolve_homes().agent.join("sessions");
@@ -462,8 +655,7 @@ impl UsageView {
                     aggregate_stats(&data.sessions, this.range, now_ms(), offset)
                 };
                 this.stats = StatsState::Loaded {
-                    data,
-                    offset,
+                    source: StatsSource::Files { data, offset },
                     summary,
                 };
                 cx.notify();
@@ -486,13 +678,17 @@ impl UsageView {
 
     fn set_range(&mut self, range: StatsRange, cx: &mut Context<Self>) {
         self.range = range;
-        if let StatsState::Loaded {
-            data,
-            offset,
-            summary,
-        } = &mut self.stats
-        {
-            *summary = aggregate_stats(&data.sessions, range, now_ms(), *offset);
+        match &mut self.stats {
+            StatsState::Loaded {
+                source: StatsSource::Files { data, offset },
+                summary,
+            } => *summary = aggregate_stats(&data.sessions, range, now_ms(), *offset),
+            StatsState::Loaded { .. } | StatsState::Loading
+                if self.shell_stats.mode == StatsMode::Shell =>
+            {
+                self.ask_shell_stats(cx)
+            }
+            _ => {}
         }
         cx.notify();
     }

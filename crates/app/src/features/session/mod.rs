@@ -18,12 +18,19 @@ mod attachments;
 mod builtins;
 mod events;
 mod lifecycle;
+mod reads;
 mod rpc;
 mod state;
 mod submit;
 mod view;
+#[cfg(test)]
+mod view_tests;
 
 pub use agents::{AgentsPanel, AgentsTab};
+pub(crate) use reads::READ_DECIDE_WAIT;
+pub(crate) use state::desktop::reads::{
+    ReadFailure, ReadOutcome, ReadRequest, ReadSupport, ReadTicket,
+};
 
 actions!(session, [Abort, Stop, ToggleAgents, NewSession]);
 
@@ -136,6 +143,8 @@ pub struct SessionView {
     mode: Option<gentle_core::gentle_state::PermissionMode>,
     default_mode: Option<gentle_core::gentle_state::PermissionMode>,
     _agents_ticker: Task<()>,
+    /// The background job output on screen and its poll.
+    job_output: agents::JobOutputView,
     todo: state::TodoIsland,
     git: state::GitStatus,
     models: state::Models,
@@ -299,6 +308,7 @@ impl SessionView {
                 &pi_rpc::resolve_homes().config,
             ),
             _agents_ticker: Task::ready(()),
+            job_output: agents::JobOutputView::default(),
             todo: state::TodoIsland::default(),
             git: state::GitStatus::default(),
             models: state::Models::default(),
@@ -373,18 +383,15 @@ impl SessionView {
     }
 
     /// Commands for the `/` menu and the palette: Pi's built-ins the app
-    /// runs, then Gentle Shell's, without the ones that do nothing here.
-    pub fn commands(&self) -> Vec<(String, String)> {
-        builtins::BUILTINS
-            .iter()
-            .map(|(name, description)| (name.to_string(), description.to_string()))
-            .chain(
-                self.commands
-                    .iter()
-                    .filter(|(name, _)| !gentle_core::commands::hidden(name))
-                    .cloned(),
-            )
-            .collect()
+    /// runs, then the other Pi built-ins Gentle Shell's session feed lists
+    /// (terminal-only ones marked), then Gentle Shell's, without the ones
+    /// that do nothing here.
+    pub fn commands(&self) -> Vec<gentle_core::commands::SlashCommand> {
+        gentle_core::commands::menu(
+            builtins::BUILTINS,
+            &self.desktop.sections().pi_commands(),
+            &self.commands,
+        )
     }
 
     /// Where skill `name` lives, if this tab's Gentle Shell has it.

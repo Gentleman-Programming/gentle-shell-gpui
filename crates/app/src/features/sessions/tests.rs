@@ -1,5 +1,6 @@
 //! Session file fixtures: summarizing, caching and listing real JSONL files
-//! in a temp directory.
+//! in a temp directory; who lists and opens sessions; and the screen drawn
+//! from Gentle Shell's listing in a headless window.
 
 // Not `super::*`: that re-exports `gpui_kit::*`, whose `test` attribute
 // shadows the built-in one and recurses.
@@ -7,11 +8,18 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use gentle_core::sessions::{SessionSummary, session_dir_name};
+use gpui_kit::{
+    AppContext as _, Context, Entity, IntoElement, Modifiers, ParentElement as _, Render,
+    Styled as _, Subscription, TestAppContext, Window, div,
+};
+use pi_rpc::desktop_rpc::{DesktopErrorCode, SessionEntry, SessionsScope};
 use pi_rpc::file_cache::FileCache;
 
-use super::Scope;
-use super::discovery::list_sessions;
+use super::discovery::{find_session, list_sessions};
 use super::summary::{cached_summary_in, summarize};
+use super::view::{choose_source, opens_elsewhere, switch_scope};
+use super::{Scope, SessionsEvent, SessionsView, Source};
+use crate::features::session::{ReadFailure, ReadSupport};
 
 fn read_summary(path: &Path) -> Option<SessionSummary> {
     summarize(std::fs::File::open(path).ok()?, path)
@@ -249,4 +257,161 @@ fn custom_session_dir_filters_by_header_cwd() {
         ids(list_sessions(&agent, cwd, Scope::All)),
         ["theirs", "mine"]
     );
+}
+
+#[test]
+fn a_session_is_found_by_id_in_any_project() {
+    let tmp = TempDir::new("find");
+    let agent = tmp.0.join("agent");
+    let other = Path::new("/elsewhere/proj");
+    let dir = agent.join("sessions").join(session_dir_name(other));
+    write_session(
+        &dir,
+        "2024-12-03T14-00-00-000Z_abc-1.jsonl",
+        &[header(
+            "abc-1",
+            "/elsewhere/proj",
+            "2024-12-03T14:00:00.000Z",
+        )],
+    );
+    // A file named otherwise is still found by its header.
+    write_session(
+        &dir,
+        "renamed.jsonl",
+        &[header(
+            "abc-2",
+            "/elsewhere/proj",
+            "2024-12-03T14:00:00.000Z",
+        )],
+    );
+    let found = find_session(&agent, "abc-1").unwrap();
+    assert_eq!(found.cwd, other);
+    assert!(found.path.ends_with("2024-12-03T14-00-00-000Z_abc-1.jsonl"));
+    assert_eq!(find_session(&agent, "abc-2").unwrap().id, "abc-2");
+    assert!(find_session(&agent, "missing").is_none());
+}
+
+#[test]
+fn the_shell_lists_only_its_own_folder_and_when_it_offers_both_methods() {
+    let cwd = Path::new("/w/proj");
+    let rpc = [ReadSupport::Rpc, ReadSupport::Rpc];
+    assert_eq!(choose_source(Some(cwd), cwd, rpc), Source::Shell);
+    assert_eq!(
+        choose_source(Some(Path::new("/w/other")), cwd, rpc),
+        Source::Files,
+        "another folder's tab would list another project"
+    );
+    assert_eq!(choose_source(None, cwd, rpc), Source::Files);
+    assert_eq!(
+        choose_source(Some(cwd), cwd, [ReadSupport::Rpc, ReadSupport::Legacy]),
+        Source::Files,
+        "listing without switching by id is the files' job"
+    );
+    assert_eq!(
+        choose_source(Some(cwd), cwd, [ReadSupport::NotReady, ReadSupport::Rpc]),
+        Source::Undecided
+    );
+}
+
+fn entry(id: &str, project: &str, current: bool) -> SessionEntry {
+    SessionEntry {
+        id: id.into(),
+        name: None,
+        modified: 1_793_577_600_000,
+        message_count: Some(3),
+        first_message: format!("Question in {project}"),
+        project: project.into(),
+        current,
+    }
+}
+
+#[test]
+fn other_projects_open_in_a_new_tab() {
+    let cwd = Path::new("/w/gentle-shell");
+    let here = entry("a", "gentle-shell", false);
+    let there = entry("b", "other", false);
+    assert_eq!(switch_scope(Scope::Project, &here, cwd), Some(None));
+    assert_eq!(
+        switch_scope(Scope::All, &here, cwd),
+        Some(Some(SessionsScope::Project)),
+        "a same-named folder is tried here first"
+    );
+    assert_eq!(switch_scope(Scope::All, &there, cwd), None);
+
+    let not_found = ReadFailure::Refused {
+        code: Some(DesktopErrorCode::NotFound),
+        message: "No session with that id in the requested scope".into(),
+    };
+    assert!(opens_elsewhere(&not_found, Some(SessionsScope::Project)));
+    assert!(
+        !opens_elsewhere(&not_found, None),
+        "not found in its own project is gone, not elsewhere"
+    );
+    assert!(opens_elsewhere(&ReadFailure::Unsupported, None));
+    let refused = ReadFailure::Refused {
+        code: Some(DesktopErrorCode::SessionsUnavailable),
+        message: "x".into(),
+    };
+    assert!(!opens_elsewhere(&refused, Some(SessionsScope::Project)));
+    assert!(!opens_elsewhere(
+        &ReadFailure::Timeout,
+        Some(SessionsScope::Project)
+    ));
+}
+
+struct Host {
+    view: Entity<SessionsView>,
+    closed: usize,
+    _subscription: Subscription,
+}
+
+impl Render for Host {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div().size_full().child(self.view.clone())
+    }
+}
+
+#[gpui::test]
+fn a_shell_listing_renders_and_its_current_session_closes(cx: &mut TestAppContext) {
+    cx.update(|cx| {
+        gpui_kit::init(cx);
+        cx.set_reduce_motion(true);
+    });
+    let (host, cx) = cx.add_window_view(|window, cx| {
+        let view = cx.new(|cx| {
+            let mut view =
+                SessionsView::empty(PathBuf::from("/w/gentle-shell"), None, None, window, cx);
+            view.source = Source::Shell;
+            view.scope = Scope::All;
+            view.entries = vec![entry("a", "gentle-shell", true), entry("b", "other", false)];
+            view.next_cursor = Some("next".into());
+            view
+        });
+        let subscription = cx.subscribe(&view, |host: &mut Host, _, event: &SessionsEvent, _| {
+            if matches!(event, SessionsEvent::Close) {
+                host.closed += 1;
+            }
+        });
+        Host {
+            view,
+            closed: 0,
+            _subscription: subscription,
+        }
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("session-row-0").is_some());
+    assert!(cx.debug_bounds("session-row-1").is_some());
+    assert!(cx.debug_bounds("session-row-2").is_none());
+    assert!(
+        cx.debug_bounds("sessions-more").is_some(),
+        "a cursor offers older sessions"
+    );
+    let count = cx.update(|_, cx| host.read(cx).view.read(cx).count());
+    assert_eq!(count, 2);
+
+    // The current session is already open: clicking it just closes.
+    let at = cx.debug_bounds("session-row-0").unwrap().center();
+    cx.simulate_click(at, Modifiers::none());
+    cx.run_until_parked();
+    assert_eq!(cx.update(|_, cx| host.read(cx).closed), 1);
 }

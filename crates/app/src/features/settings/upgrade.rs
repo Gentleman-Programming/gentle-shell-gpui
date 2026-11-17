@@ -1,5 +1,7 @@
 //! Gentle Shell's own updates: the "is available" card, `gentle-shell
-//! upgrade`, and how it ended as the app sees it afterwards.
+//! upgrade`, and how it ended as the app sees it afterwards. The offer comes
+//! from the active agent tab's Gentle Shell (`get_update_status`) when it
+//! reports one, otherwise from the npm registry (`features::updates`).
 
 use std::path::Path;
 
@@ -8,10 +10,105 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::{Disableable as _, Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+use pi_rpc::desktop_rpc::{DesktopMethod, UpdateStatus};
 
 use super::claude::forget_claude_auth;
+use super::snapshot::Snapshot;
 use super::{SettingsEvent, SettingsView};
+use crate::features::session::{ReadFailure, ReadOutcome, ReadRequest, ReadSupport, ReadTicket};
+use crate::features::updates::UpdateOffer;
+use crate::features::updates::status::offer_from_status;
 use crate::shared::ui;
+
+/// Gentle Shell's update status, when the active agent tab's Shell reports
+/// it.
+#[derive(Default)]
+pub(super) struct ShellUpdates {
+    pub(super) status: Option<UpdateStatus>,
+    /// The read in flight, and whether it refreshes.
+    pending: Option<(ReadTicket, bool)>,
+    /// The tab's Shell did not answer: the npm path, until Configuration
+    /// opens again.
+    failed: bool,
+}
+
+impl SettingsView {
+    /// Ask the active agent tab's Gentle Shell for its update status
+    /// (`refresh` looks it up, bounded by the Shell); `false` when it cannot
+    /// answer (not advertised, its tab still starting, or it failed before),
+    /// and then the npm path runs as before.
+    pub(super) fn ask_update_status(&mut self, refresh: bool, cx: &mut Context<Self>) -> bool {
+        if self.shell_updates.failed {
+            return false;
+        }
+        let Some(session) = self.session.clone() else {
+            return false;
+        };
+        if session
+            .read(cx)
+            .read_support(DesktopMethod::GetUpdateStatus)
+            != ReadSupport::Rpc
+        {
+            return false;
+        }
+        match session.update(cx, |session, cx| {
+            session.read(ReadRequest::UpdateStatus { refresh }, cx)
+        }) {
+            Ok(ticket) => {
+                self.shell_updates.pending = Some((ticket, refresh));
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// The tab changed: take Gentle Shell's answer once it arrived. A plain
+    /// read that knows nothing yet (no launcher record, no earlier refresh)
+    /// is looked up once, as the npm path would on a stale cache. A Shell
+    /// that fails falls back to the npm path; one replaced meanwhile (an
+    /// upgrade restarts the tabs) keeps the last answer.
+    pub(super) fn update_status_changed(&mut self, cx: &mut Context<Self>) {
+        let (Some((ticket, refreshed)), Some(session)) =
+            (self.shell_updates.pending, self.session.clone())
+        else {
+            return;
+        };
+        let Some(outcome) = session.update(cx, |session, _| session.take_read(ticket)) else {
+            return;
+        };
+        self.shell_updates.pending = None;
+        match outcome {
+            ReadOutcome::UpdateStatus(status) => {
+                let unknown =
+                    !refreshed && !status.offline && status.gentle_shell.checked_at.is_none();
+                self.shell_updates.status = Some(status);
+                if unknown {
+                    self.ask_update_status(true, cx);
+                }
+            }
+            ReadOutcome::Failed(ReadFailure::Dropped) => {}
+            _ => {
+                self.shell_updates.failed = true;
+                self.shell_updates.status = None;
+                self.reload(cx);
+            }
+        }
+        cx.notify();
+    }
+
+    /// The "Gentle Shell X is available" offer: Gentle Shell's when it
+    /// reported its status, the npm path's otherwise.
+    pub(super) fn update_offer(&self, s: &Snapshot) -> Option<UpdateOffer> {
+        match &self.shell_updates.status {
+            Some(status) => offer_from_status(
+                &status.gentle_shell,
+                s.managed,
+                s.skipped_release.as_deref(),
+            ),
+            None => s.update.clone(),
+        }
+    }
+}
 
 /// How `gentle-shell upgrade` ended, as the app sees it afterwards.
 #[derive(Clone, Debug, PartialEq)]

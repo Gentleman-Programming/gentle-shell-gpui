@@ -1,6 +1,8 @@
 //! The Agents panel: Gentle Agents subagents for this session, Tern-style.
 
-use std::time::Duration;
+use std::cell::Cell;
+use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -12,10 +14,14 @@ use pi_rpc::desktop_rpc::{DesktopAgent, DesktopJob, JobExitCode};
 
 use super::SessionView;
 use super::state::desktop;
+use super::state::desktop::output::{Failure, JobWatch, ThreadWatch};
 use crate::shared::ui;
-use gentle_core::activity::{AgentTask, ThreadItem};
+use gentle_core::activity::{AgentTask, Thread, ThreadItem};
 use gentle_core::gentle_state::{Job, JobOutcome};
 use gentle_core::transcript::format_tokens;
+
+/// How often the job output on screen is read again while the job runs.
+const JOB_OUTPUT_POLL: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 pub enum AgentsTab {
@@ -197,6 +203,40 @@ fn duration(ms: Option<u64>) -> String {
     ms.map(ui::format_duration).unwrap_or_else(|| "–".into())
 }
 
+/// The job output on screen and the poll that keeps it current.
+pub struct JobOutputView {
+    /// When a job's output well last drew: the poll stops once it has not
+    /// drawn for a few ticks (the card closed, the tab is hidden).
+    seen: Rc<Cell<Option<Instant>>>,
+    _poll: Task<()>,
+}
+
+impl Default for JobOutputView {
+    fn default() -> Self {
+        Self {
+            seen: Rc::default(),
+            _poll: Task::ready(()),
+        }
+    }
+}
+
+/// What a job row shows of the job's output.
+#[derive(Clone)]
+pub(super) enum JobTail {
+    /// This Shell cannot read job output (4.8.0): the row stays as it was.
+    Unavailable,
+    /// It can; the row folds open on click.
+    Folded,
+    /// The output well is open.
+    Open {
+        /// The last tail and whether earlier output was cut.
+        output: Option<(String, bool)>,
+        failure: Option<Failure>,
+        /// When the well last drew, for the poll.
+        seen: Rc<Cell<Option<Instant>>>,
+    },
+}
+
 /// One background job as the Jobs chip's card and the Jobs tab list it, from
 /// the structured channel (`list_jobs` / `jobs_update`) or, on a Shell
 /// without it, the legacy `details.gentleJobs` records.
@@ -212,6 +252,10 @@ impl JobRow {
         self.outcome == JobOutcome::Running
     }
 
+    pub(super) fn id(&self) -> &str {
+        &self.id
+    }
+
     fn from_legacy(job: &Job) -> Self {
         Self {
             id: job.id.clone(),
@@ -222,7 +266,7 @@ impl JobRow {
     }
 
     fn from_desktop(job: &DesktopJob) -> Self {
-        let outcome = if matches!(job.status.as_str(), "running" | "started" | "") {
+        let outcome = if desktop::output::is_running(job) {
             JobOutcome::Running
         } else if matches!(job.exit_code, Some(JobExitCode::Code(0))) && job.status != "failed" {
             JobOutcome::Succeeded
@@ -261,6 +305,96 @@ impl SessionView {
         }
     }
 
+    /// What job `id`'s row shows of its output.
+    pub(super) fn job_tail(&self, id: &str) -> JobTail {
+        let output = self.desktop.output();
+        if !output.job_supported() || !self.desktop.jobs_ready() {
+            return JobTail::Unavailable;
+        }
+        match output.job().filter(|job| job.id == id) {
+            Some(JobWatch {
+                output, failure, ..
+            }) => JobTail::Open {
+                output: output
+                    .as_ref()
+                    .map(|read| (read.output.clone(), read.truncated)),
+                failure: *failure,
+                seen: self.job_output.seen.clone(),
+            },
+            None => JobTail::Folded,
+        }
+    }
+
+    /// Open job `id`'s output (closing another's), or close it when open.
+    /// While it shows and the job runs, it is read again every
+    /// [`JOB_OUTPUT_POLL`].
+    pub(super) fn toggle_job_output(&mut self, id: &str, cx: &mut Context<Self>) {
+        if self.desktop.output().job().is_some_and(|job| job.id == id) {
+            self.stop_job_output(cx);
+            return;
+        }
+        self.desktop.output_mut().watch_job(id);
+        if self.desktop.output().job().is_none() {
+            return;
+        }
+        self.job_output.seen.set(Some(Instant::now()));
+        self.sync_output(cx);
+        self.job_output._poll = cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(JOB_OUTPUT_POLL).await;
+                let keep = this
+                    .update(cx, |this, cx| {
+                        let shown = this
+                            .job_output
+                            .seen
+                            .get()
+                            .is_some_and(|at| at.elapsed() < JOB_OUTPUT_POLL * 3);
+                        if !shown {
+                            this.desktop.output_mut().unwatch_job();
+                            return false;
+                        }
+                        let running = this.desktop.output_mut().tick_job();
+                        this.sync_output(cx);
+                        // Draw again, so a well still on screen says so.
+                        cx.notify();
+                        running
+                    })
+                    .unwrap_or(false);
+                if !keep {
+                    break;
+                }
+            }
+        });
+        cx.notify();
+    }
+
+    /// Close the job output on screen and stop its poll.
+    pub(super) fn stop_job_output(&mut self, cx: &mut Context<Self>) {
+        if self.desktop.output().job().is_some() {
+            self.desktop.output_mut().unwatch_job();
+            cx.notify();
+        }
+        self.job_output._poll = Task::ready(());
+    }
+
+    /// Read the thread of the helper the Activity tab shows when the
+    /// `gentle-agents` widget has none for it (the widget wins when it has
+    /// one), and stop reading it otherwise.
+    pub(super) fn sync_subagent_thread(&mut self, cx: &mut Context<Self>) {
+        let wanted = (self.agents_panel.open && self.agents_panel.tab == AgentsTab::Activity)
+            .then(|| self.selected_helper())
+            .flatten()
+            .and_then(|helper| match helper {
+                Helper::Structured(agent, None) => Some(agent.id.clone()),
+                _ => None,
+            });
+        match wanted {
+            Some(id) => self.desktop.output_mut().watch_thread(&id),
+            None => self.desktop.output_mut().unwatch_thread(),
+        }
+        self.sync_output(cx);
+    }
+
     /// Hand the generative UI's live panels the data they show: jobs,
     /// subagents (also kanban cards with an `agentId`) and the todo list,
     /// built only while a panel shows them (the panel ignores repeats).
@@ -270,6 +404,12 @@ impl SessionView {
         use serde_json::json;
 
         if self.genui.wants(Source::Jobs, cx) {
+            // The job whose output is on screen also carries its tail.
+            let watched = self.desktop.output().job().and_then(|job| {
+                job.output
+                    .as_ref()
+                    .map(|read| (job.id.clone(), read.output.clone()))
+            });
             let jobs = self
                 .job_rows()
                 .iter()
@@ -279,7 +419,11 @@ impl SessionView {
                         JobOutcome::Succeeded => "done",
                         JobOutcome::Failed => "failed",
                     };
-                    json!({"id": row.id, "label": row.label, "status": status, "state": row.state})
+                    let mut job = json!({"id": row.id, "label": row.label, "status": status, "state": row.state});
+                    if let Some((_, output)) = watched.as_ref().filter(|(id, _)| *id == row.id) {
+                        job["output"] = output.clone().into();
+                    }
+                    job
                 })
                 .collect();
             self.genui
@@ -322,8 +466,14 @@ impl SessionView {
 }
 
 /// One background job: status marker, label, exit code and, while it runs
-/// and the peer offers `cancel_job`, a cancel button.
-pub(super) fn job_row(row: &JobRow, cancel: bool, view: &WeakEntity<SessionView>) -> AnyElement {
+/// and the peer offers `cancel_job`, a cancel button. When the peer offers
+/// `get_job_output`, a click folds its output open below.
+pub(super) fn job_row(
+    row: &JobRow,
+    cancel: bool,
+    tail: JobTail,
+    view: &WeakEntity<SessionView>,
+) -> AnyElement {
     // The running marker is an icon, not a text glyph: `⧗` is missing from
     // the fonts of minimal Linux installs (WSLg) and drew as an empty box.
     let marker = match row.outcome {
@@ -334,9 +484,13 @@ pub(super) fn job_row(row: &JobRow, cancel: bool, view: &WeakEntity<SessionView>
             .into_any_element(),
         JobOutcome::Failed => div().text_color(ui::danger()).child("✗").into_any_element(),
     };
-    h_flex()
+    let row_id = row.id.clone();
+    let summary = h_flex()
+        .id(SharedString::from(format!("job-{}", row.id)))
+        .debug_selector(move || format!("job-row-{row_id}"))
+        .flex_1()
+        .min_w_0()
         .gap_2()
-        .text_size(rems(12. / 16.))
         .child(div().flex_none().child(marker))
         .child(
             div()
@@ -352,7 +506,32 @@ pub(super) fn job_row(row: &JobRow, cancel: bool, view: &WeakEntity<SessionView>
                 .flex_none()
                 .text_color(ui::faint())
                 .child(row.state.clone()),
-        )
+        );
+    let summary = match &tail {
+        JobTail::Unavailable => summary,
+        JobTail::Folded | JobTail::Open { .. } => {
+            let open = matches!(tail, JobTail::Open { .. });
+            let (id, view) = (row.id.clone(), view.clone());
+            summary
+                .cursor_pointer()
+                .child(
+                    Icon::new(if open {
+                        IconName::ChevronDown
+                    } else {
+                        IconName::ChevronRight
+                    })
+                    .xsmall()
+                    .text_color(ui::faint()),
+                )
+                .on_click(move |_, _, cx| {
+                    let _ = view.update(cx, |this, cx| this.toggle_job_output(&id, cx));
+                })
+        }
+    };
+    let line = h_flex()
+        .gap_2()
+        .text_size(rems(12. / 16.))
+        .child(summary)
         .when(cancel && row.is_running(), |d| {
             let (id, view) = (row.id.clone(), view.clone());
             d.child(
@@ -365,8 +544,57 @@ pub(super) fn job_row(row: &JobRow, cancel: bool, view: &WeakEntity<SessionView>
                         let _ = view.update(cx, |this, cx| this.cancel_running_job(id.clone(), cx));
                     }),
             )
-        })
-        .into_any_element()
+        });
+    match tail {
+        JobTail::Open {
+            output,
+            failure,
+            seen,
+        } => {
+            seen.set(Some(Instant::now()));
+            v_flex()
+                .gap_1()
+                .child(line)
+                .child(job_output_well(output, failure))
+                .into_any_element()
+        }
+        JobTail::Unavailable | JobTail::Folded => line.into_any_element(),
+    }
+}
+
+/// A job's output tail: plain text (Gentle Shell strips terminal control
+/// sequences), oldest line first, with a marker when earlier output was cut.
+fn job_output_well(output: Option<(String, bool)>, failure: Option<Failure>) -> AnyElement {
+    let well = v_flex()
+        .debug_selector(|| "job-output".into())
+        .ml(rems(18. / 16.))
+        .px_2()
+        .py_1p5()
+        .rounded_md()
+        .bg(ui::well())
+        .border_1()
+        .border_color(ui::border())
+        .overflow_hidden()
+        .font_family(ui::MONO)
+        .text_xs()
+        .text_color(ui::muted());
+    let note = |text: &'static str| div().text_color(ui::faint()).child(text);
+    match (output, failure) {
+        (_, Some(failure)) => well.child(note(match failure {
+            Failure::Gone => "This job's output is no longer available.",
+            Failure::Unavailable => "Gentle Shell can't read job output right now.",
+            Failure::Failed => "The output could not be read.",
+        })),
+        (None, None) => well.child(note("Reading the output…")),
+        (Some((text, _)), None) if text.trim().is_empty() => well.child(note("No output yet.")),
+        (Some((text, truncated)), None) => well
+            .when(truncated, |d| d.child(note("… earlier output not shown")))
+            .children(
+                text.lines()
+                    .map(|line| div().whitespace_nowrap().child(line.to_string())),
+            ),
+    }
+    .into_any_element()
 }
 
 /// What a tab shows while it has nothing to list.
@@ -417,6 +645,11 @@ impl SessionView {
                         {
                             cx.notify();
                         }
+                        // The selection or the widget may have moved: read
+                        // the thread the Activity tab now needs, if any.
+                        if open {
+                            this.sync_subagent_thread(cx);
+                        }
                         open
                     })
                     .unwrap_or(false);
@@ -425,12 +658,15 @@ impl SessionView {
                 }
             }
         });
+        self.sync_subagent_thread(cx);
         cx.notify();
     }
 
     pub(super) fn close_agents(&mut self, cx: &mut Context<Self>) {
         self.agents_panel.open = false;
         self._agents_ticker = Task::ready(());
+        self.sync_subagent_thread(cx);
+        self.stop_job_output(cx);
         cx.notify();
     }
 
@@ -608,6 +844,7 @@ impl SessionView {
                 })
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.agents_panel.tab = tab;
+                    this.sync_subagent_thread(cx);
                     cx.notify();
                 }))
                 .child(label)
@@ -635,16 +872,50 @@ impl SessionView {
             AgentsTab::Agents => {
                 self.render_agents_table(&visible, selected_id.as_deref(), now, cx)
             }
-            // Structured or not, the thread is the `gentle-agents` widget's
-            // entry for the same task id; Desktop RPC carries no thread.
+            // The thread is the `gentle-agents` widget's entry for the same
+            // task id when it has one; otherwise `get_subagent_thread` reads
+            // it, where the peer offers that.
             AgentsTab::Activity => match selected {
                 Some(Helper::Legacy(task) | Helper::Structured(_, Some(task))) => {
-                    self.render_thread(task, cx)
+                    self.render_thread(&task.summary.id, &task.thread, false, cx)
                 }
-                Some(Helper::Structured(_, None)) => empty_state(
-                    IconName::MessageSquare,
-                    "Gentle Shell has not published an activity thread for this helper.",
-                ),
+                Some(Helper::Structured(agent, None)) => {
+                    match self.desktop.output().thread().filter(|t| t.id == agent.id) {
+                        Some(ThreadWatch {
+                            thread: Some(thread),
+                            ..
+                        }) if thread.items.is_empty() => {
+                            empty_state(IconName::MessageSquare, "This helper has no activity yet.")
+                        }
+                        Some(ThreadWatch {
+                            thread: Some(thread),
+                            truncated,
+                            ..
+                        }) => self.render_thread(&agent.id, thread, *truncated, cx),
+                        Some(ThreadWatch {
+                            failure: Some(failure),
+                            ..
+                        }) => empty_state(
+                            IconName::MessageSquare,
+                            match failure {
+                                Failure::Gone => {
+                                    "Gentle Shell no longer keeps this helper's activity."
+                                }
+                                Failure::Unavailable => {
+                                    "Gentle Shell can't read helper activity right now."
+                                }
+                                Failure::Failed => "This helper's activity could not be read.",
+                            },
+                        ),
+                        Some(_) => {
+                            empty_state(IconName::MessageSquare, "Reading this helper's activity…")
+                        }
+                        None => empty_state(
+                            IconName::MessageSquare,
+                            "Gentle Shell has not published an activity thread for this helper.",
+                        ),
+                    }
+                }
                 None => no_subagents(),
             },
             AgentsTab::Jobs if jobs.is_empty() => empty_state(
@@ -655,10 +926,13 @@ impl SessionView {
                 let (cancel, view) = (self.desktop.cancel_job_supported(), cx.entity().downgrade());
                 v_flex()
                     .gap_0p5()
-                    .children(
-                        jobs.iter()
-                            .map(|job| div().px_3().py_1p5().child(job_row(job, cancel, &view))),
-                    )
+                    .children(jobs.iter().map(|job| {
+                        let tail = self.job_tail(job.id());
+                        div()
+                            .px_3()
+                            .py_1p5()
+                            .child(job_row(job, cancel, tail, &view))
+                    }))
                     .into_any_element()
             }
         };
@@ -771,6 +1045,7 @@ impl SessionView {
                                 AgentsTab::Agents => AgentsTab::Activity,
                                 AgentsTab::Activity | AgentsTab::Jobs => AgentsTab::Agents,
                             };
+                            this.sync_subagent_thread(cx);
                             cx.notify();
                         })),
                 )
@@ -850,6 +1125,7 @@ impl SessionView {
                     if event.click_count() >= 2 {
                         this.agents_panel.tab = AgentsTab::Activity;
                     }
+                    this.sync_subagent_thread(cx);
                     cx.notify();
                 }))
                 .child(
@@ -1106,18 +1382,29 @@ impl SessionView {
         .into_any_element()
     }
 
-    fn render_thread(&self, task: &AgentTask, cx: &mut Context<Self>) -> AnyElement {
-        let id = task.summary.id.clone();
-        let mut column = v_flex().gap_2().px_1();
-        if task.thread.dropped > 0 {
-            column = column.child(
-                div()
-                    .text_xs()
-                    .text_color(ui::faint())
-                    .child(format!("… {} earlier items dropped", task.thread.dropped)),
-            );
+    /// A helper's thread, from the widget or `get_subagent_thread`.
+    /// `truncated`: the store holds older items than the window carries.
+    fn render_thread(
+        &self,
+        id: &str,
+        thread: &Thread,
+        truncated: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let id = id.to_string();
+        let mut column = v_flex()
+            .debug_selector(|| "agent-thread".into())
+            .gap_2()
+            .px_1();
+        if thread.dropped > 0 || truncated {
+            let text = if thread.dropped > 0 {
+                format!("… {} earlier items dropped", thread.dropped)
+            } else {
+                "… earlier items not shown".to_string()
+            };
+            column = column.child(div().text_xs().text_color(ui::faint()).child(text));
         }
-        for (ix, item) in task.thread.items.iter().enumerate() {
+        for (ix, item) in thread.items.iter().enumerate() {
             column =
                 column.child(match item {
                     ThreadItem::Text { text } => div()

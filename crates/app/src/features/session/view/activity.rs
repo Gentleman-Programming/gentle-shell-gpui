@@ -11,7 +11,7 @@ use gpui_kit::*;
 
 use super::{NARROW, TINY, clock};
 use crate::features::session::SessionView;
-use crate::features::session::agents::{JobRow, job_row};
+use crate::features::session::agents::{JobRow, JobTail, job_row};
 use crate::shared::ui;
 use gentle_core::tools;
 use gentle_core::transcript::{Item, ToolStatus, format_tokens};
@@ -65,6 +65,23 @@ impl SessionView {
             .current
             .as_ref()
             .map_or_else(|| "the agent".to_string(), |m| m.provider.clone());
+        let sections = self.desktop.sections();
+        // Gentle Shell's own ODD phase (`implementing…`) when its session feed
+        // reports one; the phase inferred from tool calls otherwise.
+        let feed_phase = sections.phase_label().map(str::to_string);
+        // A question the session waits on that the app shows no dialog for
+        // (it only works in the terminal, or no dialog came).
+        let question = sections
+            .pending_question(std::time::Instant::now())
+            .filter(|_| self.extension.dialogs.is_empty())
+            .map(|question| {
+                let text = gentle_core::text::first_line(&question.question, 80);
+                if question.terminal_only {
+                    format!("Answer in Gentle Shell's terminal: {text}")
+                } else {
+                    format!("Waiting for an answer: {text}")
+                }
+            });
 
         let left = h_flex()
             .flex_1()
@@ -72,6 +89,22 @@ impl SessionView {
             .gap_2()
             .overflow_hidden()
             .whitespace_nowrap()
+            .when_some(question, |this, question| {
+                this.child(
+                    h_flex()
+                        .min_w_0()
+                        .gap_1()
+                        .text_color(ui::warning())
+                        .child(Icon::new(IconName::MessageSquare).xsmall())
+                        .child(
+                            div()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .child(question),
+                        ),
+                )
+            })
             .when(busy, |this| {
                 this.child(ui::pulse(
                     div().size(rems(6. / 16.)).rounded_full().bg(ui::petal()),
@@ -85,16 +118,21 @@ impl SessionView {
                     )
                 })
                 .child(div().h(rems(10. / 16.)).w(px(1.)).bg(ui::border_strong()))
-                .map(|this| match (waiting, self.activity.phase) {
-                    (Some(_), _) => this.child(
+                .map(|this| match (waiting, feed_phase, self.activity.phase) {
+                    (Some(_), _, _) => this.child(
                         div()
                             .text_color(ui::petal())
                             .child(format!("✿ waiting for {provider}…")),
                     ),
-                    (None, Some(phase)) => {
+                    (None, Some(label), _) => {
+                        this.child(div().text_color(ui::petal()).child(format!("✿ {label}")))
+                    }
+                    (None, None, Some(phase)) => {
                         this.child(div().text_color(ui::petal()).child(format!("✿ {phase}…")))
                     }
-                    (None, None) => this.child(div().text_color(ui::petal()).child("✿ working…")),
+                    (None, None, None) => {
+                        this.child(div().text_color(ui::petal()).child("✿ working…"))
+                    }
                 })
                 .when_some(current_tool, |this, tool| {
                     this.child(
@@ -259,15 +297,23 @@ impl SessionView {
     }
 
     /// Background jobs: a spinner and "2 running" or "Jobs 3", with the
-    /// latest 20 on click (the Agents window's Jobs tab lists all) and a
-    /// cancel action for running jobs once the peer offers `cancel_job`.
+    /// latest 20 on click (the Agents window's Jobs tab lists all), a cancel
+    /// action for running jobs once the peer offers `cancel_job`, and each
+    /// job's output on click once it offers `get_job_output`.
     fn render_jobs_chip(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         // Counts use the full list, never the truncated display rows, so a
         // >20-job session still reports its real running/total.
         let all = self.job_rows();
         let running = all.iter().filter(|row| row.is_running()).count();
         let total = all.len();
-        let rows: Vec<JobRow> = all.into_iter().take(20).collect();
+        let rows: Vec<(JobRow, JobTail)> = all
+            .into_iter()
+            .take(20)
+            .map(|row| {
+                let tail = self.job_tail(row.id());
+                (row, tail)
+            })
+            .collect();
         let cancel = self.desktop.cancel_job_supported();
         let color = if running > 0 {
             ui::accent()
@@ -280,6 +326,7 @@ impl SessionView {
             format!("Jobs {total}")
         };
         let weak = cx.entity().downgrade();
+        let closing = weak.clone();
         chip_popover(
             "jobs",
             IconName::Activity,
@@ -287,8 +334,18 @@ impl SessionView {
             label,
             "Background jobs",
             format!("{running}/{total}"),
-            move || rows.iter().map(|row| job_row(row, cancel, &weak)).collect(),
+            move || {
+                rows.iter()
+                    .map(|(row, tail)| job_row(row, cancel, tail.clone(), &weak))
+                    .collect()
+            },
         )
+        // A closed card shows no output: stop reading it.
+        .on_open_change(move |open, _, cx| {
+            if !*open {
+                let _ = closing.update(cx, |this, cx| this.stop_job_output(cx));
+            }
+        })
     }
 
     /// Extension widgets (`setWidget`): one chip each, its lines on click.

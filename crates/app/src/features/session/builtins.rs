@@ -54,7 +54,7 @@ pub(super) enum Submit {
 }
 
 /// `/name args` → (`name`, `args` trimmed); `None` unless `text` is a slash command.
-fn split_command(text: &str) -> Option<(&str, &str)> {
+pub(super) fn split_command(text: &str) -> Option<(&str, &str)> {
     let rest = text.trim().strip_prefix('/')?;
     let (name, args) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
     (!name.is_empty()).then_some((name, args.trim()))

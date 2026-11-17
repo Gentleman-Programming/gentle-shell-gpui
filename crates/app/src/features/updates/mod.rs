@@ -9,12 +9,18 @@
 //!
 //! And "is there a newer Engram?" (`engram`), from its GitHub releases.
 //!
+//! When the active agent tab's Gentle Shell advertises `get_update_status`,
+//! Configuration asks it instead (`status`): Gentle Shell, Pi and Pi's
+//! packages, from the sources that own those answers; `check` stays the path
+//! for every other Shell. The skip is the app's either way.
+//!
 //! Version parsing, comparison and the offer are `gentle_core::version`.
 //! Here, `registry` asks npm and `cache` reads and writes the launcher config.
 
 mod cache;
 pub mod engram;
 mod registry;
+pub mod status;
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -74,4 +80,12 @@ pub fn check(current: &str) -> Option<UpdateOffer> {
 pub fn skip(version: &str) -> std::io::Result<()> {
     let path = pi_rpc::launcher_config_path();
     cache::write_key(&path, "skippedStartupRelease", Value::from(version))
+}
+
+/// The version "Skip this version" set aside, if any.
+pub fn skipped() -> Option<String> {
+    cache::read_config(&pi_rpc::launcher_config_path())
+        .get("skippedStartupRelease")
+        .and_then(Value::as_str)
+        .map(str::to_string)
 }

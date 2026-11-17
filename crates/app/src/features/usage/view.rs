@@ -8,7 +8,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::credentials::CardState;
-use super::{StatsState, Tab, UsageEvent, UsageState, UsageView};
+use super::{StatsSource, StatsState, Tab, UsageEvent, UsageState, UsageView};
 use crate::shared::ui;
 
 mod stats;
@@ -68,7 +68,14 @@ impl Render for UsageView {
             Tab::Stats => (
                 "Token and cost totals from local sessions",
                 match &self.stats {
-                    StatsState::Loaded { data, .. } => format!("{} session files", data.files),
+                    StatsState::Loaded {
+                        source: StatsSource::Files { data, .. },
+                        ..
+                    } => format!("{} session files", data.files),
+                    StatsState::Loaded {
+                        source: StatsSource::Shell { .. },
+                        ..
+                    } => "From Gentle Shell".to_string(),
                     _ => String::new(),
                 },
             ),

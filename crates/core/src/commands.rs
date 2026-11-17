@@ -61,9 +61,133 @@ pub fn hidden(name: &str) -> bool {
     )
 }
 
+/// One row of the composer's `/` menu and the palette's command list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SlashCommand {
+    /// Without the leading `/`.
+    pub name: String,
+    pub description: String,
+    /// A Pi built-in that shows its result or picker only in Gentle Shell's
+    /// terminal (the session feed's `terminal` flag): listed, never sent.
+    pub terminal: bool,
+}
+
+/// The commands to offer, in menu order: the built-ins the app runs itself,
+/// then the Pi built-ins Gentle Shell's session feed lists (the app's own
+/// win by name), then the backend's `get_commands` list without the hidden
+/// ones, as before. `pi` is empty on a Shell without the feed.
+pub fn menu(
+    app: &[(&str, &str)],
+    pi: &[SlashCommand],
+    backend: &[(String, String)],
+) -> Vec<SlashCommand> {
+    let own = |name: &str| app.iter().any(|(own, _)| *own == name);
+    app.iter()
+        .map(|(name, description)| SlashCommand {
+            name: (*name).to_string(),
+            description: (*description).to_string(),
+            terminal: false,
+        })
+        .chain(pi.iter().filter(|command| !own(&command.name)).cloned())
+        .chain(
+            backend
+                .iter()
+                .filter(|(name, _)| !hidden(name))
+                .map(|(name, description)| SlashCommand {
+                    name: name.clone(),
+                    description: description.clone(),
+                    terminal: false,
+                }),
+        )
+        .collect()
+}
+
+/// What submitting a Pi built-in the feed lists does in the app, once the
+/// app's own built-ins had their turn. Pi runs none of them over RPC: a
+/// `prompt` would hand the text to the model.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PiBuiltin {
+    /// `/new`: the app's new session (RPC `new_session`).
+    NewSession,
+    /// `/clone`: RPC `clone`, a copy of the session at its current position.
+    Clone,
+    /// Anything else: shown as unavailable here instead of being sent.
+    Elsewhere { terminal: bool },
+}
+
+pub fn pi_builtin(command: &SlashCommand) -> PiBuiltin {
+    match (command.name.as_str(), command.terminal) {
+        ("new", false) => PiBuiltin::NewSession,
+        ("clone", false) => PiBuiltin::Clone,
+        (_, terminal) => PiBuiltin::Elsewhere { terminal },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pi(name: &str, terminal: bool) -> SlashCommand {
+        SlashCommand {
+            name: name.into(),
+            description: format!("{name} (Pi)"),
+            terminal,
+        }
+    }
+
+    #[test]
+    fn the_menu_puts_the_apps_built_ins_first_and_wins_by_name() {
+        let app = [("compact", "app compact"), ("copy", "app copy")];
+        let feed = [pi("new", false), pi("compact", true), pi("model", true)];
+        let backend = vec![
+            ("gentle:doctor".to_string(), "Doctor".to_string()),
+            ("history".to_string(), "hidden".to_string()),
+        ];
+        let menu = menu(&app, &feed, &backend);
+        let rows: Vec<(&str, &str, bool)> = menu
+            .iter()
+            .map(|c| (c.name.as_str(), c.description.as_str(), c.terminal))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("compact", "app compact", false),
+                ("copy", "app copy", false),
+                ("new", "new (Pi)", false),
+                ("model", "model (Pi)", true),
+                ("gentle:doctor", "Doctor", false),
+            ]
+        );
+    }
+
+    #[test]
+    fn without_the_feed_the_menu_is_the_apps_then_the_backends() {
+        let backend = vec![("skill:x".to_string(), "X".to_string())];
+        let names: Vec<String> = menu(&[("copy", "c")], &[], &backend)
+            .into_iter()
+            .map(|c| c.name)
+            .collect();
+        assert_eq!(names, ["copy", "skill:x"]);
+    }
+
+    #[test]
+    fn only_new_and_clone_run_from_the_app() {
+        assert_eq!(pi_builtin(&pi("new", false)), PiBuiltin::NewSession);
+        assert_eq!(pi_builtin(&pi("clone", false)), PiBuiltin::Clone);
+        assert_eq!(
+            pi_builtin(&pi("model", true)),
+            PiBuiltin::Elsewhere { terminal: true }
+        );
+        // A terminal `new` (should the feed ever say so) is not run here.
+        assert_eq!(
+            pi_builtin(&pi("new", true)),
+            PiBuiltin::Elsewhere { terminal: true }
+        );
+        assert_eq!(
+            pi_builtin(&pi("future", false)),
+            PiBuiltin::Elsewhere { terminal: false }
+        );
+    }
 
     #[test]
     fn routes_terminal_only_commands_to_native_screens() {

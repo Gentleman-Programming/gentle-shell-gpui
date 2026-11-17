@@ -216,13 +216,15 @@ impl Workspace {
         }
     }
 
+    /// The window's active agent tab (`active_session`) is the one the
+    /// sessions screen asks to list and switch, when its Gentle Shell offers
+    /// it; its backend is started (probe included) first.
     pub(super) fn open_sessions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.start_active_session(window, cx);
         let cwd = self.active_cwd(cx);
-        let current = self
-            .active_session()
-            .and_then(|t| t.read(cx).session_file());
-        let view = cx.new(|cx| SessionsView::new(cwd, current, window, cx));
+        let session = self.active_session();
+        let current = session.as_ref().and_then(|t| t.read(cx).session_file());
+        let view = cx.new(|cx| SessionsView::new(cwd, current, session, window, cx));
         let subscription = cx.subscribe_in(
             &view,
             window,
@@ -312,10 +314,13 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Configuration's update status is asked of the window's active agent
+    /// tab when its Gentle Shell reports it.
     pub(super) fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.start_active_session(window, cx);
         let cwd = self.active_cwd(cx);
-        let view = cx.new(|cx| SettingsView::new(cwd, window, cx));
+        let session = self.active_session();
+        let view = cx.new(|cx| SettingsView::new(cwd, session, window, cx));
         let subscription = cx.subscribe_in(
             &view,
             window,

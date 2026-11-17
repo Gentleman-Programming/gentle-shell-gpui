@@ -1,5 +1,7 @@
 //! Packages: `gentle-shell install|remove`, Pi's own package manager
-//! against the resolved home, and the recommended ones.
+//! against the resolved home, and the recommended ones. When the active agent
+//! tab's Gentle Shell reports update status, packages Pi's check found newer
+//! are marked, and `gentle-shell update --extensions` updates them.
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -69,7 +71,9 @@ impl SettingsView {
                 if ok {
                     cx.emit(SettingsEvent::Changed);
                 }
-                this.reload(cx);
+                // After an update, Gentle Shell's answer is looked up again:
+                // its last one still names what was just updated.
+                this.reload_with(verb == "update", cx);
                 cx.notify();
             });
         });
@@ -79,7 +83,48 @@ impl SettingsView {
     /// Installed packages (remove each), the recommended ones not yet
     /// installed, and a field to install any source.
     pub(super) fn packages_section(&self, s: &Snapshot, cx: &mut Context<Self>) -> Div {
+        let updates = self.shell_updates.status.as_ref();
+        let available = updates.map_or(0, crate::features::updates::status::packages_with_updates);
+        // gentle-ai updates the packages of an install it manages.
+        let managed = s.managed
+            || updates.is_some_and(|status| {
+                status.gentle_shell.channel == pi_rpc::desktop_rpc::ShellChannel::GentleAiManaged
+            });
         section(IconName::Layers, "Packages")
+            .when(available > 0, |d| {
+                d.child(
+                    h_flex()
+                        .gap_2()
+                        .px_2()
+                        .pb_1()
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .text_xs()
+                                .text_color(ui::accent())
+                                .child(if available == 1 {
+                                    "1 package has an update".to_string()
+                                } else {
+                                    format!("{available} packages have updates")
+                                }),
+                        )
+                        .when(!managed, |d| {
+                            d.child(
+                                Button::new("update-packages")
+                                    .xsmall()
+                                    .ghost()
+                                    .icon(Icon::new(IconName::ArrowUp))
+                                    .label("Update packages")
+                                    .tooltip("gentle-shell update --extensions")
+                                    .disabled(self.running.is_some())
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.run_package("update", "--extensions".into(), cx)
+                                    })),
+                            )
+                        }),
+                )
+            })
             .children(s.packages.iter().enumerate().map(|(i, p)| {
                 let source = p.source.clone();
                 h_flex()
@@ -101,6 +146,20 @@ impl SettingsView {
                     .when_some(p.version.clone(), |d, v| {
                         d.child(ui::chip(v, ui::info()).flex_shrink_0())
                     })
+                    .when(
+                        updates
+                            .and_then(|status| {
+                                crate::features::updates::status::package_status(
+                                    &p.source,
+                                    &status.packages.items,
+                                )
+                            })
+                            .is_some_and(|item| {
+                                item.state
+                                    == pi_rpc::desktop_rpc::PackageUpdateState::UpdateAvailable
+                            }),
+                        |d| d.child(ui::chip("update", ui::accent()).flex_shrink_0()),
+                    )
                     .child(
                         Button::new(("remove-package", i))
                             .xsmall()

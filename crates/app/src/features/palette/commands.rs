@@ -3,7 +3,7 @@
 
 use gpui_kit::assets::IconName;
 
-use gentle_core::commands;
+use gentle_core::commands::{self, SlashCommand};
 
 use crate::shared::ui;
 
@@ -177,9 +177,15 @@ pub(super) fn screen_rows() -> Vec<Row> {
     ]
 }
 
-/// The row of a backend slash command: `None` for commands that do nothing
-/// over RPC; terminal-only ones open their native screen instead of running.
-pub(super) fn command_row((name, detail): (String, String)) -> Option<Row> {
+/// The row of a slash command: `None` for commands that do nothing over RPC;
+/// terminal-only Gentle Shell ones open their native screen instead of
+/// running, and Pi built-ins that only work in the terminal say so.
+pub(super) fn command_row(command: SlashCommand) -> Option<Row> {
+    let SlashCommand {
+        name,
+        description: detail,
+        terminal,
+    } = command;
     if commands::hidden(&name) {
         return None;
     }
@@ -197,7 +203,11 @@ pub(super) fn command_row((name, detail): (String, String)) -> Option<Row> {
     Some(Row {
         icon,
         title: format!("/{name}"),
-        meta: String::new(),
+        meta: if terminal {
+            "terminal".to_string()
+        } else {
+            String::new()
+        },
         detail,
         group,
         action,
@@ -208,13 +218,21 @@ pub(super) fn command_row((name, detail): (String, String)) -> Option<Row> {
 
 #[cfg(test)]
 mod tests {
-    use gentle_core::commands::Screen;
+    use gentle_core::commands::{Screen, SlashCommand};
 
     use super::super::PaletteAction;
     use super::command_row;
 
+    fn command(name: &str, detail: &str, terminal: bool) -> SlashCommand {
+        SlashCommand {
+            name: name.into(),
+            description: detail.into(),
+            terminal,
+        }
+    }
+
     fn action(name: &str) -> Option<PaletteAction> {
-        command_row((name.into(), "detail".into())).map(|row| row.action)
+        command_row(command(name, "detail", false)).map(|row| row.action)
     }
 
     #[test]
@@ -234,10 +252,17 @@ mod tests {
             action("gentle:doctor"),
             Some(PaletteAction::Command("gentle:doctor".into()))
         );
-        let row = command_row(("gentle:stats".into(), "Local stats".into())).unwrap();
+        let row = command_row(command("gentle:stats", "Local stats", false)).unwrap();
         assert_eq!(
-            (row.title.as_str(), row.detail.as_str()),
-            ("/gentle:stats", "Local stats")
+            (row.title.as_str(), row.detail.as_str(), row.meta.as_str()),
+            ("/gentle:stats", "Local stats", "")
         );
+    }
+
+    #[test]
+    fn terminal_only_pi_built_ins_are_marked() {
+        let row = command_row(command("model", "Select model", true)).unwrap();
+        assert_eq!(row.meta, "terminal");
+        assert_eq!(row.action, PaletteAction::Command("model".into()));
     }
 }

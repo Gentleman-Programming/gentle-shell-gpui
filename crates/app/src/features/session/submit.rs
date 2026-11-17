@@ -10,6 +10,7 @@ use serde_json::json;
 
 use super::attachments::Kind;
 use super::{SessionEvent, SessionView, attachments, builtins};
+use gentle_core::commands::PiBuiltin;
 
 impl SessionView {
     pub(super) fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -123,8 +124,39 @@ impl SessionView {
                 cx.emit(SessionEvent::OpenScreen(screen));
                 true
             }
-            builtins::Submit::Prompt => false,
+            builtins::Submit::Prompt => self.intercept_pi_builtin(text, cx),
         }
+    }
+
+    /// A Pi built-in the session feed lists (none on a Shell without it):
+    /// Pi does not run them over RPC, where the text would reach the model,
+    /// so `/new` and `/clone` go through their RPC commands and the rest
+    /// say where they work instead of being sent.
+    fn intercept_pi_builtin(&mut self, text: &str, cx: &mut Context<Self>) -> bool {
+        let Some((name, _)) = builtins::split_command(text) else {
+            return false;
+        };
+        let Some(command) = self
+            .desktop
+            .sections()
+            .pi_commands()
+            .into_iter()
+            .find(|command| command.name == name)
+        else {
+            return false;
+        };
+        match gentle_core::commands::pi_builtin(&command) {
+            PiBuiltin::NewSession => self.replace_session(json!({"type": "new_session"}), cx),
+            PiBuiltin::Clone => self.replace_session(json!({"type": "clone"}), cx),
+            PiBuiltin::Elsewhere { terminal: true } => self.note(
+                format!("/{name} only works in Gentle Shell's terminal."),
+                cx,
+            ),
+            PiBuiltin::Elsewhere { terminal: false } => {
+                self.note(format!("/{name} isn't available in the app yet."), cx)
+            }
+        }
+        true
     }
 
     /// `/web <url>`: show a page in the in-app browser instead of sending the

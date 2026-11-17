@@ -158,11 +158,79 @@ pub fn relative_time(now_ms: i64, then_ms: i64) -> String {
     }
 }
 
+/// The title of a session from Pi's own listing (Gentle Shell's
+/// `list_sessions`): its name, else its first message, on one line.
+pub fn listed_title(name: Option<&str>, first_message: &str) -> String {
+    crate::text::first_line(name.unwrap_or(first_message).trim(), 120)
+}
+
+/// Whether a session from Pi's own listing matches a lowercase query: by
+/// name, first message or project name (the listing carries no path).
+pub fn listed_matches(
+    query_lower: &str,
+    name: Option<&str>,
+    first_message: &str,
+    project: &str,
+) -> bool {
+    query_lower.is_empty()
+        || [name, Some(first_message), Some(project)]
+            .into_iter()
+            .flatten()
+            .any(|t| t.to_lowercase().contains(query_lower))
+}
+
+/// How Pi's listing names `cwd`'s project: its last segment, or `unknown`.
+pub fn project_name(cwd: &Path) -> String {
+    cwd.file_name().map_or_else(
+        || "unknown".to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    )
+}
+
+/// The session id in a Pi session file name (`<timestamp>_<id>.jsonl`).
+pub fn file_session_id(path: &Path) -> Option<&str> {
+    let stem = path.file_stem()?.to_str()?;
+    let (_, id) = stem.rsplit_once('_')?;
+    (!id.is_empty()).then_some(id)
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
 
-    use super::{parse_iso_ms, relative_time, session_dir_name};
+    use super::{
+        file_session_id, listed_matches, listed_title, parse_iso_ms, project_name, relative_time,
+        session_dir_name,
+    };
+
+    #[test]
+    fn listed_sessions_title_and_match_without_paths() {
+        assert_eq!(
+            listed_title(Some("Release prep"), "Prepare"),
+            "Release prep"
+        );
+        assert_eq!(listed_title(None, "  Why\nmore"), "Why …");
+        let matches = |q: &str| listed_matches(q, Some("Release prep"), "Notes", "gentle-shell");
+        assert!(matches(""));
+        assert!(matches("release"));
+        assert!(matches("notes"));
+        assert!(matches("gentle-sh"));
+        assert!(!matches("windows"));
+        assert!(listed_matches("why", None, "Why does it fail", "x"));
+    }
+
+    #[test]
+    fn project_names_follow_pi() {
+        assert_eq!(project_name(Path::new("/w/gentle-shell")), "gentle-shell");
+        assert_eq!(project_name(Path::new("/")), "unknown");
+    }
+
+    #[test]
+    fn file_names_carry_the_session_id() {
+        let path = Path::new("/s/--w--/2026-11-17T10-00-00-000Z_5e21f0aa-3b7c.jsonl");
+        assert_eq!(file_session_id(path), Some("5e21f0aa-3b7c"));
+        assert_eq!(file_session_id(Path::new("/s/plain.jsonl")), None);
+    }
 
     #[test]
     fn encodes_cwd_like_pi() {

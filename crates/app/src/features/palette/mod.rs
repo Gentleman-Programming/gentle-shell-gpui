@@ -127,8 +127,8 @@ pub struct Activity {
 }
 
 pub struct PaletteInput {
-    /// Slash commands of the active agent pane: `(name, description)`.
-    pub commands: Vec<(String, String)>,
+    /// Slash commands of the active agent pane.
+    pub commands: Vec<gentle_core::commands::SlashCommand>,
     pub workspaces: Vec<WorkspaceRow>,
     /// The current workspace's root, for files and branches.
     pub root: PathBuf,

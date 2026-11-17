@@ -15,6 +15,7 @@ use serde_json::{Value, json};
 use super::state::desktop::changes::{Applied as ChangesApplied, FileKey};
 use super::state::desktop::config::Applied as ConfigApplied;
 use super::state::desktop::design::Applied as DesignApplied;
+use super::state::desktop::output::Applied as OutputApplied;
 use super::state::desktop::permission::Applied as PermissionApplied;
 use super::state::desktop::review::Applied as ReviewApplied;
 use super::state::desktop::subscription::Applied as SubscriptionApplied;
@@ -31,6 +32,21 @@ use gentle_core::transcript::NoticeLevel;
 /// The extension answers from the same session, so this only fires when
 /// something is genuinely wrong.
 const DESKTOP_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The reads that may legitimately take longer: a listing or stats scan
+/// reads every session file in scope, a switch replaces the session, and an
+/// update refresh is bounded by the server's own 15-second deadline.
+const DESKTOP_SLOW_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn desktop_timeout(method: DesktopMethod) -> Duration {
+    match method {
+        DesktopMethod::ListSessions
+        | DesktopMethod::SwitchSession
+        | DesktopMethod::GetUsageStats
+        | DesktopMethod::GetUpdateStatus => DESKTOP_SLOW_TIMEOUT,
+        _ => DESKTOP_TIMEOUT,
+    }
+}
 
 /// Whether Pi's `get_commands` answer lists the Gentle Desktop extension. A
 /// failed request lists nothing, so its prompt is never sent.
@@ -203,12 +219,24 @@ impl SessionView {
         cx.notify();
     }
 
-    /// Send the next queued config request once the channel is free.
+    /// Send the next queued config request once the channel is free, then
+    /// the screens' next queued read: both queues wait for the same slot.
     pub(super) fn sync_config(&mut self, cx: &mut Context<Self>) {
         let applied = self.desktop.config_pump();
         if !applied.sends.is_empty() || applied.report.is_some() {
             self.apply_config(applied, cx);
         }
+        self.sync_reads(cx);
+    }
+
+    /// Send what an output read decided. Its failures show where the output
+    /// or thread would be, never in the conversation.
+    pub(super) fn apply_output(&mut self, applied: OutputApplied, cx: &mut Context<Self>) {
+        self.send_desktop(applied.sends, cx);
+        // A gap seen while the read was in flight is due now that it settled.
+        let resync = self.desktop.flush_resync();
+        self.send_desktop(resync, cx);
+        cx.notify();
     }
 
     /// Act on a review-mode decision: say what failed, send what the slice
@@ -223,6 +251,48 @@ impl SessionView {
         // it settled or rolled back.
         let resync = self.desktop.flush_resync();
         self.send_desktop(resync, cx);
+        cx.notify();
+    }
+
+    /// Send an owed job output or thread read once the channel is free.
+    pub(super) fn sync_output(&mut self, cx: &mut Context<Self>) {
+        let applied = self.desktop.output_pump();
+        if !applied.sends.is_empty() {
+            self.apply_output(applied, cx);
+        }
+    }
+
+    /// Bring what the session feed's sections drive up to date: the todo
+    /// island (the feed's list wins over tool results while it reports one)
+    /// and the context meter. The phase, a pending question and Pi's
+    /// built-in commands are read from the sections where they are drawn.
+    pub(super) fn sync_sections(&mut self, cx: &mut Context<Self>) {
+        if !self.desktop.take_sections_changed() {
+            return;
+        }
+        let sections = self.desktop.sections();
+        let todo = sections.todo();
+        let context = sections
+            .context()
+            .map(|context| context.and_then(|context| context.percent));
+        let question = sections.question_pending();
+        if let Some(tasks) = todo {
+            self.todo.apply(tasks);
+        }
+        if let Some(percent) = context {
+            self.set_context_percent(percent, cx);
+        }
+        if question {
+            // Mention the question once its grace ran out, unless the app
+            // shows it as a dialog by then.
+            cx.spawn(async move |this, cx| {
+                cx.background_executor()
+                    .timer(desktop::sections::QUESTION_GRACE)
+                    .await;
+                let _ = this.update(cx, |_, cx| cx.notify());
+            })
+            .detach();
+        }
         cx.notify();
     }
 
@@ -303,7 +373,6 @@ impl SessionView {
         self.sync_changes(cx);
         cx.notify();
     }
-
     /// Whether the Profiles screen edits this tab's config over Desktop RPC,
     /// waits for the probe, or keeps its direct-file path. No backend to ask
     /// (it failed or exited) is the direct-file path too: there is no writer
@@ -414,7 +483,7 @@ impl SessionView {
     /// refreshed by the same re-probe. The subscription and design slices are
     /// reset with the channel; the design canvas re-seeds once behind the new
     /// probe.
-    fn reset_desktop_channel(&mut self) {
+    pub(super) fn reset_desktop_channel(&mut self) {
         self.desktop.reset();
     }
 
@@ -485,7 +554,9 @@ impl SessionView {
             return;
         }
         cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(DESKTOP_TIMEOUT).await;
+            cx.background_executor()
+                .timer(desktop_timeout(method))
+                .await;
             let _ = this.update(cx, |this, cx| {
                 // Only its own request: a newer one has another generation.
                 this.expire_desktop(generation, method, cx);
@@ -543,19 +614,25 @@ impl SessionView {
                 let applied = self.desktop.changes_expire(generation);
                 self.apply_changes(applied, cx);
             }
-            // No slice issues these yet, so no request of theirs is pending.
-            DesktopMethod::GetJobOutput
-            | DesktopMethod::GetSubagentThread
-            | DesktopMethod::ListSessions
+            DesktopMethod::GetJobOutput | DesktopMethod::GetSubagentThread => {
+                let applied = self.desktop.output_expire(generation);
+                self.apply_output(applied, cx);
+            }
+            DesktopMethod::ListSessions
             | DesktopMethod::SwitchSession
             | DesktopMethod::GetUsageStats
-            | DesktopMethod::GetUpdateStatus => {}
+            | DesktopMethod::GetUpdateStatus => {
+                let applied = self.desktop.reads_expire(generation);
+                self.apply_reads(applied, cx);
+            }
         }
         // Whichever request was dropped, the shared slot may be free for the
-        // next queued config request, review change or changes read.
+        // next queued config request or screen read, review change, changes
+        // read or owed output read.
         self.sync_config(cx);
         self.sync_review(cx);
         self.sync_changes(cx);
+        self.sync_output(cx);
     }
 
     /// Pi answered the outer prompt: hand the disposition to the slice that
@@ -605,17 +682,22 @@ impl SessionView {
                 let applied = self.desktop.changes_outer(generation, handled);
                 self.apply_changes(applied, cx);
             }
-            // No slice issues these yet, so no request of theirs is pending.
-            DesktopMethod::GetJobOutput
-            | DesktopMethod::GetSubagentThread
-            | DesktopMethod::ListSessions
+            DesktopMethod::GetJobOutput | DesktopMethod::GetSubagentThread => {
+                let applied = self.desktop.output_outer(generation, handled);
+                self.apply_output(applied, cx);
+            }
+            DesktopMethod::ListSessions
             | DesktopMethod::SwitchSession
             | DesktopMethod::GetUsageStats
-            | DesktopMethod::GetUpdateStatus => {}
+            | DesktopMethod::GetUpdateStatus => {
+                let applied = self.desktop.reads_outer(generation, handled);
+                self.apply_reads(applied, cx);
+            }
         }
         self.sync_config(cx);
         self.sync_review(cx);
         self.sync_changes(cx);
+        self.sync_output(cx);
     }
 
     /// Pi's command list: what the `/` menu offers, and the discovery that
@@ -713,6 +795,9 @@ impl SessionView {
         self.refresh_stats(cx);
     }
 
+    /// Pi's `get_session_stats`: the cost (its authority, also with the
+    /// session feed) and the context use, which the feed's `context` section
+    /// (the same `getContextUsage()` read) keeps current between reads.
     pub(super) fn refresh_stats(&mut self, cx: &mut Context<Self>) {
         self.request(
             json!({"type": "get_session_stats"}),
@@ -720,23 +805,25 @@ impl SessionView {
             |this, result, cx| {
                 if let Ok(stats) = result {
                     this.usage.cost = stats["cost"].as_f64().unwrap_or(0.0);
-                    this.usage.context_percent = stats["contextUsage"]["percent"].as_f64();
-                    let threshold = crate::features::alerts::context_threshold(cx);
-                    if this
-                        .usage
-                        .context_latch
-                        .observe(this.usage.context_percent, threshold)
-                    {
-                        let active = this.window_active(cx);
-                        crate::features::alerts::fire(
-                            gentle_core::notifications::Alert::ContextHigh,
-                            active,
-                            cx,
-                        );
-                    }
+                    this.set_context_percent(stats["contextUsage"]["percent"].as_f64(), cx);
                 }
             },
         );
+    }
+
+    /// The context meter's number, and the alert when it crosses the
+    /// threshold.
+    fn set_context_percent(&mut self, percent: Option<f64>, cx: &mut Context<Self>) {
+        self.usage.context_percent = percent;
+        let threshold = crate::features::alerts::context_threshold(cx);
+        if self.usage.context_latch.observe(percent, threshold) {
+            let active = self.window_active(cx);
+            crate::features::alerts::fire(
+                gentle_core::notifications::Alert::ContextHigh,
+                active,
+                cx,
+            );
+        }
     }
 
     /// The levels the current model accepts; until they arrive (or if the
@@ -761,8 +848,12 @@ impl SessionView {
         );
     }
 
-    /// The task list as the conversation's last `todo` call left it.
+    /// The task list as the conversation's last `todo` call left it, unless
+    /// the session feed reports the list itself.
     fn sync_todo_from_history(&mut self) {
+        if self.desktop.sections().todo().is_some() {
+            return;
+        }
         for item in self.transcript.items.iter().rev() {
             if let gentle_core::transcript::Item::Tool { name, details, .. } = item
                 && name == "todo"
@@ -811,7 +902,14 @@ impl SessionView {
     /// RPC `new_session`: a fresh conversation on the same backend. A fresh
     /// session also re-reads defaults such as the permission mode.
     pub fn new_session(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        self.request(json!({"type": "new_session"}), cx, |this, result, cx| {
+        self.replace_session(json!({"type": "new_session"}), cx);
+    }
+
+    /// `new_session` or `clone` (`/new`, `/clone` from the session feed's
+    /// command list): Pi replaces the session on the same backend, so the
+    /// conversation and the channel start over on the one it reports.
+    pub(super) fn replace_session(&mut self, command: Value, cx: &mut Context<Self>) {
+        self.request(command, cx, |this, result, cx| {
             if let Some(data) = this.report(result)
                 && data["cancelled"] != true
             {

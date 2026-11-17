@@ -6,28 +6,22 @@ use gpui_kit::*;
 
 use crate::features::session::SessionView;
 use crate::shared::ui;
+use gentle_core::commands::SlashCommand;
 
 impl SessionView {
-    /// The commands the `/` menu offers for the composer's text: built-ins
-    /// first, then Gentle Shell's (hidden ones left out). Empty when the text
-    /// isn't a bare `/name` being typed.
-    fn slash_matches(&self, text: &str) -> Vec<(String, String)> {
+    /// The commands the `/` menu offers for the composer's text, in
+    /// [`SessionView::commands`]' order (hidden ones left out). Empty when
+    /// the text isn't a bare `/name` being typed.
+    fn slash_matches(&self, text: &str) -> Vec<SlashCommand> {
         let Some(query) = text.strip_prefix('/') else {
             return Vec::new();
         };
         if query.contains(char::is_whitespace) {
             return Vec::new();
         }
-        let builtins = crate::features::session::builtins::BUILTINS.iter().copied();
-        let backend = self
-            .commands
-            .iter()
-            .filter(|(name, _)| !gentle_core::commands::hidden(name))
-            .map(|(name, description)| (name.as_str(), description.as_str()));
-        builtins
-            .chain(backend)
-            .filter(|(name, _)| name.contains(query))
-            .map(|(name, description)| (name.to_string(), description.to_string()))
+        self.commands()
+            .into_iter()
+            .filter(|command| command.name.contains(query))
             .collect()
     }
 
@@ -77,9 +71,9 @@ impl SessionView {
                 self.live.slash_cursor = next;
                 self.live.slash_scroll.scroll_to_item(next);
             }
-            "tab" => self.insert_command(&matches[cursor].0, window, cx),
+            "tab" => self.insert_command(&matches[cursor].name, window, cx),
             "enter" => {
-                let picked = &matches[cursor].0;
+                let picked = &matches[cursor].name;
                 if text.trim() == format!("/{picked}") {
                     return false;
                 }
@@ -134,42 +128,54 @@ impl SessionView {
                             .max_h(rems(SLASH_MENU_H / 16.))
                             .overflow_y_scroll()
                             .track_scroll(&self.live.slash_scroll)
-                            .children(matches.into_iter().enumerate().map(
-                                |(i, (name, description))| {
-                                    h_flex()
-                                        .id(("command", i))
-                                        .w_full()
-                                        .px_2()
-                                        .py_1p5()
-                                        .gap_3()
-                                        .rounded_lg()
-                                        .cursor_pointer()
-                                        .hover(|s| s.bg(ui::surface_hover()))
-                                        .when(i == cursor, |s| s.bg(ui::surface_hover()))
-                                        .child(
+                            .children(matches.into_iter().enumerate().map(|(i, command)| {
+                                let SlashCommand {
+                                    name,
+                                    description,
+                                    terminal,
+                                } = command;
+                                h_flex()
+                                    .id(("command", i))
+                                    .w_full()
+                                    .px_2()
+                                    .py_1p5()
+                                    .gap_3()
+                                    .rounded_lg()
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(ui::surface_hover()))
+                                    .when(i == cursor, |s| s.bg(ui::surface_hover()))
+                                    .child(
+                                        div()
+                                            .flex_shrink_0()
+                                            .font_family(ui::MONO)
+                                            .text_size(rems(12. / 16.))
+                                            .text_color(ui::accent())
+                                            .child(format!("/{name}")),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .overflow_hidden()
+                                            .text_ellipsis()
+                                            .whitespace_nowrap()
+                                            .text_size(rems(12. / 16.))
+                                            .text_color(ui::muted())
+                                            .child(description),
+                                    )
+                                    // Pi shows its result only in the
+                                    // terminal: picking it says so.
+                                    .when(terminal, |row| {
+                                        row.child(
                                             div()
                                                 .flex_shrink_0()
-                                                .font_family(ui::MONO)
-                                                .text_size(rems(12. / 16.))
-                                                .text_color(ui::accent())
-                                                .child(format!("/{name}")),
+                                                .child(ui::chip("terminal", ui::faint())),
                                         )
-                                        .child(
-                                            div()
-                                                .flex_1()
-                                                .min_w_0()
-                                                .overflow_hidden()
-                                                .text_ellipsis()
-                                                .whitespace_nowrap()
-                                                .text_size(rems(12. / 16.))
-                                                .text_color(ui::muted())
-                                                .child(description),
-                                        )
-                                        .on_click(cx.listener(move |this, _, window, cx| {
-                                            this.insert_command(&name, window, cx)
-                                        }))
-                                },
-                            )),
+                                    })
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.insert_command(&name, window, cx)
+                                    }))
+                            })),
                     ),
             )
             .into_any_element(),

@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use gentle_core::sessions::{SessionSummary, session_dir_name, sort_newest_first};
+use gentle_core::sessions::{SessionSummary, file_session_id, session_dir_name, sort_newest_first};
 use serde_json::Value;
 
 use super::Scope;
@@ -70,6 +70,22 @@ pub(super) fn list_sessions(agent_home: &Path, cwd: &Path, scope: Scope) -> Vec<
         .collect();
     sort_newest_first(&mut sessions);
     sessions
+}
+
+/// The session file with Pi's session `id`, from every project, so a session
+/// Gentle Shell listed for another project can open in a new tab rooted at
+/// its folder (the listing carries ids, not paths). The file name names the
+/// id; headers are read only when no name does. Blocking: call off the UI
+/// thread.
+pub(super) fn find_session(agent_home: &Path, id: &str) -> Option<SessionSummary> {
+    let (files, _) = candidate_files(agent_home, Path::new(""), Scope::All);
+    let named: Vec<PathBuf> = files
+        .iter()
+        .filter(|f| file_session_id(f) == Some(id))
+        .cloned()
+        .collect();
+    let found = |files: &[PathBuf]| read_summaries(files).into_iter().find(|s| s.id == id);
+    found(&named).or_else(|| found(&files))
 }
 
 /// Parse `files` on a few threads; unreadable or non-session files are dropped.

@@ -14,22 +14,22 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::{segmented, status_line};
-use crate::features::usage::{Metric, StatsState, UsageView};
+use crate::features::usage::{Metric, StatsSource, StatsState, UsageView};
 use crate::shared::ui;
 
 impl UsageView {
     pub(super) fn render_stats(&self, cx: &mut Context<Self>) -> AnyElement {
-        let (data, summary) = match &self.stats {
+        let (source, summary) = match &self.stats {
             StatsState::Idle | StatsState::Loading => {
                 return h_flex()
                     .gap_2()
                     .text_sm()
                     .text_color(ui::muted())
                     .child(Spinner::new().small().color(ui::muted()))
-                    .child("Reading session files…")
+                    .child("Reading session history…")
                     .into_any_element();
             }
-            StatsState::Loaded { data, summary, .. } => (data, summary),
+            StatsState::Loaded { source, summary } => (source, summary),
         };
         let range_button = |id: &'static str, label: &'static str, range: StatsRange| {
             Button::new(id)
@@ -40,23 +40,29 @@ impl UsageView {
                 .on_click(cx.listener(move |this, _, _, cx| this.set_range(range, cx)))
         };
         let mut notes = Vec::new();
-        if !data.skipped_large.is_empty() {
-            notes.push(format!(
-                "Skipped {} session file{} larger than 64 MiB.",
-                data.skipped_large.len(),
-                if data.skipped_large.len() == 1 {
-                    ""
-                } else {
-                    "s"
+        match source {
+            StatsSource::Files { data, .. } => {
+                if !data.skipped_large.is_empty() {
+                    notes.push(format!(
+                        "Skipped {} session file{} larger than 64 MiB.",
+                        data.skipped_large.len(),
+                        if data.skipped_large.len() == 1 {
+                            ""
+                        } else {
+                            "s"
+                        }
+                    ));
                 }
-            ));
+                if data.unreadable > 0 {
+                    notes.push(format!(
+                        "{} session file(s) could not be read.",
+                        data.unreadable
+                    ));
+                }
+            }
+            StatsSource::Shell { notes: shell } => notes.extend(shell.iter().cloned()),
         }
-        if data.unreadable > 0 {
-            notes.push(format!(
-                "{} session file(s) could not be read.",
-                data.unreadable
-            ));
-        }
+        let day_cost = matches!(source, StatsSource::Files { .. });
         v_flex()
             .gap_4()
             .child(
@@ -76,7 +82,7 @@ impl UsageView {
                     ),
             )
             .child(Self::render_totals(summary))
-            .child(self.render_chart(summary, cx))
+            .child(self.render_chart(summary, day_cost, cx))
             .child(Self::render_models(summary))
             .child(Self::render_projects(summary))
             .children(
@@ -152,7 +158,14 @@ impl UsageView {
             .into_any_element()
     }
 
-    fn render_chart(&self, summary: &StatsSummary, cx: &mut Context<Self>) -> AnyElement {
+    /// The daily chart. `day_cost` is false when the days carry no cost
+    /// (Gentle Shell's answer): then only tokens are offered.
+    fn render_chart(
+        &self,
+        summary: &StatsSummary,
+        day_cost: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let metric = self.metric;
         let value = |day: &DayStats| match metric {
             Metric::Tokens => day.tokens as f64,
@@ -190,17 +203,22 @@ impl UsageView {
             .child(
                 h_flex()
                     .gap_2()
-                    .child(ui::section_label("Last 30 days"))
+                    .child(ui::section_label(format!(
+                        "Last {} days",
+                        summary.daily.len()
+                    )))
                     .child(div().flex_1())
-                    .child(
-                        segmented()
-                            .child(metric_button(
-                                "usage-metric-tokens",
-                                "Tokens",
-                                Metric::Tokens,
-                            ))
-                            .child(metric_button("usage-metric-cost", "Cost", Metric::Cost)),
-                    ),
+                    .when(day_cost, |d| {
+                        d.child(
+                            segmented()
+                                .child(metric_button(
+                                    "usage-metric-tokens",
+                                    "Tokens",
+                                    Metric::Tokens,
+                                ))
+                                .child(metric_button("usage-metric-cost", "Cost", Metric::Cost)),
+                        )
+                    }),
             )
             .child(
                 h_flex()
@@ -215,12 +233,14 @@ impl UsageView {
                     .children(summary.daily.iter().map(|day| {
                         let v = value(day);
                         let fraction = if max > 0.0 { (v / max) as f32 } else { 0.0 };
-                        let tip = format!(
-                            "{} · {} tokens · {}",
+                        let mut tip = format!(
+                            "{} · {} tokens",
                             day_label(day.day),
-                            format_tokens(day.tokens),
-                            format_cost(day.cost)
+                            format_tokens(day.tokens)
                         );
+                        if day_cost {
+                            tip.push_str(&format!(" · {}", format_cost(day.cost)));
+                        }
                         div()
                             .id(SharedString::from(format!("usage-day-{}", day.day)))
                             .flex_1()
@@ -352,10 +372,13 @@ impl UsageView {
                                             .truncate()
                                             .child(model.model.clone()),
                                     )
-                                    .child(
-                                        ui::chip(model.provider.clone(), ui::info())
-                                            .flex_shrink_0(),
-                                    ),
+                                    // Gentle Shell's answer names no provider.
+                                    .when(!model.provider.is_empty(), |d| {
+                                        d.child(
+                                            ui::chip(model.provider.clone(), ui::info())
+                                                .flex_shrink_0(),
+                                        )
+                                    }),
                             )
                             .child(Self::numeric(64., model.messages.to_string()))
                             .child(Self::numeric(64., format_tokens(model.tokens)))
