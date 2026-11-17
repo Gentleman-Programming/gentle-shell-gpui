@@ -492,10 +492,13 @@ impl SessionView {
             .when_some(self.render_plan_limits_chip(cx), |this, chip| {
                 this.child(div().flex_shrink_0().child(chip))
             })
+            // The model picker keeps its width: a shrinking, right-justified
+            // slot let its label spill left over the plan-limits chip. When
+            // the row is tight, the folder chip on the left is the one that
+            // truncates (narrow panes clamp the picker's label instead).
             .child(
                 div()
-                    .min_w_0()
-                    .flex_shrink(1.)
+                    .flex_shrink_0()
                     .flex()
                     .justify_end()
                     .child(self.render_model_picker(narrow, cx)),
