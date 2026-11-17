@@ -41,6 +41,7 @@ use crate::shared::ui;
 use gentle_core::commands::Screen;
 
 mod actions;
+mod agent_picker;
 mod closed;
 mod layout;
 mod overlays;
@@ -54,6 +55,7 @@ mod view;
 
 use crate::features::devices::{DevicePanel, DevicePanelEvent};
 use crate::features::music::{Music, MusicChanged};
+use agent_picker::AgentDestination;
 use layout::*;
 use stages::Stage;
 use view::*;
@@ -396,7 +398,7 @@ impl Workspace {
             None => this.current,
         };
         this.current = target;
-        this.ensure_open(target, prompt.is_none(), window, cx);
+        this.ensure_open(target, window, cx);
         if let Some(prompt) = prompt {
             let root = this.space().root.clone();
             this.open_tab(PaneKind::Agent, root, Some(prompt), None, window, cx);
@@ -569,9 +571,9 @@ impl Workspace {
         self.open_tab(PaneKind::File, path, None, None, window, cx);
     }
 
-    /// Open an agent tab working in `folder` (a worktree from the sidebar).
-    pub fn open_agent_tab(&mut self, folder: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
-        self.open_tab(PaneKind::Agent, folder, None, None, window, cx);
+    /// Open a new agent from the sidebar after the user chooses its folder.
+    pub fn open_agent_tab(&mut self, _folder: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        self.pick_agent_folder(AgentDestination::Tab { prompt: None }, window, cx);
     }
 
     /// Type `text` at the active agent's prompt cursor, spaced from what is

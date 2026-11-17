@@ -429,8 +429,7 @@ impl Workspace {
         self.focus_pane(pane, window, cx);
     }
 
-    /// Split the focused pane: with `what`, that kind and target; otherwise
-    /// the focused pane's kind in its folder (or on its file).
+    /// Split the focused pane. A new agent always asks for its folder first.
     pub(super) fn split(
         &mut self,
         axis: SplitAxis,
@@ -438,22 +437,45 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(focused) = self.focused_pane() else {
-            let root = self.space().root.clone();
-            self.open_tab(PaneKind::Agent, root, None, None, window, cx);
-            return;
-        };
         let (kind, target) = match what {
             Some(what) => what,
-            None => {
-                let pane = &self.panes[&focused];
-                let kind = pane.item.kind;
-                let target = match (kind, &pane.path) {
-                    (PaneKind::File, Some(path)) => path.clone(),
-                    _ => self.pane_cwd(pane, cx),
-                };
-                (kind, target)
-            }
+            None => match self.focused_pane() {
+                Some(focused) => {
+                    let pane = &self.panes[&focused];
+                    let kind = pane.item.kind;
+                    let target = match (kind, &pane.path) {
+                        (PaneKind::File, Some(path)) => path.clone(),
+                        _ => self.pane_cwd(pane, cx),
+                    };
+                    (kind, target)
+                }
+                None => (PaneKind::Agent, self.space().root.clone()),
+            },
+        };
+        if kind == PaneKind::Agent {
+            let destination = if self.focused_pane().is_some() {
+                AgentDestination::Split(axis)
+            } else {
+                AgentDestination::Tab { prompt: None }
+            };
+            self.pick_agent_folder(destination, window, cx);
+            return;
+        }
+        self.split_at(axis, kind, target, window, cx);
+    }
+
+    /// Complete a split after a folder has been selected (or for non-agent panes).
+    pub(super) fn split_at(
+        &mut self,
+        axis: SplitAxis,
+        kind: PaneKind,
+        target: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(focused) = self.focused_pane() else {
+            self.open_tab(kind, target, None, None, window, cx);
+            return;
         };
         let Some(pane) = self.new_pane(kind, target, None, None, window, cx) else {
             return;
@@ -719,11 +741,9 @@ impl Workspace {
         }
         self.announce_close(window, cx);
         if self.space().tabs.is_empty() {
-            // Closing the last pane never closes the window (⌘Q quits):
-            // the workspace starts over with a fresh agent tab.
-            let root = self.space().root.clone();
-            self.open_tab(PaneKind::Agent, root, None, None, window, cx);
+            // Keep the window open without silently creating a replacement agent.
             self.save_now(cx);
+            cx.notify();
             return;
         }
         let active = self.space().active;

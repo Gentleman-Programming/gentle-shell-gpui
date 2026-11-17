@@ -308,7 +308,7 @@ impl Workspace {
                                     item(
                                         IconName::Bot,
                                         "Agent tab",
-                                        "Gentle Shell in this folder",
+                                        "Choose a folder for the new agent",
                                         ui::platform_shortcut("⌘T", "Ctrl+T"),
                                     )
                                     .on_click(
@@ -627,16 +627,31 @@ impl Workspace {
                 .size_full()
                 .items_center()
                 .justify_center()
-                .gap_3()
-                .text_sm()
-                .text_color(ui::muted())
-                .child("No tabs in this workspace")
+                .gap_4()
+                .child(crate::shared::banner::banner(
+                    crate::shared::banner::BannerConfig::default(),
+                    1.8,
+                    1.,
+                ))
                 .child(
-                    Button::new("empty-new-tab")
+                    div()
+                        .text_base()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(ui::fg())
+                        .child("No agents open"),
+                )
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(ui::muted())
+                        .child("Choose a folder to start a new agent."),
+                )
+                .child(
+                    Button::new("empty-open-agent")
                         .primary()
                         .small()
                         .icon(Icon::new(IconName::Plus))
-                        .label("New agent tab")
+                        .label("Open agent")
                         .on_click(
                             cx.listener(|this, _, window, cx| this.on_new_tab(&NewTab, window, cx)),
                         ),
