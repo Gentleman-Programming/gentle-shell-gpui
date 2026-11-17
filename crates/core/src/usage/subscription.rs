@@ -125,12 +125,51 @@ pub fn windows_most_used(limits: &[UsageLimit]) -> Vec<UsageWindow> {
     windows
 }
 
-/// A window's row label: its own when the payload carries one, "period" for
-/// NaN's billing-period allowance (whose `window_seconds` counts down to the
+/// A provider's windows flattened across its limits, shortest first (the
+/// payload order stands on ties), so the plan card reads its 5-hour window
+/// above its weekly one while the trigger still shows the most-used window.
+/// Windows without a declared length (NaN's billing-period allowance has no
+/// label, and its `window_seconds` count down to the reset) go last.
+pub fn windows_by_length(limits: &[UsageLimit]) -> Vec<UsageWindow> {
+    let length = |window: &UsageWindow| {
+        if window.window_seconds > 0.0 && !window.label.is_empty() {
+            Some(window.window_seconds)
+        } else {
+            None
+        }
+    };
+    let mut windows: Vec<UsageWindow> = limits
+        .iter()
+        .flat_map(|limit| limit.windows.iter().cloned())
+        .collect();
+    // `sort_by` is stable, so ties and the unknown tail keep the payload's
+    // order.
+    windows.sort_by(|a, b| match (length(a), length(b)) {
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (Some(a), Some(b)) => a.total_cmp(&b),
+        (None, None) => std::cmp::Ordering::Equal,
+    });
+    windows
+}
+
+/// A window's row label: friendly for the two windows a plan cares about —
+/// a 5-hour window reads "5-hour limit" and a week reads "Weekly · all
+/// models" — the payload's own label otherwise, and "period" for NaN's
+/// billing-period allowance (whose `window_seconds` counts down to the
 /// reset instead of naming a window length).
 pub fn window_display_label(window: &UsageWindow) -> String {
     if window.label.is_empty() {
-        "period".into()
+        return "period".into();
+    }
+    let week =
+        window.label == "week" || window.label == "7d" || window.window_seconds >= WEEK as f64;
+    let five_hours = window.label == "5h"
+        || (window.window_seconds > 0.0 && window.window_seconds == 5.0 * HOUR as f64);
+    if week {
+        "Weekly · all models".into()
+    } else if five_hours {
+        "5-hour limit".into()
     } else {
         window.label.clone()
     }
@@ -434,13 +473,24 @@ mod tests {
     use super::{
         LimitTone, UsageLimit, UsageWindow, group_usage_limits, limit_tone, parse_codex_usage,
         parse_nan_quota, provider_alias, reset_clock_label, window_display_label,
-        windows_most_used,
+        windows_by_length, windows_most_used,
     };
-    use crate::usage::time::{DAY, HOUR, MINUTE, days_from_civil, parse_iso_ms};
+    use crate::usage::time::{DAY, HOUR, MINUTE, WEEK, days_from_civil, parse_iso_ms};
     use serde_json::Value;
     use serde_json::json;
 
     const NOW: i64 = 1_762_400_000_000;
+
+    fn window_len(label: &str, percent: f64, seconds: f64) -> UsageWindow {
+        UsageWindow {
+            label: label.into(),
+            used_percent: percent,
+            window_seconds: seconds,
+            reset_at: None,
+            used: None,
+            budget: None,
+        }
+    }
 
     fn window(label: &str, percent: f64) -> UsageWindow {
         UsageWindow {
@@ -551,9 +601,77 @@ mod tests {
     }
 
     #[test]
-    fn window_labels_fall_back_to_period() {
-        assert_eq!(window_display_label(&window("week", 0.0)), "week");
+    fn window_labels_speak_like_the_plan_card() {
+        // The two windows Claude reports read like the plan, everything else
+        // keeps the payload's label ("period" for NaN's billing-period
+        // allowance, whose `window_seconds` counts down instead).
+        assert_eq!(window_display_label(&window("5h", 0.0)), "5-hour limit");
+        assert_eq!(
+            window_display_label(&window("week", 0.0)),
+            "Weekly · all models"
+        );
+        assert_eq!(
+            window_display_label(&window("7d", 0.0)),
+            "Weekly · all models"
+        );
+        assert_eq!(window_display_label(&window("1d", 0.0)), "1d");
+        assert_eq!(window_display_label(&window("4h", 0.0)), "4h");
         assert_eq!(window_display_label(&window("", 0.0)), "period");
+        // NaN's billing-period allowance keeps "period" even when its
+        // remaining time coincides with a window length: only a payload that
+        // names the window gets the friendly name.
+        let five_hours_left = UsageWindow {
+            window_seconds: 5.0 * HOUR as f64,
+            ..window("", 0.0)
+        };
+        assert_eq!(window_display_label(&five_hours_left), "period");
+    }
+
+    #[test]
+    fn windows_order_shortest_first_with_unknown_last() {
+        let limits = vec![
+            UsageLimit {
+                name: "prompts".into(),
+                windows: vec![
+                    window_len("week", 10.0, WEEK as f64),
+                    window_len("5h", 42.0, 5.0 * HOUR as f64),
+                ],
+                limit_reached: false,
+            },
+            UsageLimit {
+                name: "codex".into(),
+                windows: vec![
+                    window_len("1d", 77.5, DAY as f64),
+                    window_len("4h", 3.0, 4.0 * HOUR as f64),
+                ],
+                limit_reached: false,
+            },
+        ];
+        let ordered: Vec<String> = windows_by_length(&limits)
+            .iter()
+            .map(|w| w.label.clone())
+            .collect();
+        assert_eq!(ordered, ["4h", "5h", "1d", "week"], "shortest first");
+        // Windows without a length (NaN's billing-period allowance) go last,
+        // in the payload's order.
+        let with_unknown = vec![UsageLimit {
+            name: "glm".into(),
+            windows: vec![
+                window_len("4h", 3.0, 4.0 * HOUR as f64),
+                UsageWindow {
+                    window_seconds: 0.0,
+                    ..window("", 25.0)
+                },
+                window_len("1d", 77.5, DAY as f64),
+            ],
+            limit_reached: false,
+        }];
+        let ordered: Vec<String> = windows_by_length(&with_unknown)
+            .iter()
+            .map(|w| w.label.clone())
+            .collect();
+        assert_eq!(ordered, ["4h", "1d", ""], "unknown lengths last");
+        assert!(windows_by_length(&[]).is_empty());
     }
 
     #[test]

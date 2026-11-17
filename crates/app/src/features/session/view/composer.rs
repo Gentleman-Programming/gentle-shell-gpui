@@ -487,8 +487,10 @@ impl SessionView {
                 })
             })
             .child(div().flex_1().min_w_0())
+            // The plan-limits chip keeps its full "N%" label: without a
+            // fixed-width slot the row squeezes it into an ellipsis first.
             .when_some(self.render_plan_limits_chip(cx), |this, chip| {
-                this.child(chip)
+                this.child(div().flex_shrink_0().child(chip))
             })
             .child(
                 div()

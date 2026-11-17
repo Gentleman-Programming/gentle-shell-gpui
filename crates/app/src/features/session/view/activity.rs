@@ -578,6 +578,30 @@ pub(super) fn chip_popover(
     count: String,
     body: impl Fn() -> Vec<AnyElement> + 'static,
 ) -> Popover {
+    chip_popover_with_action(id, icon, color, label, title, count, body, None)
+}
+
+/// [`chip_popover`] with an extra control at the header's right side (where
+/// the count otherwise sits): it is rebuilt with the card, so it can carry a
+/// listener on the popover's own state — `cx.listener` + `state.dismiss` —
+/// to act and close in one click.
+type ChipHeaderAction = Box<
+    dyn Fn(&mut Window, &mut Context<gpui_kit::component::popover::PopoverState>) -> AnyElement,
+>;
+
+// One parameter per card slot is how the header reads; grouping them in a
+// struct would hide that shape.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn chip_popover_with_action(
+    id: impl Into<SharedString>,
+    icon: IconName,
+    color: Hsla,
+    label: impl Into<SharedString>,
+    title: impl Into<SharedString>,
+    count: String,
+    body: impl Fn() -> Vec<AnyElement> + 'static,
+    action: Option<ChipHeaderAction>,
+) -> Popover {
     let id: SharedString = id.into();
     let title: SharedString = title.into();
     let trigger = Button::new(SharedString::from(format!("{id}-chip")))
@@ -591,7 +615,7 @@ pub(super) fn chip_popover(
         .trigger(trigger)
         .w(rems(360. / 16.))
         .appearance(false)
-        .content(move |_, _, cx| {
+        .content(move |_, window, cx| {
             ui::island(cx)
                 .w_full()
                 .child(ui::popover_in(
@@ -619,7 +643,8 @@ pub(super) fn chip_popover(
                                             .text_color(ui::muted())
                                             .child(count.clone()),
                                     )
-                                }),
+                                })
+                                .when_some(action.as_ref(), |d, build| d.child(build(window, cx))),
                         )
                         .child(
                             v_flex()
