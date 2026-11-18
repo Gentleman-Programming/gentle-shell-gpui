@@ -62,14 +62,10 @@ impl Workspace {
             return;
         }
         self.ensure_open(index, window, cx);
-        let changed = index != self.current;
         self.current = index;
         self.space_mut().last_active = workspaces::now();
         self.focus_active(window, cx);
         self.start_shown(window, cx);
-        if changed {
-            cx.emit(WorkspaceEvent::RootChanged(self.space().root.clone()));
-        }
         self.sync_files_root(cx);
         self.schedule_save(cx);
         cx.notify();

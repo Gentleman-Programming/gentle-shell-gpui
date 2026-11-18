@@ -91,8 +91,6 @@ pub const SIDEBAR_WIDTH: f32 = 260.;
 
 /// What the window tells whoever embeds things in it (the sidebar's owner).
 pub enum WorkspaceEvent {
-    /// The shown workspace changed; its root folder.
-    RootChanged(PathBuf),
     /// The file browser must follow the folder of the selected pane/agent.
     FilesRootChanged(PathBuf),
     /// The left sidebar was shown or hidden.
@@ -492,11 +490,6 @@ impl Workspace {
     pub fn set_sidebar(&mut self, view: AnyView, cx: &mut Context<Self>) {
         self.sidebar = Some(view);
         cx.notify();
-    }
-
-    /// The shown workspace's root folder.
-    pub fn root(&self) -> &Path {
-        &self.space().root
     }
 
     /// Show `path` in the tab's preview pane, or a new split beside the largest pane.
