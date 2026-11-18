@@ -48,6 +48,7 @@ pub fn item_weight(item: &Item) -> f32 {
             };
             3.8 + text + if images.is_empty() { 0. } else { 7. }
         }
+        Item::Assistant { .. } if !crate::transcript::assistant_visible(item) => 0.,
         Item::Assistant {
             blocks,
             streaming,
@@ -387,6 +388,31 @@ mod tests {
             error: None,
         };
         assert!(item_weight(&answered) < 10.);
+    }
+
+    #[test]
+    fn a_textless_assistant_message_weighs_nothing() {
+        // A finished message that only announced tool calls renders no row;
+        // its estimate is zero.
+        let tool_calls = Item::Assistant {
+            blocks: vec![Block::ToolCall, Block::ToolCall],
+            streaming: false,
+            error: None,
+        };
+        assert_eq!(item_weight(&tool_calls), 0.);
+        // With text (or live) the message keeps its usual weight.
+        let text = Item::Assistant {
+            blocks: vec![Block::Text("hi".into())],
+            streaming: false,
+            error: None,
+        };
+        assert!(item_weight(&text) > 0.);
+        let live = Item::Assistant {
+            blocks: vec![],
+            streaming: true,
+            error: None,
+        };
+        assert!(item_weight(&live) > 0.);
     }
 
     #[test]

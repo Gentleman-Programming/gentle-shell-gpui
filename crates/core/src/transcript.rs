@@ -132,6 +132,29 @@ pub fn step_open_by_default(item: &Item) -> Option<bool> {
     }
 }
 
+/// Whether an assistant message shows anything to the user: text beyond
+/// whitespace, thinking (kept as today), an error — or it is still
+/// streaming ("Working…"). A finished message that only announced tool
+/// calls shows nothing: it renders no row, and a run of steps flows
+/// across it as if it weren't there.
+pub fn assistant_visible(item: &Item) -> bool {
+    match item {
+        Item::Assistant {
+            blocks,
+            streaming,
+            error,
+        } => {
+            *streaming
+                || error.is_some()
+                || blocks.iter().any(|b| match b {
+                    Block::Text(text) | Block::Thinking(text) => !text.trim().is_empty(),
+                    Block::ToolCall => false,
+                })
+        }
+        _ => true,
+    }
+}
+
 /// Whether a step shows its quiet one-line row instead of its card: its
 /// default ([`step_open_by_default`]) flipped once by the user's click
 /// (`toggled`). Items that never fold this way always show their card.
@@ -722,6 +745,46 @@ pub fn format_tokens(tokens: u64) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_textless_assistant_message_shows_nothing() {
+        let assistant =
+            |blocks: Vec<Block>, streaming: bool, error: Option<&str>| Item::Assistant {
+                blocks,
+                streaming,
+                error: error.map(String::from),
+            };
+        // A message that only announced tool calls shows nothing.
+        assert!(!assistant_visible(&assistant(
+            vec![Block::ToolCall, Block::ToolCall],
+            false,
+            None
+        )));
+        // Whitespace text alone is no content either.
+        assert!(!assistant_visible(&assistant(
+            vec![Block::Text("  \n\t".into())],
+            false,
+            None
+        )));
+        // Text, thinking, an error and a live message all show.
+        assert!(assistant_visible(&assistant(
+            vec![Block::Text("hi".into())],
+            false,
+            None
+        )));
+        assert!(assistant_visible(&assistant(
+            vec![Block::Thinking("hmm".into())],
+            false,
+            None
+        )));
+        assert!(assistant_visible(&assistant(vec![], false, Some("boom"))));
+        assert!(assistant_visible(&assistant(vec![], true, None)));
+        // Anything else always shows.
+        assert!(assistant_visible(&Item::User {
+            text: "hi".into(),
+            images: vec![],
+        }));
+    }
 
     #[test]
     fn a_step_shows_its_line_until_a_click_unfolds_it() {

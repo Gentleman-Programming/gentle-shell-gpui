@@ -20,7 +20,7 @@ use super::state::BackendStatus;
 use super::{CONTEXT, SessionView};
 use crate::shared::ui;
 use gentle_core::tools;
-use gentle_core::transcript::{Block, Item, NoticeLevel, ToolStatus};
+use gentle_core::transcript::{Block, Item, NoticeLevel, ToolStatus, assistant_visible};
 
 mod activity;
 mod cards;
@@ -1489,6 +1489,12 @@ impl SessionView {
                 let Some(item) = self.transcript.items.get(i) else {
                     return div().into_any_element();
                 };
+                // A finished assistant message with nothing to show (it only
+                // announced tool calls) renders no row at all: no padding, no
+                // gap, and a run of steps flows across it.
+                if !assistant_visible(item) {
+                    return div().into_any_element();
+                }
                 let element = self.render_item(i, item, narrow, cx);
                 // Keyed by index: items animate in once, never again.
                 self.list
@@ -1529,6 +1535,10 @@ impl SessionView {
             Row::Footer => return div().h(rems(32. / 16.)).into_any_element(),
         };
         let narrow = self.pane_width.get() < NARROW;
+        // Rows of consecutive steps sit close together: the top padding
+        // stays before and after a run of steps, not between its rows.
+        let tight = matches!(row, Row::Item(i)
+            if follows_step(&self.transcript.items, i));
         h_flex()
             .w_full()
             .justify_center()
@@ -1538,7 +1548,7 @@ impl SessionView {
                     .min_w_0()
                     .max_w(rems(760. / 16.))
                     .map(|d| if narrow { d.px_3() } else { d.px_6() })
-                    .pt(rems(24. / 16.))
+                    .when(!tight, |d| d.pt(rems(24. / 16.)))
                     .child(content),
             )
             .into_any_element()
@@ -1778,6 +1788,24 @@ impl BubbleText {
 }
 
 /// The card data of a tool or shell item.
+/// Whether item `ix` renders a step row right after another step row: it
+/// is a step ([`step_open_by_default`]) and the first visible item before
+/// it is too — invisible assistant messages in between don't count (they
+/// render no row). Such rows drop their top padding; the padding stays
+/// before and after a run of steps.
+fn follows_step(items: &[Item], ix: usize) -> bool {
+    let is_step = |item: &Item| gentle_core::transcript::step_open_by_default(item).is_some();
+    match items.get(ix) {
+        Some(item) if is_step(item) => {}
+        _ => return false,
+    }
+    items[..ix]
+        .iter()
+        .rev()
+        .find(|item| assistant_visible(item))
+        .is_some_and(is_step)
+}
+
 fn card_spec(item: &Item) -> Option<CardSpec> {
     let (input, output) = card_texts(item);
     let (input_lines, output_lines) = (input.map(|(text, _)| line_count(text)), line_count(output));
@@ -1811,11 +1839,20 @@ fn card_spec(item: &Item) -> Option<CardSpec> {
                 Some(description) if command_like => gentle_core::text::first_line(description, 80),
                 _ => summary.title,
             };
-            let subject = if command_like && input.is_some() {
-                String::new()
+            // The quiet step line shows what the step was about: the command
+            // for command tools, the path for file tools. The card body shows
+            // the same thing when the step unfolds.
+            let subject = if command_like {
+                match input {
+                    Some((command, _)) => gentle_core::text::first_line(command, 120),
+                    None => summary.subject,
+                }
             } else {
                 summary.subject
             };
+            // A chip that only repeats the title ("bash" next to "Bash") is
+            // noise; one that adds information stays.
+            let chip = chip.filter(|chip| !chip.eq_ignore_ascii_case(&title));
             Some(CardSpec {
                 icon: tool_icon(name),
                 title: title.into(),
@@ -2257,9 +2294,68 @@ fn working_indicator(label: &'static str, elapsed: Option<Duration>) -> Div {
 #[cfg(test)]
 mod tests {
     use super::{
-        BubbleText, USER_LINES, USER_SLACK, command_language, head_slice, language_for_path,
-        line_count, parse_diff_line, tail_slice,
+        BubbleText, USER_LINES, USER_SLACK, command_language, follows_step, head_slice,
+        language_for_path, line_count, parse_diff_line, tail_slice,
     };
+    use gentle_core::transcript::{Block, Item, ToolStatus};
+
+    fn step(name: &str, status: ToolStatus) -> Item {
+        Item::Tool {
+            call_id: format!("{name}-1"),
+            name: name.into(),
+            args: serde_json::json!({}),
+            status,
+            output: String::new(),
+            details: serde_json::json!({}),
+            duration_ms: None,
+        }
+    }
+
+    fn textless() -> Item {
+        Item::Assistant {
+            blocks: vec![Block::ToolCall],
+            streaming: false,
+            error: None,
+        }
+    }
+
+    fn text(text: &str) -> Item {
+        Item::Assistant {
+            blocks: vec![Block::Text(text.into())],
+            streaming: false,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn consecutive_step_rows_sit_close_together() {
+        let items = vec![
+            text("A"),
+            step("bash", ToolStatus::Done),
+            textless(),
+            step("read", ToolStatus::Done),
+            step("edit", ToolStatus::Done),
+            text("B"),
+        ];
+        // The first step after text keeps its padding; the steps that follow
+        // it (even across an invisible assistant message) sit close.
+        assert!(!follows_step(&items, 1));
+        assert!(follows_step(&items, 3));
+        assert!(follows_step(&items, 4));
+        // The run's end gets its padding back.
+        assert!(!follows_step(&items, 5));
+        // What you ran yourself is not a step row.
+        let shell = vec![
+            step("bash", ToolStatus::Done),
+            Item::Shell {
+                command: "ls".into(),
+                output: String::new(),
+                exit_code: Some(0),
+                running: false,
+            },
+        ];
+        assert!(!follows_step(&shell, 1));
+    }
 
     #[test]
     fn long_messages_fold_to_their_first_lines() {
