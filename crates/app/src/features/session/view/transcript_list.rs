@@ -12,7 +12,7 @@ use super::rail::preview;
 use super::{BubbleText, CardSpec, card_spec, line_count};
 use crate::shared::ui;
 use gentle_core::scroll::{self, Estimate, RailMark};
-use gentle_core::transcript::{Block, Dirty, Item};
+use gentle_core::transcript::{Block, Dirty, Item, StepGroup};
 
 /// Rows after the transcript items.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -133,6 +133,12 @@ pub(in crate::features::session) struct TranscriptList {
     /// Items folded to their quiet one-line step row, by transcript index:
     /// they estimate as [`STEP_LINE_WEIGHT`] instead of their full weight.
     step_collapsed: HashSet<usize>,
+    /// The runs of consecutive finished steps folded to one summary line
+    /// (`gentle_core::transcript::step_groups`), in item order.
+    groups: Vec<StepGroup>,
+    /// The folded ones, by their first item's index: the summary line shows
+    /// at the run's first item and its other items render nothing.
+    group_folded: HashSet<usize>,
     /// Every row's weight, in row order: the estimate's input.
     row_weights: Vec<f32>,
     /// Where the pane is along the whole conversation; its row tops are
@@ -158,6 +164,36 @@ const FOOTER_WEIGHT: f32 = 1.4;
 /// unfolding restores the estimate without re-reading the item.
 const STEP_LINE_WEIGHT: f32 = 2.;
 
+/// Item `ix`'s estimate weight: its content weight, folded to the step-line
+/// weight when its quiet line shows. A folded step group shows one summary
+/// line at its first item and renders nothing for the rest.
+fn item_row_weight(
+    ix: usize,
+    weight: Option<f32>,
+    step_collapsed: bool,
+    groups: &[StepGroup],
+    folded: &HashSet<usize>,
+) -> f32 {
+    // Hidden by a folded group it isn't the first item of.
+    if groups
+        .iter()
+        .any(|g| g.items.start != ix && g.items.contains(&ix) && folded.contains(&g.items.start))
+    {
+        return 0.;
+    }
+    let first = groups.iter().any(|g| g.items.start == ix);
+    if first && folded.contains(&ix) {
+        return STEP_LINE_WEIGHT;
+    }
+    let base = if step_collapsed {
+        STEP_LINE_WEIGHT
+    } else {
+        weight.unwrap_or(TAIL_WEIGHT)
+    };
+    // Unfolded, the group's summary line sits above its first member.
+    if first { base + STEP_LINE_WEIGHT } else { base }
+}
+
 impl TranscriptList {
     pub(in crate::features::session) fn new() -> Self {
         let shape = Shape::default();
@@ -170,6 +206,8 @@ impl TranscriptList {
             heights: HashMap::new(),
             weights: Vec::new(),
             step_collapsed: HashSet::new(),
+            groups: Vec::new(),
+            group_folded: HashSet::new(),
             row_weights: Vec::new(),
             estimate: Estimate::default(),
             stale: true,
@@ -187,6 +225,8 @@ impl TranscriptList {
         self.heights.clear();
         self.weights.clear();
         self.step_collapsed.clear();
+        self.groups.clear();
+        self.group_folded.clear();
         self.marks.clear();
         self.stale = true;
     }
@@ -237,11 +277,13 @@ impl TranscriptList {
             self.row_weights.clear();
             self.row_weights.push(HEADER_WEIGHT);
             self.row_weights.extend((0..self.shape.items).map(|ix| {
-                if self.step_collapsed.contains(&ix) {
-                    STEP_LINE_WEIGHT
-                } else {
-                    self.weights.get(ix).copied().unwrap_or(TAIL_WEIGHT)
-                }
+                item_row_weight(
+                    ix,
+                    self.weights.get(ix).copied(),
+                    self.step_collapsed.contains(&ix),
+                    &self.groups,
+                    &self.group_folded,
+                )
             }));
             self.row_weights
                 .extend(self.shape.tail.iter().map(|_| TAIL_WEIGHT));
@@ -386,6 +428,32 @@ impl TranscriptList {
         self.stale |= changed;
     }
 
+    /// Replace the transcript's step groups and which are folded (their
+    /// first items' indices); a change re-lays the estimate.
+    pub(super) fn set_groups(&mut self, groups: &[StepGroup], folded: &[usize]) {
+        let folded: HashSet<usize> = folded.iter().copied().collect();
+        if self.groups.as_slice() != groups || self.group_folded != folded {
+            self.stale = true;
+        }
+        self.groups = groups.to_vec();
+        self.group_folded = folded;
+    }
+
+    /// The group whose run starts at item `ix`, if any.
+    pub(super) fn group_at(&self, ix: usize) -> Option<&StepGroup> {
+        self.groups.iter().find(|g| g.items.start == ix)
+    }
+
+    /// Whether a folded group hides item `ix` (a member that isn't its
+    /// first item).
+    pub(super) fn group_hides(&self, ix: usize) -> bool {
+        self.groups.iter().any(|g| {
+            g.items.start != ix
+                && g.items.contains(&ix)
+                && self.group_folded.contains(&g.items.start)
+        })
+    }
+
     pub(super) fn prepared(&self, ix: usize) -> Option<&Prepared> {
         self.prepared.get(&ix)
     }
@@ -428,7 +496,63 @@ impl TranscriptList {
 
 #[cfg(test)]
 mod tests {
-    use super::{ListUpdate, Row, Shape, Tail, list_update};
+    use std::collections::HashSet;
+
+    use gentle_core::transcript::StepGroup;
+
+    use super::{
+        ListUpdate, Row, STEP_LINE_WEIGHT, Shape, TAIL_WEIGHT, Tail, item_row_weight, list_update,
+    };
+
+    fn group(start: usize, end: usize) -> StepGroup {
+        StepGroup {
+            items: start..end,
+            label: "Ran 2 commands".into(),
+        }
+    }
+
+    #[test]
+    fn folded_groups_estimate_the_summary_line_and_hide_their_members() {
+        let groups = [group(1, 4)];
+        let folded: HashSet<usize> = [1].into();
+        // The first item shows the summary line; the rest render nothing.
+        assert_eq!(
+            item_row_weight(1, Some(13.), true, &groups, &folded),
+            STEP_LINE_WEIGHT
+        );
+        assert_eq!(item_row_weight(2, Some(13.), true, &groups, &folded), 0.);
+        assert_eq!(item_row_weight(3, Some(13.), true, &groups, &folded), 0.);
+        // Outside the group nothing changes.
+        assert_eq!(
+            item_row_weight(0, Some(13.), true, &groups, &folded),
+            STEP_LINE_WEIGHT
+        );
+        assert_eq!(item_row_weight(4, Some(13.), false, &groups, &folded), 13.);
+    }
+
+    #[test]
+    fn unfolded_groups_estimate_the_line_above_each_members_weight() {
+        let groups = [group(1, 3)];
+        let folded = HashSet::new();
+        // The summary line sits above the first member's own weight.
+        assert_eq!(
+            item_row_weight(1, Some(13.), true, &groups, &folded),
+            STEP_LINE_WEIGHT * 2.
+        );
+        assert_eq!(
+            item_row_weight(1, Some(13.), false, &groups, &folded),
+            STEP_LINE_WEIGHT + 13.
+        );
+        assert_eq!(
+            item_row_weight(2, Some(13.), true, &groups, &folded),
+            STEP_LINE_WEIGHT
+        );
+        // Unmeasured members estimate from the default tail weight.
+        assert_eq!(
+            item_row_weight(2, None, false, &groups, &folded),
+            TAIL_WEIGHT
+        );
+    }
 
     #[test]
     fn rows_map_to_header_items_tail_and_footer() {

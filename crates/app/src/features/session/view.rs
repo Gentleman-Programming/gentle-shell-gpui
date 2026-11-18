@@ -20,7 +20,7 @@ use super::state::BackendStatus;
 use super::{CONTEXT, SessionView};
 use crate::shared::ui;
 use gentle_core::tools;
-use gentle_core::transcript::{Block, Item, NoticeLevel, ToolStatus};
+use gentle_core::transcript::{Block, Item, NoticeLevel, StepGroup, ToolStatus};
 
 mod activity;
 mod cards;
@@ -53,9 +53,11 @@ const INPUT: usize = 1;
 const THINKING: usize = 2;
 /// The whole step: a finished tool (or helper) row folds to its quiet line.
 const STEP: usize = 3;
+/// A run of consecutive finished steps folded to one summary line.
+const GROUP: usize = 4;
 
 fn fold_key(ix: usize, sub: usize, slot: usize) -> usize {
-    (ix << 16) | (sub << 2) | slot
+    (ix << 16) | (sub << 3) | slot
 }
 
 /// Lines of a collapsed tool input and output.
@@ -160,6 +162,15 @@ impl SessionView {
             let session = self.session_file();
             self.genui.restore_pins(session.as_deref(), cx);
         }
+        // Runs of consecutive finished steps fold to one summary line; the
+        // fold lives in `expanded` like every other fold.
+        let groups = gentle_core::transcript::step_groups(&self.transcript.items);
+        let folded: Vec<usize> = groups
+            .iter()
+            .filter(|g| !self.expanded.contains(&fold_key(g.items.start, 0, GROUP)))
+            .map(|g| g.items.start)
+            .collect();
+        self.list.set_groups(&groups, &folded);
         self.sync_live(cx);
         self.sync_genui_live(cx);
         let tail = self.tail_rows();
@@ -418,12 +429,24 @@ impl SessionView {
         }
         // Fold keys carry their item index.
         let ix = key >> 16;
-        // A whole-step fold changes the row's estimate too.
-        if key & 3 == STEP
-            && let Some(item) = self.transcript.items.get(ix)
-        {
-            let collapsed = self.step_collapsed(ix, item);
-            self.list.set_step_collapsed(ix, collapsed);
+        match key & 7 {
+            // A whole-step fold changes the row's estimate too.
+            STEP => {
+                if let Some(item) = self.transcript.items.get(ix) {
+                    let collapsed = self.step_collapsed(ix, item);
+                    self.list.set_step_collapsed(ix, collapsed);
+                }
+            }
+            // A group fold changes the estimate of every row it covers.
+            GROUP => {
+                let range = self.list.group_at(ix).map(|g| g.items.clone());
+                if let Some(range) = range {
+                    for member in range {
+                        self.list.remeasure_item(member);
+                    }
+                }
+            }
+            _ => {}
         }
         self.list.remeasure_item(ix);
         cx.notify();
@@ -1185,6 +1208,74 @@ impl SessionView {
             )
     }
 
+    /// A step group's quiet summary line, in the style of a step line: a
+    /// faint icon, the label, the run's total duration and a chevron.
+    /// Clicking it unfolds the run's step lines (or folds them back).
+    fn render_group_line(
+        &self,
+        group: &StepGroup,
+        open: bool,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let key = fold_key(group.items.start, 0, GROUP);
+        let duration = group
+            .items
+            .clone()
+            .filter_map(|ix| match self.transcript.items.get(ix) {
+                Some(Item::Tool {
+                    duration_ms: Some(ms),
+                    ..
+                }) => Some(*ms),
+                _ => None,
+            })
+            .sum::<u64>();
+        h_flex()
+            .id(("group", group.items.start))
+            .w_full()
+            .px_3()
+            .py_2()
+            .gap_2()
+            .min_w_0()
+            .cursor_pointer()
+            .hover(|s| s.bg(ui::surface_hover()))
+            .on_click(cx.listener(move |this, _, _, cx| this.toggle(key, cx)))
+            .child(Icon::new(IconName::Layers).small().text_color(ui::faint()))
+            .child(
+                div()
+                    .min_w_0()
+                    .flex_shrink(1.)
+                    .max_w(rems(420. / 16.))
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .whitespace_nowrap()
+                    .text_size(rems(13. / 16.))
+                    .text_color(ui::muted())
+                    .child(group.label.clone()),
+            )
+            .child(div().flex_1())
+            .when_some(
+                (duration > 0).then_some(Duration::from_millis(duration)),
+                |this, d| {
+                    this.child(
+                        div()
+                            .font_family(ui::MONO)
+                            .text_size(rems(11. / 16.))
+                            .text_color(ui::faint())
+                            .child(ui::format_duration(d.as_millis() as u64)),
+                    )
+                },
+            )
+            .child(
+                Icon::new(if open {
+                    IconName::ChevronUp
+                } else {
+                    IconName::ChevronDown
+                })
+                .xsmall()
+                .text_color(ui::faint()),
+            )
+    }
+
     /// Today's tool card header: icon, title, subject, +n/−n and a chevron
     /// when the output folds. Kept for `Item::Shell`, which never folds as
     /// a whole step.
@@ -1491,7 +1582,27 @@ impl SessionView {
                 let Some(item) = self.transcript.items.get(i) else {
                     return div().into_any_element();
                 };
-                let element = self.render_item(i, item, narrow, cx);
+                // A folded group renders nothing for its members that
+                // aren't its first item.
+                if self.list.group_hides(i) {
+                    return div().into_any_element();
+                }
+                // A group's summary line sits at its run's first item; open,
+                // that item renders under it.
+                let element = match self.list.group_at(i).cloned() {
+                    Some(group) => {
+                        let open = self.expanded.contains(&fold_key(i, 0, GROUP));
+                        v_flex()
+                            .w_full()
+                            .gap(rems(24. / 16.))
+                            .child(self.render_group_line(&group, open, cx))
+                            .when(open, |this| {
+                                this.child(self.render_item(i, item, narrow, cx))
+                            })
+                            .into_any_element()
+                    }
+                    None => self.render_item(i, item, narrow, cx),
+                };
                 // Keyed by index: items animate in once, never again.
                 self.list
                     .appear(("item", i), now, div().w_full().child(element))

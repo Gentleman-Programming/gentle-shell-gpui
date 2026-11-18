@@ -201,7 +201,7 @@ Gentle Shell's rose and pixel wordmark, written in like the terminal intro. It f
 
 ### Conversation — Streaming answers and live tool cards
 
-Streaming Markdown, collapsible thinking, and tool cards (`Edit path +12 −3`, `Bash …`) with live output. Helper answers (`gentle-agents.result`) appear as Markdown cards titled with the agent and its status; background job notices show their label, exit code and output tail; Gentle Shell's review preflight, exploration budget and verification reminders get named cards.
+Streaming Markdown, collapsible thinking, and tool cards (`Edit path +12 −3`, `Bash …`) with live output. Finished steps fold to quiet gray lines, and consecutive runs fold further into one summary (`Ran 3 commands (1 error) ›`) that unfolds into them. Helper answers (`gentle-agents.result`) appear as Markdown cards titled with the agent and its status; background job notices show their label, exit code and output tail; Gentle Shell's review preflight, exploration budget and verification reminders get named cards.
 
 <details>
 <summary><kbd>More</kbd> <strong>Cards, copy and the message rail</strong></summary>
