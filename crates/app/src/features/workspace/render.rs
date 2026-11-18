@@ -113,7 +113,15 @@ impl Render for Workspace {
                                     .overflow_hidden()
                                     .child(self.render_workspace_chip(cx))
                                     .child(self.render_tabs(cx))
-                                    .children(self.render_conversation_chip(cx)),
+                                    // The title chip gives way first: in a narrow
+                                    // window it truncates (and goes) before any tab.
+                                    .children(self.render_conversation_chip(cx).map(|chip| {
+                                        div()
+                                            .min_w_0()
+                                            .flex_shrink(100.)
+                                            .overflow_hidden()
+                                            .child(chip)
+                                    })),
                             )
                             .child(
                                 h_flex()

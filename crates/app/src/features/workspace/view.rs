@@ -407,7 +407,7 @@ impl Workspace {
                                 .item(entry(
                                     IconName::Pencil,
                                     "Rename",
-                                    "Same inline field as the tab",
+                                    "Give this conversation a name",
                                     String::new(),
                                     |this, window, cx| {
                                         let active = this.space().active;
@@ -426,7 +426,7 @@ impl Workspace {
                                     },
                                 ))
                                 .item(entry(
-                                    IconName::SquarePlus,
+                                    IconName::Bot,
                                     "New tab",
                                     "Gentle Shell in this folder",
                                     ui::platform_shortcut("⌘T", "Ctrl+T").to_string(),
