@@ -11,7 +11,7 @@ use gpui_kit::*;
 use pi_rpc::{UiAnswer, UiMethod};
 
 use crate::shared::ui;
-use gentle_core::transcript::{NoticeLevel, Transcript};
+use gentle_core::transcript::{Item, NoticeLevel, Transcript};
 
 mod agents;
 mod attachments;
@@ -46,9 +46,10 @@ pub enum SessionEvent {
         message: String,
     },
     /// Something the window chrome shows may have changed: [`SessionView::title`],
-    /// [`SessionView::is_running`], [`SessionView::session_file`],
-    /// [`SessionView::cwd`] or [`SessionView::model_choices`]. Streaming
-    /// output does not emit it, so the window need not redraw per token.
+    /// [`SessionView::conversation_title`], [`SessionView::is_running`],
+    /// [`SessionView::session_file`], [`SessionView::cwd`] or
+    /// [`SessionView::model_choices`]. Streaming output does not emit it, so
+    /// the window need not redraw per token.
     ChromeChanged,
     /// A Gentle Shell command whose UI is terminal-only was run (typed or
     /// from the palette): open the app's own screen for it instead.
@@ -84,6 +85,10 @@ pub enum SessionEvent {
 struct Chrome {
     title: String,
     running: bool,
+    /// The title the title bar's chip shows for this conversation (the name
+    /// or the first user message), carried here so the chip never reads the
+    /// session views while drawing.
+    conversation_title: Option<String>,
     needs_you: bool,
     session_file: Option<PathBuf>,
     models: u64,
@@ -340,6 +345,19 @@ impl SessionView {
             .unwrap_or_else(|| ui::split_path(&self.cwd).1)
     }
 
+    /// The title the title-bar chip shows for this conversation: its name,
+    /// else its first user message, cut like the summaries'; `None` while
+    /// there is neither (the chip's "New conversation" fallback). The rule
+    /// is `gentle_core::sessions::conversation_title`.
+    pub fn conversation_title(&self) -> Option<String> {
+        let first_user_message = self.transcript.items.iter().find_map(|item| match item {
+            Item::User { text, .. } => Some(text.as_str()),
+            _ => None,
+        });
+        gentle_core::sessions::conversation_title(self.session_name.as_deref(), first_user_message)
+            .map(|text| gentle_core::text::first_line(text, gentle_core::sessions::TITLE_MAX_CHARS))
+    }
+
     pub fn cwd(&self) -> &PathBuf {
         &self.cwd
     }
@@ -428,6 +446,7 @@ impl SessionView {
         let chrome = Chrome {
             title: self.title(),
             running: self.is_running(),
+            conversation_title: self.conversation_title(),
             needs_you: self.needs_you(),
             session_file: self.session_file(),
             models: self.models.rev,

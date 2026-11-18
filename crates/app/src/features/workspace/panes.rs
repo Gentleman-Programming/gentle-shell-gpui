@@ -212,6 +212,7 @@ impl Workspace {
             session_file: resume,
             title: SharedString::default(),
             running: false,
+            conversation_title: None,
             needs_you: false,
             _subscriptions: subscriptions,
         };
@@ -270,6 +271,7 @@ impl Workspace {
             session_file: None,
             title: SharedString::default(),
             running: false,
+            conversation_title: None,
             needs_you: false,
             _subscriptions: Vec::new(),
         };
@@ -293,6 +295,7 @@ impl Workspace {
             session_file: None,
             title: SharedString::default(),
             running: false,
+            conversation_title: None,
             needs_you: false,
             _subscriptions: Vec::new(),
         };

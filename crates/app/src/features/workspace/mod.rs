@@ -125,6 +125,12 @@ struct Pane {
     /// refresh it on `SessionEvent::ChromeChanged`, everything on the title poll.
     title: SharedString,
     running: bool,
+    /// The pane's conversation title as the title bar's chip shows it (a
+    /// name, or the first user message), kept here for the same reason;
+    /// `None` while untitled (the chip's "New conversation" fallback). Since
+    /// it rides on `Chrome`, `ChromeChanged` fires when it appears — the
+    /// first message or a rename.
+    conversation_title: Option<SharedString>,
     /// An agent waits on a dialog only you can answer.
     needs_you: bool,
     _subscriptions: Vec<Subscription>,
@@ -138,10 +144,19 @@ impl Pane {
             let s = s.read(cx);
             (s.is_running(), s.needs_you())
         });
-        let changed = title != self.title || running != self.running || needs_you != self.needs_you;
+        let conversation_title = self
+            .session
+            .as_ref()
+            .and_then(|s| s.read(cx).conversation_title())
+            .map(SharedString::from);
+        let changed = title != self.title
+            || running != self.running
+            || needs_you != self.needs_you
+            || conversation_title != self.conversation_title;
         self.title = title;
         self.running = running;
         self.needs_you = needs_you;
+        self.conversation_title = conversation_title;
         changed
     }
 }

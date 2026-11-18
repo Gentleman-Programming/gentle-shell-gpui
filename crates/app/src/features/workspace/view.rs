@@ -297,9 +297,9 @@ impl Workspace {
                             let item = |icon: IconName,
                                         label: &'static str,
                                         detail: &'static str,
-                                        keys: &'static str| {
+                                        keys: String| {
                                 PopupMenuItem::element(move |_, _| {
-                                    menu_row(icon, label, detail, keys)
+                                    menu_row(icon, label, detail, keys.clone())
                                 })
                             };
                             let (agent, terminal) = (weak.clone(), weak.clone());
@@ -309,7 +309,7 @@ impl Workspace {
                                         IconName::Bot,
                                         "Agent tab",
                                         "Gentle Shell in this folder",
-                                        ui::platform_shortcut("⌘T", "Ctrl+T"),
+                                        ui::platform_shortcut("⌘T", "Ctrl+T").to_string(),
                                     )
                                     .on_click(
                                         move |_, window, cx| {
@@ -324,7 +324,7 @@ impl Workspace {
                                         IconName::SquareTerminal,
                                         "Terminal tab",
                                         "A shell in this folder",
-                                        ui::platform_shortcut("⌘⇧T", "Ctrl+Shift+T"),
+                                        ui::platform_shortcut("⌘⇧T", "Ctrl+Shift+T").to_string(),
                                     )
                                     .on_click(
                                         move |_, window, cx| {
@@ -341,6 +341,115 @@ impl Workspace {
                         },
                     )),
             )
+    }
+
+    /// The conversation title chip right of the tabs (S10): the focused agent
+    /// pane's conversation title — the session's name, else its first user
+    /// message, like the sidebar's rule — with a chevron opening its menu:
+    /// Rename (the same path as double-clicking the tab), New session, New
+    /// tab, Sessions… and Close tab, each with its shortcut label. Hidden
+    /// when the focused pane isn't an agent. Like the tabs, it reads only
+    /// the pane's snapshot carried by `sync_chrome`, never the session views.
+    pub(super) fn render_conversation_chip(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let pane = self.focused_pane()?;
+        let snapshot = self.panes.get(&pane)?;
+        snapshot.session.as_ref()?;
+        let title = snapshot.conversation_title.clone();
+        let (label, untitled) = gentle_core::sessions::conversation_chip_label(title.as_deref());
+        // The element's label must be 'static: keep the snapshot's title
+        // (cheap, refcounted) and only own the fallback string.
+        let label = if untitled {
+            SharedString::from(label)
+        } else {
+            title.unwrap_or_default()
+        };
+        let weak = cx.entity().downgrade();
+        type Open = fn(&mut Workspace, &mut Window, &mut Context<Workspace>);
+        let entry = move |icon: IconName,
+                          label: &'static str,
+                          detail: &'static str,
+                          keys: String,
+                          open: Open| {
+            let weak = weak.clone();
+            PopupMenuItem::element(move |_, _| menu_row(icon, label, detail, keys.clone()))
+                .on_click(move |_, window, cx| {
+                    let _ = weak.update(cx, |this, cx| open(this, window, cx));
+                })
+        };
+        Some(
+            div()
+                .flex_none()
+                .ml(rems(6. / 16.))
+                .occlude()
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .child(
+                    Button::new("conversation-title")
+                        .ghost()
+                        .h(rems(TITLE_ITEM / 16.))
+                        .child(
+                            div()
+                                .min_w_0()
+                                .max_w(rems(200. / 16.))
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .whitespace_nowrap()
+                                .when(!untitled, |d| d.font_weight(FontWeight::MEDIUM))
+                                .text_color(if untitled { ui::faint() } else { ui::fg() })
+                                .child(label),
+                        )
+                        .child(
+                            Icon::new(IconName::ChevronDown)
+                                .xsmall()
+                                .text_color(ui::faint()),
+                        )
+                        .dropdown_menu(move |menu, window, _| {
+                            menu.min_w(rems(260. / 16.).to_pixels(window.rem_size()))
+                                .item(entry(
+                                    IconName::Pencil,
+                                    "Rename",
+                                    "Same inline field as the tab",
+                                    String::new(),
+                                    |this, window, cx| {
+                                        let active = this.space().active;
+                                        this.start_tab_rename(active, window, cx)
+                                    },
+                                ))
+                                .item(entry(
+                                    IconName::Plus,
+                                    "New session",
+                                    "Start a new conversation",
+                                    ui::shortcut("N"),
+                                    |this, window, cx| {
+                                        if let Some(tab) = this.active_session() {
+                                            tab.update(cx, |s, cx| s.new_session(window, cx));
+                                        }
+                                    },
+                                ))
+                                .item(entry(
+                                    IconName::SquarePlus,
+                                    "New tab",
+                                    "Gentle Shell in this folder",
+                                    ui::platform_shortcut("⌘T", "Ctrl+T").to_string(),
+                                    |this, window, cx| this.on_new_tab(&NewTab, window, cx),
+                                ))
+                                .item(entry(
+                                    IconName::RotateCcwClock,
+                                    "Sessions…",
+                                    "Resume a past session",
+                                    ui::shortcut_shift("O"),
+                                    |this, window, cx| this.open_sessions(window, cx),
+                                ))
+                                .item(entry(
+                                    IconName::X,
+                                    "Close tab",
+                                    "Close this tab and its panes",
+                                    ui::shortcut_shift("W"),
+                                    |this, window, cx| this.on_close_tab(&CloseTab, window, cx),
+                                ))
+                        }),
+                )
+                .into_any_element(),
+        )
     }
 
     pub(super) fn render_tree(
@@ -668,7 +777,7 @@ pub(super) fn menu_row(
     icon: IconName,
     label: &'static str,
     detail: &'static str,
-    keys: &'static str,
+    keys: String,
 ) -> impl IntoElement {
     h_flex()
         .gap_2p5()

@@ -4,6 +4,37 @@
 
 use std::path::{Path, PathBuf};
 
+/// Titles are cut to this many characters, like the summaries and the title
+/// bar's conversation chip.
+pub const TITLE_MAX_CHARS: usize = 120;
+
+/// The title a conversation shows everywhere (the sidebar's rows, the
+/// session browser and the title bar's chip): the explicit name, else its
+/// first user message; trimmed. `None` while there is neither — callers
+/// pick their own untitled fallback (`"New conversation"`,
+/// `"(no messages)"`).
+pub fn conversation_title<'a>(
+    name: Option<&'a str>,
+    first_message: Option<&'a str>,
+) -> Option<&'a str> {
+    [name, first_message]
+        .into_iter()
+        .flatten()
+        .find(|text| !text.trim().is_empty())
+        .map(str::trim)
+}
+
+/// The title bar's conversation chip label and whether it is the "New
+/// conversation" fallback: a session with a title of its own shows it in the
+/// main color; an untitled one (no name, no message yet, or a blank one)
+/// shows the fallback faint.
+pub fn conversation_chip_label(title: Option<&str>) -> (&str, bool) {
+    match title.filter(|t| !t.trim().is_empty()) {
+        Some(title) => (title, false),
+        None => ("New conversation", true),
+    }
+}
+
 /// What the browser shows for one session file.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SessionSummary {
@@ -28,12 +59,11 @@ pub struct SessionSummary {
 
 impl SessionSummary {
     pub fn title(&self) -> String {
-        let text = self
-            .name
-            .as_deref()
-            .or(self.first_message.as_deref())
-            .unwrap_or("(no messages)");
-        crate::text::first_line(text.trim(), 120)
+        crate::text::first_line(
+            conversation_title(self.name.as_deref(), self.first_message.as_deref())
+                .unwrap_or("(no messages)"),
+            TITLE_MAX_CHARS,
+        )
     }
 
     pub fn matches(&self, query_lower: &str) -> bool {
@@ -199,9 +229,10 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        file_session_id, listed_matches, listed_title, parse_iso_ms, project_name, relative_time,
-        session_dir_name,
+        SessionSummary, conversation_chip_label, conversation_title, file_session_id,
+        listed_matches, listed_title, parse_iso_ms, project_name, relative_time, session_dir_name,
     };
+    use std::path::PathBuf;
 
     #[test]
     fn listed_sessions_title_and_match_without_paths() {
@@ -275,5 +306,72 @@ mod tests {
         assert_eq!(relative_time(now, now - 2 * 86_400_000), "2d ago");
         assert_eq!(relative_time(now, now - 14 * 86_400_000), "2w ago");
         assert_eq!(relative_time(now, now - 400 * 86_400_000), "1y ago");
+    }
+
+    #[test]
+    fn conversation_title_prefers_the_name_then_the_first_message() {
+        assert_eq!(
+            conversation_title(Some("Rebase, push to main"), Some("hi")),
+            Some("Rebase, push to main")
+        );
+        assert_eq!(conversation_title(Some("Deploy"), None), Some("Deploy"));
+        assert_eq!(
+            conversation_title(None, Some("hola esto es una prueba")),
+            Some("hola esto es una prueba")
+        );
+    }
+
+    #[test]
+    fn a_conversation_without_name_or_message_is_untitled() {
+        assert_eq!(conversation_title(None, None), None);
+        // A blank name was cleared: fall through to the first message.
+        assert_eq!(conversation_title(Some(" "), Some("hi")), Some("hi"));
+        assert_eq!(conversation_title(Some(""), Some("")), None);
+    }
+
+    #[test]
+    fn chip_label_shows_the_title_or_the_fallback() {
+        assert_eq!(
+            conversation_chip_label(Some("Rebase, push to main")),
+            ("Rebase, push to main", false)
+        );
+        assert_eq!(conversation_chip_label(None), ("New conversation", true));
+        assert_eq!(
+            conversation_chip_label(Some("")),
+            ("New conversation", true)
+        );
+        assert_eq!(
+            conversation_chip_label(Some("   ")),
+            ("New conversation", true)
+        );
+    }
+
+    fn summary(name: Option<&str>, first_message: Option<&str>) -> SessionSummary {
+        SessionSummary {
+            path: PathBuf::new(),
+            id: String::new(),
+            cwd: PathBuf::new(),
+            name: name.map(str::to_string),
+            first_message: first_message.map(str::to_string),
+            modified_ms: 0,
+            message_count: 0,
+            truncated: false,
+            model: None,
+        }
+    }
+
+    #[test]
+    fn summaries_title_from_name_then_first_message() {
+        assert_eq!(summary(Some("work"), None).title(), "work");
+        assert_eq!(
+            summary(Some("work"), Some("one line\nmore")).title(),
+            "work"
+        );
+        // A blank name falls through to the first message, on one line.
+        assert_eq!(
+            summary(Some("  "), Some("one line\nmore")).title(),
+            "one line …"
+        );
+        assert_eq!(summary(None, None).title(), "(no messages)");
     }
 }

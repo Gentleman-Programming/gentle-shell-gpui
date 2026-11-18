@@ -112,7 +112,8 @@ impl Render for Workspace {
                                     .min_w_0()
                                     .overflow_hidden()
                                     .child(self.render_workspace_chip(cx))
-                                    .child(self.render_tabs(cx)),
+                                    .child(self.render_tabs(cx))
+                                    .children(self.render_conversation_chip(cx)),
                             )
                             .child(
                                 h_flex()
@@ -275,7 +276,10 @@ impl Render for Workspace {
                                                             PopupMenuItem::element(
                                                                 move |_, _| {
                                                                     menu_row(
-                                                                        icon, label, detail, "",
+                                                                        icon,
+                                                                        label,
+                                                                        detail,
+                                                                        String::new(),
                                                                     )
                                                                 },
                                                             )
