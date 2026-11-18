@@ -272,14 +272,16 @@ fn groupable_step(item: &Item) -> bool {
 /// ([`Item::Tool`], helper cards) in a transcript, each with its summary
 /// label. Everything else — assistant text, thinking, what you ran with
 /// `!`, generative-UI cards, notices — ends a run; a running step breaks
-/// it and stands alone until it finishes.
+/// it and stands alone until it finishes. A finished assistant message
+/// with nothing to show ([`assistant_visible`], a message that only
+/// announced tool calls) is transparent: the run flows across it.
 pub fn step_groups(items: &[Item]) -> Vec<StepGroup> {
     let mut groups = Vec::new();
     let mut run: Vec<usize> = Vec::new();
     for (ix, item) in items.iter().enumerate() {
         if groupable_step(item) {
             run.push(ix);
-        } else {
+        } else if assistant_visible(item) {
             flush_group(&mut run, &mut groups, items);
         }
     }
@@ -1254,6 +1256,60 @@ mod tests {
             ])
             .is_empty()
         );
+    }
+
+    /// A message that only announced tool calls (or whitespace text) is
+    /// invisible: a run of steps flows across it. Thinking with content and
+    /// a live message still break the run, as today.
+    #[test]
+    fn a_textless_assistant_message_does_not_break_a_run() {
+        let tool_only = Item::Assistant {
+            blocks: vec![Block::ToolCall],
+            streaming: false,
+            error: None,
+        };
+        let whitespace = Item::Assistant {
+            blocks: vec![Block::Text("  \n".into())],
+            streaming: false,
+            error: None,
+        };
+        for textless in [&tool_only, &whitespace] {
+            let items = vec![
+                text_item("A"),
+                step("bash", ToolStatus::Done),
+                textless.clone(),
+                step("read", ToolStatus::Done),
+                step("bash", ToolStatus::Done),
+                text_item("B"),
+            ];
+            assert_eq!(step_groups(&items)[0].items, 1..5);
+            assert_eq!(step_groups(&items)[0].label, "Ran 2 commands, read 1 file");
+        }
+        // While it streams the message is visible, so it breaks the run.
+        let live = Item::Assistant {
+            blocks: vec![],
+            streaming: true,
+            error: None,
+        };
+        let items = vec![
+            step("bash", ToolStatus::Done),
+            live,
+            step("read", ToolStatus::Done),
+            step("edit", ToolStatus::Done),
+        ];
+        assert_eq!(step_groups(&items)[0].items, 2..4);
+        // Thinking with content breaks the run, as today.
+        let thinking = Item::Assistant {
+            blocks: vec![Block::Thinking("hmm".into())],
+            streaming: false,
+            error: None,
+        };
+        let items = vec![
+            step("bash", ToolStatus::Done),
+            thinking,
+            step("read", ToolStatus::Done),
+        ];
+        assert!(step_groups(&items).is_empty());
     }
 
     #[test]
