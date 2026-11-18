@@ -434,10 +434,7 @@ impl SessionView {
     /// does). A failed tool starts open, every other step starts folded;
     /// a click flips whichever it was (the key inverts the default).
     fn step_collapsed(&self, ix: usize, item: &Item) -> bool {
-        match gentle_core::transcript::step_open_by_default(item) {
-            None => false,
-            Some(open) => open != self.expanded.contains(&fold_key(ix, 0, STEP)),
-        }
+        gentle_core::transcript::step_folded(item, self.expanded.contains(&fold_key(ix, 0, STEP)))
     }
 
     // ── Empty and error states ─────────────────────────────────────────────
