@@ -22,8 +22,11 @@ impl Render for Workspace {
             // Native pane clicks can move focus without calling focus_pane.
             self.sync_files_root(cx);
         }
-        let sidebar = self.sidebar.clone().filter(|_| self.sidebar_visible);
-        let has_sidebar = self.sidebar.is_some();
+        // Keep the native title bar for window controls, but hide workspace
+        // chrome and Files while the branded empty state is displayed.
+        let empty = self.space().tabs.is_empty();
+        let sidebar = self.sidebar.clone().filter(|_| self.sidebar_visible && !empty);
+        let has_sidebar = self.sidebar.is_some() && !empty;
         // Below this the screen buttons fold into one overflow menu.
         let narrow = window.viewport_size().width < rems(900. / 16.).to_pixels(window.rem_size());
         // Native web views would cover a screen or a dialog opened over
@@ -87,8 +90,9 @@ impl Render for Workspace {
                 TitleBar::new()
                     .h(rems(TITLE_BAR_HEIGHT / 16.))
                     .bg(gpui_kit::transparent_black())
-                    .child(
-                        h_flex()
+                    .when(!empty, |bar| {
+                        bar.child(
+                            h_flex()
                             // Fill gpui-component's bar without counting toward
                             // its width: `w_full` there resolves against the
                             // content and pushed the buttons out of the window.
@@ -428,8 +432,9 @@ impl Render for Workspace {
                                                 })),
                                         )
                                     }),
-                            ),
-                    ),
+                            )
+                        )
+                    }),
             )
             .child(
                 h_flex()
