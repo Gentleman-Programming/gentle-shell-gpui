@@ -473,7 +473,7 @@ impl SessionView {
             .overflow_hidden()
             .items_center()
             .gap_1()
-.pt(rems(80. / 16.))
+            .pt(rems(80. / 16.))
             .child(crate::shared::banner::banner(self.banner, scale, self.banner_reveal))
             .child(
                 div()
@@ -1121,88 +1121,50 @@ impl SessionView {
         let running = spec.status == ToolStatus::Running;
         let icon = if failed { IconName::CircleX } else { spec.icon };
         let icon_color = if failed { ui::danger() } else { ui::faint() };
-        h_flex()
-            .id(("step", ix))
-            .w_full()
-            .px_3()
-            .py_2()
-            .gap_2()
-            .min_w_0()
-            .cursor_pointer()
-            .hover(|s| s.bg(ui::surface_hover()))
-            .on_click(cx.listener(move |this, _, _, cx| this.toggle(key, cx)))
-            .child(if running {
-                ui::pulse(div().child(Icon::new(icon).small().text_color(icon_color)))
-                    .into_any_element()
-            } else {
-                Icon::new(icon)
-                    .small()
-                    .text_color(icon_color)
-                    .into_any_element()
-            })
-            .child(
-                div()
-                    .min_w_0()
-                    .flex_shrink(1.)
-                    .max_w(rems(420. / 16.))
-                    .overflow_hidden()
-                    .text_ellipsis()
-                    .whitespace_nowrap()
-                    .text_size(rems(13. / 16.))
-                    .text_color(ui::muted())
-                    .child(spec.title.clone()),
-            )
-            .when_some(spec.chip.clone(), |this, chip| {
-                this.child(ui::chip(chip, ui::info()).flex_shrink_0())
-            })
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .overflow_hidden()
-                    .text_ellipsis()
-                    .whitespace_nowrap()
-                    .font_family(ui::MONO)
-                    .text_size(rems(12. / 16.))
-                    .text_color(ui::faint())
-                    .child(spec.subject.clone()),
-            )
-            .when_some(spec.added, |this, n| {
-                this.child(
-                    div()
-                        .font_family(ui::MONO)
-                        .text_size(rems(12. / 16.))
-                        .text_color(ui::success())
-                        .child(format!("+{n}")),
-                )
-            })
-            .when_some(spec.removed, |this, n| {
-                this.child(
-                    div()
-                        .font_family(ui::MONO)
-                        .text_size(rems(12. / 16.))
-                        .text_color(ui::danger())
-                        .child(format!("−{n}")),
-                )
-            })
-            .when_some(duration, |this, d| {
-                this.child(
-                    div()
-                        .font_family(ui::MONO)
-                        .text_size(rems(11. / 16.))
-                        .text_color(ui::faint())
-                        .child(ui::format_duration(d.as_millis() as u64)),
-                )
-            })
-            .child(
-                Icon::new(if up {
-                    IconName::ChevronUp
-                } else {
-                    IconName::ChevronDown
-                })
-                .xsmall()
-                .text_color(ui::faint()),
-            )
+        let icon = if running {
+            ui::pulse(div().child(Icon::new(icon).small().text_color(icon_color)))
+                .into_any_element()
+        } else {
+            Icon::new(icon)
+                .small()
+                .text_color(icon_color)
+                .into_any_element()
+        };
+        self.step_row(
+            ("step", ix),
+            spec,
+            icon,
+            StepRowStyle::Quiet,
+            duration,
+            Some((key, up)),
+            cx,
+        )
+        .w_full()
+    }
+
+    /// Today's tool card header: icon, title, subject, +n/−n and a chevron
+    /// when the output folds. Kept for `Item::Shell`, which never folds as
+    /// a whole step.
+    fn card_header(
+        &self,
+        ix: usize,
+        spec: &CardSpec,
+        out_key: usize,
+        foldable: bool,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        self.step_row(
+            ("tool", ix),
+            spec,
+            Icon::new(spec.icon)
+                .small()
+                .text_color(ui::muted())
+                .into_any_element(),
+            StepRowStyle::Card,
+            None,
+            foldable.then(|| (out_key, self.expanded.contains(&out_key))),
+            cx,
+        )
     }
 
     /// A step group's quiet summary line, in the style of a step line: a
@@ -1273,28 +1235,39 @@ impl SessionView {
             )
     }
 
-    /// Today's tool card header: icon, title, subject, +n/−n and a chevron
-    /// when the output folds. Kept for `Item::Shell`, which never folds as
-    /// a whole step.
-    fn card_header(
+    /// The row both a step's quiet line and a card's header build from:
+    /// icon, title, chip, subject, +n/−n, duration and chevron, so the two
+    /// can't drift. The callers pass their differences: `icon` (the quiet
+    /// line pulses it and tones failure), `style` (title and subject tone),
+    /// `duration`, and `fold` — a toggling row's key and whether its
+    /// chevron points up.
+    #[allow(clippy::too_many_arguments)]
+    fn step_row(
         &self,
-        ix: usize,
+        id: impl Into<ElementId>,
         spec: &CardSpec,
-        out_key: usize,
-        foldable: bool,
+        icon: AnyElement,
+        style: StepRowStyle,
+        duration: Option<Duration>,
+        fold: Option<(usize, bool)>,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
+        let (title_color, title_weight, subject_color) = match style {
+            StepRowStyle::Quiet => (ui::muted(), FontWeight::NORMAL, ui::faint()),
+            StepRowStyle::Card => (ui::champagne(), FontWeight::SEMIBOLD, ui::muted()),
+        };
         h_flex()
-            .id(("tool", ix))
+            .id(id)
             .px_3()
             .py_2()
             .gap_2()
-            .when(foldable, |this| {
+            .min_w_0()
+            .when_some(fold, |this, (key, _)| {
                 this.cursor_pointer()
                     .hover(|s| s.bg(ui::surface_hover()))
-                    .on_click(cx.listener(move |this, _, _, cx| this.toggle(out_key, cx)))
+                    .on_click(cx.listener(move |this, _, _, cx| this.toggle(key, cx)))
             })
-            .child(Icon::new(spec.icon).small().text_color(ui::muted()))
+            .child(icon)
             .child(
                 div()
                     .min_w_0()
@@ -1304,8 +1277,8 @@ impl SessionView {
                     .text_ellipsis()
                     .whitespace_nowrap()
                     .text_size(rems(13. / 16.))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(ui::champagne())
+                    .font_weight(title_weight)
+                    .text_color(title_color)
                     .child(spec.title.clone()),
             )
             .when_some(spec.chip.clone(), |this, chip| {
@@ -1320,7 +1293,7 @@ impl SessionView {
                     .whitespace_nowrap()
                     .font_family(ui::MONO)
                     .text_size(rems(12. / 16.))
-                    .text_color(ui::muted())
+                    .text_color(subject_color)
                     .child(spec.subject.clone()),
             )
             .when_some(spec.added, |this, n| {
@@ -1341,9 +1314,18 @@ impl SessionView {
                         .child(format!("−{n}")),
                 )
             })
-            .when(foldable, |this| {
+            .when_some(duration, |this, d| {
                 this.child(
-                    Icon::new(if self.expanded.contains(&out_key) {
+                    div()
+                        .font_family(ui::MONO)
+                        .text_size(rems(11. / 16.))
+                        .text_color(ui::faint())
+                        .child(ui::format_duration(d.as_millis() as u64)),
+                )
+            })
+            .when_some(fold, |this, (_, up)| {
+                this.child(
+                    Icon::new(if up {
                         IconName::ChevronUp
                     } else {
                         IconName::ChevronDown
@@ -1641,7 +1623,6 @@ impl SessionView {
                     .appear(("between", count), now, div().w_full().child(indicator))
             }
             // The column's bottom padding.
-            // The column's top padding before each row.
             Row::Footer => return div().h(rems(32. / 16.)).into_any_element(),
         };
         let narrow = self.pane_width.get() < NARROW;
@@ -1658,6 +1639,7 @@ impl SessionView {
                     .min_w_0()
                     .max_w(rems(760. / 16.))
                     .map(|d| if narrow { d.px_3() } else { d.px_6() })
+                    // The column's top padding before each row.
                     .when(!tight, |d| d.pt(rems(24. / 16.)))
                     .child(content),
             )
@@ -1897,7 +1879,13 @@ impl BubbleText {
     }
 }
 
-/// The card data of a tool or shell item.
+/// How the shared step row ([`SessionView::step_row`]) styles its text:
+/// the quiet collapsed line or the unfolded card's header.
+enum StepRowStyle {
+    Quiet,
+    Card,
+}
+
 /// Whether item `ix` renders a step row right after another step row: it
 /// is a step ([`step_open_by_default`]) and the first visible item before
 /// it is too — invisible assistant messages in between don't count (they
@@ -1916,6 +1904,7 @@ fn follows_step(items: &[Item], ix: usize) -> bool {
         .is_some_and(is_step)
 }
 
+/// The card data of a tool or shell item.
 fn card_spec(item: &Item) -> Option<CardSpec> {
     let (input, output) = card_texts(item);
     let (input_lines, output_lines) = (input.map(|(text, _)| line_count(text)), line_count(output));

@@ -381,10 +381,13 @@ impl SessionView {
         };
 
         let repository = self.git.repository.clone();
+        // The branch shrinks and truncates before it would push the row's
+        // right side over the pickers; only its leaf text gives way.
         let git = self.git.snapshot.as_ref().map(|git| {
             h_flex()
                 .id("git-chip")
-                .flex_shrink_0()
+                .min_w_0()
+                .flex_shrink(1.)
                 .gap_1()
                 .text_size(rems(12. / 16.))
                 .child(
@@ -394,6 +397,10 @@ impl SessionView {
                 )
                 .child(
                     div()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .whitespace_nowrap()
                         .font_family(ui::MONO)
                         .text_color(ui::champagne())
                         .child(git.branch.clone().unwrap_or_else(|| "detached".into())),
@@ -401,6 +408,7 @@ impl SessionView {
                 .when(!git.files.is_empty(), |this| {
                     this.child(
                         div()
+                            .flex_shrink_0()
                             .font_family(ui::MONO)
                             .text_color(ui::muted())
                             .child(format!("±{}", git.files.len())),
@@ -433,71 +441,96 @@ impl SessionView {
             .child(div().flex_shrink_0().child(action_button));
 
         // Below the box: the folder, branch and cost on the left; the model
-        // and effort pickers as quiet text buttons on the right.
+        // and effort pickers as quiet text buttons on the right. The left
+        // group shrinks and truncates first; the pickers keep their width
+        // (a shrinking slot let the model's label spill left over the
+        // folder chip), so a long folder never draws over them.
         let below = h_flex()
             .w_full()
             .min_w_0()
             .gap_2()
             .items_center()
             .when(!narrow, |this| {
+                // The left group gives way and truncates (its texts with it)
+                // before anything could push into the pickers.
                 this.child(
                     h_flex()
-                        .id("cwd")
                         .min_w_0()
                         .flex_shrink(1.)
-                        .gap_1()
-                        .px_1p5()
-                        .py_0p5()
-                        .rounded_md()
-                        .cursor_pointer()
-                        .hover(|s| s.bg(ui::surface_hover()))
-                        .text_size(rems(12. / 16.))
                         .overflow_hidden()
-                        .whitespace_nowrap()
-                        .tooltip(|window, cx| Tooltip::new("Open another folder").build(window, cx))
-                        .on_click(cx.listener(|this, _, window, cx| this.choose_folder(window, cx)))
-                        .child(Icon::new(IconName::Folder).xsmall().text_color(ui::faint()))
+                        .gap_2()
+                        .items_center()
                         .child(
-                            div()
+                            h_flex()
+                                .id("cwd")
                                 .min_w_0()
+                                .flex_shrink(1.)
+                                .gap_1()
+                                .px_1p5()
+                                .py_0p5()
+                                .rounded_md()
+                                .cursor_pointer()
+                                .hover(|s| s.bg(ui::surface_hover()))
+                                .text_size(rems(12. / 16.))
                                 .overflow_hidden()
-                                .text_ellipsis_start()
-                                .font_family(ui::MONO)
-                                .text_color(ui::faint())
-                                .child(prefix),
+                                .whitespace_nowrap()
+                                .tooltip(|window, cx| {
+                                    Tooltip::new("Open another folder").build(window, cx)
+                                })
+                                .on_click(
+                                    cx.listener(|this, _, window, cx| {
+                                        this.choose_folder(window, cx)
+                                    }),
+                                )
+                                .child(Icon::new(IconName::Folder).xsmall().text_color(ui::faint()))
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .overflow_hidden()
+                                        .text_ellipsis_start()
+                                        .font_family(ui::MONO)
+                                        .text_color(ui::faint())
+                                        .child(prefix),
+                                )
+                                .child(
+                                    div()
+                                        .flex_shrink_0()
+                                        .font_family(ui::MONO)
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(ui::fg())
+                                        .child(leaf),
+                                ),
                         )
-                        .child(
-                            div()
-                                .flex_shrink_0()
-                                .font_family(ui::MONO)
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(ui::fg())
-                                .child(leaf),
-                        ),
+                        .children(git)
+                        .when(self.usage.cost > 0.0, |this| {
+                            this.child(
+                                div()
+                                    .flex_shrink_0()
+                                    .font_family(ui::MONO)
+                                    .text_size(rems(11. / 16.))
+                                    .text_color(ui::faint())
+                                    .child(format!("${:.2}", self.usage.cost)),
+                            )
+                        }),
                 )
-                .children(git)
-                .when(self.usage.cost > 0.0, |this| {
-                    this.child(
-                        div()
-                            .font_family(ui::MONO)
-                            .text_size(rems(11. / 16.))
-                            .text_color(ui::faint())
-                            .child(format!("${:.2}", self.usage.cost)),
-                    )
-                })
             })
             .child(div().flex_1().min_w_0())
             .child(
                 div()
-                    .min_w_0()
-                    .flex_shrink(1.)
+                    .flex_shrink_0()
                     .flex()
                     .justify_end()
                     .child(self.render_model_picker(narrow, cx)),
             )
             .when(
                 self.models.current.as_ref().is_some_and(|m| m.reasoning),
-                |this| this.child(self.render_effort_picker(narrow, cx)),
+                |this| {
+                    this.child(
+                        div()
+                            .flex_shrink_0()
+                            .child(self.render_effort_picker(narrow, cx)),
+                    )
+                },
             );
 
         let content = v_flex()
