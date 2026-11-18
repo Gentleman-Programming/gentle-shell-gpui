@@ -49,8 +49,12 @@ impl Workspace {
     }
 
     pub(super) fn render_workspace_chip(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let name = self.space().name.clone();
-        let color = avatar_color(&name);
+        let name = if self.space().tabs.is_empty() {
+            "Gentle Shell".to_owned()
+        } else {
+            self.space().name.clone()
+        };
+        let color = avatar_color(&self.space().name);
         let initial = name
             .chars()
             .find(|c| c.is_alphanumeric())

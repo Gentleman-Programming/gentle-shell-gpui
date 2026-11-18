@@ -95,6 +95,8 @@ pub enum WorkspaceEvent {
     FilesRootChanged(PathBuf),
     /// The left sidebar was shown or hidden.
     SidebarToggled(bool),
+    /// Tabs appeared or disappeared; pause the sidebar while none are open.
+    FilesVisibilityChanged(bool),
 }
 
 /// A window-level screen drawn over the active tab.
@@ -569,9 +571,20 @@ impl Workspace {
         self.open_tab(PaneKind::File, path, None, None, window, cx);
     }
 
-    /// Open a new agent from the sidebar after the user chooses its folder.
-    pub fn open_agent_tab(&mut self, _folder: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
-        self.pick_agent_folder(AgentDestination::Tab { prompt: None }, window, cx);
+    /// The worktree action already supplied a folder: open that exact worktree.
+    /// Interactive New Agent commands still use the native folder picker.
+    pub fn open_agent_tab(&mut self, folder: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        if folder.is_dir() {
+            self.open_tab(PaneKind::Agent, folder, None, None, window, cx);
+        } else {
+            window.push_notification(
+                Notification::warning(format!(
+                    "Worktree folder is no longer available: {}",
+                    folder.display()
+                )),
+                cx,
+            );
+        }
     }
 
     /// Type `text` at the active agent's prompt cursor, spaced from what is

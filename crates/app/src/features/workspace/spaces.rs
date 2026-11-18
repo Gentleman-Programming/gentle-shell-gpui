@@ -67,6 +67,7 @@ impl Workspace {
         self.focus_active(window, cx);
         self.start_shown(window, cx);
         self.sync_files_root(cx);
+        cx.emit(WorkspaceEvent::FilesVisibilityChanged(self.tab().is_some()));
         self.schedule_save(cx);
         cx.notify();
     }

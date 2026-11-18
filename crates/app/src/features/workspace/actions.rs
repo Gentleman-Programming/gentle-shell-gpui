@@ -190,6 +190,11 @@ impl Workspace {
         self.sidebar_visible
     }
 
+    /// An empty workspace hides Files without changing the user's preference.
+    pub fn files_sidebar_visible(&self) -> bool {
+        self.sidebar_visible && !self.space().tabs.is_empty()
+    }
+
     pub(super) fn on_open_providers(
         &mut self,
         _: &OpenProviders,

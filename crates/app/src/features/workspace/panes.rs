@@ -73,6 +73,7 @@ impl Workspace {
         });
         let index = space.tabs.len() - 1;
         self.activate(index, window, cx);
+        cx.emit(WorkspaceEvent::FilesVisibilityChanged(true));
     }
 
     /// Approximate on-screen size of each pane in the current tab.
@@ -152,6 +153,8 @@ impl Workspace {
                         }
                         cx.notify();
                     }
+                    // The agent may have moved to a different directory.
+                    this.sync_files_root(cx);
                 }
                 SessionEvent::OpenProviders => this.open_providers(window, cx),
                 SessionEvent::OpenScreen(screen) => {
@@ -556,6 +559,7 @@ impl Workspace {
             tab.tree = tree.moved(&moving, &target, axis, before);
             tab.focused = moving;
         }
+        self.sync_files_root(cx);
         self.schedule_save(cx);
         cx.notify();
     }
@@ -746,6 +750,7 @@ impl Workspace {
         if self.space().tabs.is_empty() {
             // Keep the window open without silently creating a replacement agent.
             self.sync_files_root(cx);
+            cx.emit(WorkspaceEvent::FilesVisibilityChanged(false));
             self.save_now(cx);
             cx.notify();
             return;

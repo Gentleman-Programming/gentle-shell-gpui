@@ -109,25 +109,17 @@ impl Render for Workspace {
                                     .w_0()
                                     .min_w_0()
                                     .overflow_hidden()
-                                    .when(empty, |d| {
+                                    // Keep the workspace switcher usable when there are no tabs.
+                                    .child(self.render_workspace_chip(cx))
+                                    .when(!empty, |d| {
                                         d.child(
                                             div()
-                                                .text_sm()
-                                                .font_weight(FontWeight::MEDIUM)
-                                                .text_color(ui::fg())
-                                                .child("Gentle Shell"),
+                                                .flex_none()
+                                                .w(px(1.))
+                                                .h(rems(14. / 16.))
+                                                .bg(ui::border()),
                                         )
-                                    })
-                                    .when(!empty, |d| {
-                                        d.child(self.render_workspace_chip(cx))
-                                            .child(
-                                                div()
-                                                    .flex_none()
-                                                    .w(px(1.))
-                                                    .h(rems(14. / 16.))
-                                                    .bg(ui::border()),
-                                            )
-                                            .child(self.render_tabs(cx))
+                                        .child(self.render_tabs(cx))
                                     }),
                             )
                             .child(
