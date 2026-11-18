@@ -201,9 +201,10 @@ pub fn attach_sidebar(
                         tree.update(cx, |tree, cx| tree.set_visible(visible, cx));
                     }
                 }
-                WorkspaceEvent::SidebarToggled(_) | WorkspaceEvent::FilesVisibilityChanged(_) => {
+                WorkspaceEvent::SidebarToggled(shown)
+                | WorkspaceEvent::FilesVisibilityChanged(shown) => {
                     if let Some(tree) = cache.get(&active) {
-                        let visible = owner.read(cx).files_sidebar_visible();
+                        let visible = *shown && owner.read(cx).files_sidebar_visible();
                         tree.update(cx, |tree, cx| tree.set_visible(visible, cx));
                     }
                 }
