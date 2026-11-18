@@ -38,7 +38,7 @@ tar = "0.4"
 # Mermaid diagrams in the Markdown preview: the app finds the system sans
 # font (fontdb) that merman's CLI, downloaded on demand, measures text with;
 # its macOS and Linux builds come as .tar.xz (lzma-rs).
-fontdb = "0.23"
+fontdb = "0.24"
 lzma-rs = "0.3"
 rquickjs = "0.14.0"
 # Theme scene previews for agents: a frame's shapes as SVG, rasterized to PNG
