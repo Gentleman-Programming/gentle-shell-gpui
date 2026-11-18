@@ -299,6 +299,13 @@ fn flush_group(run: &mut Vec<usize>, groups: &mut Vec<StepGroup>, items: &[Item]
     run.clear();
 }
 
+/// Whether a step shows its quiet one-line row instead of its card: its
+/// default ([`step_open_by_default`]) flipped once by the user's click
+/// (`toggled`). Items that never fold this way always show their card.
+pub fn step_folded(item: &Item, toggled: bool) -> bool {
+    step_open_by_default(item).is_some_and(|open| open == toggled)
+}
+
 /// Token usage reported while the latest assistant message streams.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Usage {
@@ -882,6 +889,41 @@ pub fn format_tokens(tokens: u64) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_step_shows_its_line_until_a_click_unfolds_it() {
+        let tool = |status| Item::Tool {
+            call_id: "a".into(),
+            name: "bash".into(),
+            args: json!({}),
+            status,
+            output: "out".into(),
+            details: json!({}),
+            duration_ms: Some(10),
+        };
+        // A finished step is folded; a click unfolds it, another folds it.
+        assert!(step_folded(&tool(ToolStatus::Done), false));
+        assert!(!step_folded(&tool(ToolStatus::Done), true));
+        // A failed step starts open; a click folds it.
+        assert!(!step_folded(&tool(ToolStatus::Failed), false));
+        assert!(step_folded(&tool(ToolStatus::Failed), true));
+        // A helper card folds like a finished step.
+        let helper = Item::Custom {
+            kind: "gentle-agents.result".into(),
+            text: "done".into(),
+            details: json!({}),
+        };
+        assert!(step_folded(&helper, false));
+        // What never folds stays open whatever the toggle says.
+        let shell = Item::Shell {
+            command: "ls".into(),
+            output: String::new(),
+            exit_code: Some(0),
+            running: false,
+        };
+        assert!(!step_folded(&shell, false));
+        assert!(!step_folded(&shell, true));
+    }
 
     #[test]
     fn steps_open_by_default_only_when_failed() {
