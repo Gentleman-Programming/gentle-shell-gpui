@@ -353,6 +353,38 @@ fn fit(text: &str, max: usize) -> String {
     super::diagram::truncate(text, max)
 }
 
+/// `text` broken at spaces into at most `lines` lines of `width` characters.
+/// When more is left, the last line ends with `…`, dropping its last word if
+/// there is no room for it; words longer than a line are cut.
+fn wrap(text: &str, width: usize, lines: usize) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for word in text.split_whitespace() {
+        let word = fit(word, width);
+        let full = out.len() == lines;
+        match out.last_mut() {
+            Some(line) if line.chars().count() + 1 + word.chars().count() <= width => {
+                line.push(' ');
+                line.push_str(&word);
+            }
+            Some(line) if full => {
+                if line.ends_with('…') {
+                    break;
+                }
+                if line.chars().count() + 1 > width {
+                    match line.rfind(' ') {
+                        Some(space) => line.truncate(space),
+                        None => *line = line.chars().take(width.saturating_sub(1)).collect(),
+                    }
+                }
+                line.push('…');
+                break;
+            }
+            _ => out.push(word),
+        }
+    }
+    out
+}
+
 fn svg_open(out: &mut String, w: f32, h: f32, palette: &Palette) {
     let _ = writeln!(
         out,
@@ -446,23 +478,43 @@ pub fn diagram_svg(d: &Diagram, palette: &Palette) -> String {
         );
         if let Some(label) = &edge.label {
             let (x, y) = at(path.label_at());
-            let text = fit(label, 30);
-            let w = text.chars().count() as f32 * 6.4 + 14.;
-            let _ = writeln!(
+            let lines = wrap(label, 24, 2);
+            let style = (edge.style != EdgeStyle::Sync).then(|| edge.style.name());
+            let rows = lines.len() + usize::from(style.is_some());
+            let w = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0) as f32 * 6. + 8.;
+            let h = rows as f32 * 13. + 4.;
+            let top = y - h / 2.;
+            // A halo in the canvas color keeps the line out of the text.
+            let _ = write!(
                 out,
-                r#"<rect x="{:.1}" y="{:.1}" width="{w:.1}" height="20" rx="10" fill="{}" stroke="{}"/><text x="{x:.1}" y="{:.1}" font-size="11" text-anchor="middle" fill="{}">{}</text>"#,
+                r#"<rect x="{:.1}" y="{top:.1}" width="{w:.1}" height="{h:.1}" rx="4" fill="{}"/>"#,
                 x - w / 2.,
-                y - 10.,
-                palette.surface,
-                palette.border,
-                y + 4.,
-                palette.muted,
-                xml(&text)
+                palette.background
             );
+            for (i, line) in lines.iter().enumerate() {
+                let _ = write!(
+                    out,
+                    r#"<text x="{x:.1}" y="{:.1}" font-size="11" text-anchor="middle" fill="{}">{}</text>"#,
+                    top + 12. + i as f32 * 13.,
+                    palette.muted,
+                    xml(line)
+                );
+            }
+            if let Some(style) = style {
+                let _ = write!(
+                    out,
+                    r#"<text x="{x:.1}" y="{:.1}" font-size="9" font-family="monospace" text-anchor="middle" fill="{}">{style}</text>"#,
+                    top + 12. + lines.len() as f32 * 13.,
+                    palette.muted,
+                );
+            }
+            out.push('\n');
         }
     }
     for (node, r) in d.nodes.iter().zip(&l.nodes) {
         let (x, y) = at(Point { x: r.x, y: r.y });
+        let actor = node.kind == NodeKind::Client;
+        let quiet = matches!(node.kind, NodeKind::External | NodeKind::Note);
         let dash = if node.status == Some(Status::Planned) {
             r#" stroke-dasharray="5 4""#
         } else {
@@ -478,30 +530,79 @@ pub fn diagram_svg(d: &Diagram, palette: &Palette) -> String {
         } else {
             ""
         };
-        let _ = writeln!(
+        let color = tone(palette, kind_tone(node.kind));
+        let fill = if quiet {
+            palette.background.as_str()
+        } else {
+            palette.surface.as_str()
+        };
+        let _ = write!(
             out,
-            r#"<g{opacity}><rect x="{x:.1}" y="{y:.1}" width="{:.1}" height="{:.1}" rx="10" fill="{}" stroke="{stroke}"{dash}/><rect x="{:.1}" y="{:.1}" width="6" height="{:.1}" rx="3" fill="{}"/>"#,
-            r.w,
-            r.h,
-            palette.surface,
-            x + 8.,
-            y + 10.,
-            r.h - 20.,
-            tone(palette, kind_tone(node.kind)),
+            r#"<g{opacity}><rect x="{x:.1}" y="{y:.1}" width="{:.1}" height="{:.1}" rx="10" fill="{fill}" stroke="{stroke}"{dash}/>"#,
+            r.w, r.h,
         );
-        let sub = node.tech.as_deref().unwrap_or(node.kind.name());
-        let _ = writeln!(
+        // Text starts after the kind tile; an actor (no tile) is centered.
+        let (tx, anchor) = if actor {
+            (x + r.w / 2., "middle")
+        } else if node.kind == NodeKind::Note {
+            (x + 12., "start")
+        } else {
+            let _ = write!(
+                out,
+                r#"<rect x="{:.1}" y="{:.1}" width="22" height="22" rx="6" fill="{color}" fill-opacity="0.18"/>"#,
+                x + 12.,
+                y + 10.,
+            );
+            (x + 42., "start")
+        };
+        let _ = write!(
             out,
-            r#"<text x="{:.1}" y="{:.1}" font-size="13" font-weight="600" fill="{}">{}</text><text x="{:.1}" y="{:.1}" font-size="11" fill="{}">{}</text></g>"#,
-            x + 22.,
-            y + r.h / 2. - 3.,
+            r#"<text x="{tx:.1}" y="{:.1}" font-size="13" font-weight="600" text-anchor="{anchor}" fill="{}">{}</text>"#,
+            y + 26.,
             palette.text,
             xml(&fit(&node.label, 22)),
-            x + 22.,
-            y + r.h / 2. + 13.,
-            palette.muted,
-            xml(&fit(sub, 26)),
         );
+        let (dx, danchor) = if actor {
+            (x + r.w / 2., "middle")
+        } else {
+            (x + 12., "start")
+        };
+        let description = node.description.as_deref().unwrap_or_default();
+        for (i, line) in wrap(description, 32, 2).iter().enumerate() {
+            let _ = write!(
+                out,
+                r#"<text x="{dx:.1}" y="{:.1}" font-size="11" text-anchor="{danchor}" fill="{}">{}</text>"#,
+                y + 48. + i as f32 * 14.,
+                palette.muted,
+                xml(line),
+            );
+        }
+        let meta = match node.tech.as_deref().filter(|t| !t.is_empty()) {
+            Some(tech) => format!("{} · {tech}", node.kind.name().to_uppercase()),
+            None => node.kind.name().to_uppercase(),
+        };
+        let _ = write!(
+            out,
+            r#"<text x="{dx:.1}" y="{:.1}" font-size="9.5" font-family="monospace" text-anchor="{danchor}" fill="{}">{}</text>"#,
+            y + r.h - 10.,
+            palette.muted,
+            xml(&fit(&meta, 34)),
+        );
+        if actor {
+            // The actor's badge above the card: the client kind's monitor.
+            let (cx, cy) = (x + r.w / 2., y);
+            let _ = write!(
+                out,
+                r#"<circle cx="{cx:.1}" cy="{cy:.1}" r="13" fill="{}" stroke="{}"/><rect x="{:.1}" y="{:.1}" width="12" height="8" rx="1.5" fill="none" stroke="{color}" stroke-width="1.5"/><path d="M{:.1},{:.1} h4" stroke="{color}" stroke-width="1.5"/>"#,
+                palette.surface,
+                palette.border,
+                cx - 6.,
+                cy - 6.,
+                cx - 2.,
+                cy + 5.,
+            );
+        }
+        out.push_str("</g>\n");
     }
     out.push_str("</svg>\n");
     out
@@ -1378,6 +1479,18 @@ mod tests {
         assert!(svg.contains(">Orders DB</text>"));
         assert!(svg.contains("Back &quot;end&quot;"));
         assert!(svg.contains("HTTPS | json"));
+        assert!(svg.contains(">SERVICE · Rust</text>"));
+    }
+
+    #[test]
+    fn wrap_breaks_at_spaces_and_ellipsizes_the_rest() {
+        assert_eq!(wrap("", 10, 2), Vec::<String>::new());
+        assert_eq!(wrap("Sends events", 24, 2), ["Sends events"]);
+        assert_eq!(
+            wrap("Builds the window menus and global actions", 16, 2),
+            ["Builds the", "window menus…"]
+        );
+        assert_eq!(wrap("a b", 1, 2), ["a", "b"]);
     }
 
     fn table() -> Table {

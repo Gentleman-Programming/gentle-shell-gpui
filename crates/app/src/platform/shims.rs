@@ -42,12 +42,7 @@ fn make_executable(path: &Path) {
 fn make_executable(_: &Path) {}
 
 fn shim_dir() -> Option<PathBuf> {
-    Some(
-        dirs::data_dir()?
-            .join("gentle-shell-gpui")
-            .join("toolchain")
-            .join("bin"),
-    )
+    crate::shared::data_dir::app().map(|dir| dir.join("toolchain").join("bin"))
 }
 
 #[cfg(unix)]

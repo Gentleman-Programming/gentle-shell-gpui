@@ -9,7 +9,7 @@ use std::rc::Rc;
 
 use gentle_core::genui::edits::{Editable as _, Edits};
 use gentle_core::genui::layout::{
-    GROUP_HEADER, GROUP_PAD, Layout, NODE_H, NODE_W, Point as P, Rect,
+    GROUP_HEADER, GROUP_PAD, Layout, Point as P, Rect, STATES as SIZE,
 };
 use gentle_core::genui::states::{self, Change, Machine, State, StateKind, Transition};
 use gpui_kit::assets::IconName;
@@ -118,10 +118,10 @@ fn slot(rect: Rect, kind: StateKind) -> Rect {
     }
     let c = rect.center();
     Rect {
-        x: c.x - NODE_W / 2.,
-        y: c.y - NODE_H / 2.,
-        w: NODE_W,
-        h: NODE_H,
+        x: c.x - SIZE.node_w / 2.,
+        y: c.y - SIZE.node_h / 2.,
+        w: SIZE.node_w,
+        h: SIZE.node_h,
     }
 }
 

@@ -326,6 +326,7 @@ impl Workspace {
             window,
             |this, view, event: &SettingsEvent, window, cx| match event {
                 SettingsEvent::Close => this.close_overlay(window, cx),
+                SettingsEvent::OpenProfiles => this.open_profiles(window, cx),
                 SettingsEvent::Changed => {
                     for tab in this.sessions() {
                         tab.update(cx, |session, cx| session.reload_models(window, cx));

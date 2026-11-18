@@ -181,15 +181,20 @@ usage/
 ├── stats.rs        # session files: walking, reading, cache
 └── view.rs, view/  # Render; subscription, stats
 
-settings/mod.rs      # SettingsView, SettingsEvent, loading and screen composition
+settings/mod.rs      # SettingsView: state, loading, page navigation
 settings/
+├── events.rs       # SettingsEvent, what the workspace handles
+├── view.rs         # Render: header, category rail, page body
+├── navigation.rs   # SettingsPage (the nine categories), search, rail and compact picker
+├── pages/          # one file per category, composing the sections below
+├── services/       # blocking work off the UI thread: snapshot load, upgrades
 ├── layout.rs       # row, section, or_dash
 ├── snapshot.rs     # reading the configuration and launcher probes
 ├── claude.rs       # Claude Code session and bridge plan
 ├── background.rs   # background subagents policy and Gentle AI section
 ├── upgrade.rs      # gentle-shell upgrade, its result and the card
 ├── packages.rs     # install and remove packages
-└── notifications.rs, theme.rs, app.rs, models.rs  # one section each
+└── notifications.rs, theme.rs, app.rs, models.rs, devices.rs, maestro.rs, music.rs, hydration.rs, agent_ui.rs  # one section each
 
 palette/mod.rs       # PaletteView, actions, events, categories
 palette/

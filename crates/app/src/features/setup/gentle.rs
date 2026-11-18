@@ -74,10 +74,11 @@ pub fn check_gentle_shell(launcher: &Result<Launcher, String>) -> (Status, Fix) 
         }
     };
     let Some(version) = &launcher.version else {
+        let stderr = pi_rpc::version_stderr(&launcher.spec);
         return (
-            Status::Failed(format!(
-                "{} didn't report its version (Node.js or Pi may be missing)",
-                launcher.spec.launcher.display()
+            Status::Failed(gentle_core::setup::failed_version(
+                &launcher.spec.launcher,
+                stderr.as_deref(),
             )),
             Fix::Auto,
         );
@@ -169,15 +170,40 @@ pub fn install_prefix(npm: &Path) -> Option<PathBuf> {
     )
 }
 
-/// Install gentle-pi with npm, or, when a launcher that can upgrade itself is
-/// already there (npm, pnpm or the self-contained install), let it: a second
-/// npm copy could sit behind the one the app keeps running.
+/// Install with npm or upgrade the chosen launcher, but never put a second
+/// copy behind a broken self-contained or managed launcher.
 pub fn install_gentle_shell(log: &Log) -> Result<(), String> {
-    if let Ok(found) = launcher()
-        && let Some(version) = &found.version
-        && parse_version(&version.gentle_shell).is_some_and(|v| v >= UPGRADE_SINCE)
-    {
-        return upgrade_gentle_shell(&found.spec, log);
+    install_found(launcher().ok(), log)
+}
+
+fn installation_action(
+    found: Option<&Launcher>,
+) -> Result<gentle_core::setup::InstallAction, String> {
+    let protected = found.is_some_and(|launcher| {
+        launcher.version.is_none() && launcher.spec.requires_installer_repair()
+    });
+    let stderr = found
+        .filter(|_| protected)
+        .and_then(|launcher| pi_rpc::version_stderr(&launcher.spec));
+    gentle_core::setup::install_action(found.map(|launcher| gentle_core::setup::Launcher {
+        path: &launcher.spec.launcher,
+        can_upgrade: launcher.version.as_ref().map(|version| {
+            parse_version(&version.gentle_shell).is_some_and(|v| v >= UPGRADE_SINCE)
+        }),
+        protected,
+        stderr: stderr.as_deref(),
+    }))
+}
+
+fn install_found(found: Option<Launcher>, log: &Log) -> Result<(), String> {
+    match (installation_action(found.as_ref())?, found.as_ref()) {
+        (gentle_core::setup::InstallAction::Upgrade, Some(launcher)) => {
+            return upgrade_gentle_shell(&launcher.spec, log);
+        }
+        (gentle_core::setup::InstallAction::Upgrade, None) => {
+            unreachable!("an upgrade requires a resolved launcher")
+        }
+        (gentle_core::setup::InstallAction::Npm, _) => {}
     }
     if cfg!(windows) {
         let go = pi_rpc::find_program("go")
@@ -468,6 +494,155 @@ pub fn claude_signed_in(claude: &Path) -> Option<bool> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    struct BrokenLauncher {
+        dir: PathBuf,
+        path: PathBuf,
+    }
+
+    impl BrokenLauncher {
+        fn new() -> Self {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let dir = std::env::temp_dir()
+                .join(format!("gs-failed-launcher-{}-{nanos}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join(if cfg!(windows) {
+                "gentle-shell.cmd"
+            } else {
+                "gentle-shell"
+            });
+            let script = if cfg!(windows) {
+                "@echo off\r\nrem gentle-shell bundled launcher (generated; do not edit)\r\necho gentle-shell: no active Gentle Shell version; run the Gentle Shell installer again. 1>&2\r\nexit /b 1\r\n"
+            } else {
+                "#!/bin/sh\n# gentle-shell bundled launcher (generated; do not edit)\necho 'gentle-shell: no active Gentle Shell version; run the Gentle Shell installer again.' >&2\nexit 1\n"
+            };
+            std::fs::write(&path, script).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            Self { dir, path }
+        }
+
+        fn launcher(&self) -> Launcher {
+            Launcher {
+                spec: pi_rpc::LaunchSpec {
+                    program: self.path.clone(),
+                    args: Vec::new(),
+                    cwd: self.dir.clone(),
+                    env: Vec::new(),
+                    launcher: self.path.clone(),
+                    bundled: None,
+                },
+                version: None,
+            }
+        }
+    }
+
+    impl Drop for BrokenLauncher {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[test]
+    fn failed_launcher_status_shows_the_real_error() {
+        let broken = BrokenLauncher::new();
+        assert_eq!(
+            check_gentle_shell(&Ok(broken.launcher())),
+            (
+                Status::Failed(format!(
+                    "gentle-shell: no active Gentle Shell version; run the Gentle Shell installer again. ({})",
+                    broken.path.display()
+                )),
+                Fix::Auto
+            )
+        );
+    }
+
+    #[test]
+    fn retry_of_a_broken_bundled_launcher_refuses_npm_and_preserves_profiles() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let broken = BrokenLauncher::new();
+        let profiles = broken.dir.join("profiles.json");
+        std::fs::write(&profiles, "existing profiles").unwrap();
+        let log_count = AtomicUsize::new(0);
+        let log = |_: String| {
+            log_count.fetch_add(1, Ordering::Relaxed);
+        };
+        assert_eq!(
+            install_found(Some(broken.launcher()), &log),
+            Err(format!(
+                "gentle-shell: no active Gentle Shell version; run the Gentle Shell installer again. ({})\nNo second gentle-pi copy was installed.",
+                broken.path.display()
+            ))
+        );
+        assert_eq!(log_count.load(Ordering::Relaxed), 0);
+        assert_eq!(std::fs::read(&profiles).unwrap(), b"existing profiles");
+    }
+
+    #[test]
+    fn working_launcher_keeps_its_existing_status() {
+        let spec = pi_rpc::LaunchSpec {
+            program: PathBuf::from("nonexistent-gentle-shell"),
+            args: Vec::new(),
+            cwd: std::env::temp_dir(),
+            env: Vec::new(),
+            launcher: PathBuf::from("nonexistent-gentle-shell"),
+            bundled: None,
+        };
+        let version = parse_launcher_version("gentle-shell 4.8.0\npi 1.5.2\n").unwrap();
+        assert_eq!(
+            check_gentle_shell(&Ok(Launcher {
+                spec,
+                version: Some(version)
+            })),
+            (
+                Status::Ok("gentle-shell 4.8.0 · pi 1.5.2".into()),
+                Fix::None
+            )
+        );
+    }
+
+    #[test]
+    fn installation_keeps_npm_fallback_and_upgrade_threshold() {
+        use gentle_core::setup::InstallAction;
+
+        assert_eq!(installation_action(None), Ok(InstallAction::Npm));
+        let broken = BrokenLauncher::new();
+        let path = broken.dir.join("npm.cmd");
+        std::fs::write(&path, "@node gentle-shell.mjs %*\r\n").unwrap();
+        let mut launcher = Launcher {
+            spec: pi_rpc::LaunchSpec {
+                program: path.clone(),
+                args: Vec::new(),
+                cwd: std::env::temp_dir(),
+                env: Vec::new(),
+                launcher: path,
+                bundled: None,
+            },
+            version: None,
+        };
+        assert_eq!(installation_action(Some(&launcher)), Ok(InstallAction::Npm));
+        for (version, expected) in [
+            ("4.0.9", InstallAction::Npm),
+            ("dev", InstallAction::Npm),
+            ("4.1.0", InstallAction::Upgrade),
+            ("4.8.0", InstallAction::Upgrade),
+        ] {
+            launcher.version = parse_launcher_version(&format!("gentle-shell {version}\n"));
+            assert_eq!(
+                installation_action(Some(&launcher)),
+                Ok(expected),
+                "{version}"
+            );
+        }
+    }
 
     #[test]
     fn reads_launcher_versions() {

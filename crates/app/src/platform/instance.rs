@@ -46,11 +46,7 @@ pub enum Role {
 }
 
 fn record_path() -> Option<PathBuf> {
-    Some(
-        dirs::data_dir()?
-            .join("gentle-shell-gpui")
-            .join("instance.json"),
-    )
+    crate::shared::data_dir::app().map(|dir| dir.join("instance.json"))
 }
 
 /// Hand `request` to a running instance, or become the primary.

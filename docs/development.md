@@ -68,7 +68,7 @@ Practical consequence: with your installed app open, `cargo run` **does not open
 
 ### Data dir
 
-Everything the app stores lives under `dirs::data_dir()/gentle-shell-gpui/`:
+Everything the app stores lives under `dirs::data_dir()/gentle-shell-gpui/`, or under `GENTLE_SHELL_GPUI_DATA_DIR` when it is set (`shared/data_dir.rs`, see [Isolated testing](#isolated-testing)):
 
 | File | Owner |
 | --- | --- |
@@ -96,6 +96,7 @@ Everything the app stores lives under `dirs::data_dir()/gentle-shell-gpui/`:
 | `ENGRAM_BIN` | `features/setup/extras.rs` | Engram binary for the check. |
 | `SHELL` | `launch.rs` (`login_shell_path`), `features/terminal/mod.rs` | Login shell whose PATH is combined (Unix), and the shell for terminal panels. |
 | `GOBIN`, `GOPATH` | `launch.rs` (`go_bin_dir`) | Where `go install` puts programs (default `~/go/bin`), added at the end of the combined PATH when it exists. |
+| `GENTLE_SHELL_GPUI_DATA_DIR` | `shared/data_dir.rs` | Replaces the app's data folder (`<data dir>/gentle-shell-gpui`). Gentle Shell's homes still come from `HOME`. |
 | `HOME` / `USERPROFILE` | `home.rs` (`home_dir`), `dirs` | Base of all homes and, on macOS/Linux, of the data dir. |
 
 The app always passes `GENTLE_SHELL_INTERACTIVE_HOST=1` and the combined `PATH` to the backend (`LaunchSpec.env`), plus, for gentle-ai's managed install, the environment its supervisor would set (`docs/integrations.md`). The rest of the environment (provider keys, `GENTLE_SHELL_NO_AUTO_SETUP`, …) is inherited.
@@ -114,6 +115,24 @@ It is cached until `pi_rpc::forget_cached()`. Every child process that needs the
 ## Isolated testing
 
 Rule: **never** test against the real app or data. Do not send keystrokes or clicks to an app the user has open, and do not edit their `workspaces.json`/`settings.json`.
+
+### Your real setup, a separate app (trying a pull request)
+
+To try a branch with your Gentle Shell, providers and sign-ins as they are, change only the app's data folder. The build gets its own window next to your installed app, with its own workspaces and settings:
+
+```bash
+git fetch origin pull/<N>/head:pr-<N> && git switch pr-<N>
+cargo build --release
+sandbox="$(mktemp -d)"
+cp "$HOME/Library/Application Support/gentle-shell-gpui/settings.json" "$sandbox/"  # optional: your theme, no welcome screen
+GENTLE_SHELL_GPUI_DATA_DIR="$sandbox" ./target/release/gentle-shell-gpui "$(mktemp -d)"
+```
+
+The branch must contain `shared/data_dir.rs`: an older one ignores the variable and opens your real data (or hands off to your running app and exits). Merge `main` into a local copy first (`git switch -c try-<N> pr-<N> && git merge origin/main`), or use a temporary `HOME` instead.
+
+On Linux the settings are in `~/.local/share/gentle-shell-gpui/`; on Windows (PowerShell) `$env:APPDATA\gentle-shell-gpui\`, with `$env:GENTLE_SHELL_GPUI_DATA_DIR = "<folder>"` before running the exe. Unlike a temporary `HOME`, this also isolates the app on Windows.
+
+What stays shared: agent tabs run your real Gentle Shell, so sessions, memories and sign-ins are the real ones, and an agent edits the folder you open (hence the empty `mktemp -d` folder above). The toolchain the app installs (Maestro, Java, music, the diagram renderer) isn't in the new folder; link it if a test needs it: `ln -s "$HOME/Library/Application Support/gentle-shell-gpui/toolchain" "$sandbox/toolchain"`.
 
 ### Temporary HOME (first run)
 

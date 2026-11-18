@@ -1,7 +1,5 @@
 //! Gentle Shell's own updates: the "is available" card, `gentle-shell
-//! upgrade`, and how it ended as the app sees it afterwards. The offer comes
-//! from the active agent tab's Gentle Shell (`get_update_status`) when it
-//! reports one, otherwise from the npm registry (`features::updates`).
+//! upgrade`, and how it ended as the app sees it afterwards.
 
 use std::path::Path;
 
@@ -155,49 +153,34 @@ fn upgrade_outcome(
     }
 }
 
+/// Gentle Shell update UI state. The actual upgrade and skip operations still
+/// run through their existing handlers and continue using the same config.
+#[derive(Default)]
+pub(super) struct ShellUpdateUiState {
+    pub(super) upgrading: bool,
+    pub(super) result: Option<UpgradeResult>,
+    pub(super) skip_error: Option<String>,
+}
+
 impl SettingsView {
     /// Gentle Shell's own `upgrade` toward `target` (it knows how it was
     /// installed; since 4.7 it moves to its self-contained install), then ask
     /// the launcher the app resolves now which version it runs: that's the
     /// result shown.
     fn run_upgrade(&mut self, target: String, cx: &mut Context<Self>) {
-        if self.upgrading {
+        if self.shell_update.upgrading {
             return;
         }
-        self.upgrading = true;
-        self.upgrade = None;
+        self.shell_update.upgrading = true;
+        self.shell_update.result = None;
         let cwd = self.cwd.clone();
         self._job = cx.spawn(async move |this, cx| {
             let (succeeded, text, running, launcher) = cx
                 .background_executor()
-                .spawn(async move {
-                    let spec = match pi_rpc::resolve_backend(&cwd) {
-                        Ok(spec) => spec,
-                        Err(error) => return (false, format!("{error:#}"), None, None),
-                    };
-                    let mut command = spec.launcher_command(["upgrade"]);
-                    command.stdin(std::process::Stdio::null());
-                    let (succeeded, text) = match command.output() {
-                        Ok(out) => (
-                            out.status.success(),
-                            format!(
-                                "{}{}",
-                                String::from_utf8_lossy(&out.stdout),
-                                String::from_utf8_lossy(&out.stderr)
-                            ),
-                        ),
-                        Err(error) => (false, error.to_string()),
-                    };
-                    // The upgrade may have installed Gentle Shell somewhere
-                    // new (its self-contained install): resolve it afresh.
-                    pi_rpc::forget_cached();
-                    let now = pi_rpc::resolve_backend(&cwd).ok();
-                    let running = now.as_ref().and_then(pi_rpc::backend_version);
-                    (succeeded, text, running, now.map(|spec| spec.launcher))
-                })
+                .spawn(async move { super::services::updates::upgrade_shell(&cwd) })
                 .await;
             let _ = this.update(cx, |this, cx| {
-                this.upgrading = false;
+                this.shell_update.upgrading = false;
                 forget_claude_auth();
                 let lines: Vec<String> = text
                     .lines()
@@ -209,7 +192,7 @@ impl SettingsView {
                 if matches!(outcome, UpgradeOutcome::Installed(_)) {
                     cx.emit(SettingsEvent::BackendUpdated);
                 }
-                this.upgrade = Some(UpgradeResult {
+                this.shell_update.result = Some(UpgradeResult {
                     target,
                     outcome,
                     lines: lines[lines.len().saturating_sub(8)..].to_vec(),
@@ -223,7 +206,7 @@ impl SettingsView {
 
     fn skip_update(&mut self, version: String, cx: &mut Context<Self>) {
         if let Err(error) = crate::features::updates::skip(&version) {
-            self.skip_error = Some(format!("Could not remember the skip: {error}"));
+            self.shell_update.skip_error = Some(format!("Could not remember the skip: {error}"));
         }
         self.reload(cx);
     }
@@ -242,10 +225,10 @@ impl SettingsView {
             "Gentle Shell",
             "Runs gentle-shell upgrade. Open agent tabs then restart on the new version and keep their conversations; a tab mid-turn switches when the turn ends.",
             &offer,
-            self.upgrading,
+            self.shell_update.upgrading,
             cx.listener(move |this, _, _, cx| this.run_upgrade(target.clone(), cx)),
             cx.listener(move |this, _, _, cx| this.skip_update(skipped.clone(), cx)),
-            self.skip_error.clone(),
+            self.shell_update.skip_error.clone(),
         )
     }
 
@@ -259,13 +242,7 @@ impl SettingsView {
         self.engram._job = cx.spawn(async move |this, cx| {
             let (result, lines) = cx
                 .background_executor()
-                .spawn(async move {
-                    let lines = std::sync::Mutex::new(Vec::new());
-                    let result = crate::features::setup::upgrade_engram(&|line| {
-                        lines.lock().unwrap().push(line);
-                    });
-                    (result, lines.into_inner().unwrap())
-                })
+                .spawn(async move { super::services::updates::upgrade_engram() })
                 .await;
             let _ = this.update(cx, |this, cx| {
                 this.engram.upgrading = false;

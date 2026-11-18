@@ -20,7 +20,7 @@ impl Global for StoreDir {}
 pub fn dir(cx: &App) -> Option<PathBuf> {
     match cx.try_global::<StoreDir>() {
         Some(dir) => Some(dir.0.clone()),
-        None => dirs::data_dir().map(|d| d.join("gentle-shell-gpui")),
+        None => crate::shared::data_dir::app(),
     }
 }
 

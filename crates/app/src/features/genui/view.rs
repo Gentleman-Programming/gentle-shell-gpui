@@ -1,6 +1,6 @@
 //! Drawing a diagram surface, React Flow style: a header with the editing
-//! tools, a dotted canvas with group boxes, edges, node cards and edge label
-//! pills, floating controls (bottom-left), a minimap (bottom-right) and the
+//! tools, a dotted canvas with group boxes, edges, node cards and edge
+//! labels, floating controls (bottom-left), a minimap (bottom-right) and the
 //! selection's details (top-right, `details.rs`), and a footer with the
 //! pending edits; and the conversation rows around it: a surface being
 //! drawn, one that failed, older versions and the user's sent edits.
@@ -25,6 +25,9 @@ use crate::shared::{backdrop, ui};
 /// The card's height in the conversation (px at 100 %): a fixed size, so
 /// the surface can be a cached view that only redraws when it changes.
 pub(super) const CARD_HEIGHT: f32 = 460.;
+/// Below this scale node descriptions, the kind · tech line and edge labels
+/// are left out: smaller than ~4 px they are noise, not text.
+const DETAIL_ZOOM: f32 = 0.35;
 /// The minimap's size (px at 100 %).
 const MINIMAP_W: f32 = 168.;
 const MINIMAP_H: f32 = 108.;
@@ -478,8 +481,10 @@ impl DiagramView {
             );
         }
 
-        // Edge labels: small pills on the curve.
-        if s >= 0.35 {
+        // Edge labels: the phrase on the curve, up to two lines, on the
+        // canvas color so the line doesn't run through the text; the
+        // style (async, data flow, dependency) under it in MONO.
+        if s >= DETAIL_ZOOM {
             for (ix, (edge, (path, alpha))) in
                 self.working.edges.iter().zip(&shown.edges).enumerate()
             {
@@ -490,38 +495,51 @@ impl DiagramView {
                 if !visible.contains(p) {
                     continue;
                 }
-                let width = 140.;
-                let (x, y) = at(p.x - width / 2., p.y - 10.);
+                let (width, height) = (layout::RANK_GAP + 24., 48.);
+                let (x, y) = at(p.x - width / 2., p.y - height / 2.);
                 let highlighted = selected_edge == Some(ix) || self.hover_edge == Some(ix);
+                let style =
+                    (edge.style != EdgeStyle::Sync && s >= 0.5).then(|| style_name(edge.style));
                 body = body.child(
-                    h_flex()
+                    v_flex()
                         .absolute()
                         .left(x)
                         .top(y)
                         .w(px(width * s))
+                        .h(px(height * s))
+                        .items_center()
                         .justify_center()
                         .opacity(*alpha)
                         .child(
-                            div()
-                                .px(px(6. * s))
-                                .py(px(1. * s))
-                                .rounded_full()
-                                .bg(ui::surface())
-                                .border_1()
-                                .border_color(if highlighted {
-                                    ui::accent().opacity(0.6)
-                                } else {
-                                    ui::border()
-                                })
+                            v_flex()
                                 .max_w_full()
-                                .truncate()
-                                .text_size(px(10.5 * s))
-                                .text_color(if highlighted {
-                                    ui::accent()
-                                } else {
-                                    ui::muted()
-                                })
-                                .child(label.clone()),
+                                .items_center()
+                                .px(px(4. * s))
+                                .rounded(px(4. * s))
+                                .bg(ui::well())
+                                .child(
+                                    div()
+                                        .max_w_full()
+                                        .overflow_hidden()
+                                        .line_clamp(2)
+                                        .text_center()
+                                        .text_size(px(10.5 * s))
+                                        .text_color(if highlighted {
+                                            ui::accent()
+                                        } else {
+                                            ui::muted()
+                                        })
+                                        .child(label.clone()),
+                                )
+                                .when_some(style, |d, style| {
+                                    d.child(
+                                        div()
+                                            .font_family(ui::MONO)
+                                            .text_size(px(9. * s))
+                                            .text_color(ui::faint())
+                                            .child(style),
+                                    )
+                                }),
                         ),
                 );
             }
@@ -1020,70 +1038,61 @@ impl DiagramView {
     }
 }
 
-/// A node's card: kind tile, title and subtitle (tech, or the kind), the
-/// status dot; status changes its border (risk), dashes it (planned) or
-/// dims it (deprecated).
+/// A node's card, read top to bottom: the kind tile and title, what the node
+/// does (its description, at most two lines) and `KIND · tech` in `MONO`.
+/// The kind sets its weight: a client is an actor (its icon in a badge above
+/// the card, on `raised`), an external system sits sunken on `well` with a
+/// lighter border, a note has no tile. Status changes the border (risk),
+/// dashes it (planned) or dims the card (deprecated), and puts a dot by the
+/// title.
 fn node_card(node: &gentle_core::genui::diagram::Node, rect: Rect, s: f32) -> Div {
-    let color = kind_color(node.kind);
+    let kind = node.kind;
+    let actor = kind == NodeKind::Client;
+    let external = kind == NodeKind::External;
+    let note = kind == NodeKind::Note;
+    let color = kind_color(kind);
     let border = match node.status {
         Some(Status::Risk) => ui::danger().opacity(0.7),
+        _ if external || note => ui::border(),
         _ => ui::border_strong(),
     };
-    let subtitle = node
-        .tech
+    let meta = match node.tech.as_deref().filter(|t| !t.is_empty()) {
+        Some(tech) => format!("{} · {tech}", kind.name().to_uppercase()),
+        None => kind.name().to_uppercase(),
+    };
+    let description = node
+        .description
         .clone()
-        .unwrap_or_else(|| node.kind.name().to_string());
-    div()
-        .w(px(rect.w * s))
-        .h(px(rect.h * s))
+        .filter(|d| !d.trim().is_empty() && s >= DETAIL_ZOOM);
+    let tile = div()
+        .flex_shrink_0()
+        .size(px(20. * s))
+        .rounded(px(6. * s))
+        .bg(color.opacity(if external { 0.08 } else { 0.14 }))
         .flex()
-        .flex_row()
         .items_center()
+        .justify_center()
+        .child(
+            Icon::new(kind_icon(kind))
+                .size(px(13. * s))
+                .text_color(color),
+        );
+    let header = h_flex()
+        .w_full()
+        .min_w_0()
         .gap(px(8. * s))
-        .px(px(10. * s))
-        .rounded(px(10. * s))
-        .bg(ui::surface())
-        .border_1()
-        .border_color(border)
-        .shadow_sm()
-        .when(node.status == Some(Status::Planned), |d| d.border_dashed())
-        .when(node.status == Some(Status::Deprecated), |d| d.opacity(0.55))
+        .when(!actor && !note, |d| d.child(tile))
         .child(
             div()
-                .flex_shrink_0()
-                .size(px(26. * s))
-                .rounded(px(7. * s))
-                .bg(color.opacity(0.14))
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(
-                    Icon::new(kind_icon(node.kind))
-                        .size(px(15. * s))
-                        .text_color(color),
-                ),
-        )
-        .child(
-            v_flex()
                 .flex_1()
                 .min_w_0()
-                .child(
-                    div()
-                        .truncate()
-                        .text_size(px(13. * s))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(ui::fg())
-                        .child(node.label.clone()),
-                )
-                .when(s >= 0.5, |d| {
-                    d.child(
-                        div()
-                            .truncate()
-                            .text_size(px(11. * s))
-                            .text_color(ui::muted())
-                            .child(subtitle),
-                    )
-                }),
+                .truncate()
+                .when(actor, |d| d.text_center())
+                .text_size(px(13. * s))
+                .line_height(px(16. * s))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(ui::fg())
+                .child(node.label.clone()),
         )
         .when_some(node.status.filter(|_| s >= 0.6), |d, status| {
             d.child(
@@ -1092,6 +1101,81 @@ fn node_card(node: &gentle_core::genui::diagram::Node, rect: Rect, s: f32) -> Di
                     .size(px(7. * s))
                     .rounded_full()
                     .bg(status_color(status)),
+            )
+        });
+    v_flex()
+        .relative()
+        .w(px(rect.w * s))
+        .h(px(rect.h * s))
+        .px(px(12. * s))
+        .py(px(9. * s))
+        .gap(px(4. * s))
+        .rounded(px(10. * s))
+        .bg(if actor {
+            ui::raised()
+        } else if external || note {
+            ui::well()
+        } else {
+            ui::surface()
+        })
+        .border_1()
+        .border_color(border)
+        .when(!external && !note, |d| d.shadow_sm())
+        .when(node.status == Some(Status::Planned), |d| d.border_dashed())
+        .when(node.status == Some(Status::Deprecated), |d| d.opacity(0.55))
+        .child(header)
+        .when_some(description, |d, text| {
+            d.child(
+                div()
+                    .flex_shrink_0()
+                    .w_full()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .line_clamp(2)
+                    .when(actor, |d| d.text_center())
+                    .when(note, |d| d.italic())
+                    .text_size(px(11. * s))
+                    .line_height(px(14. * s))
+                    .text_color(ui::muted())
+                    .child(text),
+            )
+        })
+        .child(div().flex_1())
+        .when(s >= DETAIL_ZOOM, |d| {
+            d.child(
+                div()
+                    .flex_shrink_0()
+                    .w_full()
+                    .truncate()
+                    .when(actor, |d| d.text_center())
+                    .font_family(ui::MONO)
+                    .text_size(px(9.5 * s))
+                    .line_height(px(12. * s))
+                    .text_color(ui::faint())
+                    .child(meta),
+            )
+        })
+        // An actor wears its kind icon in a round badge above the card.
+        .when(actor, |d| {
+            let size = 26. * s;
+            d.child(
+                div()
+                    .absolute()
+                    .top(px(-size / 2.))
+                    .left(px(rect.w * s / 2. - size / 2.))
+                    .size(px(size))
+                    .rounded_full()
+                    .bg(ui::surface())
+                    .border_1()
+                    .border_color(ui::border_strong())
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        Icon::new(kind_icon(kind))
+                            .size(px(13. * s))
+                            .text_color(color),
+                    ),
             )
         })
 }

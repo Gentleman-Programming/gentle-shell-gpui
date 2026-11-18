@@ -51,7 +51,7 @@ If nothing is found, the error asks for `npm i -g gentle-pi` or `GENTLE_SHELL_BI
 | `env` | `GENTLE_SHELL_INTERACTIVE_HOST=1` (enables `ask_user_question` dialogs and live helper activity) and `PATH` = combined PATH. Managed install: also its own environment (see below). |
 | `cwd` | The tab's folder |
 | `launcher` | The `gentle-shell` command a person runs: what Settings shows and messages name. `program`, except for the managed install (its `bin\gentle-shell.cmd`). |
-| `bundled` | `BundledInstall { node, package, managed }` of a self-contained or managed install; `None` for npm/pnpm/yarn (see [The `gentle-pi` and Pi packages](#the-gentle-pi-and-pi-packages)). `managed_by_gentle_ai()` reads `managed`. |
+| `bundled` | `BundledInstall { node, package, managed }` of a complete self-contained or managed install; `None` for npm/pnpm/yarn **and for an incomplete install** (see [The `gentle-pi` and Pi packages](#the-gentle-pi-and-pi-packages)). `managed_by_gentle_ai()` reads `managed`. |
 
 Launcher subcommands go through `spec.launcher_command(sub)`: the same program, the arguments before `--mode`, then `sub`, in `cwd` with `env`. Used by `--version` (`run_version`), `upgrade` (`settings/upgrade.rs`, `setup/gentle.rs`), `install`/`remove` (`setup::run_gentle_shell`), `setup` (`setup/gentle.rs`), `mcp` (`setup/maestro.rs`) and the commit message (`files/changes.rs`, `--print`).
 
@@ -97,7 +97,7 @@ It also publishes `%LOCALAPPDATA%\Microsoft\WindowsApps\gentle-shell.cmd` (on th
 
 `managed_install(launcher)` recognizes the binding or that shim (`shim_target`, `supervisor_root`: pure parsers of the two `.cmd` files) and requires `supervisor.exe`, `manifest.json`, the Node and `gentle-shell.mjs` in the folder. The app does not launch through the supervisor: it builds its environment from scratch (`userWindowsLaunchEnvironment`), so `GENTLE_SHELL_INTERACTIVE_HOST` and the app's PATH would never reach Gentle Shell (no Gentle Desktop), and it forwards everything after `--` to Pi, so `--version`, `setup` or `upgrade` would not reach the launcher. Instead `program` is `runtime\node\node.exe`, `args` start with `gentle-shell.mjs`, and `ManagedInstall::env` mirrors gentle-ai's `userWindowsEnvironment(root)`: `HOME`/`USERPROFILE`, `APPDATA`, `LOCALAPPDATA`, `TEMP`/`TMP`, `GENTLE_PI_CONFIG_HOME`, `PI_CODING_AGENT_DIR`, `GENTLE_PI_AGENT_HOME`, `GENTLE_SHELL_HOME`, `GENTLE_SHELL_CONFIG`, `GENTLE_PI_NO_SKILL_REGISTRY`, the Go and npm variables, `NODE_USE_SYSTEM_CA`, and `PATH` = its `runtime\node`, `runtime\go\bin`, `runtime\codegraph\bin`, then the combined PATH. The rest of the app's environment is inherited. Not reproduced: the supervisor's integrity check, its Job Object and its shared-Engram decision (Gentle Shell's own Engram handling applies, as with any other install).
 
-gentle-ai is what updates and repairs this install, so for it (`managed_by_gentle_ai`): Setup & requirements turns the Gentle Shell and Companion setup fixes into "Open terminal" with `gentle-ai`, reports Node.js and Go as provided by the install, and Settings offers no `gentle-shell upgrade` (nor writes the update check into its `config\gentle-shell.json`, which gentle-ai verifies). Gentle AI itself is the package-local `gentle-pi\.gentle-ai\v<pin>\gentle-ai.exe`; the Companion setup check reads its pin from that package and the provisioning marker from `config\gentle-shell.json`.
+gentle-ai is what updates and repairs this install, so for it (`managed_by_gentle_ai`): Setup & requirements turns the Gentle Shell and Companion setup fixes into "Open terminal" with `gentle-ai` (a launcher without a version shows its own error there too). An incomplete managed install, not recognized as one, gets Retry with the refusal and diagnostics described below. It reports Node.js and Go as provided by the install, and Settings offers no `gentle-shell upgrade` (nor writes the update check into its `config\gentle-shell.json`, which gentle-ai verifies). Gentle AI itself is the package-local `gentle-pi\.gentle-ai\v<pin>\gentle-ai.exe`; the Companion setup check reads its pin from that package and the provisioning marker from `config\gentle-shell.json`.
 
 ### Combined PATH
 
@@ -112,7 +112,7 @@ gentle-ai is what updates and repairs this install, so for it (`managed_by_gentl
 
 ### Backend version
 
-`version_output(spec)` runs `<launcher> --version` (`launcher_command`) and caches it per launcher, invalidating when the `Stamp` of the launcher file (for a self-contained or managed install, its `gentle-pi`'s `package.json`) or of the launcher config (`launcher_config_path`) changes. `backend_version` extracts the `gentle-shell X.Y.Z` line. `forget_versions()` is used after `gentle-shell upgrade`.
+`version_output(spec)` runs `<launcher> --version` (`launcher_command`) and caches it per launcher, invalidating when the `Stamp` of the launcher file (for a self-contained or managed install, its `gentle-pi`'s `package.json`) or of the launcher config (`launcher_config_path`) changes. `backend_version` extracts the `gentle-shell X.Y.Z` line. `forget_versions()` is used after `gentle-shell upgrade`. If Setup finds no launcher version, `version_stderr` repeats the probe with a deadline and bounded stderr; its first meaningful line is shown with the launcher path. Only an empty stderr uses the old Node/Pi guess. Working launchers keep the original stdout cache and do not run this diagnostic probe.
 
 ### `pi_rpc::command`
 
@@ -616,7 +616,7 @@ Engram (`engram.rs`): the installed version from `engram version`, the latest fr
 | Check | Install |
 | --- | --- |
 | Node | `fetch.rs` `install_node`: Node 22 LTS from `https://nodejs.org/dist`, checksum-verified, into `toolchain/node` |
-| GentleShell | `npm install -g gentle-pi --allow-scripts=gentle-pi --foreground-scripts`; `install_prefix` adds `--prefix` (the managed Node's, or `toolchain/npm-global` if the global one requires root) |
+| GentleShell | A launcher reporting 4.1.0 or newer runs `gentle-shell upgrade`. A self-contained or gentle-ai managed launcher without a version is refused: Retry reports the launcher path and its stderr and asks to run the Gentle Shell installer again, rather than install a second copy with a different profiles folder. Recognition uses the bundled candidate paths, generated launcher marker or managed binding/shim, even when `spec.bundled` is `None`. Otherwise `npm install -g gentle-pi --allow-scripts=gentle-pi --foreground-scripts` is used; `install_prefix` adds `--prefix` (the managed Node's, or `toolchain/npm-global` if the global one requires root). |
 | Setup | `gentle-shell setup` |
 | ClaudeBridge | `gentle-shell install npm:<bridge>` |
 | Engram | `Gentleman-Programming/engram` release from GitHub, verified, into `toolchain/bin` |

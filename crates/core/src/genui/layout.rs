@@ -11,13 +11,38 @@ use std::collections::HashMap;
 
 use super::diagram::{Diagram, Direction};
 
-pub const NODE_W: f32 = 168.;
-pub const NODE_H: f32 = 60.;
-pub const RANK_GAP: f32 = 96.;
+/// A diagram node's box: room for the title, a two-line description and the
+/// kind · tech line.
+pub const NODE_W: f32 = 208.;
+pub const NODE_H: f32 = 88.;
+/// Wide enough between ranks for a short verb-phrase edge label.
+pub const RANK_GAP: f32 = 120.;
 pub const NODE_GAP: f32 = 32.;
 pub const GROUP_PAD: f32 = 20.;
 pub const GROUP_HEADER: f32 = 26.;
 pub const GROUP_GAP: f32 = 40.;
+
+/// The node box and the gap between ranks a surface lays out with.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Sizing {
+    pub node_w: f32,
+    pub node_h: f32,
+    pub rank_gap: f32,
+}
+
+/// Architecture diagrams.
+pub const DIAGRAM: Sizing = Sizing {
+    node_w: NODE_W,
+    node_h: NODE_H,
+    rank_gap: RANK_GAP,
+};
+
+/// State machines: compact cards that hold a name and one line.
+pub const STATES: Sizing = Sizing {
+    node_w: 168.,
+    node_h: 60.,
+    rank_gap: 96.,
+};
 
 const ORDER_SWEEPS: usize = 4;
 const TRANSPOSE_PASSES: usize = 4;
@@ -238,6 +263,11 @@ impl Layout {
 /// then pinned nodes (x and y set) are overridden, so dragging one node never
 /// moves the others.
 pub fn layout(d: &Diagram) -> Layout {
+    layout_with(d, DIAGRAM)
+}
+
+/// [`layout`] with another node box and rank gap.
+pub fn layout_with(d: &Diagram, sizing: Sizing) -> Layout {
     let n = d.nodes.len();
     let index: HashMap<&str, usize> = d
         .nodes
@@ -270,7 +300,7 @@ pub fn layout(d: &Diagram) -> Layout {
         .collect();
 
     let lr = d.direction == Direction::LeftRight;
-    let (mut nodes, waypoints) = place(d, &ranks, &links);
+    let (mut nodes, waypoints) = place(d, &ranks, &links, sizing);
     let pinned: Vec<bool> = d
         .nodes
         .iter()
@@ -308,7 +338,7 @@ pub fn layout(d: &Diagram) -> Layout {
         .map(|((e, link), crosses)| match (e, link) {
             (Some((a, b)), _) if a == b => self_loop(&nodes[*a]),
             (Some((a, b)), Some((lo, hi))) if !pinned[*lo] && !pinned[*hi] => {
-                let path = route(lr, &nodes[*lo], &nodes[*hi], ranks[*lo], crosses);
+                let path = route(lr, &nodes[*lo], &nodes[*hi], ranks[*lo], crosses, sizing);
                 if lo == a && hi == b {
                     path
                 } else {
@@ -426,6 +456,7 @@ fn place(
     d: &Diagram,
     ranks: &[usize],
     links: &[Option<(usize, usize)>],
+    sizing: Sizing,
 ) -> (Vec<Rect>, Vec<Vec<f32>>) {
     let n = d.nodes.len();
     if n == 0 {
@@ -473,7 +504,7 @@ fn place(
         dummies.push(start..rank_of.len());
     }
 
-    let node_cross = if lr { NODE_H } else { NODE_W };
+    let node_cross = if lr { sizing.node_h } else { sizing.node_w };
     let size: Vec<f32> = (0..rank_of.len())
         .map(|v| if v < n { node_cross } else { DUMMY_SIZE })
         .collect();
@@ -514,24 +545,24 @@ fn place(
     };
     layers.order();
 
-    let main_size = if lr { NODE_W } else { NODE_H };
+    let main_size = if lr { sizing.node_w } else { sizing.node_h };
     let nodes = (0..n)
         .map(|v| {
-            let main = ranks[v] as f32 * (main_size + RANK_GAP);
+            let main = ranks[v] as f32 * (main_size + sizing.rank_gap);
             let cross = layers.cross[v] - node_cross / 2.;
             if lr {
                 Rect {
                     x: main,
                     y: cross,
-                    w: NODE_W,
-                    h: NODE_H,
+                    w: sizing.node_w,
+                    h: sizing.node_h,
                 }
             } else {
                 Rect {
                     x: cross,
                     y: main,
-                    w: NODE_W,
-                    h: NODE_H,
+                    w: sizing.node_w,
+                    h: sizing.node_h,
                 }
             }
         })
@@ -798,7 +829,14 @@ fn inversions(v: &mut [f32], scratch: &mut Vec<f32>) -> usize {
 /// dummy's cross position, S-curves in the gaps between ranks, all tangents
 /// along the main axis so the joins are smooth. `crosses` are the dummies'
 /// centers for the ranks after `first_rank`.
-fn route(lr: bool, from: &Rect, to: &Rect, first_rank: usize, crosses: &[f32]) -> EdgePath {
+fn route(
+    lr: bool,
+    from: &Rect,
+    to: &Rect,
+    first_rank: usize,
+    crosses: &[f32],
+    sizing: Sizing,
+) -> EdgePath {
     let at = |main: f32, cross: f32| {
         if lr {
             Point { x: main, y: cross }
@@ -808,13 +846,13 @@ fn route(lr: bool, from: &Rect, to: &Rect, first_rank: usize, crosses: &[f32]) -
     };
     let (main_size, start, end) = if lr {
         (
-            NODE_W,
+            sizing.node_w,
             (from.right(), from.center().y),
             (to.x, to.center().y),
         )
     } else {
         (
-            NODE_H,
+            sizing.node_h,
             (from.bottom(), from.center().x),
             (to.y, to.center().x),
         )
@@ -824,7 +862,7 @@ fn route(lr: bool, from: &Rect, to: &Rect, first_rank: usize, crosses: &[f32]) -
     let mut points = Vec::with_capacity(2 * crosses.len() + 2);
     points.push(start);
     for (k, &cross) in crosses.iter().enumerate() {
-        let main = (first_rank + 1 + k) as f32 * (main_size + RANK_GAP);
+        let main = (first_rank + 1 + k) as f32 * (main_size + sizing.rank_gap);
         points.push((main, cross));
         points.push((main + main_size, cross));
     }

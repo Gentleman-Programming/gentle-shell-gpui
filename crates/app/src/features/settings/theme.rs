@@ -195,6 +195,9 @@ impl SettingsView {
         let active = state.active_theme().clone();
         let mut card = section(IconName::Sparkles, "Theme")
             .child(
+                div().pt_1().pb_1().child(ui::section_label("Window & interface")),
+            )
+            .child(
                 h_flex()
                     .pt_1()
                     .pb_2()
@@ -293,6 +296,12 @@ impl SettingsView {
                 .map(|(i, t)| theme_card(i, &t, i == active, cx))
                 .collect()
         };
+        card = card.child(
+            div()
+                .pt_3()
+                .pb_1()
+                .child(ui::section_label("Theme library")),
+        );
         for (source, label) in groups {
             let cards = cards_of(source, cx);
             if cards.is_empty() {

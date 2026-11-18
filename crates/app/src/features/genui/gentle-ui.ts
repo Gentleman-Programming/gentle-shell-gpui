@@ -2068,11 +2068,14 @@ const EXAMPLE = JSON.stringify({
 	spec: {
 		groups: [{ id: "backend", label: "Backend" }],
 		nodes: [
-			{ id: "web", label: "Web app", kind: "client" },
-			{ id: "api", label: "API", group: "backend", tech: "Rust" },
-			{ id: "db", label: "Orders DB", kind: "database", group: "backend" },
+			{ id: "web", label: "Web app", kind: "client", description: "Customers browse and pay" },
+			{ id: "api", label: "API", group: "backend", tech: "Rust", description: "Validates carts and takes payments" },
+			{ id: "db", label: "Orders DB", kind: "database", group: "backend", tech: "Postgres", description: "Orders and their line items" },
 		],
-		edges: [{ from: "web", to: "api", label: "HTTPS" }, { from: "api", to: "db", style: "data" }],
+		edges: [
+			{ from: "web", to: "api", label: "Places orders over HTTPS" },
+			{ from: "api", to: "db", label: "Writes orders", style: "data" },
+		],
 	},
 });
 
@@ -2151,6 +2154,7 @@ const GUIDELINES = [
 	`Attach ref { path (repo-relative), line?, endLine? } to every gentle_ui item that corresponds to code (a diagram node, erd table, table row, checklist item or kanban card) so the user can open it, e.g. "ref":{"path":"src/auth/mod.rs","line":42}; paths outside the workspace are rejected.`,
 	`The user's edits to a gentle_ui UI arrive as "${EVENT_MESSAGE}" messages with the full current spec; they are authoritative, so build on them and don't undo them. Such a message may also insert a saved UI (treat it like your own, update it by id) or ask you to add one to the project's docs.`,
 	"In gentle_ui specs omit x/y and let auto-layout place things; keep labels short and put details in description, tech or note.",
+	"In a gentle_ui diagram give every node a one-line description of what it does (it shows on the node's card) and its tech when known; label every edge with a short verb phrase saying what flows (\"Sends emails to users\", \"Reads orders\"), not a single word; use kind client for people and apps that start the flow and external for systems you don't own.",
 	"A gentle_ui form's answers arrive once, when the user submits (op submit); wait for them instead of guessing. To ask again or change the questions, update the form: an update reopens it.",
 	`gentle_ui example: ${EXAMPLE}`,
 	...KIND_EXAMPLES,

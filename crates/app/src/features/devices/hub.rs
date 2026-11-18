@@ -22,7 +22,7 @@ use crate::features::setup::devices as setup;
 const START_TIMEOUT: Duration = Duration::from_secs(60);
 
 fn state_dir() -> Option<PathBuf> {
-    dirs::data_dir().map(|dir| dir.join("gentle-shell-gpui").join("devices"))
+    crate::shared::data_dir::app().map(|dir| dir.join("devices"))
 }
 
 fn state_path() -> Option<PathBuf> {

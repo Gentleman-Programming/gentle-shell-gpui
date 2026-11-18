@@ -866,7 +866,7 @@ impl Editable for Machine {
 /// drawn as small shapes in the middle of their slot (their `nodes` rect
 /// is the shape's box) and transitions ending on those shapes.
 pub fn layout(m: &Machine) -> Layout {
-    let mut l = layout::layout(&m.proxy());
+    let mut l = layout::layout_with(&m.proxy(), layout::STATES);
     let index = |id: &str| m.state_index(id);
     let shift = |p: Point, center: Point, kind: StateKind| -> Point {
         let (dx, dy) = (p.x - center.x, p.y - center.y);

@@ -585,9 +585,9 @@ pub fn load_catalog(gentle: Vec<Theme>, user: Vec<Theme>) -> Vec<Theme> {
     catalog
 }
 
-/// The app's own themes folder: `<data dir>/gentle-shell-gpui/themes/`.
+/// The app's own themes folder: `<app data dir>/themes/` (`shared::data_dir`).
 pub fn app_themes_dir() -> Option<PathBuf> {
-    dirs::data_dir().map(|dir| dir.join("gentle-shell-gpui").join("themes"))
+    super::data_dir::app().map(|dir| dir.join("themes"))
 }
 
 /// The user's themes: Pi's folder, then the app's.
@@ -632,9 +632,9 @@ pub fn pick_default(catalog: &[Theme], persisted: Option<&str>, pi: Option<&str>
         .unwrap_or(0)
 }
 
-/// `dirs::data_dir()/gentle-shell-gpui/settings.json`.
+/// `<app data dir>/settings.json` (`shared::data_dir`).
 pub fn store_path() -> Option<PathBuf> {
-    dirs::data_dir().map(|dir| dir.join("gentle-shell-gpui").join("settings.json"))
+    super::data_dir::app().map(|dir| dir.join("settings.json"))
 }
 
 fn read_settings(path: &Path) -> Option<Value> {
@@ -1228,7 +1228,7 @@ mod tests {
         assert_eq!(light.fg, 0x2b2a27);
         assert_eq!(light.muted, 0x6b675f);
         assert_eq!(light.faint, 0x9a958b);
-        assert_eq!(light.accent, 0xb85c3c);
+        assert_eq!(light.accent, 0xa95334);
         assert_eq!(light.accent_active, 0x9c4a2e);
         assert_eq!(light.raised, 0xece7dc);
         assert_eq!(light.border, 0xdcd5c7);

@@ -12,7 +12,7 @@ const TTL_MS: u64 = 6 * 60 * 60 * 1000;
 const RECHECK_MS: u64 = 60 * 60 * 1000;
 
 fn store() -> Option<PathBuf> {
-    dirs::data_dir().map(|dir| dir.join("gentle-shell-gpui").join("engram-update.json"))
+    crate::shared::data_dir::app().map(|dir| dir.join("engram-update.json"))
 }
 
 fn read(path: &Path) -> Value {

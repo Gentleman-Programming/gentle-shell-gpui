@@ -92,9 +92,7 @@ fn write_if_changed(path: &Path, text: &str) -> Option<()> {
 /// The instructions for `prefs`, written to the app's data folder; the
 /// file to append, or `None` when it can't be written.
 pub fn agent_instructions(prefs: Prefs) -> Option<PathBuf> {
-    let path = dirs::data_dir()?
-        .join("gentle-shell-gpui")
-        .join("agent-instructions.md");
+    let path = crate::shared::data_dir::app()?.join("agent-instructions.md");
     let mut text = PAGES.to_string();
     if prefs.enabled && prefs.agents {
         text.push_str(DEVICES);

@@ -21,6 +21,7 @@ pub mod notifications;
 pub mod profiles;
 pub mod scroll;
 pub mod sessions;
+pub mod setup;
 pub mod text;
 pub mod tools;
 pub mod transcript;

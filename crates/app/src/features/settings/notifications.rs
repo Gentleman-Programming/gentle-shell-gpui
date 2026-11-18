@@ -58,11 +58,17 @@ fn alert_switch(
         .child(div().text_xs().text_color(ui::faint()).child(hint))
 }
 
+/// Feedback for failed notification preference writes.
+#[derive(Default)]
+pub(super) struct NotificationUiState {
+    pub(super) note: Option<String>,
+}
+
 impl SettingsView {
     /// Write one change to Gentle Shell's notifications.json; the section
     /// re-reads the file on the next render.
     fn set_notification(&mut self, change: notifications::Change, cx: &mut Context<Self>) {
-        self.notifications_note = alerts::apply(change)
+        self.notifications.note = alerts::apply(change)
             .err()
             .map(|e| format!("Could not write notifications.json: {e}"));
         cx.notify();
@@ -123,7 +129,7 @@ impl SettingsView {
         .when_some(warning, |d, text| {
             d.child(div().text_xs().text_color(ui::warning()).child(text))
         })
-        .when_some(self.notifications_note.clone(), |d, text| {
+        .when_some(self.notifications.note.clone(), |d, text| {
             d.child(div().text_xs().text_color(ui::danger()).child(text))
         })
     }

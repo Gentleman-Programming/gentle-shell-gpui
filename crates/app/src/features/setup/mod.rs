@@ -94,9 +94,9 @@ fn user_home() -> PathBuf {
     dirs::home_dir().unwrap_or_else(std::env::temp_dir)
 }
 
-/// `<data dir>/gentle-shell-gpui/toolchain`.
+/// `<app data dir>/toolchain` (`shared::data_dir`).
 fn toolchain_dir() -> Option<PathBuf> {
-    dirs::data_dir().map(|dir| dir.join("gentle-shell-gpui").join("toolchain"))
+    crate::shared::data_dir::app().map(|dir| dir.join("toolchain"))
 }
 
 /// Where an npm prefix (or a Node install) keeps its executables.

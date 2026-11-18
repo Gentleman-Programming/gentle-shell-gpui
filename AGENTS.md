@@ -43,6 +43,7 @@ Dependency rules and the anatomy of a feature: [`docs/architecture.md`](docs/arc
 
 - **Never test on someone's real app:** never send clicks or keystrokes to an app a person is using.
 - **Open an isolated copy (macOS and Linux):** `HOME=$(mktemp -d) target/release/gentle-shell-gpui` opens the app as a first run (welcome included), without touching real data or clashing with the running instance. On Windows the data goes to `%APPDATA%`, so a temporary `HOME` doesn't isolate it.
+- **Try a branch with your real setup:** `GENTLE_SHELL_GPUI_DATA_DIR=$(mktemp -d) target/release/gentle-shell-gpui $(mktemp -d)` runs a separate app (own window, workspaces and settings) next to the installed one, with your real Gentle Shell, providers and sign-ins. Works on Windows too. Details in [`docs/development.md`](docs/development.md#isolated-testing).
 - **Temporary scaffolding:** if reaching a state needs a code change (a timer, an environment variable), remove it before committing and check with `grep` that nothing is left.
 
 Details, "clean machine" variants and screenshots: [`docs/development.md`](docs/development.md).

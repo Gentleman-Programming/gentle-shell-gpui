@@ -10,8 +10,7 @@ const SOURCE: &str = include_str!("gentle-ui.ts");
 /// Write the extension to the app's data folder; its path, or `None` when it
 /// can't be written.
 pub fn install() -> Option<PathBuf> {
-    let path = dirs::data_dir()?
-        .join("gentle-shell-gpui")
+    let path = crate::shared::data_dir::app()?
         .join("extensions")
         .join("gentle-ui.ts");
     write_if_changed(&path, SOURCE)?;

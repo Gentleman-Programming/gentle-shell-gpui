@@ -27,11 +27,7 @@ struct Store {
 }
 
 fn store_path() -> Option<PathBuf> {
-    Some(
-        dirs::data_dir()?
-            .join("gentle-shell-gpui")
-            .join("app-update.json"),
-    )
+    crate::shared::data_dir::app().map(|dir| dir.join("app-update.json"))
 }
 
 fn read_store(path: &Path) -> Store {

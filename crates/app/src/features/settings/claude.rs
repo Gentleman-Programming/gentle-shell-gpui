@@ -118,12 +118,12 @@ impl SettingsView {
         forget_claude_auth();
         match save_bridge_plan(&agent, plan) {
             Ok(()) => {
-                self.log = vec![format!(
+                self.package.log = vec![format!(
                     "Claude bridge plan set to {plan}. New sessions use it."
                 )];
                 cx.emit(SettingsEvent::Changed);
             }
-            Err(e) => self.log = vec![format!("Could not write claude-bridge.json: {e}")],
+            Err(e) => self.package.log = vec![format!("Could not write claude-bridge.json: {e}")],
         }
         self.reload(cx);
     }

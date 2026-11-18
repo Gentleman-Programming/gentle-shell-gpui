@@ -69,6 +69,48 @@ impl LaunchSpec {
     pub fn managed_by_gentle_ai(&self) -> bool {
         self.bundled.as_ref().is_some_and(|bundled| bundled.managed)
     }
+
+    /// Whether a failed launcher must be repaired by its own installer.
+    pub fn requires_installer_repair(&self) -> bool {
+        let local_app_data = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
+        let candidates = bundled_candidates(
+            &crate::home::home_dir(),
+            local_app_data.as_deref(),
+            cfg!(windows),
+        );
+        self.bundled.is_some() || protected_launcher(&self.launcher, &candidates)
+    }
+}
+
+fn protected_launcher(launcher: &Path, candidates: &[PathBuf]) -> bool {
+    let is_candidate = |path: &Path| {
+        candidates.iter().any(|candidate| {
+            path == candidate
+                || (cfg!(windows)
+                    && path
+                        .to_string_lossy()
+                        .eq_ignore_ascii_case(&candidate.to_string_lossy()))
+                || dunce::canonicalize(path)
+                    .ok()
+                    .zip(dunce::canonicalize(candidate).ok())
+                    .is_some_and(|(path, candidate)| path == candidate)
+        })
+    };
+    if is_candidate(launcher) {
+        return true;
+    }
+    let Ok(script) = std::fs::read_to_string(launcher) else {
+        return false;
+    };
+    if script.contains(BUNDLED_LAUNCHER_MARK) || supervisor_root(&script).is_some() {
+        return true;
+    }
+    shim_target(&script).is_some_and(|target| {
+        is_candidate(&target)
+            || std::fs::read_to_string(target)
+                .ok()
+                .is_some_and(|binding| supervisor_root(&binding).is_some())
+    })
 }
 
 /// Resolve `gentle-shell` and build the RPC launch for `cwd`.
@@ -682,6 +724,46 @@ fn run_version(spec: &LaunchSpec) -> Option<String> {
     output_within(&mut command, VERSION_TIMEOUT).map(|(_, stdout)| stdout)
 }
 
+/// Re-run a failed version probe to capture bounded diagnostics, without
+/// changing the cached stdout or the normal probe's treatment of stderr.
+pub fn version_stderr(spec: &LaunchSpec) -> Option<String> {
+    // Shorter than VERSION_TIMEOUT: a hung launcher already cost one full wait.
+    version_stderr_within(spec, Duration::from_secs(10))
+}
+
+fn version_stderr_within(spec: &LaunchSpec, timeout: Duration) -> Option<String> {
+    use std::io::Read as _;
+
+    const STDERR_LIMIT: usize = 16 * 1024;
+    let (mut reader, writer) = std::io::pipe().ok()?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        let mut remaining = STDERR_LIMIT;
+        while remaining > 0 {
+            let Ok(n) = reader.read(&mut buf[..remaining.min(4096)]) else {
+                break;
+            };
+            if n == 0 || tx.send(buf[..n].to_vec()).is_err() {
+                break;
+            }
+            remaining -= n;
+        }
+    });
+    let mut command = spec.launcher_command(["--version"]);
+    command.stdin(Stdio::null()).stderr(Stdio::from(writer));
+    let _ = output_within(&mut command, timeout);
+    drop(command);
+    let deadline = std::time::Instant::now() + DRAIN_GRACE;
+    let mut bytes = Vec::new();
+    while let Ok(chunk) =
+        rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+    {
+        bytes.extend_from_slice(&chunk);
+    }
+    Some(String::from_utf8_lossy(&bytes).into_owned())
+}
+
 /// After the child exits, how long to wait for its stdout to close: a
 /// process it left in the background may hold the pipe open for good.
 const DRAIN_GRACE: std::time::Duration = std::time::Duration::from_millis(200);
@@ -1269,6 +1351,184 @@ mod managed_tests {
             supervisor_root(r#""C:\i\supervisor.exe" shell launch "C:\i" gentle-shell %*"#),
             Some(PathBuf::from(r"C:\i"))
         );
+    }
+
+    #[test]
+    fn real_npm_and_pnpm_shims_are_not_protected() {
+        let layout = layout("shims");
+        for (name, body) in [
+            (
+                "npm.cmd",
+                "@ECHO off\r\nGOTO start\r\n:find_dp0\r\nSET dp0=%~dp0\r\nEXIT /b\r\n:start\r\nSETLOCAL\r\nCALL :find_dp0\r\nendLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & \"%_prog%\"  \"%dp0%\\node_modules\\gentle-pi\\bin\\gentle-shell.mjs\" %*\r\n",
+            ),
+            (
+                "pnpm.cmd",
+                "@SETLOCAL\r\n@IF EXIST \"%~dp0\\node.exe\" (\r\n  \"%~dp0\\node.exe\"  \"%~dp0\\..\\gentle-pi\\bin\\gentle-shell.mjs\" %*\r\n) ELSE (\r\n  node  \"%~dp0\\..\\gentle-pi\\bin\\gentle-shell.mjs\" %*\r\n)\r\n",
+            ),
+        ] {
+            let path = layout.dir.join(name);
+            std::fs::write(&path, body).unwrap();
+            assert!(!protected_launcher(&path, &[]), "{name}");
+        }
+    }
+
+    #[test]
+    fn broken_generated_and_managed_launchers_are_protected() {
+        let layout = layout("repair");
+        let inherited = OsString::new();
+        let generated = layout
+            .dir
+            .join("standalone")
+            .join("bin")
+            .join("gentle-shell.cmd");
+        std::fs::create_dir_all(generated.parent().unwrap()).unwrap();
+        std::fs::write(
+            &generated,
+            "@echo off\r\nrem gentle-shell bundled launcher (generated; do not edit)\r\n",
+        )
+        .unwrap();
+        let spec = launch_spec(generated.clone(), &layout.dir, inherited.clone(), None, &[]);
+        assert!(spec.bundled.is_none()); // No current version or runtime.
+        assert!(spec.requires_installer_repair());
+
+        std::fs::remove_file(layout.root.join("supervisor.exe")).unwrap();
+        for launcher in [
+            layout.shim.clone(),
+            layout.root.join("bin/gentle-shell.cmd"),
+        ] {
+            let spec = launch_spec(launcher, &layout.dir, inherited.clone(), None, &[]);
+            assert!(spec.bundled.is_none());
+            assert!(spec.requires_installer_repair());
+        }
+
+        let candidate = layout.dir.join("candidate.cmd");
+        std::fs::write(&candidate, "@echo off\r\n").unwrap();
+        assert!(protected_launcher(
+            &candidate,
+            std::slice::from_ref(&candidate)
+        ));
+        let npm = layout.dir.join("npm.cmd");
+        std::fs::write(
+            &npm,
+            "@node \"%dp0%\\node_modules\\gentle-pi\\bin\\gentle-shell.mjs\" %*\r\n",
+        )
+        .unwrap();
+        let spec = launch_spec(npm.clone(), &layout.dir, inherited, None, &[]);
+        assert!(!spec.requires_installer_repair());
+        assert!(!protected_launcher(&npm, &[candidate]));
+    }
+
+    #[test]
+    fn failed_version_diagnostics_capture_stderr_without_changing_version_output() {
+        let layout = layout("version-error");
+        let path = layout.dir.join(if cfg!(windows) {
+            "broken.cmd"
+        } else {
+            "broken"
+        });
+        let script = if cfg!(windows) {
+            "@echo off\r\necho gentle-shell: no active version 1>&2\r\nexit /b 1\r\n"
+        } else {
+            "#!/bin/sh\necho 'gentle-shell: no active version' >&2\nexit 1\n"
+        };
+        std::fs::write(&path, script).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let spec = LaunchSpec {
+            program: path.clone(),
+            args: Vec::new(),
+            cwd: layout.dir.clone(),
+            env: Vec::new(),
+            launcher: path,
+            bundled: None,
+        };
+        assert_eq!(version_output(&spec).as_deref(), Some(""));
+        assert_eq!(backend_version(&spec), None);
+        assert_eq!(
+            version_stderr(&spec).as_deref().map(str::trim),
+            Some("gentle-shell: no active version")
+        );
+    }
+
+    #[test]
+    fn diagnostics_survive_a_version_probe_timing_out() {
+        let layout = layout("version-timeout");
+        let path = layout
+            .dir
+            .join(if cfg!(windows) { "slow.cmd" } else { "slow" });
+        let script = if cfg!(windows) {
+            "@echo off\r\necho broken before timeout 1>&2\r\n:loop\r\ngoto loop\r\n"
+        } else {
+            "#!/bin/sh\necho 'broken before timeout' >&2\nwhile :; do :; done\n"
+        };
+        std::fs::write(&path, script).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let spec = LaunchSpec {
+            program: path.clone(),
+            args: Vec::new(),
+            cwd: layout.dir.clone(),
+            env: Vec::new(),
+            launcher: path,
+            bundled: None,
+        };
+        assert_eq!(
+            version_stderr_within(&spec, Duration::from_millis(300))
+                .as_deref()
+                .map(str::trim),
+            Some("broken before timeout")
+        );
+    }
+
+    #[test]
+    fn successful_version_output_is_still_cached() {
+        let layout = layout("version-cache");
+        let path = layout.dir.join(if cfg!(windows) {
+            "working.cmd"
+        } else {
+            "working"
+        });
+        let runs = layout.dir.join("runs");
+        let script = if cfg!(windows) {
+            format!(
+                "@echo off\r\necho x>>\"{}\"\r\necho gentle-shell 4.8.0\r\necho pi 1.5.2\r\necho warning 1>&2\r\n",
+                runs.display()
+            )
+        } else {
+            format!(
+                "#!/bin/sh\necho x >> '{}'\necho 'gentle-shell 4.8.0'\necho 'pi 1.5.2'\necho warning >&2\n",
+                runs.display()
+            )
+        };
+        std::fs::write(&path, script).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let spec = LaunchSpec {
+            program: path.clone(),
+            args: Vec::new(),
+            cwd: layout.dir.clone(),
+            env: Vec::new(),
+            launcher: path,
+            bundled: None,
+        };
+        let expected = if cfg!(windows) {
+            "gentle-shell 4.8.0\r\npi 1.5.2\r\n"
+        } else {
+            "gentle-shell 4.8.0\npi 1.5.2\n"
+        };
+        assert_eq!(version_output(&spec).as_deref(), Some(expected));
+        assert_eq!(version_output(&spec).as_deref(), Some(expected));
+        assert_eq!(backend_version(&spec).as_deref(), Some("4.8.0"));
+        assert_eq!(std::fs::read_to_string(runs).unwrap().lines().count(), 1);
     }
 
     #[test]
