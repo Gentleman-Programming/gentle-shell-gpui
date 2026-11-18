@@ -230,6 +230,9 @@ One PR per change, from a `feat/…` or `refactor/…` branch. PRs are merged wi
 | `ci.yml` (CI) | `push` to `main` and `pull_request`, both with `paths-ignore: ["**.md", "packaging/icons/**"]` | Matrix `macos-latest`, `ubuntu-latest`, `windows-latest` (`fail-fast: false`): `cargo clippy --workspace --all-targets --locked -- -D warnings` and `cargo test --workspace --locked`. Cache `Swatinem/rust-cache@v2`. |
 | `cache-warm.yml` (Cache warm) | `push` to `main` touching `Cargo.lock`, `**/Cargo.toml`, `cache-warm.yml` or `release.yml`; `workflow_dispatch` | Builds `--profile dist` for the four targets and saves the cache with `shared-key: dist-<target>`. It exists because a tag can only restore caches from the default branch. |
 | `release.yml` (Release) | Tags `v*`; `workflow_dispatch` (dry run) | See [Releases](#releases). |
+| `security.yml` (Security) | `pull_request`, `push` to `main`, Mondays, `workflow_dispatch` | `cargo-deny`, dependency review, `zizmor` on the workflows and the PR risk report. See [`security.md`](security.md). |
+
+Every workflow has a read-only token unless a job needs more, actions are pinned to a commit SHA (Dependabot updates them), and checkout doesn't keep credentials.
 
 Concurrency: CI uses `group: ci-${{ github.ref }}` with `cancel-in-progress: true` (a new push to the same branch cancels the previous one); Cache warm also cancels; Release uses `cancel-in-progress: false`.
 
@@ -334,7 +337,7 @@ It runs `generate.py` (SVG), `render.swift` (PNG in several sizes), `iconutil` (
 - [ ] `cargo fmt`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo test --workspace --locked`.
 - [ ] Smoke test in a temporary `HOME`; screenshots only of the sandbox window.
 - [ ] No temporary code for reaching states.
-- [ ] `Cargo.lock` included if it changed.
+- [ ] `Cargo.lock` included if it changed; new crates come from crates.io and are named in the PR description.
 - [ ] `architecture.md` or an ADR updated if a boundary changes; README if something visible changes.
 - [ ] Commits prefixed `feat|fix|refactor|test|docs(<area>):`.
 

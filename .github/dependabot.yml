@@ -1,0 +1,30 @@
+# Keeps the SHA-pinned actions and the crates current. Each update is a PR
+# that goes through the same CI, security checks and review as any other.
+# The cooldown waits a week after a release before proposing it: hijacked
+# versions are usually caught and yanked within days.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: ci
+
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    # Minor and patch bumps in one PR; majors one by one, they may need code.
+    groups:
+      crates:
+        update-types: [minor, patch]
+    commit-message:
+      prefix: chore(deps)
