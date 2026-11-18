@@ -64,11 +64,8 @@ pub fn image_key(data: &str) -> u64 {
     hasher.finish()
 }
 
-/// Whether a step starts open, from its kind and status: a failed tool
-/// step does (its error is why you'd look at it), every other collapsible
-/// step starts folded to its quiet one-line row. `None` for items that
-/// never fold this way — `Shell` (what you ran yourself) keeps its output
-/// visible, and the other items are not steps.
+/// One entry of a conversation: what you or the model wrote, a tool call
+/// with its result, a `!command`, a notice or an extension message.
 #[derive(Debug, Clone)]
 pub enum Item {
     User {
@@ -124,7 +121,7 @@ pub enum Item {
 /// and the other items are not steps.
 pub fn step_open_by_default(item: &Item) -> Option<bool> {
     match item {
-        Item::Tool { name, status, .. } if name == crate::genui::TOOL => None,
+        Item::Tool { name, .. } if name == crate::genui::TOOL => None,
         Item::Tool { status, .. } => Some(*status == ToolStatus::Failed),
         Item::Custom { kind, .. } if kind == crate::genui::EVENT_MESSAGE => None,
         Item::Custom { .. } => Some(false),

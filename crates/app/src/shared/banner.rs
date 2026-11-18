@@ -268,19 +268,18 @@ impl Default for BannerConfig {
     }
 }
 
-/// The banner's colors in a solid theme: the rose blooms in the theme's
-/// `petal`, the wordmark is written in its `fg`, and the shadow dims from
-/// the ink (like the fixed palettes: dimmer and grayer than the ink).
-/// `None` keeps the palette `banner.json` chose, for every other theme.
-fn theme_colors(solid: bool, petal: Hsla, fg: Hsla) -> Option<(Hsla, Hsla, Hsla)> {
-    solid.then(|| {
-        let shadow = Hsla {
-            l: fg.l * 0.44,
-            s: fg.s * 0.45,
-            ..fg
-        };
-        (petal, fg, shadow)
-    })
+/// A solid theme's banner colors: the rose blooms in `petal` (the theme's
+/// accent — what `ui::petal()` reads), the wordmark is written in its
+/// `fg`, and the shadow dims from the ink (like the fixed palettes: dimmer
+/// and grayer than the ink). Other themes keep the palette `banner.json`
+/// chose, so this only runs for solid ones.
+fn solid_colors(petal: Hsla, fg: Hsla) -> (Hsla, Hsla, Hsla) {
+    let shadow = Hsla {
+        l: fg.l * 0.44,
+        s: fg.s * 0.45,
+        ..fg
+    };
+    (petal, fg, shadow)
 }
 
 /// `<config>/banner.json`, tolerant like the launcher's own read: missing or
@@ -380,8 +379,10 @@ pub fn banner(config: BannerConfig, scale: f32, reveal: f32) -> impl IntoElement
     // A solid theme tints the banner in its own colors; every other theme
     // keeps the palette banner.json chose (which stays read-only).
     let (rose_base, ink, shadow) = if themes::solid() {
+        // The petal is the theme's accent (the same color; the palette only
+        // carries it under `accent`).
         let (petal, fg) = themes::palette(|p| (p.accent, p.fg));
-        theme_colors(true, petal, fg).expect("solid theme")
+        solid_colors(petal, fg)
     } else {
         let (rose_color, ink, shadow) = config.palette.colors();
         (Hsla::from(rose_color), Hsla::from(ink), Hsla::from(shadow))
@@ -566,19 +567,17 @@ mod tests {
     }
 
     #[test]
-    fn solid_themes_tint_the_banner_and_others_keep_banner_json() {
+    fn solid_banner_colors_bloom_the_rose_and_dim_the_shadow_from_the_ink() {
         use gpui_kit::hsla;
         let petal = hsla(330. / 360., 0.85, 0.62, 1.);
         let fg = hsla(240. / 360., 0.03, 0.93, 1.);
-        // A solid theme: the rose blooms in the theme's petal, the wordmark
-        // is written in its fg, and the shadow dims from the ink.
-        let (rose, ink, shadow) = super::theme_colors(true, petal, fg).expect("solid theme");
+        // The rose blooms in the petal passed in, the wordmark is written in
+        // the fg, and the shadow dims from the ink.
+        let (rose, ink, shadow) = super::solid_colors(petal, fg);
         assert_eq!((rose.h, rose.s, rose.l), (petal.h, petal.s, petal.l));
         assert_eq!((ink.h, ink.s, ink.l), (fg.h, fg.s, fg.l));
         assert!((shadow.l - fg.l * 0.44).abs() < 1e-5);
         assert!((shadow.s - fg.s * 0.45).abs() < 1e-5);
-        // Any other theme keeps the palette banner.json chose.
-        assert_eq!(super::theme_colors(false, petal, fg), None);
     }
 
     #[test]
