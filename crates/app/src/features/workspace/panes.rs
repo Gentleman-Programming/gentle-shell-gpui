@@ -373,6 +373,7 @@ impl Workspace {
         space.active = index.min(space.tabs.len().saturating_sub(1));
         self.focus_active(window, cx);
         self.start_shown(window, cx);
+        self.sync_files_root(cx);
         self.schedule_save(cx);
         cx.notify();
     }
@@ -402,6 +403,7 @@ impl Workspace {
             tab.focused = pane;
         }
         self.focus_active(window, cx);
+        self.sync_files_root(cx);
         cx.notify();
     }
 
@@ -697,6 +699,7 @@ impl Workspace {
         self.panes.remove(&pane);
         if active {
             self.focus_active(window, cx);
+            self.sync_files_root(cx);
         }
         self.announce_close(window, cx);
         self.schedule_save(cx);
@@ -742,6 +745,7 @@ impl Workspace {
         self.announce_close(window, cx);
         if self.space().tabs.is_empty() {
             // Keep the window open without silently creating a replacement agent.
+            self.sync_files_root(cx);
             self.save_now(cx);
             cx.notify();
             return;

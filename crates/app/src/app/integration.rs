@@ -96,8 +96,8 @@ pub fn register(cx: &mut App) {
     });
 }
 
-/// The Files | Changes | Branches sidebar for `workspace`, re-rooted when the shown
-/// workspace changes. The subscriptions live as long as the workspace.
+/// Files | Changes | Branches follow the selected tab/agent's working folder.
+/// The subscriptions live as long as the workspace.
 pub fn attach_sidebar(
     workspace: &Entity<crate::features::workspace::Workspace>,
     window: &mut Window,
@@ -159,7 +159,7 @@ pub fn attach_sidebar(
         toggled
     }
 
-    let root = workspace.read(cx).root().to_path_buf();
+    let root = workspace.read(cx).files_root(cx);
     // Replaced (and so dropped) with the tree, so re-rooting doesn't pile up
     // subscriptions.
     let mut _toggled = mount(workspace, root, window, cx);
@@ -170,7 +170,7 @@ pub fn attach_sidebar(
             workspace,
             cx,
             move |owner, event: &WorkspaceEvent, window, cx| {
-                if let WorkspaceEvent::RootChanged(root) = event {
+                if let WorkspaceEvent::FilesRootChanged(root) = event {
                     _toggled = mount(&owner, root.clone(), window, cx);
                 }
             },

@@ -70,6 +70,7 @@ impl Workspace {
         if changed {
             cx.emit(WorkspaceEvent::RootChanged(self.space().root.clone()));
         }
+        self.sync_files_root(cx);
         self.schedule_save(cx);
         cx.notify();
     }

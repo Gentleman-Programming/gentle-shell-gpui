@@ -19,6 +19,8 @@ impl Render for Workspace {
             && let Some(tab) = self.tab_mut()
         {
             tab.focused = inside;
+            // Native pane clicks can move focus without calling focus_pane.
+            self.sync_files_root(cx);
         }
         let sidebar = self.sidebar.clone().filter(|_| self.sidebar_visible);
         let has_sidebar = self.sidebar.is_some();

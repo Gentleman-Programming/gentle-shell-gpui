@@ -93,6 +93,8 @@ pub const SIDEBAR_WIDTH: f32 = 260.;
 pub enum WorkspaceEvent {
     /// The shown workspace changed; its root folder.
     RootChanged(PathBuf),
+    /// The file browser must follow the folder of the selected pane/agent.
+    FilesRootChanged(PathBuf),
     /// The left sidebar was shown or hidden.
     SidebarToggled(bool),
 }
@@ -251,6 +253,8 @@ pub struct Workspace {
     web_shown: std::collections::HashSet<PaneId>,
     sidebar: Option<AnyView>,
     sidebar_visible: bool,
+    /// The last folder sent to the Files sidebar; avoids unnecessary remounts.
+    last_files_root: Option<PathBuf>,
     save_task: Option<Task<()>>,
     /// Re-reads every pane's title and busy state once a second (non-agent
     /// views can't be observed through `AnyView`), redrawing only on change.
@@ -365,6 +369,7 @@ impl Workspace {
             web_shown: Default::default(),
             sidebar: None,
             sidebar_visible: saved.sidebar,
+            last_files_root: None,
             save_task: None,
             notices: cx.new(|_| Notices::default()),
             renaming: None,
