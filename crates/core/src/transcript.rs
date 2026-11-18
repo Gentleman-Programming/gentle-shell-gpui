@@ -132,6 +132,173 @@ pub fn step_open_by_default(item: &Item) -> Option<bool> {
     }
 }
 
+/// A run of consecutive finished steps folded to one quiet summary line
+/// (S11c): the transcript items it covers and the label it shows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StepGroup {
+    /// The items the group folds, always two or more.
+    pub items: std::ops::Range<usize>,
+    /// The summary, e.g. "Ran 3 commands (1 error)".
+    pub label: String,
+}
+
+/// What a step counts as in its group's summary, classified the way the
+/// app's cards are (`bash` and friends run commands, `read` reads files,
+/// `edit`/`write` edit them, helper cards finish background tasks).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StepKind {
+    Command,
+    Read,
+    Edit,
+    Helper,
+    Other,
+}
+
+fn step_kind(item: &Item) -> StepKind {
+    match item {
+        Item::Tool { name, .. } => match name.as_str() {
+            "bash" | "bash_background" | "monitor" | "codemode" => StepKind::Command,
+            "read" => StepKind::Read,
+            "edit" | "write" => StepKind::Edit,
+            _ => StepKind::Other,
+        },
+        Item::Custom { .. } => StepKind::Helper,
+        _ => StepKind::Other,
+    }
+}
+
+/// One clause of a group summary, capitalized only when first ("Read 2
+/// files, edited 1 file").
+fn step_clause(kind: StepKind, n: usize, first: bool) -> String {
+    let noun = |one: &'static str, many: &'static str| if n == 1 { one } else { many };
+    let verb = match kind {
+        StepKind::Command => {
+            if first {
+                "Ran"
+            } else {
+                "ran"
+            }
+        }
+        StepKind::Read => {
+            if first {
+                "Read"
+            } else {
+                "read"
+            }
+        }
+        StepKind::Edit => {
+            if first {
+                "Edited"
+            } else {
+                "edited"
+            }
+        }
+        StepKind::Helper => {
+            if first {
+                "Finished"
+            } else {
+                "finished"
+            }
+        }
+        StepKind::Other => {
+            if first {
+                "Used"
+            } else {
+                "used"
+            }
+        }
+    };
+    let (one, many) = match kind {
+        StepKind::Command => ("command", "commands"),
+        StepKind::Read | StepKind::Edit => ("file", "files"),
+        StepKind::Helper => ("background task", "background tasks"),
+        StepKind::Other => ("tool", "tools"),
+    };
+    format!("{verb} {} {}", n, noun(one, many))
+}
+
+/// Whether a group member failed, for the summary's error count. Helper
+/// cards carry no status; only failed tool steps count.
+fn step_failed(item: &Item) -> bool {
+    matches!(
+        item,
+        Item::Tool {
+            status: ToolStatus::Failed,
+            ..
+        }
+    )
+}
+
+/// The summary of the steps in a run: one clause per kind in order of first
+/// appearance, joined with ", ", with the errors named — " (1 error)" after
+/// a single clause, ", 1 with error" after several.
+pub fn step_group_label(steps: &[&Item]) -> String {
+    let mut clauses: Vec<(StepKind, usize)> = Vec::new();
+    let mut errors = 0;
+    for step in steps {
+        let kind = step_kind(step);
+        match clauses.iter_mut().find(|(k, _)| *k == kind) {
+            Some((_, count)) => *count += 1,
+            None => clauses.push((kind, 1)),
+        }
+        errors += usize::from(step_failed(step));
+    }
+    let label = clauses
+        .iter()
+        .enumerate()
+        .map(|(ix, (kind, n))| step_clause(*kind, *n, ix == 0))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let noun = if errors == 1 { "error" } else { "errors" };
+    match (errors, clauses.len()) {
+        (0, _) => label,
+        (_, 1) => format!("{label} ({errors} {noun})"),
+        (_, _) => format!("{label}, {errors} with {noun}"),
+    }
+}
+
+/// Whether `item` is a finished collapsible step that can join a run: what
+/// [`step_open_by_default`] folds to its quiet line, that isn't running.
+fn groupable_step(item: &Item) -> bool {
+    match item {
+        Item::Tool { status, .. } => {
+            step_open_by_default(item).is_some() && *status != ToolStatus::Running
+        }
+        _ => step_open_by_default(item).is_some(),
+    }
+}
+
+/// The runs of two or more consecutive finished collapsible steps
+/// ([`Item::Tool`], helper cards) in a transcript, each with its summary
+/// label. Everything else — assistant text, thinking, what you ran with
+/// `!`, generative-UI cards, notices — ends a run; a running step breaks
+/// it and stands alone until it finishes.
+pub fn step_groups(items: &[Item]) -> Vec<StepGroup> {
+    let mut groups = Vec::new();
+    let mut run: Vec<usize> = Vec::new();
+    for (ix, item) in items.iter().enumerate() {
+        if groupable_step(item) {
+            run.push(ix);
+        } else {
+            flush_group(&mut run, &mut groups, items);
+        }
+    }
+    flush_group(&mut run, &mut groups, items);
+    groups
+}
+
+/// Turn the current run into a group if it holds two or more steps.
+fn flush_group(run: &mut Vec<usize>, groups: &mut Vec<StepGroup>, items: &[Item]) {
+    if run.len() >= 2 {
+        let steps: Vec<&Item> = run.iter().map(|&ix| &items[ix]).collect();
+        groups.push(StepGroup {
+            items: run[0]..run[run.len() - 1] + 1,
+            label: step_group_label(&steps),
+        });
+    }
+    run.clear();
+}
+
 /// Token usage reported while the latest assistant message streams.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Usage {
@@ -792,6 +959,243 @@ mod tests {
 
     fn apply_all(t: &mut Transcript, events: &[Value]) -> Vec<Effects> {
         events.iter().map(|e| t.apply(e)).collect()
+    }
+
+    // ── Step groups (S11c) ─────────────────────────────────────────────────
+
+    fn step(name: &str, status: ToolStatus) -> Item {
+        Item::Tool {
+            call_id: format!("c-{name}"),
+            name: name.into(),
+            args: json!({}),
+            status,
+            output: String::new(),
+            details: json!({}),
+            duration_ms: None,
+        }
+    }
+
+    fn helper() -> Item {
+        Item::Custom {
+            kind: "gentle-jobs.notice".into(),
+            text: "done".into(),
+            details: json!({}),
+        }
+    }
+
+    fn text_item(text: &str) -> Item {
+        Item::Assistant {
+            blocks: vec![Block::Text(text.into())],
+            streaming: false,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn consecutive_finished_steps_fold_into_one_group() {
+        let items = vec![
+            text_item("On it"),
+            step("bash", ToolStatus::Done),
+            step("read", ToolStatus::Done),
+            step("edit", ToolStatus::Done),
+            text_item("Done"),
+        ];
+        assert_eq!(
+            step_groups(&items),
+            vec![StepGroup {
+                items: 1..4,
+                label: "Ran 1 command, read 1 file, edited 1 file".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn a_run_becomes_a_group_as_its_steps_finish() {
+        let mut t = Transcript::default();
+        apply_all(
+            &mut t,
+            &[
+                json!({"type":"message_start","message":{"role":"user","content":"go"}}),
+                json!({"type":"message_start","message":{"role":"assistant","content":[]}}),
+                json!({"type":"message_end","message":{"role":"assistant","stopReason":"toolUse","content":[]}}),
+                json!({"type":"tool_execution_start","toolCallId":"a","toolName":"bash","args":{}}),
+                json!({"type":"tool_execution_start","toolCallId":"b","toolName":"bash","args":{}}),
+                json!({"type":"tool_execution_start","toolCallId":"c","toolName":"bash","args":{}}),
+            ],
+        );
+        assert!(step_groups(&t.items).is_empty(), "nothing finished yet");
+        t.apply(&json!({"type":"tool_execution_end","toolCallId":"a","result":{}}));
+        // One finished step alone is not a group.
+        assert!(step_groups(&t.items).is_empty());
+        t.apply(&json!({"type":"tool_execution_end","toolCallId":"b","result":{}}));
+        let groups = step_groups(&t.items);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].items, 2..4);
+        assert_eq!(groups[0].label, "Ran 2 commands");
+    }
+
+    #[test]
+    fn a_running_step_splits_off_and_stands_alone() {
+        let mut t = Transcript::default();
+        apply_all(
+            &mut t,
+            &[
+                json!({"type":"message_start","message":{"role":"user","content":"go"}}),
+                json!({"type":"message_start","message":{"role":"assistant","content":[]}}),
+                json!({"type":"message_end","message":{"role":"assistant","stopReason":"toolUse","content":[]}}),
+                json!({"type":"tool_execution_start","toolCallId":"a","toolName":"bash","args":{}}),
+                json!({"type":"tool_execution_start","toolCallId":"b","toolName":"read","args":{}}),
+                json!({"type":"tool_execution_start","toolCallId":"c","toolName":"bash","args":{}}),
+                json!({"type":"tool_execution_end","toolCallId":"a","result":{}}),
+                json!({"type":"tool_execution_end","toolCallId":"b","result":{}}),
+            ],
+        );
+        // The finished steps before it stay grouped; the running one is not in it.
+        let groups = step_groups(&t.items);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].items, 2..4);
+        assert_eq!(groups[0].label, "Ran 1 command, read 1 file");
+        // When it finishes, it joins.
+        t.apply(&json!({"type":"tool_execution_end","toolCallId":"c","result":{}}));
+        assert_eq!(step_groups(&t.items)[0].items, 2..5);
+    }
+
+    #[test]
+    fn a_failed_step_stays_in_its_group_and_is_counted() {
+        let items = vec![
+            text_item("On it"),
+            step("bash", ToolStatus::Done),
+            step("bash", ToolStatus::Failed),
+            text_item("Sorry"),
+        ];
+        assert_eq!(
+            step_groups(&items),
+            vec![StepGroup {
+                items: 1..3,
+                label: "Ran 2 commands (1 error)".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn anything_but_finished_steps_breaks_a_run() {
+        let shell = Item::Shell {
+            command: "ls".into(),
+            output: String::new(),
+            exit_code: None,
+            running: false,
+        };
+        let thinking = Item::Assistant {
+            blocks: vec![Block::Thinking("hmm".into())],
+            streaming: false,
+            error: None,
+        };
+        let genui = Item::Tool {
+            call_id: "g".into(),
+            name: crate::genui::TOOL.into(),
+            args: json!({}),
+            status: ToolStatus::Done,
+            output: String::new(),
+            details: json!({}),
+            duration_ms: None,
+        };
+        let notice = Item::Notice {
+            level: NoticeLevel::Info,
+            text: "n".into(),
+        };
+        // What you ran yourself, thinking and notices are not steps.
+        for before in [&shell, &thinking, &notice] {
+            let items = vec![
+                text_item("A"),
+                before.clone(),
+                step("bash", ToolStatus::Done),
+            ];
+            assert!(step_groups(&items).is_empty());
+        }
+        // A `!command` between runs keeps both runs single.
+        let items = vec![
+            step("bash", ToolStatus::Done),
+            shell.clone(),
+            step("bash", ToolStatus::Done),
+            step("read", ToolStatus::Done),
+        ];
+        assert_eq!(step_groups(&items)[0].items, 2..4);
+        // The generative-UI tool is a live card, not a step.
+        let items = vec![
+            genui,
+            step("bash", ToolStatus::Done),
+            step("read", ToolStatus::Done),
+        ];
+        assert_eq!(step_groups(&items)[0].items, 1..3);
+        // A running step starts its own run, alone until it finishes.
+        let items = vec![
+            step("bash", ToolStatus::Running),
+            step("read", ToolStatus::Done),
+            step("read", ToolStatus::Done),
+        ];
+        assert_eq!(step_groups(&items)[0].items, 1..3);
+    }
+
+    #[test]
+    fn single_finished_steps_and_empty_runs_do_not_group() {
+        assert!(step_groups(&[]).is_empty());
+        assert!(step_groups(&[text_item("hi")]).is_empty());
+        assert!(step_groups(&[text_item("hi"), step("bash", ToolStatus::Done)]).is_empty());
+        assert!(
+            step_groups(&[
+                step("bash", ToolStatus::Done),
+                text_item("ok"),
+                step("read", ToolStatus::Done)
+            ])
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn helpers_group_as_background_tasks() {
+        let groups = step_groups(&[
+            text_item("x"),
+            helper(),
+            helper(),
+            step("grep", ToolStatus::Done),
+            text_item("y"),
+        ]);
+        assert_eq!(groups[0].label, "Finished 2 background tasks, used 1 tool");
+    }
+
+    #[test]
+    fn group_labels_pluralize_and_count_errors() {
+        let done = step("bash", ToolStatus::Done);
+        let failed = step("bash", ToolStatus::Failed);
+        let edit = step("edit", ToolStatus::Done);
+        let grep = step("grep", ToolStatus::Done);
+        let three: Vec<&Item> = (0..3).map(|_| &done).collect();
+        assert_eq!(step_group_label(&[]), "");
+        assert_eq!(step_group_label(&[&done]), "Ran 1 command");
+        assert_eq!(step_group_label(&three), "Ran 3 commands");
+        assert_eq!(step_group_label(&[&failed]), "Ran 1 command (1 error)");
+        assert_eq!(
+            step_group_label(&[&done, &failed]),
+            "Ran 2 commands (1 error)"
+        );
+        assert_eq!(
+            step_group_label(&[&failed, &failed]),
+            "Ran 2 commands (2 errors)"
+        );
+        assert_eq!(
+            step_group_label(&[&done, &failed, &edit]),
+            "Ran 2 commands, edited 1 file, 1 with error"
+        );
+        assert_eq!(
+            step_group_label(&[&failed, &failed, &edit]),
+            "Ran 2 commands, edited 1 file, 2 with errors"
+        );
+        // The order of mention is each kind's first appearance.
+        assert_eq!(
+            step_group_label(&[&edit, &done]),
+            "Edited 1 file, ran 1 command"
+        );
+        assert_eq!(step_group_label(&[&grep, &grep]), "Used 2 tools");
     }
 
     #[test]
