@@ -301,11 +301,15 @@ backdrop.occlude().child(ui::pop_in(
 - Header, in this order: `small` icon in `muted`, `text_base SEMIBOLD` title, subtitle that takes the remaining space and truncates, optional actions (spinner, count chip, `segmented`, `ghost().xsmall()` buttons with tooltip) and the close X (`ghost().xsmall()` with `IconName::X`). No `esc` badge in the header: Esc closes every screen anyway.
 - The body is the only part that scrolls (`flex_1().min_h_0().overflow_y_scroll()` with an id).
 - The view does not handle Esc: it emits its `Close` event and the `Workspace` removes it (`on_close_overlay`). The veil uses `.occlude()` so clicks do not pass through to what is behind; only the palette closes on a click on the veil.
-- Screens open below the title bar (`Workspace::render` places them under its 36 px), so its buttons stay usable: a screen button opens its screen in place of the current one, and the open screen's button shows selected and closes it. Only the welcome and onboarding cover the whole window.
+- Screens open below the title bar (`Workspace::render` places them under its 40 px), so its buttons stay usable: Configuration keeps its title-bar button, which opens its screen in place of the current one and shows selected and closes it while it is open. The other screens (Profiles, Memory, Sessions, Providers) live in the title bar's `⋯` menu at every width, where an entry can't carry that lit state. Only the welcome and onboarding cover the whole window.
+
+### Title bar
+
+The window's own chrome: workspace chip and tabs left, app actions right (`features/workspace/render.rs`), 40 px tall so every right-hand action fits. Every right-hand action is a 32×32 target with a 16 px icon through one helper (`title_action`, the ghost variant's default `Medium` size: `size_8` and `size_4`, both rems, so they follow the interface size); the three popover triggers (music ♪, instances tray, bell) are 32 px squares too. Tile, split down and close pane sit together on a sunken `well` pill, and hovering the close button still marks the pane it would close. The right cluster keeps `occlude()` (Windows answers unoccluded clicks as title-bar drags) and the two 1 px dividers are gone: 8 px gaps separate the actions. Tooltips name their shortcut with the shared helpers (`ui::platform_shortcut`, `ui::shortcut`: `⌘K` on macOS, `Ctrl+K` elsewhere) instead of hardcoding `⌘`.
 
 ### Full screen: welcome
 
-`features/welcome/` takes up the whole window (below the 36 px title bar on Windows and Linux; on macOS it leaves a drag area below the traffic lights).
+`features/welcome/` takes up the whole window (below the 40 px title bar on Windows and Linux; on macOS it leaves a drag area below the traffic lights).
 
 - `screen_bg()` background with a gradient from the top: `petal().opacity(0.10)` while installing, `success().opacity(0.10)` when everything required is ready and `petal().opacity(0.18)` during the entrance.
 - Banner at scale 2.6, blooming and writing itself over `banner::WRITE` (2600 ms, as long as `INTRO` + `AFTER_INTRO`); when ready it switches to `Palette::Green` with `pop_in`. Heading (34 px `BOLD`) and footer enter with `appear_after` at `AFTER_INTRO` (1100 ms). If the screen is shown again, `intro_done` draws everything in place without animating.

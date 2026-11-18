@@ -647,7 +647,7 @@ impl Workspace {
 }
 
 /// Height of the title bar's pills, tabs and buttons.
-pub(super) const TITLE_ITEM: f32 = 28.;
+pub(super) const TITLE_ITEM: f32 = 30.;
 
 /// A quiet square icon button for the title bar.
 pub(super) fn title_button(id: &'static str, icon: IconName) -> Button {

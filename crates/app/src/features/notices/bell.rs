@@ -59,7 +59,7 @@ impl RenderOnce for BellTrigger {
         div()
             .id("notices-bell")
             .relative()
-            .size(rems(28. / 16.))
+            .size(rems(32. / 16.))
             .flex()
             .items_center()
             .justify_center()
@@ -74,7 +74,7 @@ impl RenderOnce for BellTrigger {
             .when(!self.open, |d| {
                 d.tooltip(|window, cx| Tooltip::new("Notifications").build(window, cx))
             })
-            .child(Icon::new(IconName::Bell).small())
+            .child(Icon::new(IconName::Bell).with_size(gpui_kit::component::Size::Medium))
             .when(unread > 0, |d| {
                 d.child(
                     div()

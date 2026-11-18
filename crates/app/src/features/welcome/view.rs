@@ -15,7 +15,7 @@ use crate::shared::ui;
 /// The client-drawn title bar (Windows, Linux) keeps its window controls
 /// visible above the screen; on macOS the screen fills the window under the
 /// native traffic lights.
-const TITLE_BAR: f32 = 36.;
+const TITLE_BAR: f32 = 40.;
 /// The banner is ~175 px wide per unit of scale.
 const BANNER_SCALE: f32 = 2.6;
 

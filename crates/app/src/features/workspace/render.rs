@@ -3,8 +3,17 @@
 use super::*;
 use gpui_kit::component::Selectable as _;
 
-/// The title bar's height; overlay screens open below it.
-pub(super) const TITLE_BAR_HEIGHT: f32 = 36.;
+/// The title bar's height; overlay screens open below it. 40 px so the
+/// 32 px actions keep 4 px of air at each edge.
+pub(super) const TITLE_BAR_HEIGHT: f32 = 40.;
+
+/// A quiet 32×32 title action with a 16 px icon: every right-hand action of
+/// the title bar. The ghost variant's default `Medium` size is exactly that
+/// (`size_8` and `size_4`, both rems, so they follow the interface size);
+/// the hover tint and the 8 px radius come from the variant and the theme.
+fn title_action(id: &'static str, icon: IconName) -> Button {
+    Button::new(id).ghost().icon(Icon::new(icon))
+}
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -22,8 +31,6 @@ impl Render for Workspace {
         }
         let sidebar = self.sidebar.clone().filter(|_| self.sidebar_visible);
         let has_sidebar = self.sidebar.is_some();
-        // Below this the screen buttons fold into one overflow menu.
-        let narrow = window.viewport_size().width < rems(900. / 16.).to_pixels(window.rem_size());
         // Native web views would cover a screen or a dialog opened over
         // them; device cards stop capturing while covered.
         let covered =
@@ -105,100 +112,96 @@ impl Render for Workspace {
                                     .min_w_0()
                                     .overflow_hidden()
                                     .child(self.render_workspace_chip(cx))
-                                    .child(
-                                        div()
-                                            .flex_none()
-                                            .w(px(1.))
-                                            .h(rems(14. / 16.))
-                                            .bg(ui::border()),
-                                    )
                                     .child(self.render_tabs(cx)),
                             )
                             .child(
                                 h_flex()
                                     .flex_none()
-                                    .gap_1()
+                                    .gap_2()
                                     // Without this, Windows answers clicks on these
                                     // buttons as title-bar drags (HTCAPTION).
                                     .occlude()
                                     // Tern keeps pane layout in the title bar, so
                                     // panes carry no header; these act on the
-                                    // focused pane.
+                                    // focused pane, grouped on a sunken pill.
                                     .when(self.tab().is_some(), |d| {
                                         d.child(
-                                            Button::new("title-tile-pane")
-                                                .ghost()
-                                                .xsmall()
-                                                .icon(Icon::new(IconName::LayoutDashboard))
-                                                .tooltip(format!(
-                                                    "New pane, tiled ({})",
-                                                    ui::platform_shortcut("⌘D", "Ctrl+Shift+D")
-                                                ))
-                                                .on_click(cx.listener(|this, _, window, cx| {
-                                                    this.on_tile_pane(&TilePane, window, cx)
-                                                })),
-                                        )
-                                        .child(
-                                            Button::new("title-split-down")
-                                                .ghost()
-                                                .xsmall()
-                                                .icon(Icon::new(IconName::Rows2))
-                                                .tooltip(format!(
-                                                    "Split down ({})",
-                                                    ui::platform_shortcut("⌘⇧D", "Ctrl+Shift+E")
-                                                ))
-                                                .on_click(cx.listener(|this, _, window, cx| {
-                                                    this.on_split_down(&SplitDown, window, cx)
-                                                })),
-                                        )
-                                        .child({
-                                            // Names the pane it closes; hovering it
-                                            // marks that pane (see `render_pane`).
-                                            let target = self
-                                                .focused_pane()
-                                                .map(|id| self.pane_title(id))
-                                                .unwrap_or_default();
-                                            let hover = cx.entity().downgrade();
-                                            // The hover is the wrapper's: the button's
-                                            // tooltip already takes its own `on_hover`,
-                                            // and GPUI allows one per element.
-                                            div()
-                                                .id("title-close-pane-hover")
-                                                .on_hover(move |hovered, _, cx| {
-                                                    let hovered = *hovered;
-                                                    let _ = hover.update(cx, |this, cx| {
-                                                        if this.close_hover != hovered {
-                                                            this.close_hover = hovered;
-                                                            cx.notify();
-                                                        }
-                                                    });
-                                                })
+                                            h_flex()
+                                                .gap_1()
+                                                .p(rems(2. / 16.))
+                                                .rounded(rems(8. / 16.))
+                                                .bg(ui::well())
                                                 .child(
-                                                    Button::new("title-close-pane")
-                                                        .ghost()
-                                                        .xsmall()
-                                                        .icon(Icon::new(IconName::X))
-                                                        .tooltip(format!(
-                                                            "Close \u{201c}{}\u{201d} ({})",
-                                                            target.trim_end_matches(" •"),
-                                                            ui::shortcut("W")
-                                                        ))
-                                                        .on_click(cx.listener(
-                                                            |this, _, window, cx| {
-                                                                this.close_hover = false;
-                                                                this.on_close_pane(
-                                                                    &ClosePane, window, cx,
-                                                                )
-                                                            },
-                                                        )),
+                                                    title_action(
+                                                        "title-tile-pane",
+                                                        IconName::LayoutDashboard,
+                                                    )
+                                                    .tooltip(format!(
+                                                        "New pane, tiled ({})",
+                                                        ui::platform_shortcut("⌘D", "Ctrl+Shift+D")
+                                                    ))
+                                                    .on_click(cx.listener(|this, _, window, cx| {
+                                                        this.on_tile_pane(&TilePane, window, cx)
+                                                    })),
                                                 )
-                                        })
-                                        .child(
-                                            div()
-                                                .w(px(1.))
-                                                .h(rems(14. / 16.))
-                                                .mx_1()
-                                                .bg(ui::border()),
+                                                .child(
+                                                    title_action(
+                                                        "title-split-down",
+                                                        IconName::Rows2,
+                                                    )
+                                                    .tooltip(format!(
+                                                        "Split down ({})",
+                                                        ui::platform_shortcut(
+                                                            "⌘⇧D",
+                                                            "Ctrl+Shift+E"
+                                                        )
+                                                    ))
+                                                    .on_click(cx.listener(|this, _, window, cx| {
+                                                        this.on_split_down(&SplitDown, window, cx)
+                                                    })),
+                                                )
+                                                .child({
+                                                    // Names the pane it closes; hovering it
+                                                    // marks that pane (see `render_pane`).
+                                                    let target = self
+                                                        .focused_pane()
+                                                        .map(|id| self.pane_title(id))
+                                                        .unwrap_or_default();
+                                                    let hover = cx.entity().downgrade();
+                                                    // The hover is the wrapper's: the button's
+                                                    // tooltip already takes its own `on_hover`,
+                                                    // and GPUI allows one per element.
+                                                    div()
+                                                        .id("title-close-pane-hover")
+                                                        .on_hover(move |hovered, _, cx| {
+                                                            let hovered = *hovered;
+                                                            let _ = hover.update(cx, |this, cx| {
+                                                                if this.close_hover != hovered {
+                                                                    this.close_hover = hovered;
+                                                                    cx.notify();
+                                                                }
+                                                            });
+                                                        })
+                                                        .child(
+                                                            title_action(
+                                                                "title-close-pane",
+                                                                IconName::X,
+                                                            )
+                                                            .tooltip(format!(
+                                                                "Close \u{201c}{}\u{201d} ({})",
+                                                                target.trim_end_matches(" •"),
+                                                                ui::shortcut("W")
+                                                            ))
+                                                            .on_click(cx.listener(
+                                                                |this, _, window, cx| {
+                                                                    this.close_hover = false;
+                                                                    this.on_close_pane(
+                                                                        &ClosePane, window, cx,
+                                                                    )
+                                                                },
+                                                            )),
+                                                        )
+                                                }),
                                         )
                                     })
                                     .when_some(
@@ -242,188 +245,135 @@ impl Render for Workspace {
                                             ))
                                     })
                                     .child(
-                                        Button::new("open-palette")
-                                            .ghost()
-                                            .xsmall()
-                                            .icon(Icon::new(IconName::Command))
+                                        title_action("open-palette", IconName::Command)
                                             .tooltip(format!("Commands ({})", ui::shortcut("K")))
                                             .on_click(cx.listener(|this, _, window, cx| {
                                                 this.on_open_palette(&OpenPalette, window, cx)
                                             })),
                                     )
-                                    .when(narrow, |d| {
+                                    .child({
+                                        // The screens live here at every width (no narrow
+                                        // fork anymore): one code path for the menu.
                                         let weak = cx.entity().downgrade();
-                                        d.child(
-                                            div()
-                                                .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                                                    cx.stop_propagation()
-                                                })
-                                                .child(
-                                                    Button::new("title-overflow")
-                                                        .ghost()
-                                                        .xsmall()
-                                                        .icon(Icon::new(IconName::Ellipsis))
-                                                        .dropdown_menu(move |menu, window, _| {
-                                                            type Open = fn(
-                                                                &mut Workspace,
-                                                                &mut Window,
-                                                                &mut Context<Workspace>,
-                                                            );
-                                                            let entry = |icon: IconName,
-                                                                         label: &'static str,
-                                                                         detail: &'static str,
-                                                                         open: Open| {
-                                                                let weak = weak.clone();
-                                                                PopupMenuItem::element(
-                                                                    move |_, _| {
-                                                                        menu_row(
-                                                                            icon, label, detail,
-                                                                            "",
-                                                                        )
-                                                                    },
-                                                                )
-                                                                .on_click(move |_, window, cx| {
-                                                                    let _ = weak.update(
-                                                                        cx,
-                                                                        |this, cx| {
-                                                                            open(this, window, cx)
-                                                                        },
-                                                                    );
-                                                                })
-                                                            };
-                                                            menu.min_w(
-                                                                rems(260. / 16.)
-                                                                    .to_pixels(window.rem_size()),
+                                        div()
+                                            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                                cx.stop_propagation()
+                                            })
+                                            .child(
+                                                title_action("title-overflow", IconName::Ellipsis)
+                                                    .dropdown_menu(move |menu, window, _| {
+                                                        type Open = fn(
+                                                            &mut Workspace,
+                                                            &mut Window,
+                                                            &mut Context<Workspace>,
+                                                        );
+                                                        let entry = |icon: IconName,
+                                                                     label: &'static str,
+                                                                     detail: &'static str,
+                                                                     open: Open| {
+                                                            let weak = weak.clone();
+                                                            PopupMenuItem::element(
+                                                                move |_, _| {
+                                                                    menu_row(
+                                                                        icon, label, detail, "",
+                                                                    )
+                                                                },
                                                             )
-                                                            .item(entry(
-                                                                IconName::Settings,
-                                                                "Configuration",
-                                                                "Settings for this folder",
-                                                                |this, window, cx| {
-                                                                    this.open_settings(window, cx)
-                                                                },
-                                                            ))
-                                                            .item(entry(
-                                                                IconName::Route,
-                                                                "Profiles",
-                                                                "Model and effort per agent",
-                                                                |this, window, cx| {
-                                                                    this.open_profiles(window, cx)
-                                                                },
-                                                            ))
-                                                            .item(entry(
-                                                                IconName::Brain,
-                                                                "Memory",
-                                                                "Engram observations",
-                                                                |this, window, cx| {
-                                                                    this.open_memory(window, cx)
-                                                                },
-                                                            ))
-                                                            .item(entry(
-                                                                IconName::RotateCcwClock,
-                                                                "Sessions",
-                                                                "Resume a past session",
-                                                                |this, window, cx| {
-                                                                    this.open_sessions(window, cx)
-                                                                },
-                                                            ))
-                                                            .item(entry(
-                                                                IconName::KeyRound,
-                                                                "Providers",
-                                                                "Sign-in and API keys",
-                                                                |this, window, cx| {
-                                                                    this.open_providers(window, cx)
-                                                                },
-                                                            ))
-                                                        }),
-                                                ),
-                                        )
+                                                            .on_click(move |_, window, cx| {
+                                                                let _ = weak.update(
+                                                                    cx,
+                                                                    |this, cx| {
+                                                                        open(this, window, cx)
+                                                                    },
+                                                                );
+                                                            })
+                                                        };
+                                                        menu.min_w(
+                                                            rems(260. / 16.)
+                                                                .to_pixels(window.rem_size()),
+                                                        )
+                                                        .item(entry(
+                                                            IconName::Settings,
+                                                            "Configuration",
+                                                            "Settings for this folder",
+                                                            |this, window, cx| {
+                                                                this.open_settings(window, cx)
+                                                            },
+                                                        ))
+                                                        .item(entry(
+                                                            IconName::Route,
+                                                            "Profiles",
+                                                            "Model and effort per agent",
+                                                            |this, window, cx| {
+                                                                this.open_profiles(window, cx)
+                                                            },
+                                                        ))
+                                                        .item(entry(
+                                                            IconName::Brain,
+                                                            "Memory",
+                                                            "Engram observations",
+                                                            |this, window, cx| {
+                                                                this.open_memory(window, cx)
+                                                            },
+                                                        ))
+                                                        .item(entry(
+                                                            IconName::RotateCcwClock,
+                                                            "Sessions",
+                                                            "Resume a past session",
+                                                            |this, window, cx| {
+                                                                this.open_sessions(window, cx)
+                                                            },
+                                                        ))
+                                                        .item(entry(
+                                                            IconName::KeyRound,
+                                                            "Providers",
+                                                            "Sign-in and API keys",
+                                                            |this, window, cx| {
+                                                                this.open_providers(window, cx)
+                                                            },
+                                                        ))
+                                                    }),
+                                            )
                                     })
-                                    .when(!narrow, |d| {
-                                        // The screens stay reachable while one is open
-                                        // (they open below the title bar): a button opens
-                                        // its screen in place of the current one, and the
-                                        // open screen's button is lit and closes it.
-                                        type Open = fn(
-                                            &mut Workspace,
-                                            &mut Window,
-                                            &mut Context<Workspace>,
-                                        );
-                                        let button = |id: &'static str,
-                                                      icon: IconName,
-                                                      tip: &'static str,
-                                                      open_now: bool,
-                                                      open: Open| {
-                                            Button::new(id)
-                                                .ghost()
-                                                .xsmall()
-                                                .icon(Icon::new(icon))
-                                                .tooltip(tip)
-                                                .selected(open_now)
-                                                .on_click(cx.listener(move |this, _, window, cx| {
-                                                    if open_now {
-                                                        this.close_overlay(window, cx)
-                                                    } else {
-                                                        open(this, window, cx)
-                                                    }
-                                                }))
-                                        };
-                                        let open = |is: fn(&Overlay) -> bool| {
-                                            self.overlay.as_ref().is_some_and(|(o, _)| is(o))
-                                        };
-                                        d.child(button(
-                                            "open-settings",
-                                            IconName::Settings,
-                                            "Configuration",
-                                            open(|o| matches!(o, Overlay::Settings(_))),
-                                            |this, window, cx| this.open_settings(window, cx),
-                                        ))
-                                        .child(button(
-                                            "open-profiles",
-                                            IconName::Route,
-                                            "Profiles: model and effort per agent",
-                                            open(|o| matches!(o, Overlay::Profiles(_))),
-                                            |this, window, cx| this.open_profiles(window, cx),
-                                        ))
-                                        .child(button(
-                                            "open-memory",
-                                            IconName::Brain,
-                                            "Memory (Engram)",
-                                            open(|o| matches!(o, Overlay::Memory(_))),
-                                            |this, window, cx| this.open_memory(window, cx),
-                                        ))
-                                        .child(button(
-                                            "open-sessions",
-                                            IconName::RotateCcwClock,
-                                            "Sessions",
-                                            open(|o| matches!(o, Overlay::Sessions(_))),
-                                            |this, window, cx| this.open_sessions(window, cx),
-                                        ))
-                                        .child(button(
-                                            "open-providers",
-                                            IconName::KeyRound,
-                                            "Providers and sign-in",
-                                            open(|o| matches!(o, Overlay::Providers(_))),
-                                            |this, window, cx| this.open_providers(window, cx),
-                                        ))
+                                    .child({
+                                        // Configuration stays a visible button: the other
+                                        // screens moved into the ⋯ menu at every width, but
+                                        // a menu entry can't show selected while its screen
+                                        // is open (see design-system.md), so this one keeps
+                                        // the lit-and-closes behavior.
+                                        let open = self.overlay.as_ref().is_some_and(|(o, _)| {
+                                            matches!(o, Overlay::Settings(_))
+                                        });
+                                        title_action("open-settings", IconName::Settings)
+                                            .tooltip("Configuration")
+                                            .selected(open)
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                if open {
+                                                    this.close_overlay(window, cx)
+                                                } else {
+                                                    this.open_settings(window, cx)
+                                                }
+                                            }))
                                     })
                                     .when(has_sidebar, |d| {
                                         d.child(
-                                            Button::new("toggle-sidebar")
-                                                .ghost()
-                                                .xsmall()
-                                                .icon(Icon::new(if self.sidebar_visible {
+                                            title_action(
+                                                "toggle-sidebar",
+                                                if self.sidebar_visible {
                                                     IconName::PanelLeftClose
                                                 } else {
                                                     IconName::PanelLeftOpen
-                                                }))
-                                                .tooltip(format!(
-                                                    "Toggle sidebar ({})",
-                                                    ui::shortcut("B")
-                                                ))
-                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                },
+                                            )
+                                            .tooltip(format!(
+                                                "Toggle sidebar ({})",
+                                                ui::shortcut("B")
+                                            ))
+                                            .on_click(
+                                                cx.listener(|this, _, _, cx| {
                                                     this.toggle_sidebar(cx)
-                                                })),
+                                                }),
+                                            ),
                                         )
                                     }),
                             ),
@@ -512,10 +462,7 @@ impl Workspace {
                 // Clicks here are not title-bar drags.
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .child(
-                    Button::new("title-devices")
-                        .ghost()
-                        .xsmall()
-                        .icon(Icon::new(IconName::Smartphone))
+                    title_action("title-devices", IconName::Smartphone)
                         .when(open, |b| b.text_color(ui::petal()))
                         .tooltip("Devices: simulators and emulators")
                         .on_click(cx.listener(|this, _, _, cx| {

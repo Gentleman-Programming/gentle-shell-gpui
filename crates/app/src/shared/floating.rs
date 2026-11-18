@@ -19,7 +19,7 @@ pub const MIN_H: f32 = 220.;
 pub const MAX_INSET: f32 = 10.;
 /// Height of the window's title bar at 100 % (it scales with the interface
 /// size), which a maximized card leaves alone.
-pub const TITLE_BAR: f32 = 36.;
+pub const TITLE_BAR: f32 = 40.;
 /// The header you drag to move the card.
 pub const HEADER: f32 = 38.;
 /// The grab band along each edge, inside the card.

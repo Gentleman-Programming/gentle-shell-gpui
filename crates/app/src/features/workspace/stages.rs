@@ -527,7 +527,7 @@ impl RenderOnce for TrayTrigger {
         div()
             .id("instances-tray")
             .relative()
-            .size(rems(28. / 16.))
+            .size(rems(32. / 16.))
             .flex()
             .items_center()
             .justify_center()
@@ -539,7 +539,7 @@ impl RenderOnce for TrayTrigger {
             .when(!self.open, |d| {
                 d.tooltip(|window, cx| Tooltip::new("Pages agents opened").build(window, cx))
             })
-            .child(Icon::new(IconName::Globe).small())
+            .child(Icon::new(IconName::Globe).with_size(gpui_kit::component::Size::Medium))
             .child(
                 div()
                     .absolute()

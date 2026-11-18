@@ -62,8 +62,8 @@ pub fn run(
                 titlebar: Some(TitlebarOptions {
                     title: Some("Gentle Shell".into()),
                     appears_transparent: true,
-                    // Centered in the 36 px title bar (workspace.rs).
-                    traffic_light_position: Some(point(px(14.), px(11.))),
+                    // Centered in the 40 px title bar (workspace/render.rs).
+                    traffic_light_position: Some(point(px(14.), px(14.))),
                 }),
                 app_id: Some("dev.gentle-shell.gpui".into()),
                 #[cfg(target_os = "linux")]

@@ -351,7 +351,7 @@ impl RenderOnce for MusicTrigger {
         const BARS: [f32; 3] = [6., 11., 8.];
         div()
             .id("music-button")
-            .size(rems(28. / 16.))
+            .size(rems(32. / 16.))
             .flex()
             .items_center()
             .justify_center()
@@ -373,7 +373,7 @@ impl RenderOnce for MusicTrigger {
                     .into_any_element()
             } else {
                 Icon::new(IconName::Music)
-                    .small()
+                    .with_size(gpui_kit::component::Size::Medium)
                     .text_color(ui::fg())
                     .into_any_element()
             })
