@@ -96,7 +96,7 @@ Everything the app stores lives under `dirs::data_dir()/gentle-shell-gpui/`, or 
 | `GENTLE_PI_BACKGROUND_SUBAGENTS` | `features/settings/snapshot.rs` | Source of the background subagents policy shown in Settings. |
 | `GENTLE_SHELL_GENTLE_AI_PIN` | `features/setup/gentle.rs` | Gentle AI pin used by the setup check. |
 | `ENGRAM_URL`, `ENGRAM_PORT`, `ENGRAM_HTTP_TOKEN` | `features/memory/client.rs` | Engram server (default port `7437`). |
-| `ENGRAM_BIN` | `features/setup/extras.rs` | Engram binary for the check. |
+| `ENGRAM_BIN` | `features/setup/extras.rs` | Engram binary for the check, ahead of the PATH. When it names a missing file the check fails with that path and Install and Update stop, since a download can't fix it. |
 | `SHELL` | `launch.rs` (`login_shell_path`), `features/terminal/mod.rs` | Login shell whose PATH is combined (Unix), and the shell for terminal panels. |
 | `GOBIN`, `GOPATH` | `launch.rs` (`go_bin_dir`) | Where `go install` puts programs (default `~/go/bin`), added at the end of the combined PATH when it exists. |
 | `GENTLE_SHELL_GPUI_DATA_DIR` | `shared/data_dir.rs` | Replaces the app's data folder (`<data dir>/gentle-shell-gpui`). Gentle Shell's homes still come from `HOME`. |
