@@ -761,6 +761,9 @@ mod tests {
         assert_eq!(rpc_provider_title("openai"), "OpenAI · ChatGPT");
         assert_eq!(rpc_provider_title("claude"), "Anthropic · Claude");
         assert_eq!(rpc_provider_title("anthropic"), "Anthropic · Claude");
+        // Claude through the bridge keeps a title of its own: the windows are
+        // the same Claude plan, but the card says which path served them.
+        assert_eq!(rpc_provider_title("claude-bridge"), "Claude Code · bridge");
         assert_eq!(rpc_provider_title("nan"), "NaN Cloud");
         // A provider the app has no title for shows its own id, not a blank
         // "Provider" (DeepSeek, Copilot, …).
