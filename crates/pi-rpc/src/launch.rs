@@ -913,6 +913,9 @@ pub fn output_within(
     use std::time::Instant;
 
     let mut child = command.stdout(std::process::Stdio::piped()).spawn().ok()?;
+    // A run killed at its deadline may leave processes it started; they end
+    // with the app at the latest (Windows; elsewhere a no-op).
+    crate::job::contain(&child);
     let mut stdout = child.stdout.take()?;
     let (tx, rx) = mpsc::channel::<Vec<u8>>();
     std::thread::spawn(move || {
