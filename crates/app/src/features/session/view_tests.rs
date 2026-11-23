@@ -3,7 +3,7 @@
 //! send, driven by simulated clicks.
 
 // Not a glob: GPUI exports a `test` attribute that would shadow `#[test]`.
-use gpui_kit::{Entity, Modifiers, TestAppContext, VisualTestContext};
+use gpui_kit::{AppContext as _, Entity, Modifiers, TestAppContext, VisualTestContext};
 use pi_rpc::desktop_rpc::{PROMPT_COMMAND, SCHEMA, WIDGET_KEY};
 use pi_rpc::{UiMethod, UiRequest};
 use serde_json::{Value, json};
@@ -362,6 +362,84 @@ fn arrows_recall_sent_prompts_and_return_to_the_draft(cx: &mut TestAppContext) {
     assert_eq!(composer(cx), "second\nline two");
     cx.simulate_keystrokes("down");
     assert_eq!(composer(cx), "draft");
+}
+
+#[gpui::test]
+fn dictation_appends_to_the_originating_draft_without_taking_focus(cx: &mut TestAppContext) {
+    let (origin, cx) = tab(cx);
+    cx.update(|window, cx| {
+        let other = cx.new(|cx| SessionView::new(std::env::temp_dir(), None, window, cx, false));
+        let other_draft = other.read(cx).composer();
+        other_draft.update(cx, |state, cx| {
+            state.set_value("other draft", window, cx);
+            state.focus(window, cx);
+        });
+        let before = window.focused(cx);
+        let draft = origin.read(cx).composer();
+        draft.update(cx, |state, cx| {
+            state.set_value("café while typing", window, cx);
+            state.set_selected_range_with_direction(0..5, true, cx);
+        });
+        origin.update(cx, |view, cx| {
+            use super::voice::Status;
+            use pi_rpc::voice::VoiceEvent;
+
+            let result = || VoiceEvent::Result {
+                text: "  dictated words  ".into(),
+                truncated: false,
+            };
+            view.voice.status = Status::Transcribing;
+            view.reset_conversation();
+            view.finish_dictation(result(), window, cx);
+            assert_eq!(draft.read(cx).value().as_ref(), "café while typing");
+
+            view.voice.status = Status::Transcribing;
+            view.finish_dictation(result(), window, cx);
+        });
+        assert_eq!(
+            draft.read(cx).value().as_ref(),
+            "café while typing dictated words"
+        );
+        assert_eq!(draft.read(cx).selected_range(), 0..5);
+        assert!(draft.read(cx).is_selection_reversed());
+        assert_eq!(other_draft.read(cx).value().as_ref(), "other draft");
+        assert_eq!(window.focused(cx), before);
+        assert!(origin.read(cx).transcript.items.is_empty());
+    });
+}
+
+#[gpui::test]
+fn dictation_drops_delayed_results_after_the_draft_is_consumed(cx: &mut TestAppContext) {
+    use super::voice::Status;
+    use pi_rpc::voice::VoiceEvent;
+
+    let (origin, cx) = tab(cx);
+    cx.update(|window, cx| {
+        origin.update(cx, |view, cx| {
+            let draft = view.composer();
+            draft.update(cx, |state, cx| state.set_value("draft to send", window, cx));
+            view.voice.status = Status::Transcribing;
+            view.submit(window, cx); // No backend: submission is rejected, so the draft survives.
+            assert_eq!(view.voice.status, Status::Transcribing);
+            assert_eq!(draft.read(cx).value().as_ref(), "draft to send");
+
+            // The accepted submission's shared draft-consumption boundary.
+            view.consume_submitted_draft(window, cx);
+            assert_eq!(view.voice.status, Status::Cancelling);
+            assert!(draft.read(cx).value().is_empty());
+            draft.update(cx, |state, cx| state.set_value("next draft", window, cx));
+            view.finish_dictation(
+                VoiceEvent::Result {
+                    text: "late".into(),
+                    truncated: false,
+                },
+                window,
+                cx,
+            );
+            assert_eq!(draft.read(cx).value().as_ref(), "next draft");
+            assert_eq!(view.voice.status, Status::Idle);
+        });
+    });
 }
 
 /// Esc closes what is open first; with nothing open it stops the running

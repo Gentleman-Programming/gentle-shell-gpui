@@ -9,6 +9,7 @@ use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::notification::Notification;
 use gpui_kit::*;
 use pi_rpc::PiProcess;
+use pi_rpc::voice::VoiceAdapter;
 
 use super::SessionView;
 use super::state::BackendStatus;
@@ -279,6 +280,7 @@ impl SessionView {
     }
 
     fn start(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.voice.reset_backend();
         self.shutdown_backend();
         self.backend.started = true;
         self.backend.status = BackendStatus::Starting;
@@ -333,13 +335,17 @@ impl SessionView {
                             .push((crate::features::canvas::AGENT_ENV.into(), canvas.into()));
                     }
                     let version = pi_rpc::backend_version(&spec);
+                    // Resolve mutable install aliases before the RPC launch.
+                    let adapter = VoiceAdapter::from_launch(&spec);
                     let (process, rx) = PiProcess::spawn(&spec)?;
-                    anyhow::Ok((process, rx, version))
+                    let voice_launch = adapter.map(|adapter| (spec, adapter));
+                    anyhow::Ok((process, rx, version, voice_launch))
                 })
                 .await;
             let rx = match spawned {
-                Ok((process, rx, version)) => {
+                Ok((process, rx, version, voice_launch)) => {
                     let ok = this.update(cx, |this, cx| {
+                        this.voice.launch = voice_launch;
                         this.backend.status = BackendStatus::Ready(process);
                         this.backend.version = version;
                         this.genui_mode = genui_mode;
@@ -375,7 +381,12 @@ impl SessionView {
                 // One update (and one frame) for everything already queued.
                 let batch = drain_queued(first, &rx);
                 if this
-                    .update_in(cx, |this, window, cx| this.handle_batch(batch, window, cx))
+                    .update_in(cx, |this, window, cx| {
+                        this.handle_batch(batch, window, cx);
+                        if !this.backend.is_ready() {
+                            this.voice.reset_backend();
+                        }
+                    })
                     .is_err()
                 {
                     break;
@@ -397,6 +408,7 @@ impl SessionView {
 
     /// Forget the conversation shown, for another one on the same backend.
     pub(super) fn reset_conversation(&mut self) {
+        self.voice.reset_state();
         self.transcript = Transcript::default();
         self.markdown.clear();
         self.expanded.clear();

@@ -741,8 +741,21 @@ impl SessionView {
         });
     }
 
+    fn request_state(
+        &self,
+        cx: &mut Context<Self>,
+        then: impl FnOnce(&mut Self, Result<Value>, &mut Context<Self>) + 'static,
+    ) {
+        let epoch = self.voice.state_epoch();
+        self.request(json!({"type": "get_state"}), cx, move |this, result, cx| {
+            // `request` already drops replies from replaced or exited processes.
+            this.voice.observe_state(epoch, result.is_ok());
+            then(this, result, cx);
+        });
+    }
+
     pub(super) fn refresh_state(&mut self, cx: &mut Context<Self>) {
-        self.request(json!({"type": "get_state"}), cx, |this, result, _| {
+        self.request_state(cx, |this, result, _| {
             if let Some(state) = this.report(result) {
                 this.models.current = ModelInfo::parse(&state["model"]);
                 this.models.thinking = state["thinkingLevel"].as_str().unwrap_or("off").to_string();
@@ -790,7 +803,7 @@ impl SessionView {
     /// Re-read the session's model and thinking level after something other
     /// than the picker moved them (a profile Gentle Shell applied).
     fn refresh_model(&mut self, cx: &mut Context<Self>) {
-        self.request(json!({"type": "get_state"}), cx, |this, result, _| {
+        self.request_state(cx, |this, result, _| {
             if let Some(state) = this.report(result) {
                 this.models.current = ModelInfo::parse(&state["model"]);
                 this.models.thinking = state["thinkingLevel"].as_str().unwrap_or("off").to_string();
@@ -877,7 +890,7 @@ impl SessionView {
                 this.models.current = Some(model);
                 this.refresh_stats(cx);
                 this.refresh_thinking_levels(cx);
-                this.request(json!({"type": "get_state"}), cx, |this, result, _| {
+                this.request_state(cx, |this, result, _| {
                     if let Ok(state) = result {
                         this.models.thinking =
                             state["thinkingLevel"].as_str().unwrap_or("off").to_string();

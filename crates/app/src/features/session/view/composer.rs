@@ -22,6 +22,7 @@ use super::dialogs::checkbox_box;
 use super::{NARROW, TINY, image_tile, number_badge};
 use crate::features::session::SessionView;
 use crate::features::session::attachments::PastedText;
+use crate::features::session::voice::Status;
 use crate::shared::kisses::{HEART, LIPS, noise, paint_sprite};
 use crate::shared::ui;
 use gentle_core::transcript::format_tokens;
@@ -377,6 +378,26 @@ impl SessionView {
                 .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx)))
         };
 
+        let voice = self.voice.status;
+        let mic_label = if voice == Status::Idle && !ready {
+            Status::Unavailable.message()
+        } else {
+            voice.message()
+        };
+        let mic = Button::new("dictation-mic")
+            .ghost()
+            .xsmall()
+            .icon(Icon::new(IconName::Mic))
+            .text_color(if voice == Status::Recording {
+                ui::danger()
+            } else {
+                ui::muted()
+            })
+            .tooltip(mic_label)
+            .accessibility_label(mic_label)
+            .disabled((!ready || voice.active()) && voice != Status::Recording)
+            .on_click(cx.listener(|this, _, window, cx| this.toggle_dictation(window, cx)));
+
         let repository = self.git.repository.clone();
         // In the row below the box the branch shrinks and truncates —
         // only its leaf text gives way — before anything else there would.
@@ -458,6 +479,18 @@ impl SessionView {
                 |this, chip| this.child(div().flex_shrink_0().child(chip)),
             )
             .child(div().flex_1().min_w_0())
+            .child(div().flex_shrink_0().child(mic))
+            .when(voice.can_cancel(), |this| {
+                this.child(
+                    Button::new("dictation-cancel")
+                        .ghost()
+                        .xsmall()
+                        .icon(Icon::new(IconName::X))
+                        .tooltip("Cancel dictation")
+                        .accessibility_label("Cancel dictation")
+                        .on_click(cx.listener(|this, _, _, cx| this.cancel_dictation(cx))),
+                )
+            })
             .child(div().flex_shrink_0().child(action_button));
 
         // Below the box: the folder, branch and cost in a quiet row of
@@ -553,6 +586,14 @@ impl SessionView {
             .pb_2p5()
             .children(self.render_attachments(cx))
             .child(self.render_text_field(ready, cx))
+            .when(voice != Status::Idle, |this| {
+                this.child(
+                    div()
+                        .text_xs()
+                        .text_color(ui::muted())
+                        .child(voice.message()),
+                )
+            })
             .child(bottom);
         let composer_box = div()
             .relative()

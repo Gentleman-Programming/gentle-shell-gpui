@@ -235,6 +235,8 @@ A slash command's text output appears as one result card. Hover an answer, or a 
 
 Enter sends; while the agent runs, Enter steers it and Esc, ⌘. (Ctrl+. elsewhere) or the Stop button stops it, as in Gentle Shell's terminal ("stopping…" shows until the turn ends; the conversation and your draft stay). Esc closes what is open first (the `/` menu, the model picker, the Agents panel, a dialog, an expanded surface), and an Esc right after one that closed something doesn't stop. `!cmd` / `!!cmd` run shell commands; the Stop button, Esc and ⌘. stop a running one too (`abort_bash`). `/` lists commands (↑/↓ move through them, Tab or Enter fills one in, Esc closes the list), including Pi's built-ins: `/compact [what to keep]`, `/name <title>`, `/copy`, `/export [path]` (HTML) and `/reload` (restarts the backend and resumes the conversation).
 
+Use the composer’s microphone to start local dictation, then click it again to stop and transcribe. **Cancel dictation** discards the recording or pending result. Text appends to the original tab’s draft and is never sent automatically. Dictation reuses the model and runtime already installed by [a compatible Gentle Shell](docs/integrations.md#local-dictation); Desktop does not download them.
+
 ↑ on the composer's first line brings back the prompts you sent before, newest first, as in Gentle Shell's terminal (a resumed conversation's prompts included); ↓ on its last line walks back to the newest and then to what you were writing. A recalled prompt is only put in the composer, never sent. Inside a multi-line prompt the arrows move the cursor as usual, and while attachments or long pastes are in the composer they stay out of it.
 
 <details>
