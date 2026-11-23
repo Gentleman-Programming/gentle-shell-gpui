@@ -92,6 +92,7 @@ impl Workspace {
                     ),
                 };
                 SavedWorkspace {
+                    id: space.id.clone(),
                     name: space.name.clone(),
                     root: space.root.clone(),
                     tabs,
