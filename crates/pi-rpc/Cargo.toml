@@ -11,7 +11,14 @@ async-channel.workspace = true
 dunce = "1"
 serde.workspace = true
 serde_json.workspace = true
+sha2 = "0.10.9"
 which = "8"
+
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+libc = "0.2.191"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
 
 [dev-dependencies]
 pollster = "1.0"

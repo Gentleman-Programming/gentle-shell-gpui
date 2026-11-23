@@ -22,6 +22,7 @@ use super::dialogs::checkbox_box;
 use super::{NARROW, TINY, image_tile, number_badge};
 use crate::features::session::SessionView;
 use crate::features::session::attachments::PastedText;
+use crate::features::session::voice::Status;
 use crate::shared::kisses::{HEART, LIPS, noise, paint_sprite};
 use crate::shared::ui;
 use gentle_core::input_style::InputStyle;
@@ -550,11 +551,49 @@ impl SessionView {
             .then(|| self.render_usage_chip())
             .flatten()
             .map(|chip| div().flex_shrink_0().child(chip));
-        let action = div()
-            .relative()
+        let voice = self.voice.status;
+        let mic_label = if voice == Status::Idle && !ready {
+            Status::Unavailable.message()
+        } else {
+            voice.message()
+        };
+        let mic = Button::new("dictation-mic")
+            .ghost()
+            .xsmall()
+            .icon(Icon::new(IconName::Mic))
+            .text_color(if voice == Status::Recording {
+                ui::danger()
+            } else {
+                ui::muted()
+            })
+            .tooltip(mic_label)
+            .accessibility_label(mic_label)
+            .disabled((!ready || voice.active()) && voice != Status::Recording)
+            .on_click(cx.listener(|this, _, window, cx| this.toggle_dictation(window, cx)));
+        // Keep dictation beside the existing send/stop action in every style.
+        // The pulse still measures and surrounds only the send/stop action.
+        let action = h_flex()
             .flex_shrink_0()
-            .child(action_button)
-            .children(self.action_ring(style));
+            .gap_1()
+            .child(mic)
+            .when(voice.can_cancel(), |this| {
+                this.child(
+                    Button::new("dictation-cancel")
+                        .ghost()
+                        .xsmall()
+                        .icon(Icon::new(IconName::X))
+                        .tooltip("Cancel dictation")
+                        .accessibility_label("Cancel dictation")
+                        .on_click(cx.listener(|this, _, _, cx| this.cancel_dictation(cx))),
+                )
+            })
+            .child(
+                div()
+                    .relative()
+                    .flex_shrink_0()
+                    .child(action_button)
+                    .children(self.action_ring(style)),
+            );
         let spacer = || div().flex_1().min_w_0();
         let row = || h_flex().w_full().min_w_0().gap_1p5().items_center();
         // The line or frame a focused composer lights up.
@@ -778,6 +817,14 @@ impl SessionView {
             .children(self.render_dialog(cx))
             .children(self.render_review_confirm(cx))
             .child(self.render_activity(rem_size, cx))
+            .when(voice != Status::Idle, |this| {
+                this.child(
+                    div()
+                        .text_xs()
+                        .text_color(ui::muted())
+                        .child(voice.message()),
+                )
+            })
             .child(composer)
             .children(self.render_kisses());
         (main.into_any_element(), strip)

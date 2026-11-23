@@ -11,6 +11,7 @@ mod home;
 mod launch;
 mod login;
 mod record;
+pub mod voice;
 
 pub use home::{
     Homes, adopt_standalone_config, backend_homes, gentle_pi_root, launcher_config_path,

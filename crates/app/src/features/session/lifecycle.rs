@@ -9,6 +9,7 @@ use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::notification::Notification;
 use gpui_kit::*;
 use pi_rpc::PiProcess;
+use pi_rpc::voice::VoiceAdapter;
 
 use super::SessionView;
 use super::state::BackendStatus;
@@ -258,6 +259,7 @@ impl SessionView {
     }
 
     fn start(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.voice.reset_backend();
         self.shutdown_backend();
         self.backend.started = true;
         self.backend.status = BackendStatus::Starting;
@@ -325,13 +327,22 @@ impl SessionView {
                             .push(runs_on.path(&path).unwrap_or_else(|| path.into_owned()));
                     }
                     let version = crate::features::backend::shell_version(&runs_on, &spec);
+                    // Pin the local pair before RPC starts. Remote wrappers must
+                    // not use a separate local installation for dictation.
+                    let adapter = if runs_on == gentle_core::backend::Backend::Local {
+                        VoiceAdapter::from_launch(&spec)
+                    } else {
+                        None
+                    };
                     let (process, rx) = PiProcess::spawn(&spec)?;
-                    anyhow::Ok((process, rx, version, runs_on))
+                    let voice_launch = adapter.map(|adapter| (spec, adapter));
+                    anyhow::Ok((process, rx, version, runs_on, voice_launch))
                 })
                 .await;
             let rx = match spawned {
-                Ok((process, rx, version, runs_on)) => {
+                Ok((process, rx, version, runs_on, voice_launch)) => {
                     let ok = this.update(cx, |this, cx| {
+                        this.voice.launch = voice_launch;
                         this.backend.status = BackendStatus::Ready(process);
                         this.backend.version = version;
                         this.runs_on = Some(runs_on);
@@ -368,7 +379,12 @@ impl SessionView {
                 // One update (and one frame) for everything already queued.
                 let batch = drain_queued(first, &rx);
                 if this
-                    .update_in(cx, |this, window, cx| this.handle_batch(batch, window, cx))
+                    .update_in(cx, |this, window, cx| {
+                        this.handle_batch(batch, window, cx);
+                        if !this.backend.is_ready() {
+                            this.voice.reset_backend();
+                        }
+                    })
                     .is_err()
                 {
                     break;
@@ -390,6 +406,7 @@ impl SessionView {
 
     /// Forget the conversation shown, for another one on the same backend.
     pub(super) fn reset_conversation(&mut self) {
+        self.voice.reset_state();
         self.transcript = Transcript::default();
         self.markdown.clear();
         self.expanded.clear();
