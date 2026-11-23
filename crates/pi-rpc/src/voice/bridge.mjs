@@ -33,10 +33,15 @@ function boundedFile(path, limit) {
   } finally { closeSync(fd); }
 }
 
-async function load(root) {
+export function supportsManifest(manifest, mode) {
+  return manifest.name === 'gentle-pi' && (manifest.version === '4.9.0' ||
+    (mode === 'bundled' && manifest.version === '5.0.0'));
+}
+
+async function load(root, mode) {
   if (!isAbsolute(root) || root !== realpathSync(root)) throw new Error();
   const manifest = JSON.parse(boundedFile(join(root, 'package.json'), 64 * 1024).toString('utf8'));
-  if (manifest.name !== 'gentle-pi' || manifest.version !== '4.9.0') throw new Error();
+  if (!supportsManifest(manifest, mode)) throw new Error();
   const sources = new Map();
   let worker;
   for (const [file, digest] of Object.entries(files)) {
@@ -75,7 +80,7 @@ const codes = new Set(('unsupported node-version not-installed invalid-request r
 
 export async function main(root, mode, home) {
   let api;
-  try { api = await load(root); } catch { return emit('error', { code: 'unsupported' }); }
+  try { api = await load(root, mode); } catch { return emit('error', { code: 'unsupported' }); }
   const [worker, session, platform, install, bundled] = api;
   const diagnosis = platform.diagnoseVoicePlatform(platform.readVoicePlatformProbe());
   if (diagnosis.support !== 'known' || !isAbsolute(home)) return emit('error', { code: 'unsupported' });

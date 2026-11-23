@@ -41,6 +41,34 @@ const ENV: &[&str] = &[
     "LC_CTYPE",
 ];
 
+fn bundled_package_matches(root: &Path, selected_package: &Path, package: &Path) -> Option<()> {
+    // Resolve `current` (or the release named by the Windows marker) separately
+    // from the package link. The target cannot nominate a different release.
+    let release = dunce::canonicalize(selected_package.parent()?.parent()?).ok()?;
+    if release.parent()? != root.join("versions") {
+        return None;
+    }
+    let modules = release.join("node_modules");
+    if package == modules.join("gentle-pi") {
+        return Some(());
+    }
+    if release.file_name()? != "5.0.0-1.6.0" {
+        return None;
+    }
+    let store = modules.join(".pnpm");
+    let relative = package.strip_prefix(store).ok()?;
+    let slot = relative.iter().next()?;
+    let peers = slot.to_str()?.strip_prefix("gentle-pi@5.0.0_")?;
+    // pnpm's encoded peer suffix occupies one component, followed by the
+    // exact package tail. A relocated store fails the canonical prefix check.
+    (!peers.is_empty()
+        && peers
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"@.+_-".contains(&b))
+        && relative == Path::new(slot).join("node_modules").join("gentle-pi"))
+    .then_some(())
+}
+
 /// A vetted install paired to the selected backend, not to the focused folder
 /// or to the globally preferred Gentle Shell installation.
 #[derive(Debug, Clone)]
@@ -129,8 +157,6 @@ impl VoiceAdapter {
         let root = dunce::canonicalize(&install).ok()?;
         let node = dunce::canonicalize(&bundled.node).ok()?;
         let package = dunce::canonicalize(crate::gentle_pi_root(spec)?).ok()?;
-        // The POSIX bundle's `current` symlink is intentional. Its canonical
-        // package must nevertheless be under this install's versions tree.
         let expected_node = root.join(bundled.node.strip_prefix(&install).ok()?);
         let runtime = root.join("runtime");
         if node != expected_node
@@ -151,12 +177,7 @@ impl VoiceAdapter {
             }
             config
         } else {
-            let version = package.parent()?.parent()?;
-            if version.parent()? != root.join("versions").as_path()
-                || package != version.join("node_modules").join("gentle-pi")
-            {
-                return None;
-            }
+            bundled_package_matches(&root, &bundled.package, &package)?;
             root.clone()
         };
         if home.to_str().is_none() || package.to_str().is_none() {
@@ -183,10 +204,32 @@ impl VoiceAdapter {
         })
     }
 
+    /// Check that the original RPC launch still resolves to this pinned pair.
+    /// This compares paths, not file identity; do not use the fresh resolution
+    /// to run dictation or as a substitute for the runtime trust checks.
+    pub fn matches_launch(&self, spec: &LaunchSpec) -> bool {
+        Self::from_launch(spec).is_some_and(|fresh| {
+            fresh.root == self.root
+                && fresh.node == self.node
+                && fresh.package == self.package
+                && fresh.home == self.home
+                && fresh.mode == self.mode
+        })
+    }
+
     /// Check platform and installed voice components without opening a device.
     /// Run on a background executor; returns `Ready` or an `Error` record.
     pub fn probe(&self) -> Result<VoiceEvent> {
-        let (session, events) = self.spawn(true)?;
+        self.probe_inner(None)
+    }
+
+    /// Probe with the same app-quit signal used for recording.
+    pub fn probe_until_shutdown(&self, shutdown: Arc<AtomicBool>) -> Result<VoiceEvent> {
+        self.probe_inner(Some(shutdown))
+    }
+
+    fn probe_inner(&self, shutdown: Option<Arc<AtomicBool>>) -> Result<VoiceEvent> {
+        let (session, events) = self.spawn(true, shutdown)?;
         let result = events
             .recv_blocking()
             .map_err(|_| anyhow!("Voice helper stopped."));
@@ -196,7 +239,16 @@ impl VoiceAdapter {
 
     /// Start recording once. Keep the handle for as long as events are relevant.
     pub fn start(&self) -> Result<(VoiceSession, async_channel::Receiver<VoiceEvent>)> {
-        self.spawn(false)
+        self.spawn(false, None)
+    }
+
+    /// Start with a one-way app-quit signal. Once set, bypass the normal
+    /// cancellation grace period and tear down the process tree.
+    pub fn start_until_shutdown(
+        &self,
+        shutdown: Arc<AtomicBool>,
+    ) -> Result<(VoiceSession, async_channel::Receiver<VoiceEvent>)> {
+        self.spawn(false, Some(shutdown))
     }
 
     fn isolated_command(&self, path: &Path) -> Command {
@@ -209,8 +261,15 @@ impl VoiceAdapter {
         command
     }
 
-    fn spawn(&self, probe: bool) -> Result<(VoiceSession, async_channel::Receiver<VoiceEvent>)> {
-        let controls = Arc::new(Controls::default());
+    fn spawn(
+        &self,
+        probe: bool,
+        shutdown: Option<Arc<AtomicBool>>,
+    ) -> Result<(VoiceSession, async_channel::Receiver<VoiceEvent>)> {
+        let controls = Arc::new(Controls {
+            shutdown,
+            ..Controls::default()
+        });
         let session = VoiceSession(controls.clone());
         let (events, receiver) = async_channel::bounded(4);
         let adapter = self.clone();
@@ -223,7 +282,7 @@ impl VoiceAdapter {
                         .unwrap_or_else(|_| VoiceEvent::Error {
                             code: "bridge".into(),
                         });
-                let result = if controls.cancel.load(Relaxed) {
+                let result = if controls.cancel.load(Relaxed) || controls.quitting() {
                     VoiceEvent::Cancelled
                 } else {
                     result
@@ -239,7 +298,7 @@ impl VoiceAdapter {
         controls: &Controls,
         events: &async_channel::Sender<VoiceEvent>,
     ) -> Result<VoiceEvent> {
-        if controls.cancel.load(Relaxed) {
+        if controls.cancel.load(Relaxed) || controls.quitting() {
             return Ok(VoiceEvent::Cancelled);
         }
         for path in [&self.root, &self.node, &self.package, &self.home] {
@@ -262,7 +321,7 @@ impl VoiceAdapter {
                 code: "unsupported".into(),
             });
         };
-        if controls.cancel.load(Relaxed) {
+        if controls.cancel.load(Relaxed) || controls.quitting() {
             return Ok(VoiceEvent::Cancelled);
         }
         let mut tree = Tree::spawn(&mut command)?;
@@ -274,6 +333,15 @@ impl VoiceAdapter {
 struct Controls {
     stop: AtomicBool,
     cancel: AtomicBool,
+    shutdown: Option<Arc<AtomicBool>>,
+}
+
+impl Controls {
+    fn quitting(&self) -> bool {
+        self.shutdown
+            .as_ref()
+            .is_some_and(|signal| signal.load(Relaxed))
+    }
 }
 
 pub struct VoiceSession(Arc<Controls>);
@@ -336,7 +404,7 @@ fn supervise(
                 }
             }
         })?;
-    if controls.cancel.load(Relaxed) {
+    if controls.cancel.load(Relaxed) || controls.quitting() {
         return Ok(VoiceEvent::Cancelled);
     }
     // An unsupported package can answer and exit before the first write.
@@ -346,6 +414,9 @@ fn supervise(
         (false, false, false, false);
     let mut status = None;
     let terminal = loop {
+        if controls.quitting() {
+            return Ok(VoiceEvent::Cancelled);
+        }
         ensure!(Instant::now() < deadline, "Voice helper timed out");
         if status.is_none() {
             status = tree.exited()?;
@@ -384,6 +455,9 @@ fn supervise(
     let deadline = deadline.min(Instant::now() + GRACE);
     let mut eof = false;
     while Instant::now() < deadline {
+        if controls.quitting() {
+            return Ok(VoiceEvent::Cancelled);
+        }
         if status.is_none() {
             status = tree.exited()?;
         }

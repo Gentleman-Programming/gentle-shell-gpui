@@ -2,6 +2,20 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { test } from 'node:test';
+import { supportsManifest } from './bridge.mjs';
+
+test('only bundled mode adds the exact gentle-pi 5.0.0 manifest', () => {
+  const supported = (version, mode, name = 'gentle-pi') => supportsManifest({ name, version }, mode);
+  assert.equal(supported('4.9.0', 'bundled'), true);
+  assert.equal(supported('4.9.0', 'managed'), true);
+  assert.equal(supported('5.0.0', 'bundled'), true);
+  assert.equal(supported('5.0.0', 'managed'), false);
+  assert.equal(supported('5.0.0', undefined), false);
+  assert.equal(supported('5.0.0', 'bundled', 'other-package'), false);
+  for (const version of ['5.0.0-1.6.0', '5.0.0+build', '5.0.1']) {
+    assert.equal(supported(version, 'bundled'), false);
+  }
+});
 
 const source = `
 import { serve } from './crates/pi-rpc/src/voice/bridge.mjs';

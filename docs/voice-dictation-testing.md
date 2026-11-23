@@ -15,7 +15,7 @@ Use this checklist to validate the GPUI mic button with an existing compatible G
 | --- | --- |
 | macOS arm64 first, x64 if available | Use the packaged app. Start with the microphone permission denied; the app should fail visibly without recording. Grant permission and retry. Report which process the OS identified in the permission prompt, if any. |
 | Linux x64 natively, arm64 if available | Use a desktop audio session with a default input. Repeat with no usable input device: expect an actionable error and no stuck recording state. Do not use WSL to stand in for native Linux. |
-| Windows x64 | Retest the released-package path, not the earlier proof that ran a source snapshot. Check the normal stop path and cancellation while the recognizer is working. |
+| Windows x64 | Retest the generated bundle with active release `5.0.0-1.6.0` and `gentle-pi` 5.0.0 in its release-local pnpm store, not the earlier source snapshot. In the same tab, confirm a chat roundtrip before testing dictation. Check the normal stop path and cancellation while the recognizer is working. |
 
 ## Check where a late result goes
 

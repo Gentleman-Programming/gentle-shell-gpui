@@ -151,6 +151,165 @@ fn replaced_node_is_rejected_before_spawn() {
     assert!(!scratch.0.join("executed").exists());
 }
 
+#[test]
+fn voice_pairing_rejects_a_retargeted_bundle() {
+    use std::fs;
+
+    let scratch = scratch();
+    let prefix = &scratch.0;
+    let launcher = prefix.join("bin/gentle-shell");
+    let runtime = prefix.join("runtime/node-24/bin");
+    let current = prefix.join("current");
+    let original = prefix.join("versions/a/node_modules/gentle-pi");
+    let replacement = prefix.join("versions/b/node_modules/gentle-pi");
+    for path in [
+        &original,
+        &replacement,
+        launcher.parent().unwrap(),
+        &runtime,
+    ] {
+        fs::create_dir_all(path).unwrap();
+    }
+    fs::write(runtime.join("node"), "not executed").unwrap();
+    fs::write(
+        &launcher,
+        "# gentle-shell bundled launcher (generated; do not edit)\nruntime/node-24/bin/node\n",
+    )
+    .unwrap();
+    let select = |version: &str| {
+        #[cfg(unix)]
+        {
+            if current.exists() {
+                fs::remove_file(&current).unwrap();
+            }
+            std::os::unix::fs::symlink(format!("versions/{version}"), &current).unwrap();
+        }
+        #[cfg(not(unix))]
+        fs::write(&current, version).unwrap();
+    };
+    let launch = || LaunchSpec {
+        program: launcher.clone(),
+        args: vec![],
+        cwd: prefix.clone(),
+        env: vec![],
+        bundled: crate::launch::bundled_install(&launcher),
+        launcher: launcher.clone(),
+    };
+    select("a");
+    let spec = launch();
+    let pinned = VoiceAdapter::from_launch(&spec).unwrap();
+    assert_eq!(pinned.package, original);
+    assert!(pinned.matches_launch(&spec));
+
+    select("b");
+    assert!(!pinned.matches_launch(&spec));
+    let restarted = launch();
+    let next = VoiceAdapter::from_launch(&restarted).unwrap();
+    assert_eq!(next.package, replacement);
+    assert!(next.matches_launch(&restarted));
+    assert!(!pinned.matches_launch(&restarted));
+}
+
+#[test]
+fn bundled_pnpm_pairing_stays_in_the_selected_release_and_store() {
+    use std::fs;
+
+    fn link(target: &Path, path: &Path) {
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, path).unwrap();
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            let result = Command::new("cmd.exe")
+                .args(["/D", "/V:OFF", "/C"])
+                .raw_arg(r#"mklink /J "%VOICE_LINK%" "%VOICE_TARGET%""#)
+                .env("VOICE_LINK", path)
+                .env("VOICE_TARGET", target)
+                .output()
+                .unwrap();
+            assert!(result.status.success(), "{result:?}");
+        }
+    }
+
+    fn unlink(path: &Path) {
+        #[cfg(unix)]
+        fs::remove_file(path).unwrap();
+        #[cfg(windows)]
+        fs::remove_dir(path).unwrap();
+    }
+
+    let scratch = scratch();
+    let prefix = scratch.0.join("bundle");
+    let launcher = prefix.join("bin/gentle-shell");
+    let runtime = prefix.join("runtime/node-24/bin");
+    let release = prefix.join("versions/5.0.0-1.6.0");
+    let modules = release.join("node_modules");
+    let alias = modules.join("gentle-pi");
+    let store = modules.join(".pnpm");
+    let slot = "gentle-pi@5.0.0_@earendil-works+pi-coding-agent@0.1.0";
+    let suffix = "node_modules/gentle-pi";
+    let package = store.join(slot).join(suffix);
+    for path in [&package, launcher.parent().unwrap(), &runtime] {
+        fs::create_dir_all(path).unwrap();
+    }
+    fs::write(runtime.join("node"), "not executed").unwrap();
+    fs::write(
+        &launcher,
+        "# gentle-shell bundled launcher (generated; do not edit)\nruntime/node-24/bin/node\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("versions/5.0.0-1.6.0", prefix.join("current")).unwrap();
+    #[cfg(windows)]
+    fs::write(prefix.join("current"), "5.0.0-1.6.0\n").unwrap();
+    #[cfg(windows)]
+    link(&package, &alias);
+    #[cfg(unix)]
+    link(package.strip_prefix(&modules).unwrap(), &alias);
+    let spec = LaunchSpec {
+        program: launcher.clone(),
+        args: vec![],
+        cwd: prefix.clone(),
+        env: vec![],
+        bundled: crate::launch::bundled_install(&launcher),
+        launcher,
+    };
+    let pinned = VoiceAdapter::from_launch(&spec).expect("confined pnpm package");
+    assert_eq!(pinned.package, package);
+    assert!(pinned.matches_launch(&spec));
+    unlink(&alias);
+
+    for target in [
+        scratch.0.join(slot).join(suffix),
+        prefix
+            .join("versions/5.0.0-other/node_modules/.pnpm")
+            .join(slot)
+            .join(suffix),
+        prefix.join("versions/4.9.0").join(suffix),
+        store.join("gentle-pi@5.0.01_peer").join(suffix),
+        store.join("gentle-pi@5.0.0_").join(suffix),
+    ] {
+        fs::create_dir_all(&target).unwrap();
+        link(&target, &alias);
+        assert!(VoiceAdapter::from_launch(&spec).is_none(), "{target:?}");
+        assert!(!pinned.matches_launch(&spec), "{target:?}");
+        unlink(&alias);
+    }
+
+    let redirected = modules.join("other-store");
+    fs::rename(&store, &redirected).unwrap();
+    link(&redirected, &store);
+    link(&package, &alias);
+    assert_eq!(
+        dunce::canonicalize(&alias).unwrap(),
+        redirected.join(slot).join(suffix)
+    );
+    assert!(VoiceAdapter::from_launch(&spec).is_none());
+    assert!(!pinned.matches_launch(&spec));
+    unlink(&alias);
+    unlink(&store);
+}
+
 #[cfg(unix)]
 #[test]
 fn rejects_bundled_node_symlink_outside_selected_install() {
