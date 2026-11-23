@@ -24,8 +24,9 @@ pub use job::contain;
 pub use launch::neutral_dir;
 pub use launch::{
     BundledInstall, LaunchSpec, backend_version, child_path, command, find_program, forget_cached,
-    forget_versions, output_within, remote_backend, resolve_backend, resolve_node, set_extensions,
-    set_extra_path, set_system_prompt, split_args, version_output, version_stderr,
+    forget_versions, managed_install_root, output_within, remote_backend, resolve_backend,
+    resolve_node, set_extensions, set_extra_path, set_system_prompt, split_args, version_output,
+    version_stderr,
 };
 pub use record::{Record, Response, UiMethod, UiRequest, parse_record};
 

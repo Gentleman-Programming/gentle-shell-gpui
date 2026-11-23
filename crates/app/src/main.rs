@@ -56,6 +56,22 @@ fn main() {
         }
         instance::Role::Primary(requests) => requests,
     };
+    // Windows can't rename a folder a process works in, and a shortcut may
+    // start the app in its install folder: work from a neutral folder so an
+    // update can replace the install. The first tab still opens where the
+    // app was launched (`cli::default_cwd`).
+    cli::remember_launch_dir();
+    #[cfg(windows)]
+    {
+        if let Some(dir) = pi_rpc::neutral_dir()
+            && let Err(error) = std::env::set_current_dir(dir)
+        {
+            eprintln!(
+                "Could not leave the launch folder for {}: {error}",
+                dir.display()
+            );
+        }
+    }
     // `gentle-open` and `gentle-device` live in the toolchain folder the
     // agents get on PATH; create them before that PATH is computed.
     platform::shims::install();

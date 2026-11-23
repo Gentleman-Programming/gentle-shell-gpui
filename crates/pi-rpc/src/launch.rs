@@ -357,6 +357,13 @@ pub(crate) fn chosen_managed_install() -> Option<ManagedInstall> {
     chosen_launcher().as_deref().and_then(managed_install)
 }
 
+/// The folder of gentle-ai's managed install
+/// (`%LOCALAPPDATA%\gentle-shell\install`) when it is the chosen launcher,
+/// which its installer replaces whole on an update.
+pub fn managed_install_root() -> Option<PathBuf> {
+    chosen_managed_install().map(|install| install.root)
+}
+
 /// Gentle Shell installed in its own folder, when present: the self-contained
 /// install its installer and `gentle-shell upgrade` (since 4.7) set up, with
 /// its own Node and Pi, or on Windows gentle-ai's managed install. It wins
