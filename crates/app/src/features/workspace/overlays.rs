@@ -64,6 +64,7 @@ impl Workspace {
             .map(|(index, space)| WorkspaceRow {
                 index,
                 name: space.name.clone(),
+                root: space.root.clone(),
                 tabs: space.tab_count(),
                 current: index == self.current,
                 activity: self.space_activity(space),

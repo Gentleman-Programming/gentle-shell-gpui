@@ -117,6 +117,7 @@ pub struct WorkspaceRow {
     /// Index in the window's workspace list.
     pub index: usize,
     pub name: String,
+    pub root: PathBuf,
     pub tabs: usize,
     pub current: bool,
     pub activity: Activity,
