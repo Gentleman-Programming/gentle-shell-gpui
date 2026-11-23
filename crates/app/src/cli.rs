@@ -39,13 +39,23 @@ pub fn parse_cli() -> Cli {
 /// The folder the first tab opens: the CLI argument, else the folder the app
 /// was launched in, else home (GUI launches start in `/`).
 pub fn default_cwd() -> PathBuf {
-    parse_cli()
-        .folder
-        .filter(|p| p.is_dir())
-        .and_then(|p| dunce::canonicalize(p).ok())
+    cli_folder(parse_cli().folder, launch_dir())
         .or_else(|| launch_folder(launch_dir(), pi_rpc::managed_install_root().as_deref()))
         .or_else(dirs::home_dir)
         .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// The CLI folder argument as an existing folder. A relative argument (`.`,
+/// `myproject`) names a folder under `launch`, the folder the app was launched
+/// in, not under the app's current folder, which startup moves (`main`, on
+/// Windows).
+fn cli_folder(arg: Option<PathBuf>, launch: Option<PathBuf>) -> Option<PathBuf> {
+    arg.map(|p| match &launch {
+        Some(launch) if p.is_relative() => launch.join(p),
+        _ => p,
+    })
+    .filter(|p| p.is_dir())
+    .and_then(|p| dunce::canonicalize(p).ok())
 }
 
 static LAUNCH_DIR: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
@@ -126,5 +136,29 @@ mod tests {
             .join("Gentle Shell");
         assert_eq!(launch_folder(Some(programs), Some(&root)), None);
         assert_eq!(launch_folder(Some(root.clone()), Some(&root)), None);
+    }
+
+    /// A relative folder argument names a folder under the launch folder,
+    /// even after startup moved the app's current folder elsewhere.
+    #[test]
+    fn a_relative_folder_argument_resolves_against_the_launch_folder() {
+        let launch = std::env::temp_dir().join(format!("gentle-cli-launch-{}", std::process::id()));
+        let project = launch.join("myproject");
+        std::fs::create_dir_all(&project).unwrap();
+        let expected = dunce::canonicalize(&project).unwrap();
+        let resolved = cli_folder(Some(PathBuf::from("myproject")), Some(launch.clone()));
+        let dot = cli_folder(Some(PathBuf::from(".")), Some(project.clone()));
+        std::fs::remove_dir_all(&launch).unwrap();
+        assert_eq!(resolved, Some(expected.clone()));
+        assert_eq!(dot, Some(expected));
+    }
+
+    /// An absolute folder argument opens as given, as before.
+    #[test]
+    fn an_absolute_folder_argument_opens_as_given() {
+        let folder = dunce::canonicalize(std::env::temp_dir()).unwrap();
+        let elsewhere = Some(PathBuf::from("Z:\nowhere"));
+        assert_eq!(cli_folder(Some(folder.clone()), elsewhere), Some(folder));
+        assert_eq!(cli_folder(None, Some(std::env::temp_dir())), None);
     }
 }
