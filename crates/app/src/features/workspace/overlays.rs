@@ -67,6 +67,7 @@ impl Workspace {
                 root: space.root.clone(),
                 tabs: space.tab_count(),
                 current: index == self.current,
+                last_active: space.last_active,
                 activity: self.space_activity(space),
             })
             .collect()
