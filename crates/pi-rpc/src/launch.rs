@@ -13,7 +13,9 @@ use crate::file_cache::Stamp;
 /// On Windows it sets `CREATE_NO_WINDOW`: a release build has no console, so
 /// every console child (git, node, shells, the backend) would flash a console
 /// window of its own, and a debug build's children would attach to the
-/// launching terminal. Elsewhere it is plain `Command::new`.
+/// launching terminal. It also starts in [`neutral_dir`] unless the caller
+/// sets `current_dir`, so no child holds the app's install folder open.
+/// Elsewhere it is plain `Command::new`.
 pub fn command(program: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
     #[cfg(windows)]
     {
@@ -21,10 +23,55 @@ pub fn command(program: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         let mut command = std::process::Command::new(program);
         command.creation_flags(CREATE_NO_WINDOW);
+        if let Some(dir) = neutral_dir() {
+            command.current_dir(dir);
+        }
         command
     }
     #[cfg(not(windows))]
     std::process::Command::new(program)
+}
+
+/// A folder outside any install for this app and its children to work in on
+/// Windows: the user's profile folder, else `System32`.
+///
+/// A process holds its working folder open, and Windows can't rename or
+/// delete a folder a process works in, so a child (or the app itself)
+/// started in the app's install folder would make the installer's update
+/// fail with "Access is denied". The profile comes from the shell's known
+/// folder, not `%USERPROFILE%`: gentle-ai's managed install points that
+/// variable at a folder inside the install for its children.
+#[cfg(windows)]
+pub fn neutral_dir() -> Option<&'static Path> {
+    static DIR: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        known_profile_dir()
+            .or_else(system_dir)
+            .filter(|dir| dir.is_dir())
+    })
+    .as_deref()
+}
+
+#[cfg(windows)]
+fn known_profile_dir() -> Option<PathBuf> {
+    use windows::Win32::System::Com::CoTaskMemFree;
+    use windows::Win32::UI::Shell::{FOLDERID_Profile, KF_FLAG_DEFAULT, SHGetKnownFolderPath};
+    // SAFETY: the returned string is read once and then freed as documented.
+    unsafe {
+        let path = SHGetKnownFolderPath(&FOLDERID_Profile, KF_FLAG_DEFAULT, None).ok()?;
+        let dir = path.to_string().ok().map(PathBuf::from);
+        CoTaskMemFree(Some(path.0 as *const _));
+        dir.filter(|dir| dir.is_dir())
+    }
+}
+
+#[cfg(windows)]
+fn system_dir() -> Option<PathBuf> {
+    use windows::Win32::System::SystemInformation::GetSystemDirectoryW;
+    let mut buffer = [0u16; 260];
+    // SAFETY: the buffer outlives the call, which writes at most its length.
+    let len = unsafe { GetSystemDirectoryW(Some(&mut buffer)) } as usize;
+    (len > 0 && len < buffer.len()).then(|| PathBuf::from(String::from_utf16_lossy(&buffer[..len])))
 }
 
 /// How to start one RPC backend process.

@@ -18,6 +18,8 @@ pub use home::{
 };
 pub use login::{AuthEvent, AuthPrompt, LoginHelper, LoginMessage, PromptOption, ProviderInfo};
 
+#[cfg(windows)]
+pub use launch::neutral_dir;
 pub use launch::{
     BundledInstall, LaunchSpec, backend_version, child_path, command, find_program, forget_cached,
     forget_versions, output_within, remote_backend, resolve_backend, resolve_node, set_extensions,

@@ -13,5 +13,15 @@ serde.workspace = true
 serde_json.workspace = true
 which = "8"
 
+# Windows: the neutral folder children start in (the user's profile, read
+# from the shell rather than an environment variable a child may override).
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_SystemInformation",
+    "Win32_UI_Shell",
+] }
+
 [dev-dependencies]
 pollster = "1.0"
