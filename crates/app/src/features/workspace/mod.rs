@@ -461,6 +461,7 @@ impl Workspace {
         let devices = cx.new(DevicePanel::new);
         let mut lifecycle = vec![
             cx.on_app_quit(|this, cx| {
+                let voice_active = SessionView::shutdown_dictation(cx);
                 this.music.read(cx).shutdown();
                 this.save_now(cx);
                 // The app exits before any tab is released: ask every backend
@@ -470,8 +471,9 @@ impl Workspace {
                 for session in this.sessions() {
                     signalled |= session.read(cx).shutdown_backend();
                 }
-                let settle =
-                    signalled.then(|| cx.background_executor().timer(Duration::from_millis(100)));
+                // Dictation also needs a short window to reap its process tree.
+                let settle = (signalled || voice_active)
+                    .then(|| cx.background_executor().timer(Duration::from_millis(100)));
                 async move {
                     if let Some(settle) = settle {
                         settle.await;

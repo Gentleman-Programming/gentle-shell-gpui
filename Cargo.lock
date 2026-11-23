@@ -5673,10 +5673,13 @@ dependencies = [
  "anyhow",
  "async-channel",
  "dunce",
+ "libc",
  "pollster 1.0.1",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "which",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

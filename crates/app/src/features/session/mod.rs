@@ -26,6 +26,7 @@ mod submit;
 mod view;
 #[cfg(test)]
 mod view_tests;
+mod voice;
 
 pub use agents::{AgentsPanel, AgentsTab};
 pub(crate) use reads::READ_DECIDE_WAIT;
@@ -129,6 +130,7 @@ pub struct SessionView {
     /// workspace says so): its web views may show.
     web_shown: bool,
     composer: Entity<TextareaState>,
+    voice: voice::Voice,
     /// The composer has the keyboard: its border takes the accent.
     composer_focused: bool,
     /// When the composer last took the keyboard: its pulse plays for
@@ -232,6 +234,7 @@ impl SessionView {
         let model_search = cx.new(|cx| InputState::new(window, cx).placeholder("Search models…"));
         // GPUI keeps decoded images until told to drop them.
         cx.on_release(|this, cx| {
+            this.voice.invalidate();
             this.image_cache.release_all(cx);
             for attachment in this.attachments.drain(..) {
                 attachment.image.remove_asset(cx);
@@ -331,6 +334,7 @@ impl SessionView {
             runs_on: None,
             web_shown: false,
             composer,
+            voice: voice::Voice::default(),
             composer_focused: false,
             composer_pulse: None,
             kisses: Vec::new(),

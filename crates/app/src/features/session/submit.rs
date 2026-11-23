@@ -38,8 +38,7 @@ impl SessionView {
             self.warn(message, window, cx);
             return;
         }
-        self.composer
-            .update(cx, |state, cx| state.set_value("", window, cx));
+        self.consume_submitted_draft(window, cx);
         self.prompt_history.record(&text);
         let pasted = !std::mem::take(&mut self.pasted).is_empty();
         self.list.scroll_to_end();
@@ -58,6 +57,13 @@ impl SessionView {
         let images = std::mem::take(&mut self.attachments);
         self.send_prompt_with(text, images, cx);
         cx.notify();
+    }
+
+    /// Called only after submission passes the existing draft guards.
+    pub(super) fn consume_submitted_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.voice.invalidate();
+        self.composer
+            .update(cx, |state, cx| state.set_value("", window, cx));
     }
 
     /// Text from outside the composer (`-p`, a later launch's prompt): runs

@@ -51,6 +51,7 @@ gpui_kit::assets::icon_assets!(
         X,
         Zap,
         Paperclip,
+        Mic,
         // Configuration → Water reminder.
         Droplets,
         // Architecture docs and the diagram renderer.
