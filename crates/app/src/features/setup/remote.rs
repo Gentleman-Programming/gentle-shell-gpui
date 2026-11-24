@@ -1,7 +1,8 @@
 //! Setup's checks when agents run in a backend (a WSL distro, a VM, a
 //! container): Node.js, Gentle Shell, its setup, a provider, git and the
 //! optional pieces are looked for there, never on this computer. Fixes are
-//! commands for a terminal, which opens in the backend too.
+//! commands for a terminal, which opens in the backend too. A Gentle Shell
+//! server runs nothing of the app's: Setup only checks it answers.
 
 use gentle_core::backend::Backend;
 use serde_json::Value;
@@ -14,6 +15,48 @@ use crate::features::backend;
 /// The backend agents run in, when they don't run on this computer.
 pub(super) fn backend() -> Option<Backend> {
     Some(backend::saved()).filter(|choice| *choice != Backend::Local)
+}
+
+/// Installs and fixes can't reach a Gentle Shell server: the error to show
+/// instead of running them anywhere (never on this computer).
+pub(super) fn refuse_server() -> Result<(), String> {
+    match backend() {
+        Some(choice) if choice.is_server() => Err(backend::server::UNAVAILABLE.to_string()),
+        _ => Ok(()),
+    }
+}
+
+/// Blocking: Setup's checks for a Gentle Shell server. Gentle Shell is the
+/// server answering this device's token; what its sessions need was set up
+/// there (`gentle-shell setup`), so the rest isn't checked from here.
+pub(super) fn server_checks(choice: &Backend) -> Vec<Check> {
+    let label = choice.label();
+    let shell = match backend::server::info(choice) {
+        Ok(info) => Status::Ok(match info.version {
+            Some(version) => format!("Gentle Shell {version} on {label}"),
+            None => format!("Answering on {label}"),
+        }),
+        Err(error) => Status::Failed(error),
+    };
+    super::check_order(std::env::consts::OS)
+        .into_iter()
+        .map(|id| {
+            let status = match id {
+                CheckId::GentleShell => shell.clone(),
+                CheckId::Go => Status::Ok("Not needed".into()),
+                _ => Status::Ok(format!("On {label}: not checked from here")),
+            };
+            let (title, summary, need) = meta(id);
+            Check {
+                id,
+                title,
+                summary,
+                need,
+                status,
+                fix: Fix::None,
+            }
+        })
+        .collect()
 }
 
 /// What `engram version` prints in `choice`.

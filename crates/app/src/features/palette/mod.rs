@@ -76,6 +76,9 @@ pub enum PaletteAction {
         name: String,
         pick_folder: bool,
     },
+    /// A new workspace at `root`, typed: a folder on a Gentle Shell server,
+    /// which this computer can't browse.
+    CreateWorkspaceAt(PathBuf),
     OpenFile(PathBuf),
     /// Asks for confirmation before running `git switch`.
     SwitchBranch(String),

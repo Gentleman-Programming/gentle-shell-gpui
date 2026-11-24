@@ -1,18 +1,21 @@
-//! Where agents run: this computer, a WSL distro (Windows) or an environment
-//! a command reaches (a Linux VM through OrbStack or Lima, a container). The
+//! Where agents run: this computer, a WSL distro (Windows), an environment
+//! a command reaches (a Linux VM through OrbStack or Lima, a container), or a
+//! Gentle Shell server (`gentle-shell serve`) this device pairs with. The
 //! choice is `features::backend`'s; new agent tabs start there, open tabs
 //! stay where they started.
 
 use gentle_core::backend::{Backend, Distro};
 use gpui_kit::assets::IconName;
+use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::spinner::Spinner;
-use gpui_kit::component::{Icon, Sizable as _, h_flex, v_flex};
+use gpui_kit::component::{Disableable as _, Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+use pi_rpc::serve::ServerInfo;
 
 use super::SettingsView;
-use super::layout::{control, section};
+use super::layout::{control, row, section};
 use crate::features::backend;
 use crate::shared::ui;
 
@@ -21,15 +24,16 @@ enum Kind {
     Local,
     Wsl,
     Command,
+    Server,
 }
 
 impl Kind {
     /// The options this computer offers: WSL only on Windows.
     fn all() -> &'static [Kind] {
         if cfg!(windows) {
-            &[Kind::Local, Kind::Wsl, Kind::Command]
+            &[Kind::Local, Kind::Wsl, Kind::Command, Kind::Server]
         } else {
-            &[Kind::Local, Kind::Command]
+            &[Kind::Local, Kind::Command, Kind::Server]
         }
     }
 
@@ -38,6 +42,7 @@ impl Kind {
             Kind::Local => "This computer",
             Kind::Wsl => "WSL",
             Kind::Command => "Command",
+            Kind::Server => "Gentle Shell server",
         }
     }
 
@@ -46,6 +51,7 @@ impl Kind {
             Backend::Local => Kind::Local,
             Backend::Wsl { .. } => Kind::Wsl,
             Backend::Command { .. } => Kind::Command,
+            Backend::Server { .. } => Kind::Server,
         }
     }
 }
@@ -67,6 +73,17 @@ pub(super) struct RunsOn {
     check: Task<()>,
     /// Pointing Configuration at the new backend's Gentle Shell home.
     homes: Task<()>,
+    /// A server's address and the pairing code `gentle-shell serve pair`
+    /// printed there.
+    server_url: Entity<InputState>,
+    server_code: Entity<InputState>,
+    _server_code: Subscription,
+    /// What the saved server says about itself, once asked (or why it
+    /// couldn't be asked).
+    server: Option<Result<ServerInfo, String>>,
+    pairing: bool,
+    pair_error: Option<String>,
+    pair: Task<()>,
 }
 
 impl RunsOn {
@@ -89,6 +106,22 @@ impl RunsOn {
                 }
             }
         });
+        let url = match &choice {
+            Backend::Server { url, .. } => url.clone(),
+            _ => String::new(),
+        };
+        let server_url = cx.new(|cx| {
+            let mut state =
+                InputState::new(window, cx).placeholder(gentle_core::serve::DEFAULT_URL);
+            state.set_value(url, window, cx);
+            state
+        });
+        let server_code = cx.new(|cx| InputState::new(window, cx).placeholder("ABCD-EFGH"));
+        let code_subscription = cx.subscribe(&server_code, |this, _, event: &InputEvent, cx| {
+            if let InputEvent::PressEnter { .. } = event {
+                this.pair_server(cx);
+            }
+        });
         Self {
             kind: Kind::of(&choice),
             choice,
@@ -100,6 +133,13 @@ impl RunsOn {
             task: Task::ready(()),
             check: Task::ready(()),
             homes: Task::ready(()),
+            server_url,
+            server_code,
+            _server_code: code_subscription,
+            server: None,
+            pairing: false,
+            pair_error: None,
+            pair: Task::ready(()),
         }
     }
 }
@@ -132,7 +172,8 @@ impl SettingsView {
         self.check_runs_on(cx);
     }
 
-    /// Whether the saved backend has `gentle-shell`.
+    /// Whether the saved backend has `gentle-shell`; a server, whether it
+    /// answers this device.
     fn check_runs_on(&mut self, cx: &mut Context<Self>) {
         let choice = self.runs_on.choice.clone();
         if choice == Backend::Local {
@@ -142,16 +183,24 @@ impl SettingsView {
         }
         self.runs_on.checking = true;
         self.runs_on.check = cx.spawn(async move |this, cx| {
-            let found = cx
+            let (found, server) = cx
                 .background_executor()
                 .spawn({
                     let choice = choice.clone();
-                    async move { backend::has_gentle_shell(&choice) }
+                    async move {
+                        if choice.is_server() {
+                            let info = backend::server::info(&choice);
+                            (info.is_ok(), Some(info))
+                        } else {
+                            (backend::has_gentle_shell(&choice), None)
+                        }
+                    }
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
                 if this.runs_on.choice == choice {
                     this.runs_on.found = Some(found);
+                    this.runs_on.server = server;
                     this.runs_on.checking = false;
                     cx.notify();
                 }
@@ -172,6 +221,7 @@ impl SettingsView {
         }
         self.runs_on.choice = choice;
         self.runs_on.found = None;
+        self.runs_on.server = None;
         self.check_runs_on(cx);
         self.runs_on.homes = cx.spawn(async move |this, cx| {
             cx.background_executor()
@@ -179,6 +229,55 @@ impl SettingsView {
                 .await;
             let _ = this.update(cx, |this, cx| this.reload(cx));
         });
+        cx.notify();
+    }
+
+    /// Pair with the server at the typed address using the typed code
+    /// (`POST /api/pair`); once paired, new agent tabs run there.
+    fn pair_server(&mut self, cx: &mut Context<Self>) {
+        if self.runs_on.pairing {
+            return;
+        }
+        let url = self.runs_on.server_url.read(cx).value().to_string();
+        let url = if url.trim().is_empty() {
+            gentle_core::serve::DEFAULT_URL.to_string()
+        } else {
+            url
+        };
+        let code = self.runs_on.server_code.read(cx).value().to_string();
+        self.runs_on.pairing = true;
+        self.runs_on.pair_error = None;
+        self.runs_on.pair = cx.spawn(async move |this, cx| {
+            let paired = cx
+                .background_executor()
+                .spawn(async move { backend::server::pair(&url, &code) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.runs_on.pairing = false;
+                match paired {
+                    Ok((choice, info)) => {
+                        this.choose_runs_on(choice, cx);
+                        this.runs_on.server = Some(Ok(info));
+                    }
+                    Err(error) => this.runs_on.pair_error = Some(error),
+                }
+                cx.notify();
+            });
+        });
+        cx.notify();
+    }
+
+    /// Forget this device's token for the saved server and run agents on
+    /// this computer again. The server keeps the device until it is revoked
+    /// there; its sessions keep running.
+    fn unpair_server(&mut self, cx: &mut Context<Self>) {
+        if let Backend::Server { url, .. } = &self.runs_on.choice
+            && let Err(err) = backend::server::forget(url)
+        {
+            eprintln!("gentle-shell-gpui: could not forget the server's token: {err}");
+        }
+        self.choose_runs_on(Backend::Local, cx);
+        self.runs_on.kind = Kind::Server;
         cx.notify();
     }
 
@@ -204,7 +303,8 @@ impl SettingsView {
                     cx.notify();
                 }
             },
-            Kind::Command => {
+            // A server is saved once paired.
+            Kind::Command | Kind::Server => {
                 self.runs_on.kind = kind;
                 cx.notify();
             }
@@ -238,6 +338,7 @@ impl SettingsView {
                     .child(Input::new(&self.runs_on.command).appearance(false).small()),
             )
             .into_any_element(),
+            Kind::Server => self.render_server(cx).into_any_element(),
         };
         section(IconName::Server, "Where agents run")
             .child(control(
@@ -258,6 +359,13 @@ impl SettingsView {
                              (OrbStack: orb -m dev --, Lima: limactl shell dev, a container: \
                              docker exec -i dev). Press Enter to use it."
                         }
+                        Kind::Server => {
+                            "A Gentle Shell server (gentle-shell serve) runs the agents and \
+                             keeps them running while this app is closed. On the server, \
+                             gentle-shell serve pair prints a code. Project folders are paths \
+                             on the server; files, git, terminals and Setup aren't available \
+                             there yet."
+                        }
                         _ => {
                             "Agents, terminals, git and Setup run here; open agent tabs stay \
                              where they started. A project opened from \
@@ -265,6 +373,105 @@ impl SettingsView {
                         }
                     }),
             )
+    }
+
+    /// The paired server (its name, address and id, and Unpair), or the
+    /// address and code to pair with one.
+    fn render_server(&self, cx: &mut Context<Self>) -> Div {
+        if let Backend::Server { url, device, name } = &self.runs_on.choice {
+            let server_id = match &self.runs_on.server {
+                Some(Ok(info)) => info.server_id.clone(),
+                Some(Err(_)) => "unreachable".to_string(),
+                None => "…".to_string(),
+            };
+            let version = match &self.runs_on.server {
+                Some(Ok(ServerInfo {
+                    version: Some(version),
+                    ..
+                })) => version.clone(),
+                _ => "—".to_string(),
+            };
+            return v_flex()
+                .pt_2()
+                .gap_1()
+                .child(row("Server", name.clone()))
+                .child(row("Address", url.clone()))
+                .child(row("Server id", server_id))
+                .child(row("Gentle Shell", version))
+                .child(row("This device", device.clone()))
+                .child(
+                    h_flex().pt_1().child(
+                        Button::new("runs-on-unpair")
+                            .small()
+                            .ghost()
+                            .icon(Icon::new(IconName::Unlink))
+                            .label("Unpair")
+                            .tooltip(
+                                "Forget this computer's token and run agents here. Revoke the \
+                                 device on the server with gentle-shell serve devices --revoke.",
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| this.unpair_server(cx))),
+                    ),
+                );
+        }
+        let pairing = self.runs_on.pairing;
+        v_flex()
+            .child(control(
+                "Address",
+                false,
+                ui::field()
+                    .flex_1()
+                    .min_w_0()
+                    .h(rems(30. / 16.))
+                    .child(Icon::new(IconName::Server).small().text_color(ui::faint()))
+                    .child(
+                        Input::new(&self.runs_on.server_url)
+                            .appearance(false)
+                            .small(),
+                    ),
+            ))
+            .child(control(
+                "Pairing code",
+                false,
+                h_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .gap_2()
+                    .child(
+                        ui::field()
+                            .flex_1()
+                            .min_w_0()
+                            .h(rems(30. / 16.))
+                            .child(
+                                Icon::new(IconName::KeyRound)
+                                    .small()
+                                    .text_color(ui::faint()),
+                            )
+                            .child(
+                                Input::new(&self.runs_on.server_code)
+                                    .appearance(false)
+                                    .small(),
+                            ),
+                    )
+                    .child(
+                        Button::new("runs-on-pair")
+                            .small()
+                            .primary()
+                            .when(pairing, |b| b.loading(true))
+                            .label(if pairing { "Pairing…" } else { "Pair" })
+                            .disabled(pairing)
+                            .on_click(cx.listener(|this, _, _, cx| this.pair_server(cx))),
+                    ),
+            ))
+            .children(self.runs_on.pair_error.clone().map(|error| {
+                h_flex()
+                    .pt_2()
+                    .gap_2()
+                    .text_xs()
+                    .text_color(ui::danger())
+                    .child(Icon::new(IconName::CircleAlert).xsmall())
+                    .child(div().min_w_0().child(error))
+            }))
     }
 
     fn render_distros(&self, cx: &mut Context<Self>) -> Div {
@@ -344,7 +551,8 @@ impl SettingsView {
         )
     }
 
-    /// Whether the saved backend has `gentle-shell`, under the controls.
+    /// Whether the saved backend has `gentle-shell` (a server: whether it
+    /// answers), under the controls.
     fn render_runs_on_status(&self) -> Div {
         let line = |icon: IconName, color: Hsla, text: String| {
             h_flex()
@@ -353,8 +561,12 @@ impl SettingsView {
                 .text_xs()
                 .text_color(color)
                 .child(Icon::new(icon).xsmall())
-                .child(text)
+                .child(div().min_w_0().child(text))
         };
+        // The saved choice's status shows under its own option only.
+        if Kind::of(&self.runs_on.choice) != self.runs_on.kind {
+            return div();
+        }
         let label = self.runs_on.choice.label();
         match (
             &self.runs_on.choice,
@@ -373,6 +585,14 @@ impl SettingsView {
                 IconName::CircleCheck,
                 ui::success(),
                 format!("New agent tabs run on {label}."),
+            ),
+            (Backend::Server { .. }, false, Some(false)) => line(
+                IconName::CircleAlert,
+                ui::warning(),
+                match &self.runs_on.server {
+                    Some(Err(error)) => error.clone(),
+                    _ => format!("{label} doesn't answer."),
+                },
             ),
             (_, false, Some(false)) => line(
                 IconName::CircleAlert,

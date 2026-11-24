@@ -283,6 +283,7 @@ fn uv_command(uv: &Path, music: &Path) -> Command {
 /// instruments' Python binding needs the system FluidSynth library; without
 /// it, gentle-stream installs without them (its instruments are synthesized).
 pub fn install(log: &Log) -> Result<(), String> {
+    super::remote::refuse_server()?;
     if let Some(choice) = super::remote::backend() {
         return remote_install(&choice, log);
     }

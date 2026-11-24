@@ -522,9 +522,11 @@ impl Workspace {
                 // The app exits before any tab is released: ask every backend
                 // to stop now. A moment's wait lets the launchers pass SIGTERM
                 // on to Pi before the exit closes its stdin (GPUI caps it).
+                // Sessions on a Gentle Shell server keep running for the next
+                // launch to reattach to.
                 let mut signalled = false;
                 for session in this.sessions() {
-                    signalled |= session.read(cx).shutdown_backend();
+                    signalled |= session.read(cx).quit_backend();
                 }
                 let settle =
                     signalled.then(|| cx.background_executor().timer(Duration::from_millis(100)));

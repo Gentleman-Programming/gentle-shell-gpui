@@ -37,6 +37,9 @@ pub(super) struct Backend {
     pub(super) pending_session: Option<PathBuf>,
     /// A new Gentle Shell was installed mid-turn: restart on it once idle.
     pub(super) restart_pending: bool,
+    /// The Gentle Shell server session a restored tab reattaches to when it
+    /// starts (it kept running while the app was closed).
+    pub(super) attach: Option<gentle_core::serve::ServerSession>,
 }
 
 impl Backend {
@@ -49,6 +52,7 @@ impl Backend {
             pending_prompt: prompt,
             pending_session: None,
             restart_pending: false,
+            attach: None,
         }
     }
 

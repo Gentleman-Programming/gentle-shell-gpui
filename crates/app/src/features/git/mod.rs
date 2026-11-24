@@ -33,7 +33,7 @@ pub use refs::{
 pub use snapshot::snapshot;
 
 fn git(cwd: &Path, args: &[&str]) -> Option<String> {
-    let mut command = crate::features::backend::git(cwd, &[]);
+    let mut command = crate::features::backend::git(cwd, &[]).ok()?;
     command
         .args(args)
         .stdin(Stdio::null())
@@ -87,7 +87,8 @@ pub fn repository_path(root: &Path, toplevel: &Path) -> Option<String> {
 /// Run `git` for its effect. The error is git's own message; credentials
 /// are never prompted for (there is no terminal to answer).
 pub fn run(cwd: &Path, args: &[&str]) -> Result<String, String> {
-    let mut command = crate::features::backend::git(cwd, &[("GIT_TERMINAL_PROMPT", "0")]);
+    let mut command = crate::features::backend::git(cwd, &[("GIT_TERMINAL_PROMPT", "0")])
+        .map_err(|e| e.to_string())?;
     command.args(args).stdin(Stdio::null());
     let out = command.output().map_err(|e| format!("git: {e}"))?;
     if out.status.success() {

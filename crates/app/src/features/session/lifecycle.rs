@@ -153,6 +153,7 @@ impl SessionView {
         self.cwd = cwd;
         // A conversation still waiting to be resumed belongs to the old folder.
         self.backend.pending_session = None;
+        self.backend.attach = None;
         if self.backend.started {
             self.start(window, cx);
         } else {
@@ -164,8 +165,9 @@ impl SessionView {
     /// keeping its conversation (the session file is resumed on the new
     /// backend). A tab in the middle of a turn switches when the turn ends.
     pub fn restart_for_update(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // A tab not started yet starts on the new version anyway.
-        if !self.backend.started {
+        // A tab not started yet starts on the new version anyway; a server's
+        // tab doesn't run this computer's Gentle Shell.
+        if !self.backend.started || self.runs_on.as_ref().is_some_and(|b| b.is_server()) {
             return;
         }
         self.restart_when_idle(
@@ -311,13 +313,49 @@ impl SessionView {
     }
 
     /// Ask the backend to stop, without waiting for it; whether one was
-    /// running. The app quits with this, before any tab is released.
+    /// running. A server's session is stopped there too.
     pub fn shutdown_backend(&self) -> bool {
         let BackendStatus::Ready(process) = &self.backend.status else {
             return false;
         };
         process.shutdown(Duration::from_secs(3));
         true
+    }
+
+    /// The app is quitting, before any tab is released: a local backend is
+    /// asked to stop; a Gentle Shell server's session keeps running, and the
+    /// next launch reattaches to it. Whether a local one was signalled.
+    pub fn quit_backend(&self) -> bool {
+        let BackendStatus::Ready(process) = &self.backend.status else {
+            return false;
+        };
+        if process.detach() {
+            return false;
+        }
+        process.shutdown(Duration::from_secs(3));
+        true
+    }
+
+    /// Reattach to `session` on a Gentle Shell server when this tab starts:
+    /// a restored tab whose session kept running there.
+    pub fn attach_server_session(&mut self, session: gentle_core::serve::ServerSession) {
+        self.backend.attach = Some(session);
+    }
+
+    /// The Gentle Shell server session this tab follows (or will reattach
+    /// to), saved with the tab so the next launch picks it up.
+    pub fn server_session(&self) -> Option<gentle_core::serve::ServerSession> {
+        if let Some(attach) = &self.backend.attach {
+            return Some(attach.clone());
+        }
+        let Some(gentle_core::backend::Backend::Server { url, .. }) = &self.runs_on else {
+            return None;
+        };
+        let id = self.process()?.server_session()?.to_string();
+        Some(gentle_core::serve::ServerSession {
+            url: url.clone(),
+            id,
+        })
     }
 
     fn start(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -372,12 +410,31 @@ impl SessionView {
         // The backend chosen when the tab first started: a restart resumes
         // its conversation there, wherever new tabs go now.
         let runs_on = self.runs_on.clone();
+        // A server session the restored tab reattaches to (it kept running).
+        let attach = self.backend.attach.take();
         self._io = cx.spawn_in(window, async move |this, cx| {
             let spawned = cx
                 .background_executor()
                 .spawn(async move {
                     let runs_on =
                         runs_on.unwrap_or_else(|| crate::features::backend::for_tab(&cwd));
+                    if let gentle_core::backend::Backend::Server { url, .. } = &runs_on {
+                        // The server starts the session itself, in the folder
+                        // as it sees it; a conversation resumes by its Pi id.
+                        let client = crate::features::backend::server::client(&runs_on)?;
+                        let version = client.server().ok().and_then(|info| info.version);
+                        let attach = attach.filter(|s| s.url == *url).map(|s| s.id);
+                        let pi_session = resume.as_deref().and_then(|path| {
+                            gentle_core::serve::pi_session_id(&path.to_string_lossy())
+                        });
+                        let (process, rx) = PiProcess::serve(
+                            client,
+                            &cwd.to_string_lossy(),
+                            attach.as_deref(),
+                            pi_session.as_deref(),
+                        )?;
+                        return anyhow::Ok((process, rx, version, runs_on));
+                    }
                     // The canvas this agent works on: its extension's tools.
                     let files: Vec<(String, &std::path::Path)> = canvas
                         .as_deref()

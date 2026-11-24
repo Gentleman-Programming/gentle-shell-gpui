@@ -67,31 +67,43 @@ impl Render for ProvidersView {
         let listing = self.flow.is_none() && !(self.error.is_some() && self.helper.is_none());
         let body: AnyElement = if let Some((cwd, label)) = &self.remote {
             let (cwd, label) = (cwd.clone(), label.clone());
+            // A Gentle Shell server has no terminals for this app yet.
+            let server = crate::features::backend::on_server(&cwd);
             v_flex()
                 .gap_3()
                 .child(notice(
                     IconName::SquareTerminal,
                     ui::accent(),
-                    format!(
-                        "Agents here run on {label}, so they sign in there: open Gentle Shell \
-                         in a terminal on {label} and run /login. Credentials go to its auth.json."
-                    ),
+                    if server {
+                        format!(
+                            "Agents here run on {label}, so they sign in there: run gentle-shell \
+                             on the server and /login. Credentials go to its auth.json."
+                        )
+                    } else {
+                        format!(
+                            "Agents here run on {label}, so they sign in there: open Gentle \
+                             Shell in a terminal on {label} and run /login. Credentials go to \
+                             its auth.json."
+                        )
+                    },
                 ))
-                .child(
-                    h_flex().child(
-                        Button::new("providers-remote-login")
-                            .primary()
-                            .small()
-                            .icon(Icon::new(IconName::SquareTerminal))
-                            .label(format!("Open a terminal on {label}"))
-                            .on_click(cx.listener(move |_, _, _, cx| {
-                                cx.emit(ProvidersEvent::Terminal(
-                                    cwd.clone(),
-                                    "gentle-shell".to_string(),
-                                ))
-                            })),
-                    ),
-                )
+                .when(!server, |d| {
+                    d.child(
+                        h_flex().child(
+                            Button::new("providers-remote-login")
+                                .primary()
+                                .small()
+                                .icon(Icon::new(IconName::SquareTerminal))
+                                .label(format!("Open a terminal on {label}"))
+                                .on_click(cx.listener(move |_, _, _, cx| {
+                                    cx.emit(ProvidersEvent::Terminal(
+                                        cwd.clone(),
+                                        "gentle-shell".to_string(),
+                                    ))
+                                })),
+                        ),
+                    )
+                })
                 .into_any_element()
         } else if let Some(error) = &self.error
             && self.helper.is_none()

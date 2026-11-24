@@ -277,6 +277,7 @@ mod tests {
                 cwd,
                 path,
                 session: None,
+                server: None,
             }),
             pinned: false,
             focused: 0,

@@ -37,6 +37,7 @@ pub(super) fn clear_pin(path: &Path) -> io::Result<()> {
 fn worktree_identity(cwd: &Path) -> Option<(PathBuf, PathBuf)> {
     let git = |arg: &str| -> Option<PathBuf> {
         let output = crate::features::backend::git(cwd, &[])
+            .ok()?
             .args([
                 "--no-optional-locks",
                 "rev-parse",

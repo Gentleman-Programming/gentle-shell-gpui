@@ -222,6 +222,7 @@ pub fn remove(log: &Log) -> Result<(), String> {
 
 /// Java (when missing), the CLI (when missing), then the MCP server.
 pub fn install(log: &Log) -> Result<(), String> {
+    super::remote::refuse_server()?;
     if let Some(choice) = super::remote::backend() {
         return remote_install(&choice, log);
     }

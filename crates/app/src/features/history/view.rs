@@ -1198,6 +1198,11 @@ impl HistoryView {
                 .child(Spinner::new().small().color(ui::muted()))
                 .child("Reading history…")
                 .into_any_element(),
+            // git runs where the folder's agents do; a server has none for us.
+            Some(None) if crate::features::backend::on_server(&self.toplevel) => state(
+                IconName::Server,
+                crate::features::backend::server::UNAVAILABLE,
+            ),
             Some(None) => state(
                 IconName::FolderGit,
                 "This folder isn't in a Git repository.",

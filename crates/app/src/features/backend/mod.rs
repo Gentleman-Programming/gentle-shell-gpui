@@ -2,7 +2,10 @@
 //! `settings.json`, the WSL distro a project folder implies, that
 //! environment's login PATH and Gentle Shell homes, the WSL distros on this
 //! computer, and what runs through it: `gentle-shell` (agent tabs and its
-//! commands), terminals and `git`.
+//! commands), terminals and `git`. A Gentle Shell server ([`server`]) runs
+//! only its sessions: everything else answers [`server::UNAVAILABLE`] there.
+
+pub mod server;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -60,6 +63,14 @@ pub fn for_tab(cwd: &Path) -> Backend {
     Backend::for_folder(&cwd.to_string_lossy()).unwrap_or_else(saved)
 }
 
+/// Whether work rooted at `cwd` runs on a Gentle Shell server, where the
+/// app has no terminals, files, git or Setup (only agent sessions): the
+/// views that read a folder show [`server::UNAVAILABLE`] instead of
+/// reading this computer's.
+pub fn on_server(cwd: &Path) -> bool {
+    for_tab(cwd).is_server()
+}
+
 /// How `choice` reads `path`, a path on this computer, or why it can't.
 fn reach(choice: &Backend, path: &Path) -> Result<String> {
     choice.path(&path.to_string_lossy()).ok_or_else(|| {
@@ -81,6 +92,10 @@ pub fn launch_spec(
     env: &[(String, String)],
     files: &[(String, &Path)],
 ) -> Result<pi_rpc::LaunchSpec> {
+    // A server starts its sessions itself (`PiProcess::serve`).
+    if choice.is_server() {
+        return Err(anyhow!(server::UNAVAILABLE));
+    }
     let folder = reach(choice, cwd)?;
     let Some(launch) = choice.launch(&folder) else {
         let mut spec = pi_rpc::resolve_backend(cwd)?;
@@ -169,8 +184,8 @@ pub fn put_file(
     let mode = if executable { "chmod 755" } else { "true" };
     let script =
         format!(r#"mkdir -p "${{1%/*}}" && cat > "$1.$$" && {mode} "$1.$$" && mv -f "$1.$$" "$1""#);
-    let mut command = in_root(choice, &["sh", "-c", &script, "sh", there])
-        .ok_or("Agents run on this computer.")?;
+    let mut command =
+        in_root(choice, &["sh", "-c", &script, "sh", there]).ok_or_else(|| no_runner(choice))?;
     command
         .stdin(std::fs::File::open(file).map_err(|e| format!("{}: {e}", file.display()))?)
         .stderr(std::process::Stdio::null());
@@ -190,8 +205,8 @@ pub fn put_file(
 /// caller marks what must run. Blocking.
 pub fn put_dir(choice: &Backend, dir: &Path, there: &str) -> Result<(), String> {
     let script = r#"rm -rf "$1.part" && mkdir -p "$1.part" && tar -xf - --no-same-owner -C "$1.part" && rm -rf "$1" && mv "$1.part" "$1""#;
-    let mut command = in_root(choice, &["sh", "-c", script, "sh", there])
-        .ok_or("Agents run on this computer.")?;
+    let mut command =
+        in_root(choice, &["sh", "-c", script, "sh", there]).ok_or_else(|| no_runner(choice))?;
     let mut child = command
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
@@ -218,6 +233,15 @@ pub fn put_dir(choice: &Backend, dir: &Path, there: &str) -> Result<(), String> 
             choice.label(),
             String::from_utf8_lossy(&out.stderr).trim()
         )),
+    }
+}
+
+/// Why `choice` can't run something there: it is this computer, or a server.
+fn no_runner(choice: &Backend) -> String {
+    if choice.is_server() {
+        server::UNAVAILABLE.to_string()
+    } else {
+        "Agents run on this computer.".to_string()
     }
 }
 
@@ -311,9 +335,13 @@ pub fn home_shell_spec() -> Result<pi_rpc::LaunchSpec> {
 /// `git` for the repository at `cwd`, run where `cwd`'s agents run (in a
 /// WSL distro instead of over `\\wsl.localhost`, which is slow), with `env`
 /// set; the caller adds the arguments. A folder the backend can't reach
-/// runs on this computer, the only place that can read it.
-pub fn git(cwd: &Path, env: &[(&str, &str)]) -> Command {
+/// runs on this computer, the only place that can read it. On a Gentle
+/// Shell server nothing runs: [`server::UNAVAILABLE`].
+pub fn git(cwd: &Path, env: &[(&str, &str)]) -> std::io::Result<Command> {
     let choice = for_tab(cwd);
+    if choice.is_server() {
+        return Err(std::io::Error::other(server::UNAVAILABLE));
+    }
     let launch = reach(&choice, cwd)
         .ok()
         .and_then(|folder| choice.launch(&folder));
@@ -325,12 +353,12 @@ pub fn git(cwd: &Path, env: &[(&str, &str)]) -> Command {
                 .arg("env")
                 .args(env.iter().map(|(key, value)| format!("{key}={value}")))
                 .arg("git");
-            command
+            Ok(command)
         }
         _ => {
             let mut command = pi_rpc::command("git");
             command.current_dir(cwd).envs(env.iter().copied());
-            command
+            Ok(command)
         }
     }
 }
@@ -380,6 +408,7 @@ pub fn read(choice: &Backend, path: &str) -> Option<String> {
         Backend::Command { .. } => run_in(choice, &["cat".to_string(), path.to_string()])
             .filter(|(ok, _)| *ok)
             .map(|(_, text)| text),
+        Backend::Server { .. } => None,
     }
 }
 

@@ -94,6 +94,24 @@ impl PaletteView {
                 },
             );
         }
+        // A Gentle Shell server's folders have no picker here: typed as the
+        // server sees them.
+        let runs_on = crate::features::backend::saved();
+        if runs_on.is_server() && query.starts_with('/') {
+            rows.insert(
+                0,
+                Row {
+                    icon: IconName::Server,
+                    title: format!("Open \u{201c}{query}\u{201d} on {}", runs_on.label()),
+                    meta: String::new(),
+                    detail: "A workspace in that folder on the server".into(),
+                    group: "Workspaces",
+                    action: PaletteAction::CreateWorkspaceAt(query.into()),
+                    workspace: None,
+                    current: false,
+                },
+            );
+        }
         rows.push(Row {
             icon: IconName::Folder,
             title: "Browse folders…".into(),

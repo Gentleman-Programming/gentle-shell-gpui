@@ -192,6 +192,11 @@ fn spawn_pty(
     listener: Listener,
     size: WindowSize,
 ) -> anyhow::Result<(EventLoopSender, Option<ShellIdle>)> {
+    // A Gentle Shell server has no terminals for its clients yet, and its
+    // folders aren't this computer's.
+    if crate::features::backend::on_server(cwd) {
+        anyhow::bail!(crate::features::backend::server::UNAVAILABLE);
+    }
     // Where the project's agents run, the backend's login shell in the
     // project folder; there the folder is the backend's, so the PTY starts
     // from the user's home here.

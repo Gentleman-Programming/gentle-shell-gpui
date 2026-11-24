@@ -739,6 +739,7 @@ mod tests {
                     cwd: PathBuf::from("/x"),
                     path: None,
                     session: None,
+                    server: None,
                 }),
                 pinned,
                 focused: 0,

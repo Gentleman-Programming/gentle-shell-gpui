@@ -113,6 +113,9 @@ fn start(cwd: PathBuf) -> Result<(Server, String), String> {
 /// `wsl.exe` or `docker` wouldn't stop it); its page is reached through
 /// the backend's forwarded localhost.
 fn serve(cwd: &Path, json: bool) -> Result<(Server, String), String> {
+    if crate::features::backend::on_server(cwd) {
+        return Err(crate::features::backend::server::UNAVAILABLE.into());
+    }
     let args: &[&str] = if json {
         &["tower", "--no-open", "--json"]
     } else {

@@ -1,13 +1,16 @@
-//! Where agent tabs run: this computer, a WSL2 distro, or any environment a
-//! command reaches (a Linux VM through OrbStack or Lima, a container). The
-//! app stays the native frontend; `gentle-shell --mode rpc` runs in the
-//! backend and speaks the same JSONL over the launching command's stdio.
+//! Where agent tabs run: this computer, a WSL2 distro, any environment a
+//! command reaches (a Linux VM through OrbStack or Lima, a container), or a
+//! Gentle Shell server (`gentle-shell serve`) the app paired with. The app
+//! stays the native frontend; `gentle-shell --mode rpc` runs in the backend
+//! and speaks the same JSONL over the launching command's stdio, or over a
+//! server's HTTP and event stream ([`crate::serve`]).
 //!
 //! A backend is two things: the command that runs a program in a folder
 //! there ([`Backend::launch`]), and how a path on this computer reads there
 //! ([`Backend::path`]). The choice is the app's `settings.json` key
 //! [`KEY`]; a folder under `\\wsl.localhost\<distro>\` implies that distro
-//! ([`Backend::for_folder`]).
+//! ([`Backend::for_folder`]). A server runs no command of the app's: it
+//! starts sessions itself, in folders typed as the server sees them.
 
 use serde_json::{Value, json};
 
@@ -25,12 +28,23 @@ pub enum Backend {
     /// (`orb -m dev --`, `limactl shell dev`, `docker exec -i dev`). It sees
     /// this computer's paths as they are, as OrbStack and Lima mount them.
     Command { prefix: Vec<String> },
+    /// A Gentle Shell server (`gentle-shell serve`) at `url`
+    /// ([`crate::serve::normalize_url`]), paired as the device `device` and
+    /// named `name` there. Its token is a secret the app keeps outside
+    /// `settings.json`.
+    Server {
+        url: String,
+        device: String,
+        name: String,
+    },
 }
 
 impl Backend {
-    /// `{"kind": "wsl", "distro": "Ubuntu"}` or `{"kind": "command",
-    /// "prefix": ["orb", "-m", "dev", "--"]}`; anything else, a blank distro
-    /// or an empty prefix is [`Backend::Local`].
+    /// `{"kind": "wsl", "distro": "Ubuntu"}`, `{"kind": "command",
+    /// "prefix": ["orb", "-m", "dev", "--"]}` or `{"kind": "server", "url":
+    /// "http://127.0.0.1:8787", "device": "dev_…", "name": "pc"}`; anything
+    /// else, a blank distro, an empty prefix, or a server without a valid
+    /// address or device is [`Backend::Local`].
     pub fn from_json(value: &Value) -> Self {
         match value["kind"].as_str() {
             Some("wsl") => match value["distro"].as_str().map(str::trim) {
@@ -55,6 +69,20 @@ impl Backend {
                     Self::Local
                 }
             }
+            Some("server") => {
+                let url = value["url"]
+                    .as_str()
+                    .and_then(|url| crate::serve::normalize_url(url).ok());
+                let device = value["device"].as_str().map(str::trim).unwrap_or_default();
+                match url {
+                    Some(url) if !device.is_empty() => Self::Server {
+                        url,
+                        device: device.to_string(),
+                        name: value["name"].as_str().unwrap_or_default().to_string(),
+                    },
+                    _ => Self::Local,
+                }
+            }
             _ => Self::Local,
         }
     }
@@ -66,7 +94,16 @@ impl Backend {
             Self::Local => None,
             Self::Wsl { distro } => Some(json!({"kind": "wsl", "distro": distro})),
             Self::Command { prefix } => Some(json!({"kind": "command", "prefix": prefix})),
+            Self::Server { url, device, name } => {
+                Some(json!({"kind": "server", "url": url, "device": device, "name": name}))
+            }
         }
+    }
+
+    /// Whether this is a Gentle Shell server: nothing of the app's runs there
+    /// (terminals, git, file reads, Setup), only its sessions.
+    pub fn is_server(&self) -> bool {
+        matches!(self, Self::Server { .. })
     }
 
     /// The distro a folder under `\\wsl.localhost\<distro>\` (or the older
@@ -81,10 +118,11 @@ impl Backend {
     /// How the backend sees `host`, a path on this computer: unchanged
     /// locally and through a command; in WSL, `C:\a` is `/mnt/c/a` and
     /// `\\wsl.localhost\<distro>\home\a` is `/home/a`. `None` when the
-    /// backend can't reach it (another distro's share, a network path).
+    /// backend can't reach it (another distro's share, a network path). A
+    /// server's folders are typed as it sees them, so they go as they are.
     pub fn path(&self, host: &str) -> Option<String> {
         match self {
-            Self::Local | Self::Command { .. } => Some(host.to_string()),
+            Self::Local | Self::Command { .. } | Self::Server { .. } => Some(host.to_string()),
             Self::Wsl { distro } => {
                 if let Some((share, rest)) = wsl_share(host) {
                     return share
@@ -111,10 +149,11 @@ impl Backend {
     /// The argv that runs a program (appended after it) in `cwd`, a path as
     /// the backend sees it. `wsl.exe --exec` passes the arguments as they
     /// are, without a shell re-reading them; through a command a small
-    /// `sh` changes folder first. `None` for [`Backend::Local`].
+    /// `sh` changes folder first. `None` for [`Backend::Local`], and for a
+    /// server, which runs no command of the app's.
     pub fn launch(&self, cwd: &str) -> Option<Vec<String>> {
         match self {
-            Self::Local => None,
+            Self::Local | Self::Server { .. } => None,
             Self::Wsl { distro } => Some(
                 ["wsl.exe", "-d", distro, "--cd", cwd, "--exec"]
                     .map(str::to_string)
@@ -133,10 +172,11 @@ impl Backend {
     /// The argv of an interactive terminal in `cwd`, a path as the backend
     /// sees it, or `~` for the user's home there: the user's login shell.
     /// `wsl.exe` without `--exec` starts the distro's own (its `--cd` takes
-    /// `~` too). `None` for [`Backend::Local`].
+    /// `~` too). `None` for [`Backend::Local`], and for a server, which has no
+    /// terminals yet.
     pub fn terminal(&self, cwd: &str) -> Option<Vec<String>> {
         match self {
-            Self::Local => None,
+            Self::Local | Self::Server { .. } => None,
             Self::Wsl { distro } => Some(
                 ["wsl.exe", "-d", distro, "--cd", cwd]
                     .map(str::to_string)
@@ -178,12 +218,16 @@ impl Backend {
     }
 
     /// A short name for the backend: "This computer", "WSL · Ubuntu",
-    /// "orb -m dev --".
+    /// "orb -m dev --", "pc (server)" (its address when it has no name).
     pub fn label(&self) -> String {
         match self {
             Self::Local => "This computer".to_string(),
             Self::Wsl { distro } => format!("WSL · {distro}"),
             Self::Command { prefix } => prefix.join(" "),
+            Self::Server { name, .. } if !name.trim().is_empty() => {
+                format!("{} (server)", name.trim())
+            }
+            Self::Server { url, .. } => url.trim_start_matches("http://").to_string(),
         }
     }
 }
@@ -294,9 +338,23 @@ mod tests {
             Backend::Command {
                 prefix: vec!["orb".into(), "-m".into(), "dev".into(), "--".into()],
             },
+            Backend::Server {
+                url: "http://127.0.0.1:8787".into(),
+                device: "dev_1".into(),
+                name: "pc".into(),
+            },
         ] {
             assert_eq!(Backend::from_json(&backend.to_json().unwrap()), backend);
         }
+        // A typed address is kept the way requests use it.
+        assert_eq!(
+            Backend::from_json(&json!({"kind": "server", "url": "PC:8787/", "device": "d"})),
+            Backend::Server {
+                url: "http://pc:8787".into(),
+                device: "d".into(),
+                name: String::new(),
+            }
+        );
         assert_eq!(Backend::Local.to_json(), None);
         for value in [
             json!(null),
@@ -304,6 +362,9 @@ mod tests {
             json!({"kind": "command", "prefix": []}),
             json!({"kind": "command", "prefix": [""]}),
             json!({"kind": "ssh"}),
+            json!({"kind": "server", "url": "https://pc:8787", "device": "d"}),
+            json!({"kind": "server", "url": "http://pc:8787", "device": " "}),
+            json!({"kind": "server", "device": "d"}),
         ] {
             assert_eq!(Backend::from_json(&value), Backend::Local, "{value}");
         }

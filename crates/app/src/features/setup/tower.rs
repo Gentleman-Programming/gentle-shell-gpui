@@ -219,6 +219,7 @@ fn copy_dir(from: &Path, to: &Path) -> std::io::Result<()> {
 /// Builds Tower's web app for the Gentle Shell the app runs and installs it
 /// into its package. Does nothing when it's already there.
 pub fn install(log: &Log) -> Result<(), String> {
+    super::remote::refuse_server()?;
     if let Some(choice) = super::remote::backend() {
         return remote_install(&choice, log);
     }

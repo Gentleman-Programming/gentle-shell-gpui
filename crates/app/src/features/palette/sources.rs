@@ -2,7 +2,7 @@
 //! local git branches; plus `git switch` for the branch rows.
 
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 /// Files under `root`, relative, honoring `.gitignore`; at most `cap`.
 pub(super) fn walk_files(root: &Path, cap: usize) -> Vec<String> {
@@ -21,21 +21,19 @@ pub(super) fn walk_files(root: &Path, cap: usize) -> Vec<String> {
         .collect()
 }
 
-fn git_command(root: &Path) -> Command {
-    let mut command = crate::features::backend::git(root, &[]);
-    command
+/// `git` in `root` with `args`, its output captured.
+fn git_output(root: &Path, args: &[&str]) -> std::io::Result<std::process::Output> {
+    crate::features::backend::git(root, &[])?
+        .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    command
+        .stderr(Stdio::piped())
+        .output()
 }
 
 /// Local branches, `(name, is_current)`; empty outside a repository.
 pub(super) fn list_branches(root: &Path) -> Vec<(String, bool)> {
-    let Ok(out) = git_command(root)
-        .args(["branch", "--format=%(HEAD)%(refname:short)"])
-        .output()
-    else {
+    let Ok(out) = git_output(root, &["branch", "--format=%(HEAD)%(refname:short)"]) else {
         return Vec::new();
     };
     if !out.status.success() {
@@ -56,10 +54,7 @@ fn parse_branches(raw: &str) -> Vec<(String, bool)> {
 
 /// `git switch <branch>` in `root`; the error is git's own message.
 pub fn switch_branch(root: &Path, branch: &str) -> Result<(), String> {
-    let out = git_command(root)
-        .args(["switch", branch])
-        .output()
-        .map_err(|e| e.to_string())?;
+    let out = git_output(root, &["switch", branch]).map_err(|e| e.to_string())?;
     if out.status.success() {
         Ok(())
     } else {

@@ -284,8 +284,11 @@ impl FileTreeView {
                 // The status decorates the Files tab: only while it is shown
                 // and the window is in front.
                 let Ok(due) = this.update_in(cx, |this, window, _| {
-                    (this.visible && this.tab == Tab::Files && window.is_window_active())
-                        .then(|| this.git_job())
+                    (this.visible
+                        && this.tab == Tab::Files
+                        && !this.on_server()
+                        && window.is_window_active())
+                    .then(|| this.git_job())
                 }) else {
                     break;
                 };
@@ -323,8 +326,9 @@ impl FileTreeView {
 
     /// Only the shown Git panel polls.
     fn sync_panels(&mut self, cx: &mut Context<Self>) {
-        let changes = self.visible && self.tab == Tab::Changes;
-        let refs = self.visible && self.tab == Tab::Branches;
+        let shown = self.visible && !self.on_server();
+        let changes = shown && self.tab == Tab::Changes;
+        let refs = shown && self.tab == Tab::Branches;
         self.changes
             .update(cx, |view, cx| view.set_visible(changes, cx));
         self.refs.update(cx, |view, cx| view.set_visible(refs, cx));
@@ -343,7 +347,16 @@ impl FileTreeView {
         cx.notify();
     }
 
+    /// Whether the folder is a Gentle Shell server's: nothing here can read
+    /// it, so the tree, Changes and Branches say so instead.
+    fn on_server(&self) -> bool {
+        crate::features::backend::on_server(&self.root)
+    }
+
     fn refresh_git(&mut self, cx: &mut Context<Self>) {
+        if self.on_server() {
+            return;
+        }
         let job = self.git_job();
         cx.spawn(async move |this, cx| {
             let state = cx.background_executor().spawn(job).await;
@@ -370,6 +383,9 @@ impl FileTreeView {
     }
 
     fn load_dir(&mut self, dir: PathBuf, cx: &mut Context<Self>) {
+        if self.on_server() {
+            return;
+        }
         let show_ignored = self.show_ignored;
         cx.spawn(async move |this, cx| {
             let listed = dir.clone();
@@ -1479,7 +1495,8 @@ impl FileTreeView {
 
 impl Render for FileTreeView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let files = self.tab == Tab::Files;
+        let server = self.on_server();
+        let files = self.tab == Tab::Files && !server;
         let tree = cx.entity().downgrade();
         let header = h_flex()
             .h(rems(40. / 16.))
@@ -1551,7 +1568,7 @@ impl Render for FileTreeView {
             .child(self.tab_button(Tab::Changes, IconName::Diff, "Changes", change_count, cx))
             .child(self.tab_button(Tab::Branches, IconName::GitBranch, "Branches", 0, cx));
         // Finding a file, under the tabs while the tree shows.
-        let search = (self.tab == Tab::Files).then(|| {
+        let search = files.then(|| {
             h_flex().flex_none().px_2().pb_1p5().child(
                 ui::field()
                     .id("file-tree-search")
@@ -1648,9 +1665,14 @@ impl Render for FileTreeView {
             .size_full()
             .min_h_0()
             .child(header)
-            .child(tabs)
+            .when(!server, |d| d.child(tabs))
             .children(search)
             .child(match self.tab {
+                _ if server => empty_state(
+                    IconName::Server,
+                    crate::features::backend::server::UNAVAILABLE,
+                )
+                .into_any_element(),
                 Tab::Files => self.render_files(cx),
                 Tab::Changes => div()
                     .flex_1()

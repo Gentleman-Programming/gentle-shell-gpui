@@ -439,7 +439,9 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> Option<PaneId> {
         let root = self.spaces[space].root.clone();
-        let cwd = if saved.cwd.is_dir() {
+        // A Gentle Shell server's folder is a path there, not on this computer.
+        let on_server = saved.server.is_some() || crate::features::backend::on_server(&saved.cwd);
+        let cwd = if saved.cwd.is_dir() || on_server {
             saved.cwd.clone()
         } else if root.is_dir() {
             root.clone()
@@ -448,9 +450,16 @@ impl Workspace {
         };
         match saved.kind {
             PaneKind::Agent => {
-                let resume = saved.session.clone().filter(|p| p.exists());
+                let resume = saved.session.clone().filter(|p| on_server || p.exists());
                 // Started once its tab is shown (see `start_shown`).
-                Some(self.new_agent_pane(cwd, None, resume, false, window, cx))
+                let id = self.new_agent_pane(cwd, None, resume, false, window, cx);
+                // Its server session kept running while the app was closed.
+                if let Some(server) = saved.server.clone()
+                    && let Some(session) = self.panes.get(&id).and_then(|p| p.session.clone())
+                {
+                    session.update(cx, |session, _| session.attach_server_session(server));
+                }
+                Some(id)
             }
             PaneKind::Terminal => {
                 PaneFactories::get(cx).terminal.as_ref()?;

@@ -27,9 +27,14 @@ pub struct SavedPane {
     /// The file a file or canvas pane shows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<PathBuf>,
-    /// The conversation an agent pane had, resumed when it still exists.
+    /// The conversation an agent pane had, resumed when it still exists (on
+    /// a Gentle Shell server, a path there).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<PathBuf>,
+    /// The Gentle Shell server session an agent pane followed: it keeps
+    /// running while the app is closed, and the pane reattaches to it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server: Option<gentle_core::serve::ServerSession>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

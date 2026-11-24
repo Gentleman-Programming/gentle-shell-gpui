@@ -79,6 +79,10 @@ impl Workspace {
                 None if pane.item.kind == PaneKind::Canvas => pane.session_file.clone(),
                 None => None,
             },
+            server: pane
+                .session
+                .as_ref()
+                .and_then(|session| session.read(cx).server_session()),
         })
     }
 
@@ -187,6 +191,7 @@ mod tests {
             cwd: PathBuf::from(folder),
             path: None,
             session: None,
+            server: None,
         }
     }
 

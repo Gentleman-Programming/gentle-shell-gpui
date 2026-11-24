@@ -2011,6 +2011,7 @@ fn status_tint(label: &str) -> Hsla {
 
 fn git(cwd: &Path, args: &[&str]) -> Option<String> {
     let out = crate::features::backend::git(cwd, &[])
+        .ok()?
         .args(args)
         .stdin(Stdio::null())
         .stderr(Stdio::null())

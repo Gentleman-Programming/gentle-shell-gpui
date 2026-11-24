@@ -13,18 +13,24 @@ fn sample() -> SavedState {
         cwd: PathBuf::from("/tmp/project"),
         path: None,
         session: Some(PathBuf::from("/tmp/sessions/a.jsonl")),
+        server: Some(gentle_core::serve::ServerSession {
+            url: "http://127.0.0.1:8787".into(),
+            id: "ses_1".into(),
+        }),
     };
     let terminal = SavedPane {
         kind: PaneKind::Terminal,
         cwd: PathBuf::from("/tmp/project"),
         path: None,
         session: None,
+        server: None,
     };
     let file = SavedPane {
         kind: PaneKind::File,
         cwd: PathBuf::from("/tmp/project"),
         path: Some(PathBuf::from("/tmp/project/README.md")),
         session: None,
+        server: None,
     };
     SavedState {
         version: VERSION,
