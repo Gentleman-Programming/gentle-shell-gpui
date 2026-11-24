@@ -1,18 +1,22 @@
 //! A Gentle Shell server's session as a backend (`PiProcess::serve`),
 //! against a small stand-in for `gentle-shell serve`: plain HTTP/1.1 and a
 //! Server-Sent Events stream, with the server's own ids on the stream's
-//! copies of responses, `202 pending`, reconnects and `snapshot-required`.
+//! copies of responses, `202 pending`, reconnects and `snapshot-required`;
+//! and finding the server a connection code names, then pairing there.
 
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use gentle_core::serve::ConnectionCode;
 use pi_rpc::serve::ServeClient;
 use pi_rpc::{Incoming, PiProcess};
 use serde_json::{Value, json};
 
 const TOKEN: &str = "gss_test";
+const SERVER_ID: &str = "srv_fake";
+const PAIRING_CODE: &str = "ABCD-EFGH";
 
 #[derive(Default)]
 struct State {
@@ -26,6 +30,8 @@ struct State {
     /// The next stream connection answers `snapshot-required`.
     evicted: bool,
     running: bool,
+    /// The pairing code was used.
+    paired: bool,
 }
 
 #[derive(Clone)]
@@ -126,6 +132,40 @@ impl Fake {
             .log
             .push(format!("{method} {target}"));
         let mut stream = stream;
+        // Who the server is, and pairing: no token.
+        match (method.as_str(), target.as_str()) {
+            ("GET", "/.well-known/gentle-shell") => {
+                return reply(
+                    &mut stream,
+                    200,
+                    &json!({
+                        "schema": "gentle-shell.serve.identity/v1",
+                        "serverId": SERVER_ID,
+                        "name": "fake",
+                        "protocol": "gentle-shell.serve/v1",
+                        "version": "0.0.0"
+                    }),
+                );
+            }
+            ("POST", "/api/pair") => {
+                let mut state = self.state.lock().unwrap();
+                return if !state.paired && body["code"] == PAIRING_CODE {
+                    state.paired = true;
+                    reply(
+                        &mut stream,
+                        201,
+                        &json!({"id": "dev_1", "name": body["name"], "token": TOKEN}),
+                    )
+                } else {
+                    reply(
+                        &mut stream,
+                        403,
+                        &json!({"error": {"code": "invalid_code", "message": "Invalid pairing code"}}),
+                    )
+                };
+            }
+            _ => {}
+        }
         if !authorized {
             return reply(
                 &mut stream,
@@ -362,4 +402,60 @@ fn a_revoked_token_says_so() {
         .err()
         .unwrap();
     assert!(error.to_string().contains("Pair it again"), "{error}");
+}
+
+/// A connection code for the fake: its port at `hosts`.
+fn code_for(fake: &Fake, server_id: &str, hosts: &[&str]) -> ConnectionCode {
+    let port: u16 = fake.url.rsplit_once(':').unwrap().1.parse().unwrap();
+    ConnectionCode {
+        server_id: server_id.into(),
+        name: "omarchy".into(),
+        port,
+        urls: hosts
+            .iter()
+            .map(|host| format!("http://{host}:{port}"))
+            .collect(),
+        pairing_code: PAIRING_CODE.into(),
+    }
+}
+
+#[test]
+fn a_connection_code_finds_its_server_and_pairs_there_once() {
+    let fake = Fake::start();
+    // A name that never resolves and an address nothing answers at come
+    // first: the address that answers as the server wins all the same.
+    let code = code_for(
+        &fake,
+        SERVER_ID,
+        &["nowhere.invalid", "192.0.2.1", "127.0.0.1"],
+    );
+    let url = pi_rpc::serve::locate(&code).unwrap();
+    assert_eq!(url, fake.url);
+    let paired = pi_rpc::serve::pair_code(&code, &url, "Gentle Shell GPUI on test").unwrap();
+    assert_eq!(paired.token, TOKEN);
+    assert_eq!(paired.device, "dev_1");
+    let again = pi_rpc::serve::pair_code(&code, &url, "Gentle Shell GPUI on test").unwrap_err();
+    assert!(again.contains("expired or was already used"), "{again}");
+    assert!(again.contains("omarchy"), "{again}");
+}
+
+#[test]
+fn the_pairing_code_goes_only_to_the_server_named_in_the_code() {
+    let fake = Fake::start();
+    let code = code_for(&fake, "srv_restarted", &["127.0.0.1"]);
+    let error = pi_rpc::serve::locate(&code).unwrap_err();
+    assert!(error.contains("different Gentle Shell server"), "{error}");
+    assert_eq!(fake.log(), vec!["GET /.well-known/gentle-shell"]);
+}
+
+#[test]
+fn a_server_nowhere_on_the_network_says_what_to_check() {
+    let fake = Fake::start();
+    let code = code_for(&fake, SERVER_ID, &["nowhere.invalid"]);
+    let error = pi_rpc::serve::locate(&code).unwrap_err();
+    assert!(
+        error.starts_with("Couldn't find omarchy on your network."),
+        "{error}"
+    );
+    assert!(fake.log().is_empty());
 }

@@ -9,6 +9,9 @@ publish.workspace = true
 name = "gentle_core"
 
 [dependencies]
+# A Gentle Shell server's connection code (`serve::decode_connection_code`):
+# base64url. The version the app already locks.
+base64 = "0.23"
 # A sent message's HTML fragments, found as the Markdown renderer sees them.
 markdown = "1"
 regex.workspace = true

@@ -1,13 +1,16 @@
 //! Gentle Shell servers (`gentle-shell serve`) as where agents run: pairing
-//! this device with one, and the device token pairing returns. The token is a
-//! secret, so it stays out of `settings.json` (which names only the server,
-//! the device id and the server's name): it lives in `server-tokens.json` in
-//! the app's folder, owner-only (`0600`), keyed by server address.
+//! this device with one (at a typed address, or wherever on the network a
+//! connection code's server answers), and the device token pairing returns.
+//! The token is a secret, so it stays out of `settings.json` (which names
+//! only the server, the device id and the server's name): it lives in
+//! `server-tokens.json` in the app's folder, owner-only (`0600`), keyed by
+//! server address.
 
 use std::path::PathBuf;
 
 use gentle_core::backend::Backend;
-use pi_rpc::serve::{ServeClient, ServerInfo};
+use gentle_core::serve::ConnectionCode;
+use pi_rpc::serve::{Paired, ServeClient, ServerInfo};
 use serde_json::{Map, Value, json};
 
 /// What a server tab can't do yet: the server has no terminals, files or
@@ -90,13 +93,32 @@ pub fn client(choice: &Backend) -> anyhow::Result<ServeClient> {
 pub fn pair(url: &str, code: &str) -> Result<(Backend, ServerInfo), String> {
     let url = gentle_core::serve::normalize_url(url)?;
     let code = gentle_core::serve::normalize_code(code)?;
-    let name = format!(
+    let paired = ServeClient::new(&url, None)
+        .pair(&code, &device_name())
+        .map_err(|e| e.message)?;
+    let name = host_of(&url);
+    paired_with(url, name, paired)
+}
+
+/// Pair this device with the server a connection code names, at `url`
+/// (where `pi_rpc::serve::locate` found it on the network), named as the
+/// code names it. Blocking.
+pub fn pair_code(code: &ConnectionCode, url: &str) -> Result<(Backend, ServerInfo), String> {
+    let paired = pi_rpc::serve::pair_code(code, url, &device_name())?;
+    paired_with(url.to_string(), code.name.clone(), paired)
+}
+
+/// How this device names itself to a server.
+fn device_name() -> String {
+    format!(
         "Gentle Shell GPUI on {}",
         sysinfo::System::host_name().unwrap_or_else(|| "this computer".into())
-    );
-    let paired = ServeClient::new(&url, None)
-        .pair(&code, &name)
-        .map_err(|e| e.message)?;
+    )
+}
+
+/// Save the token a pairing with the server at `url` returned: the backend
+/// to save, named `name`, with what the server says about itself.
+fn paired_with(url: String, name: String, paired: Paired) -> Result<(Backend, ServerInfo), String> {
     let client = ServeClient::new(&url, Some(paired.token.clone()));
     let info = client.server().map_err(|e| e.message)?;
     let mut tokens = read_tokens();
@@ -107,7 +129,7 @@ pub fn pair(url: &str, code: &str) -> Result<(Backend, ServerInfo), String> {
     write_tokens(&tokens).map_err(|e| format!("Couldn't save the device token: {e}"))?;
     Ok((
         Backend::Server {
-            name: host_of(&url),
+            name,
             url,
             device: paired.device,
         },

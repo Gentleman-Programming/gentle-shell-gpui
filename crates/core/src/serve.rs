@@ -1,7 +1,9 @@
 //! Gentle Shell servers (`gentle-shell serve`, protocol
 //! `gentle-shell.serve/v1`): the rules a client of one follows, without the
-//! network. The server address a user types ([`normalize_url`]), what its
-//! errors mean to them ([`error_text`]), its Server-Sent Events framing
+//! network. The server address a user types ([`normalize_url`]), the
+//! connection code `gentle-shell serve share` prints and how the server it
+//! names is found ([`decode_connection_code`], [`search`]), what its errors
+//! mean to them ([`error_text`]), its Server-Sent Events framing
 //! ([`SseParser`]), the stream's cursor and what each event asks of the
 //! client ([`Stream`]), and the Pi responses the stream repeats under the
 //! server's own ids ([`RpcIds`]).
@@ -121,6 +123,297 @@ pub fn normalize_code(input: &str) -> Result<String, String> {
         Err("Enter the code `gentle-shell serve pair` printed.".into())
     } else {
         Ok(code.to_string())
+    }
+}
+
+/// What a connection code (`gentle-shell serve share`) starts with.
+pub const CODE_PREFIX: &str = "gsc1.";
+
+/// Where a server says who it is, without a token.
+pub const IDENTITY_PATH: &str = "/.well-known/gentle-shell";
+
+/// The schema of a server's identity answer.
+pub const IDENTITY_SCHEMA: &str = "gentle-shell.serve.identity/v1";
+
+/// The most addresses a connection code is looked for at.
+pub const CODE_ADDRESSES: usize = 8;
+
+/// The letters a pairing code is made of (Crockford base32: no I, L, O, U).
+const PAIRING_ALPHABET: &str = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+
+/// A server and a pairing code for it, as one string to copy and paste:
+/// `gsc1.` and the base64url (no padding) of
+/// `{"v":1,"id","n","p","a":[…],"c"}`. A secret while the pairing code in
+/// it is valid (5 minutes, once).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectionCode {
+    /// The server's id (`srv_…`): only the server answering with it is
+    /// sent the pairing code.
+    pub server_id: String,
+    /// The server's name (its host name), for the user.
+    pub name: String,
+    pub port: u16,
+    /// The base URLs to look for the server at, in the code's order (its
+    /// network addresses, then its host names), each `http://host:port`.
+    pub urls: Vec<String>,
+    /// `XXXX-XXXX`, as the server prints it.
+    pub pairing_code: String,
+}
+
+/// Why a pasted connection code can't be used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodeError {
+    /// It doesn't start with `gsc1.`.
+    NotACode,
+    /// Not base64url, not JSON, or not the code's shape: cut short or
+    /// mangled when copied.
+    Damaged,
+    /// A version of the code this app doesn't read.
+    Version(u64),
+    NoServerId,
+    /// No address the server could be looked for at.
+    NoAddress,
+    BadPort,
+    BadPairingCode,
+}
+
+impl std::fmt::Display for CodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CodeError::NotACode => f.write_str(
+                "That isn't a connection code (they start with gsc1.). On the other computer, \
+                 run gentle-shell serve share and copy the whole code.",
+            ),
+            CodeError::Damaged => f.write_str(
+                "This connection code is damaged or cut short. Copy the whole code again.",
+            ),
+            CodeError::Version(v) if *v > 1 => f.write_str(
+                "This connection code is from a newer Gentle Shell. Update Gentle Shell GPUI \
+                 to use it.",
+            ),
+            CodeError::Version(_) => f.write_str("This connection code's version is unknown."),
+            CodeError::NoServerId => f.write_str(
+                "This connection code doesn't say which server it is for. Run gentle-shell \
+                 serve share again and copy the new code.",
+            ),
+            CodeError::NoAddress => f.write_str(
+                "This connection code has no network address to look for the server at. \
+                 Connect the other computer to the network, then run gentle-shell serve \
+                 share again.",
+            ),
+            CodeError::BadPort => f.write_str(
+                "This connection code's port isn't valid. Run gentle-shell serve share again \
+                 and copy the new code.",
+            ),
+            CodeError::BadPairingCode => f.write_str(
+                "This connection code's pairing code isn't valid. Run gentle-shell serve \
+                 share again and copy the new code.",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for CodeError {}
+
+/// Whether `input` looks like a connection code (it may still be damaged).
+pub fn is_connection_code(input: &str) -> bool {
+    input.trim_start().starts_with(CODE_PREFIX)
+}
+
+/// A pasted connection code, checked. White space is ignored (a terminal
+/// may wrap a long code), as is `=` padding. Addresses that aren't a host
+/// name or an IP address are skipped, and only the first
+/// [`CODE_ADDRESSES`] are kept.
+pub fn decode_connection_code(input: &str) -> Result<ConnectionCode, CodeError> {
+    use base64::Engine as _;
+    let compact: String = input.chars().filter(|c| !c.is_whitespace()).collect();
+    let payload = compact
+        .strip_prefix(CODE_PREFIX)
+        .ok_or(CodeError::NotACode)?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload.trim_end_matches('='))
+        .map_err(|_| CodeError::Damaged)?;
+    let value: Value = serde_json::from_slice(&bytes).map_err(|_| CodeError::Damaged)?;
+    if !value.is_object() {
+        return Err(CodeError::Damaged);
+    }
+    match value["v"].as_u64() {
+        Some(1) => {}
+        Some(v) => return Err(CodeError::Version(v)),
+        None => return Err(CodeError::Damaged),
+    }
+    let server_id = value["id"]
+        .as_str()
+        .map(str::trim)
+        .filter(|id| {
+            (1..=128).contains(&id.len())
+                && id
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        })
+        .ok_or(CodeError::NoServerId)?
+        .to_string();
+    let port = value["p"]
+        .as_u64()
+        .and_then(|p| u16::try_from(p).ok())
+        .filter(|p| *p > 0)
+        .ok_or(CodeError::BadPort)?;
+    let pairing_code = value["c"]
+        .as_str()
+        .and_then(pairing_code)
+        .ok_or(CodeError::BadPairingCode)?;
+    let mut urls: Vec<String> = Vec::new();
+    for address in value["a"].as_array().into_iter().flatten() {
+        let Some(url) = address.as_str().and_then(|a| address_url(a, port)) else {
+            continue;
+        };
+        if !urls.contains(&url) {
+            urls.push(url);
+        }
+        if urls.len() == CODE_ADDRESSES {
+            break;
+        }
+    }
+    let first = urls.first().ok_or(CodeError::NoAddress)?;
+    let name = match value["n"].as_str().map(str::trim) {
+        Some(name) if !name.is_empty() => name.to_string(),
+        _ => url_host(first).to_string(),
+    };
+    Ok(ConnectionCode {
+        server_id,
+        name,
+        port,
+        urls,
+        pairing_code,
+    })
+}
+
+/// `http://address:port` for an address in a connection code (a host name,
+/// an IPv4 or an IPv6 address); `None` for anything else.
+fn address_url(address: &str, port: u16) -> Option<String> {
+    let address = address.trim();
+    let host = if address.contains(':') {
+        let ip: std::net::Ipv6Addr = address
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse()
+            .ok()?;
+        format!("[{ip}]")
+    } else {
+        address.to_string()
+    };
+    normalize_url(&format!("http://{host}:{port}")).ok()
+}
+
+/// The host of a base URL [`normalize_url`] made.
+fn url_host(url: &str) -> &str {
+    let rest = url.trim_start_matches("http://");
+    match rest.rsplit_once(':') {
+        Some((host, port)) if port.chars().all(|c| c.is_ascii_digit()) => host,
+        _ => rest,
+    }
+}
+
+/// A pairing code read as the server reads it (case, dashes and white
+/// space ignored, O as 0, I and L as 1), as `XXXX-XXXX`.
+fn pairing_code(code: &str) -> Option<String> {
+    let code: String = code
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '-')
+        .map(|c| match c.to_ascii_uppercase() {
+            'O' => '0',
+            'I' | 'L' => '1',
+            c => c,
+        })
+        .collect();
+    (code.len() == 8 && code.chars().all(|c| PAIRING_ALPHABET.contains(c)))
+        .then(|| format!("{}-{}", &code[..4], &code[4..]))
+}
+
+impl ConnectionCode {
+    /// No address answered as this server.
+    pub fn not_found(&self) -> String {
+        format!(
+            "Couldn't find {} on your network. Is it on and on the same Wi-Fi? On it, run \
+             gentle-shell serve share again. If it still can't be found, its firewall may \
+             block port {}: allow it there.",
+            self.name, self.port
+        )
+    }
+
+    /// A Gentle Shell server answered, but not the one in the code.
+    pub fn other_server(&self) -> String {
+        format!(
+            "A different Gentle Shell server answered instead of {} (it may have restarted). \
+             On {}, run gentle-shell serve share again and paste the new code.",
+            self.name, self.name
+        )
+    }
+
+    /// The server refused the pairing code: unknown, used or expired.
+    pub fn expired(&self) -> String {
+        format!(
+            "This connection code has expired or was already used. On {}, run gentle-shell \
+             serve share again and paste the new code.",
+            self.name
+        )
+    }
+}
+
+/// What one address answered at [`IDENTITY_PATH`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Probe {
+    /// Nothing answered in time.
+    Unreachable,
+    /// Something answered, but not as a Gentle Shell server.
+    NotAServer,
+    /// A Gentle Shell server, with its id.
+    Server(String),
+}
+
+/// What an identity answer says: the server's id when it is one.
+pub fn identity(body: &Value) -> Probe {
+    match body["serverId"].as_str() {
+        Some(id) if body["schema"] == IDENTITY_SCHEMA && !id.is_empty() => {
+            Probe::Server(id.to_string())
+        }
+        _ => Probe::NotAServer,
+    }
+}
+
+/// Where the search for a connection code's server stands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Search {
+    /// The address (its index in [`ConnectionCode::urls`]) that answered
+    /// as the server.
+    Found(usize),
+    /// Not found yet; addresses are still being asked.
+    Waiting,
+    /// Only other Gentle Shell servers answered.
+    OtherServer,
+    /// No Gentle Shell server answered.
+    NotFound,
+}
+
+/// The search for the server `server_id` once `arrived` answers came (in
+/// the order they came: `(address index, answer)`): the first address that
+/// answered as that server wins. `finished` is whether no more answers
+/// will come (every address answered, or time is up).
+pub fn search(server_id: &str, arrived: &[(usize, Probe)], finished: bool) -> Search {
+    let found = arrived
+        .iter()
+        .find(|(_, probe)| matches!(probe, Probe::Server(id) if id == server_id));
+    if let Some((index, _)) = found {
+        Search::Found(*index)
+    } else if !finished {
+        Search::Waiting
+    } else if arrived
+        .iter()
+        .any(|(_, probe)| matches!(probe, Probe::Server(_)))
+    {
+        Search::OtherServer
+    } else {
+        Search::NotFound
     }
 }
 
@@ -706,5 +999,190 @@ mod tests {
             (0..8).map(backoff_secs).collect::<Vec<_>>(),
             vec![1, 2, 4, 8, 16, 30, 30, 30]
         );
+    }
+
+    fn encode(value: &Value) -> String {
+        use base64::Engine as _;
+        format!(
+            "{CODE_PREFIX}{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(value.to_string())
+        )
+    }
+
+    fn shared() -> Value {
+        json!({
+            "v": 1,
+            "id": "srv_abc123",
+            "n": "omarchy",
+            "p": 8787,
+            "a": ["192.168.1.20", "10.0.0.5", "omarchy", "omarchy.local"],
+            "c": "ABCD-EFGH"
+        })
+    }
+
+    #[test]
+    fn a_connection_code_reads_as_its_server_and_addresses() {
+        let code = decode_connection_code(&encode(&shared())).unwrap();
+        assert_eq!(
+            code,
+            ConnectionCode {
+                server_id: "srv_abc123".into(),
+                name: "omarchy".into(),
+                port: 8787,
+                urls: vec![
+                    "http://192.168.1.20:8787".into(),
+                    "http://10.0.0.5:8787".into(),
+                    "http://omarchy:8787".into(),
+                    "http://omarchy.local:8787".into(),
+                ],
+                pairing_code: "ABCD-EFGH".into(),
+            }
+        );
+        assert!(is_connection_code(&format!("  {}", encode(&shared()))));
+        assert!(!is_connection_code("ABCD-EFGH"));
+    }
+
+    #[test]
+    fn a_connection_code_survives_wrapping_padding_and_a_sloppy_pairing_code() {
+        let mut value = shared();
+        value["c"] = "abcdefgh".into();
+        let text = encode(&value);
+        let (head, tail) = text.split_at(20);
+        let wrapped = format!("\n {head}\n  {tail}==\n");
+        let code = decode_connection_code(&wrapped).unwrap();
+        assert_eq!(code.pairing_code, "ABCD-EFGH");
+        value["c"] = "o1l2-i3o4".into();
+        assert_eq!(
+            decode_connection_code(&encode(&value))
+                .unwrap()
+                .pairing_code,
+            "0112-1304"
+        );
+    }
+
+    #[test]
+    fn addresses_are_checked_deduplicated_and_capped() {
+        let mut value = shared();
+        value["a"] = json!([
+            "fd00::5",
+            "bad host",
+            "10.0.0.1/admin",
+            "user@10.0.0.2",
+            "10.0.0.3:99",
+            7,
+            "10.0.0.4",
+            "10.0.0.4",
+            "a1",
+            "a2",
+            "a3",
+            "a4",
+            "a5",
+            "a6",
+            "a7",
+            "a8"
+        ]);
+        let code = decode_connection_code(&encode(&value)).unwrap();
+        assert_eq!(code.urls.len(), CODE_ADDRESSES);
+        assert_eq!(code.urls[0], "http://[fd00::5]:8787");
+        assert_eq!(code.urls[1], "http://10.0.0.4:8787");
+        assert_eq!(code.urls[7], "http://a6:8787");
+        // No name: the first address's host.
+        value["n"] = "  ".into();
+        value["a"] = json!(["192.168.1.20"]);
+        assert_eq!(
+            decode_connection_code(&encode(&value)).unwrap().name,
+            "192.168.1.20"
+        );
+    }
+
+    #[test]
+    fn a_connection_code_that_cant_be_used_says_why() {
+        let with = |key: &str, field: Value| {
+            let mut value = shared();
+            value[key] = field;
+            decode_connection_code(&encode(&value)).unwrap_err()
+        };
+        assert_eq!(
+            decode_connection_code("ABCD-EFGH").unwrap_err(),
+            CodeError::NotACode
+        );
+        assert_eq!(
+            decode_connection_code("gsc1.!!!").unwrap_err(),
+            CodeError::Damaged
+        );
+        let cut = encode(&shared());
+        assert_eq!(
+            decode_connection_code(&cut[..cut.len() - 6]).unwrap_err(),
+            CodeError::Damaged
+        );
+        assert_eq!(
+            decode_connection_code(&encode(&json!([1, 2]))).unwrap_err(),
+            CodeError::Damaged
+        );
+        assert_eq!(with("v", json!(2)), CodeError::Version(2));
+        assert!(with("v", json!(2)).to_string().contains("newer"));
+        assert_eq!(with("v", json!("1")), CodeError::Damaged);
+        assert_eq!(with("id", json!("")), CodeError::NoServerId);
+        assert_eq!(with("id", json!("srv/../x")), CodeError::NoServerId);
+        assert_eq!(with("id", Value::Null), CodeError::NoServerId);
+        assert_eq!(with("a", json!([])), CodeError::NoAddress);
+        assert_eq!(with("a", json!(["bad host"])), CodeError::NoAddress);
+        assert_eq!(with("a", Value::Null), CodeError::NoAddress);
+        assert_eq!(with("p", json!(0)), CodeError::BadPort);
+        assert_eq!(with("p", json!(65536)), CodeError::BadPort);
+        assert_eq!(with("p", json!("8787")), CodeError::BadPort);
+        assert_eq!(with("c", json!("ABCD-EFG")), CodeError::BadPairingCode);
+        assert_eq!(with("c", json!("ABCD-EFGU")), CodeError::BadPairingCode);
+        assert_eq!(with("c", Value::Null), CodeError::BadPairingCode);
+    }
+
+    #[test]
+    fn the_first_address_answering_as_the_server_wins() {
+        let id = "srv_abc123";
+        let server = |id: &str| Probe::Server(id.into());
+        // Answers in the order they came, not the code's.
+        let arrived = [(0, Probe::Unreachable), (3, server(id)), (2, server(id))];
+        assert_eq!(search(id, &arrived, false), Search::Found(3));
+        assert_eq!(search(id, &arrived[..1], false), Search::Waiting);
+        assert_eq!(search(id, &arrived[..1], true), Search::NotFound);
+        let others = [
+            (0, Probe::NotAServer),
+            (1, server("srv_other")),
+            (2, Probe::Unreachable),
+        ];
+        assert_eq!(search(id, &others, false), Search::Waiting);
+        assert_eq!(search(id, &others, true), Search::OtherServer);
+        assert_eq!(search(id, &[], true), Search::NotFound);
+    }
+
+    #[test]
+    fn an_identity_answer_names_a_server_only_with_its_schema() {
+        assert_eq!(
+            identity(&json!({
+                "schema": IDENTITY_SCHEMA,
+                "serverId": "srv_1",
+                "name": "pc",
+                "protocol": "gentle-shell.serve/v1",
+                "version": "0.1.0"
+            })),
+            Probe::Server("srv_1".into())
+        );
+        assert_eq!(identity(&json!({"serverId": "srv_1"})), Probe::NotAServer);
+        assert_eq!(
+            identity(&json!({"schema": IDENTITY_SCHEMA, "serverId": ""})),
+            Probe::NotAServer
+        );
+        assert_eq!(identity(&Value::Null), Probe::NotAServer);
+    }
+
+    #[test]
+    fn search_failures_read_as_what_to_do() {
+        let code = decode_connection_code(&encode(&shared())).unwrap();
+        let missing = code.not_found();
+        assert!(missing.starts_with("Couldn't find omarchy on your network."));
+        assert!(missing.contains("gentle-shell serve share again"));
+        assert!(missing.contains("port 8787"));
+        assert!(code.other_server().contains("restarted"));
+        assert!(code.expired().contains("expired or was already used"));
     }
 }

@@ -73,6 +73,13 @@ pub(super) struct RunsOn {
     check: Task<()>,
     /// Pointing Configuration at the new backend's Gentle Shell home.
     homes: Task<()>,
+    /// The connection code `gentle-shell serve share` printed on the
+    /// server: pasting one connects.
+    server_link: Entity<InputState>,
+    _server_link: Subscription,
+    /// Whether the address and pairing code fields show (Enter address
+    /// manually).
+    manual: bool,
     /// A server's address and the pairing code `gentle-shell serve pair`
     /// printed there.
     server_url: Entity<InputState>,
@@ -82,6 +89,8 @@ pub(super) struct RunsOn {
     /// couldn't be asked).
     server: Option<Result<ServerInfo, String>>,
     pairing: bool,
+    /// Where connecting with a code is ("Looking for pc on your network…").
+    progress: Option<String>,
     pair_error: Option<String>,
     pair: Task<()>,
 }
@@ -122,6 +131,23 @@ impl RunsOn {
                 this.pair_server(cx);
             }
         });
+        let server_link = cx.new(|cx| InputState::new(window, cx).placeholder("gsc1.…"));
+        let link_subscription =
+            cx.subscribe(&server_link, |this, input, event: &InputEvent, cx| {
+                let text = input.read(cx).value().to_string();
+                match event {
+                    // A pasted code connects at once.
+                    InputEvent::Change if gentle_core::serve::is_connection_code(&text) => {
+                        this.connect_code(&text, cx);
+                    }
+                    InputEvent::Change if text.trim().is_empty() && !this.runs_on.pairing => {
+                        this.runs_on.pair_error = None;
+                        cx.notify();
+                    }
+                    InputEvent::PressEnter { .. } => this.connect_code(&text, cx),
+                    _ => {}
+                }
+            });
         Self {
             kind: Kind::of(&choice),
             choice,
@@ -133,11 +159,15 @@ impl RunsOn {
             task: Task::ready(()),
             check: Task::ready(()),
             homes: Task::ready(()),
+            server_link,
+            _server_link: link_subscription,
+            manual: false,
             server_url,
             server_code,
             _server_code: code_subscription,
             server: None,
             pairing: false,
+            progress: None,
             pair_error: None,
             pair: Task::ready(()),
         }
@@ -233,18 +263,26 @@ impl SettingsView {
     }
 
     /// Pair with the server at the typed address using the typed code
-    /// (`POST /api/pair`); once paired, new agent tabs run there.
+    /// (`POST /api/pair`); once paired, new agent tabs run there. A
+    /// connection code typed in either field connects with it instead.
     fn pair_server(&mut self, cx: &mut Context<Self>) {
         if self.runs_on.pairing {
             return;
         }
         let url = self.runs_on.server_url.read(cx).value().to_string();
+        let code = self.runs_on.server_code.read(cx).value().to_string();
+        if let Some(link) = [&url, &code]
+            .into_iter()
+            .find(|text| gentle_core::serve::is_connection_code(text))
+        {
+            self.connect_code(&link.clone(), cx);
+            return;
+        }
         let url = if url.trim().is_empty() {
             gentle_core::serve::DEFAULT_URL.to_string()
         } else {
             url
         };
-        let code = self.runs_on.server_code.read(cx).value().to_string();
         self.runs_on.pairing = true;
         self.runs_on.pair_error = None;
         self.runs_on.pair = cx.spawn(async move |this, cx| {
@@ -252,18 +290,67 @@ impl SettingsView {
                 .background_executor()
                 .spawn(async move { backend::server::pair(&url, &code) })
                 .await;
-            let _ = this.update(cx, |this, cx| {
-                this.runs_on.pairing = false;
-                match paired {
-                    Ok((choice, info)) => {
-                        this.choose_runs_on(choice, cx);
-                        this.runs_on.server = Some(Ok(info));
-                    }
-                    Err(error) => this.runs_on.pair_error = Some(error),
+            let _ = this.update(cx, |this, cx| this.paired(paired, cx));
+        });
+        cx.notify();
+    }
+
+    /// Connect with a connection code (`gentle-shell serve share`): look
+    /// for its server at every address in it, then pair where it answered.
+    fn connect_code(&mut self, text: &str, cx: &mut Context<Self>) {
+        if self.runs_on.pairing {
+            return;
+        }
+        let code = match gentle_core::serve::decode_connection_code(text) {
+            Ok(code) => code,
+            Err(error) => {
+                self.runs_on.pair_error = Some(error.to_string());
+                cx.notify();
+                return;
+            }
+        };
+        self.runs_on.pairing = true;
+        self.runs_on.pair_error = None;
+        self.runs_on.progress = Some(format!("Looking for {} on your network…", code.name));
+        self.runs_on.pair = cx.spawn(async move |this, cx| {
+            let found = cx
+                .background_executor()
+                .spawn({
+                    let code = code.clone();
+                    async move { pi_rpc::serve::locate(&code) }
+                })
+                .await;
+            let url = match found {
+                Ok(url) => url,
+                Err(error) => {
+                    let _ = this.update(cx, |this, cx| this.paired(Err(error), cx));
+                    return;
                 }
+            };
+            let _ = this.update(cx, |this, cx| {
+                this.runs_on.progress = Some(format!("Pairing with {}…", code.name));
                 cx.notify();
             });
+            let paired = cx
+                .background_executor()
+                .spawn(async move { backend::server::pair_code(&code, &url) })
+                .await;
+            let _ = this.update(cx, |this, cx| this.paired(paired, cx));
         });
+        cx.notify();
+    }
+
+    /// A pairing ended: save the server, or say why it didn't pair.
+    fn paired(&mut self, paired: Result<(Backend, ServerInfo), String>, cx: &mut Context<Self>) {
+        self.runs_on.pairing = false;
+        self.runs_on.progress = None;
+        match paired {
+            Ok((choice, info)) => {
+                self.choose_runs_on(choice, cx);
+                self.runs_on.server = Some(Ok(info));
+            }
+            Err(error) => self.runs_on.pair_error = Some(error),
+        }
         cx.notify();
     }
 
@@ -360,11 +447,11 @@ impl SettingsView {
                              docker exec -i dev). Press Enter to use it."
                         }
                         Kind::Server => {
-                            "A Gentle Shell server (gentle-shell serve) runs the agents and \
-                             keeps them running while this app is closed. On the server, \
-                             gentle-shell serve pair prints a code. Project folders are paths \
-                             on the server; files, git, terminals and Setup aren't available \
-                             there yet."
+                            "On the other computer, run gentle-shell serve share and paste the \
+                             code here. Use it on a network you trust: the server speaks plain \
+                             HTTP. It runs the agents and keeps them running while this app is \
+                             closed. Project folders are paths on the server; files, git, \
+                             terminals and Setup aren't available there yet."
                         }
                         _ => {
                             "Agents, terminals, git and Setup run here; open agent tabs stay \
@@ -376,7 +463,8 @@ impl SettingsView {
     }
 
     /// The paired server (its name, address and id, and Unpair), or the
-    /// address and code to pair with one.
+    /// connection code to connect with one (and, under Enter address
+    /// manually, the address and pairing code).
     fn render_server(&self, cx: &mut Context<Self>) -> Div {
         if let Backend::Server { url, device, name } = &self.runs_on.choice {
             let server_id = match &self.runs_on.server {
@@ -415,7 +503,9 @@ impl SettingsView {
                 );
         }
         let pairing = self.runs_on.pairing;
-        v_flex()
+        let connecting = pairing && self.runs_on.progress.is_some();
+        let manual = self.runs_on.manual;
+        let manual_fields = v_flex()
             .child(control(
                 "Address",
                 false,
@@ -456,13 +546,63 @@ impl SettingsView {
                     .child(
                         Button::new("runs-on-pair")
                             .small()
-                            .primary()
-                            .when(pairing, |b| b.loading(true))
-                            .label(if pairing { "Pairing…" } else { "Pair" })
+                            .ghost()
+                            .when(pairing && !connecting, |b| b.loading(true))
+                            .label(if pairing && !connecting {
+                                "Pairing…"
+                            } else {
+                                "Pair"
+                            })
                             .disabled(pairing)
                             .on_click(cx.listener(|this, _, _, cx| this.pair_server(cx))),
                     ),
+            ));
+        v_flex()
+            .child(control(
+                "Connection code",
+                false,
+                h_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .gap_2()
+                    .child(
+                        ui::field()
+                            .flex_1()
+                            .min_w_0()
+                            .h(rems(30. / 16.))
+                            .child(Icon::new(IconName::Link).small().text_color(ui::faint()))
+                            .child(
+                                Input::new(&self.runs_on.server_link)
+                                    .appearance(false)
+                                    .small(),
+                            ),
+                    )
+                    .child(
+                        Button::new("runs-on-connect")
+                            .small()
+                            .primary()
+                            .when(connecting, |b| b.loading(true))
+                            .label(if connecting {
+                                "Connecting…"
+                            } else {
+                                "Connect"
+                            })
+                            .disabled(pairing)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                let text = this.runs_on.server_link.read(cx).value().to_string();
+                                this.connect_code(&text, cx);
+                            })),
+                    ),
             ))
+            .children(self.runs_on.progress.clone().map(|progress| {
+                h_flex()
+                    .pt_2()
+                    .gap_2()
+                    .text_xs()
+                    .text_color(ui::muted())
+                    .child(Spinner::new().xsmall().color(ui::muted()))
+                    .child(div().min_w_0().child(progress))
+            }))
             .children(self.runs_on.pair_error.clone().map(|error| {
                 h_flex()
                     .pt_2()
@@ -472,6 +612,31 @@ impl SettingsView {
                     .child(Icon::new(IconName::CircleAlert).xsmall())
                     .child(div().min_w_0().child(error))
             }))
+            .child(
+                h_flex()
+                    .id("runs-on-manual")
+                    .pt_3()
+                    .gap_1()
+                    .cursor_pointer()
+                    .text_xs()
+                    .text_color(ui::muted())
+                    .hover(|s| s.text_color(ui::fg()))
+                    .child(
+                        Icon::new(if manual {
+                            IconName::ChevronDown
+                        } else {
+                            IconName::ChevronRight
+                        })
+                        .xsmall()
+                        .text_color(ui::faint()),
+                    )
+                    .child("Enter address manually")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.runs_on.manual = !this.runs_on.manual;
+                        cx.notify();
+                    })),
+            )
+            .when(manual, |d| d.child(manual_fields))
     }
 
     fn render_distros(&self, cx: &mut Context<Self>) -> Div {

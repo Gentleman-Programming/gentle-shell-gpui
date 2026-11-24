@@ -21,10 +21,12 @@
 use std::io::Read as _;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
-use gentle_core::serve::{self as protocol, RpcIds, SseParser, Step, Stream};
+use gentle_core::serve::{
+    self as protocol, ConnectionCode, Probe, RpcIds, Search, SseParser, Step, Stream,
+};
 use serde_json::{Value, json};
 
 use crate::{Incoming, Io, Pending, PiProcess, Traffic, dispatch, record::record_from};
@@ -42,12 +44,20 @@ const OVERTAKE: Duration = Duration::from_secs(2);
 /// The largest answer read (`get_messages` of a long conversation with
 /// images); the server caps a record at 16 MiB.
 const BODY_LIMIT: u64 = 64 * 1024 * 1024;
+/// How long one address may take to say who it is, looking for the server
+/// a connection code names.
+const PROBE: Duration = Duration::from_millis(1500);
+/// How long looking for that server may take in all.
+const SEARCH: Duration = Duration::from_secs(4);
 
 /// What went wrong talking to a server, in words for the user.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServeError {
     /// The HTTP status, when the server answered.
     pub status: Option<u16>,
+    /// The server's error code (`invalid_code`, `rate_limited`, …), when
+    /// it sent one.
+    pub error: Option<String>,
     pub message: String,
 }
 
@@ -145,6 +155,7 @@ impl ServeClient {
     fn unreachable(&self, error: ureq::Error) -> ServeError {
         ServeError {
             status: None,
+            error: None,
             message: format!("Couldn't reach the server at {}: {error}", self.url),
         }
     }
@@ -170,6 +181,7 @@ impl ServeClient {
                     .body(serde_json::to_vec(body).unwrap_or_default())
                     .map_err(|e| ServeError {
                         status: None,
+                        error: None,
                         message: format!("Bad request to {url}: {e}"),
                     })?;
                 agent.run(request)
@@ -177,6 +189,7 @@ impl ServeClient {
             None => {
                 let request = request.body(()).map_err(|e| ServeError {
                     status: None,
+                    error: None,
                     message: format!("Bad request to {url}: {e}"),
                 })?;
                 agent.run(request)
@@ -192,6 +205,7 @@ impl ServeClient {
         let (code, message) = protocol::error_body(&body);
         Err(ServeError {
             status: Some(status),
+            error: code.map(str::to_string),
             message: protocol::error_text(status, code, message),
         })
     }
@@ -200,6 +214,7 @@ impl ServeClient {
         let (status, mut response) = self.call(&self.agent, method, path, body)?;
         read_json(&mut response).map_err(|message| ServeError {
             status: Some(status),
+            error: None,
             message,
         })
     }
@@ -221,6 +236,7 @@ impl ServeClient {
             }),
             _ => Err(ServeError {
                 status: None,
+                error: None,
                 message: "The server's pairing answer has no device or token.".into(),
             }),
         }
@@ -290,12 +306,80 @@ impl ServeClient {
     }
 }
 
+/// The server a connection code names, looked for at every address in it
+/// at once (`GET /.well-known/gentle-shell`, no token): the base URL of the
+/// first that answers as that server, or what to do in words. Each address
+/// gets [`PROBE`], the whole search [`SEARCH`]. The pairing code is sent
+/// nowhere here. Blocking.
+pub fn locate(code: &ConnectionCode) -> Result<String, String> {
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .max_redirects(0)
+        .timeout_global(Some(PROBE))
+        .build()
+        .into();
+    let (tx, rx) = mpsc::channel();
+    for (index, url) in code.urls.iter().enumerate() {
+        let (agent, tx) = (agent.clone(), tx.clone());
+        let url = format!("{url}{}", protocol::IDENTITY_PATH);
+        // One that can't start counts as unreachable: its sender is gone.
+        let _ = std::thread::Builder::new()
+            .name("serve-probe".into())
+            .spawn(move || {
+                let _ = tx.send((index, probe(&agent, &url)));
+            });
+    }
+    drop(tx);
+    let deadline = Instant::now() + SEARCH;
+    let mut arrived = Vec::new();
+    loop {
+        let finished = match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(answer) => {
+                arrived.push(answer);
+                arrived.len() == code.urls.len()
+            }
+            // Time is up, or every probe that started answered.
+            Err(_) => true,
+        };
+        match protocol::search(&code.server_id, &arrived, finished) {
+            Search::Found(index) => return Ok(code.urls[index].clone()),
+            Search::Waiting => {}
+            Search::OtherServer => return Err(code.other_server()),
+            Search::NotFound => return Err(code.not_found()),
+        }
+    }
+}
+
+/// What the address at `url` says it is.
+fn probe(agent: &ureq::Agent, url: &str) -> Probe {
+    let Ok(mut response) = agent.get(url).call() else {
+        return Probe::Unreachable;
+    };
+    if !response.status().is_success() {
+        return Probe::NotAServer;
+    }
+    read_json(&mut response).map_or(Probe::NotAServer, |body| protocol::identity(&body))
+}
+
+/// Pair this device, named `name`, with the server a connection code names
+/// at `url` (where [`locate`] found it). A code the server no longer takes
+/// reads as one to make again. Blocking.
+pub fn pair_code(code: &ConnectionCode, url: &str, name: &str) -> Result<Paired, String> {
+    ServeClient::new(url, None)
+        .pair(&code.pairing_code, name)
+        .map_err(|e| match (e.status, e.error.as_deref()) {
+            (Some(403), Some("invalid_code")) => code.expired(),
+            _ => e.message,
+        })
+}
+
 fn session_path(id: &str, rest: &str) -> Result<String, ServeError> {
     if protocol::is_session_id(id) {
         Ok(format!("/api/sessions/{id}{rest}"))
     } else {
         Err(ServeError {
             status: Some(404),
+            error: None,
             message: protocol::error_text(404, None, None),
         })
     }
@@ -304,6 +388,7 @@ fn session_path(id: &str, rest: &str) -> Result<String, ServeError> {
 fn malformed() -> ServeError {
     ServeError {
         status: None,
+        error: None,
         message: "The server's answer isn't what Gentle Shell servers send.".into(),
     }
 }
