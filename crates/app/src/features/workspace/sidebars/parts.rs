@@ -3,6 +3,7 @@
 //! Terminal tiles at the bottom.
 
 use super::super::badge::workspace_avatar;
+use super::super::menu::WorkspaceMenuSource;
 use super::*;
 
 /// A row, as tall as a Files tree row.
@@ -13,10 +14,11 @@ pub(super) const INDENT: f32 = 22.;
 
 impl Workspace {
     /// The header: the shown workspace (a click switches, a right-click
-    /// edits its badge), then `actions`.
+    /// opens its menu), then `actions`.
     pub(super) fn sidebar_header(&self, actions: Vec<AnyElement>, cx: &mut Context<Self>) -> Div {
         let space = self.space();
         let mark = Mark::of(space);
+        let index = self.current;
         h_flex()
             .h(rems(40. / 16.))
             .flex_none()
@@ -35,24 +37,44 @@ impl Workspace {
                     .rounded_md()
                     .cursor_pointer()
                     .hover(|s| s.bg(ui::surface_hover().opacity(0.6)))
-                    .tooltip(|window, cx| {
-                        Tooltip::new("Switch workspace · right-click for its badge")
-                            .build(window, cx)
+                    .when(!self.popups_open(), |d| {
+                        d.tooltip(|window, cx| {
+                            Tooltip::new("Switch workspace · right-click for its menu")
+                                .build(window, cx)
+                        })
                     })
                     .on_click(
                         cx.listener(|this, _, window, cx| this.open_workspace_switcher(window, cx)),
                     )
-                    .map(|d| self.with_badge_picker(d, self.current, cx))
-                    .child(workspace_avatar(&mark))
-                    .child(
-                        div()
-                            .min_w_0()
-                            .truncate()
-                            .text_size(rems(13.5 / 16.))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(ui::fg())
-                            .child(space.name.clone()),
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                            cx.stop_propagation();
+                            this.open_workspace_menu(
+                                index,
+                                WorkspaceMenuSource::Header,
+                                event.position,
+                                window,
+                                cx,
+                            );
+                        }),
                     )
+                    .child(workspace_avatar(&mark))
+                    .map(|d| {
+                        if self.renaming_workspace(index, WorkspaceMenuSource::Header) {
+                            d.child(self.workspace_rename_input(cx))
+                        } else {
+                            d.child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(rems(13.5 / 16.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(ui::fg())
+                                    .child(space.name.clone()),
+                            )
+                        }
+                    })
                     .child(
                         Icon::new(IconName::ChevronsUpDown)
                             .xsmall()
@@ -74,6 +96,7 @@ impl Workspace {
                 .on_click(
                     cx.listener(|this, _, _, cx| this.set_tab_layout(TabLayout::Horizontal, cx)),
                 )
+                .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
                 .into_any_element(),
         ]
     }
@@ -85,6 +108,8 @@ impl Workspace {
                 .flex_1()
                 .min_w_0()
                 .h(rems(30. / 16.))
+                // The field's own Cut/Copy/Paste menu is the only one.
+                .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
                 .child(Icon::new(IconName::Search).small().text_color(ui::faint()))
                 .child(Input::new(&self.tab_search).appearance(false).small()),
         )
@@ -124,7 +149,8 @@ impl Workspace {
 
     /// A tab as a 26 px row: kind icon in its state's tone, title, pin,
     /// status dot and pane count; the shown tab raised, with the accent
-    /// marker on its left.
+    /// marker on its left. Selected tabs, the shown one included, are raised
+    /// and ringed in petal.
     pub(super) fn tab_row(
         &self,
         tab: &TabEntry,
@@ -132,6 +158,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let tip = tab.tooltip();
+        let selected = self.is_tab_selected(tab.space, tab.id);
         let row = h_flex()
             .id(SharedString::from(format!(
                 "sidebar-tab-{}-{}",
@@ -145,9 +172,17 @@ impl Workspace {
             .pr_2()
             .gap_1p5()
             .rounded_md()
-            .when(tab.shown, |d| d.bg(ui::raised()))
-            .when(!tab.shown, |d| d.hover(|s| s.bg(ui::surface_hover())))
-            .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+            // Every row keeps the ring's width so none shifts when selected.
+            .border_1()
+            .border_color(gpui_kit::transparent_black())
+            .when(tab.shown || selected, |d| d.bg(ui::raised()))
+            .when(selected, |d| d.border_color(ui::petal().opacity(0.45)))
+            .when(!tab.shown && !selected, |d| {
+                d.hover(|s| s.bg(ui::surface_hover()))
+            })
+            .when(!self.popups_open(), |d| {
+                d.tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+            })
             .when(tab.shown, |d| {
                 d.child(
                     div()
@@ -186,7 +221,8 @@ impl Workspace {
 
     /// A workspace as a 26 px row: `chevron` (open or closed) when it
     /// folds, its badge, name, activity dot and tab count. A right-click
-    /// edits its badge; the caller adds what a click does.
+    /// opens its menu; the caller adds what a click does. Dragging a row
+    /// onto another reorders the workspaces.
     pub(super) fn space_row(
         &self,
         space: &SpaceEntry,
@@ -195,6 +231,8 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
         let tip = space.tooltip();
+        let index = space.index;
+        let name = space.name.clone();
         h_flex()
             .id((id, space.index))
             .relative()
@@ -207,8 +245,22 @@ impl Workspace {
             .rounded_md()
             .cursor_pointer()
             .hover(|d| d.bg(ui::surface_hover()))
-            .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
-            .map(|d| self.with_badge_picker(d, space.index, cx))
+            .when(!self.popups_open(), |d| {
+                d.tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+            })
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    this.open_workspace_menu(
+                        index,
+                        WorkspaceMenuSource::SidebarRow,
+                        event.position,
+                        window,
+                        cx,
+                    );
+                }),
+            )
             .when_some(chevron, |d, open| {
                 d.child(
                     Icon::new(if open {
@@ -221,16 +273,22 @@ impl Workspace {
                 )
             })
             .child(workspace_avatar(&space.mark))
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .text_size(rems(12.5 / 16.))
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(if space.current { ui::fg() } else { ui::muted() })
-                    .child(space.name.clone()),
-            )
+            .map(|d| {
+                if self.renaming_workspace(index, WorkspaceMenuSource::SidebarRow) {
+                    d.child(self.workspace_rename_input(cx))
+                } else {
+                    d.child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(rems(12.5 / 16.))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(if space.current { ui::fg() } else { ui::muted() })
+                            .child(space.name.clone()),
+                    )
+                }
+            })
             .when_some(space.dot(), |d, (color, _)| {
                 d.child(
                     div()
@@ -248,5 +306,16 @@ impl Workspace {
                     .text_color(ui::faint())
                     .child(space.tabs.to_string()),
             )
+            .on_drag(
+                WorkspaceDrag {
+                    index,
+                    name: name.clone(),
+                },
+                |drag, _, _, cx| cx.new(|_| DragChip(drag.name.clone())),
+            )
+            .drag_over::<WorkspaceDrag>(|style, _, _, _| style.bg(ui::petal().opacity(0.18)))
+            .on_drop(cx.listener(move |this, drag: &WorkspaceDrag, window, cx| {
+                this.move_workspace(drag.index, index, window, cx);
+            }))
     }
 }

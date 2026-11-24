@@ -291,11 +291,33 @@ impl gpui_kit::Render for Selectable {
 fn a_sent_prompt_can_be_selected(cx: &mut TestAppContext) {
     use gpui_kit::{AppContext as _, MouseButton, base::TextSelection};
 
+    struct FocusedSession {
+        session: Entity<SessionView>,
+        focus: gpui_kit::FocusHandle,
+    }
+
+    impl gpui_kit::Render for FocusedSession {
+        fn render(
+            &mut self,
+            _: &mut gpui_kit::Window,
+            _: &mut gpui_kit::Context<Self>,
+        ) -> impl gpui_kit::IntoElement {
+            use gpui_kit::{InteractiveElement as _, ParentElement as _, Styled as _};
+            gpui_kit::div()
+                .id("focus")
+                .track_focus(&self.focus)
+                .size_full()
+                .child(self.session.clone())
+        }
+    }
+
     cx.update(|cx| {
         gpui_kit::init(cx);
         cx.set_reduce_motion(true);
     });
     let (_root, cx) = cx.add_window_view(|window, cx| {
+        let focus = cx.focus_handle();
+        window.focus(&focus, cx);
         let session = cx.new(|cx| {
             let mut view = SessionView::new(std::env::temp_dir(), None, window, cx, false);
             view.backend.started = true;
@@ -308,7 +330,8 @@ fn a_sent_prompt_can_be_selected(cx: &mut TestAppContext) {
             view.sync_view(cx);
             view
         });
-        Selectable(session)
+        let view = cx.new(|_| FocusedSession { session, focus });
+        gpui_kit::base::Root::new(view, window, cx)
     });
     cx.run_until_parked();
     let bounds = cx
@@ -323,8 +346,366 @@ fn a_sent_prompt_can_be_selected(cx: &mut TestAppContext) {
     cx.simulate_mouse_up(end, MouseButton::Left, Modifiers::none());
     cx.update(|window, cx| {
         let _ = window.draw(cx);
-        assert_eq!(TextSelection::selected_text(window, cx), "fix the parser");
+        assert_eq!(TextSelection::selected_text(window, cx), "fix the parser\n");
+        cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string("sentinel".into()));
     });
+    cx.simulate_keystrokes(if cfg!(target_os = "macos") {
+        "cmd-c"
+    } else {
+        "ctrl-c"
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_, cx| cx.read_from_clipboard().and_then(|item| item.text())),
+        Some("fix the parser".into())
+    );
+}
+
+/// Selecting a sent bubble copies the displayed text, without matched delimiters.
+#[gpui::test]
+fn user_bubble_inline_code_selection_omits_matched_delimiters(cx: &mut TestAppContext) {
+    use gpui_kit::{AppContext as _, MouseButton, base::TextSelection};
+
+    cx.update(|cx| {
+        gpui_kit::init(cx);
+        cx.set_reduce_motion(true);
+    });
+    let (_root, cx) = cx.add_window_view(|window, cx| {
+        let session = cx.new(|cx| {
+            let mut view = SessionView::new(std::env::temp_dir(), None, window, cx, false);
+            view.backend.started = true;
+            view.transcript
+                .items
+                .push(gentle_core::transcript::Item::User {
+                    text: "fix `café` and `x` then `open".into(),
+                    images: Vec::new(),
+                });
+            view.sync_view(cx);
+            view
+        });
+        Selectable(session)
+    });
+    cx.run_until_parked();
+    let bounds = cx.debug_bounds("user-text-0").expect("sent prompt");
+    let start = gpui_kit::point(bounds.left() + gpui_kit::px(1.), bounds.center().y);
+    let end = gpui_kit::point(bounds.right() - gpui_kit::px(1.), bounds.center().y);
+    cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::none());
+    cx.simulate_mouse_move(end, Some(MouseButton::Left), Modifiers::none());
+    cx.simulate_mouse_up(end, MouseButton::Left, Modifiers::none());
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+        assert_eq!(
+            TextSelection::selected_text(window, cx),
+            "fix café and x then `open\n"
+        );
+    });
+    cx.simulate_keystrokes(if cfg!(target_os = "macos") {
+        "cmd-c"
+    } else {
+        "ctrl-c"
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_, cx| cx
+            .read_from_clipboard()
+            .and_then(|item| item.text())
+            .unwrap_or_default()),
+        "fix café and x then `open"
+    );
+}
+
+/// Authored soft breaks stay visible and selection copies the formatted text.
+#[gpui::test]
+fn user_bubble_authored_newlines_and_clipboard(cx: &mut TestAppContext) {
+    use gpui_kit::{AppContext as _, MouseButton, point, px};
+
+    cx.update(|cx| {
+        gpui_kit::init(cx);
+        cx.set_reduce_motion(true);
+    });
+    let (_, cx) = cx.add_window_view(|window, cx| {
+        let session = cx.new(|cx| {
+            let mut view = SessionView::new(std::env::temp_dir(), None, window, cx, false);
+            view.backend.started = true;
+            view.transcript
+                .items
+                .push(gentle_core::transcript::Item::User {
+                    text: "1- `code`\n2- **bold**\n3- ~~strike~~".into(),
+                    images: Vec::new(),
+                });
+            view.sync_view(cx);
+            view
+        });
+        Selectable(session)
+    });
+    cx.run_until_parked();
+    let bounds = cx.debug_bounds("user-text-0").expect("sent prompt");
+    let start = point(bounds.left() + px(1.), bounds.top() + px(5.));
+    let first_end = point(bounds.right() - px(1.), bounds.top() + px(5.));
+    cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::none());
+    cx.simulate_mouse_move(first_end, Some(MouseButton::Left), Modifiers::none());
+    cx.simulate_mouse_up(first_end, MouseButton::Left, Modifiers::none());
+    cx.simulate_keystrokes(if cfg!(target_os = "macos") {
+        "cmd-c"
+    } else {
+        "ctrl-c"
+    });
+    cx.run_until_parked();
+    let partial = cx.update(|_, cx| {
+        cx.read_from_clipboard()
+            .and_then(|item| item.text())
+            .unwrap_or_default()
+    });
+    assert_eq!(partial, "1- code");
+
+    let end = point(bounds.right() - px(1.), bounds.bottom() - px(5.));
+    cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::none());
+    cx.simulate_mouse_move(end, Some(MouseButton::Left), Modifiers::none());
+    cx.simulate_mouse_up(end, MouseButton::Left, Modifiers::none());
+    cx.simulate_keystrokes(if cfg!(target_os = "macos") {
+        "cmd-c"
+    } else {
+        "ctrl-c"
+    });
+    cx.run_until_parked();
+    let clipboard = cx.update(|_, cx| {
+        cx.read_from_clipboard()
+            .and_then(|item| item.text())
+            .unwrap_or_default()
+    });
+    assert!(
+        bounds.size.height > px(40.),
+        "three authored lines must occupy three rows"
+    );
+    assert_eq!(clipboard, "1- code\n2- bold\n3- strike");
+}
+
+/// Existing list and fenced-code blocks retain their rendered lines and copy text.
+#[gpui::test]
+fn user_bubble_list_and_fenced_code_preserved(cx: &mut TestAppContext) {
+    use gpui_kit::{AppContext as _, MouseButton, point, px};
+
+    cx.update(|cx| {
+        gpui_kit::init(cx);
+        cx.set_reduce_motion(true);
+    });
+    for (source, expected) in [
+        ("- one\n- two\n- three", "one\ntwo\nthree"),
+        ("```\none\ntwo\nthree\n```", "one\ntwo\nthree"),
+    ] {
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let session = cx.new(|cx| {
+                let mut view = SessionView::new(std::env::temp_dir(), None, window, cx, false);
+                view.backend.started = true;
+                view.transcript
+                    .items
+                    .push(gentle_core::transcript::Item::User {
+                        text: source.into(),
+                        images: Vec::new(),
+                    });
+                view.sync_view(cx);
+                view
+            });
+            Selectable(session)
+        });
+        cx.run_until_parked();
+        let bounds = cx.debug_bounds("user-text-0").expect("sent prompt");
+        assert!(
+            bounds.size.height > px(40.),
+            "block must occupy multiple rows: {source:?}"
+        );
+        let start = point(bounds.left() + px(1.), bounds.top() + px(5.));
+        let end = point(bounds.right() - px(1.), bounds.bottom() - px(5.));
+        cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_move(end, Some(MouseButton::Left), Modifiers::none());
+        cx.simulate_mouse_up(end, MouseButton::Left, Modifiers::none());
+        cx.simulate_keystrokes(if cfg!(target_os = "macos") {
+            "cmd-c"
+        } else {
+            "ctrl-c"
+        });
+        cx.run_until_parked();
+        let clipboard = cx.update(|_, cx| {
+            cx.read_from_clipboard()
+                .and_then(|item| item.text())
+                .unwrap_or_default()
+        });
+        assert_eq!(clipboard, expected, "source: {source:?}");
+    }
+}
+
+fn assert_user_bubble_copy(
+    cx: &mut TestAppContext,
+    source: &str,
+    expected: &str,
+    start_inset: Option<f32>,
+    end_inset: f32,
+) {
+    use gpui_kit::{AppContext as _, MouseButton, base::TextSelection, point, px};
+
+    cx.update(|cx| {
+        gpui_kit::init(cx);
+        cx.set_reduce_motion(true);
+    });
+    let (_, cx) = cx.add_window_view(|window, cx| {
+        let session = cx.new(|cx| {
+            let mut view = SessionView::new(std::env::temp_dir(), None, window, cx, false);
+            view.backend.started = true;
+            view.transcript
+                .items
+                .push(gentle_core::transcript::Item::User {
+                    text: source.into(),
+                    images: Vec::new(),
+                });
+            view.sync_view(cx);
+            view
+        });
+        Selectable(session)
+    });
+    cx.run_until_parked();
+    let bounds = cx.debug_bounds("user-text-0").expect("sent prompt");
+    let end = point(bounds.right() - px(end_inset), bounds.bottom() - px(10.));
+    let start_inset = start_inset.unwrap_or_else(|| {
+        // Find a hit inside the first glyph's leading half rather than assuming
+        // the list marker's indentation and glyph metrics in pixels.
+        (1..200)
+            .find(|x| {
+                let start = point(bounds.left() + px(*x as f32), bounds.top() + px(10.));
+                cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::none());
+                cx.simulate_mouse_move(end, Some(MouseButton::Left), Modifiers::none());
+                cx.simulate_mouse_up(end, MouseButton::Left, Modifiers::none());
+                cx.update(|window, cx| {
+                    let _ = window.draw(cx);
+                    TextSelection::selected_text(window, cx).trim_end_matches('\n') == expected
+                })
+            })
+            .expect("selection reached the first glyph") as f32
+    });
+    let start = point(bounds.left() + px(start_inset), bounds.top() + px(10.));
+    cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::none());
+    cx.simulate_mouse_move(end, Some(MouseButton::Left), Modifiers::none());
+    cx.simulate_mouse_up(end, MouseButton::Left, Modifiers::none());
+    let selected = cx.update(|window, cx| {
+        let _ = window.draw(cx);
+        TextSelection::selected_text(window, cx)
+    });
+    cx.simulate_keystrokes(if cfg!(target_os = "macos") {
+        "cmd-c"
+    } else {
+        "ctrl-c"
+    });
+    cx.run_until_parked();
+    let clipboard = cx.update(|_, cx| {
+        cx.read_from_clipboard()
+            .and_then(|item| item.text())
+            .unwrap_or_default()
+    });
+    assert_eq!(selected.trim_end_matches('\n'), expected, "selection");
+    assert_eq!(clipboard, expected, "clipboard");
+}
+
+#[gpui::test]
+fn user_bubble_complete_html_fragments_are_literal(cx: &mut TestAppContext) {
+    for (source, expected) in [
+        (
+            "<div><span>hola</span></div>",
+            "<div><span>hola</span></div>",
+        ),
+        (
+            "**outside** <span title=\"**attr**\">**inside**</span> **after**",
+            "outside <span title=\"**attr**\">**inside**</span> after",
+        ),
+        (
+            "<div><br><span title=\"a > b\">**hola**</span></div>",
+            "<div><br><span title=\"a > b\">**hola**</span></div>",
+        ),
+    ] {
+        assert_user_bubble_copy(cx, source, expected, Some(1.), 1.);
+    }
+}
+
+#[gpui::test]
+fn user_bubble_html_comment_does_not_close_fragment(cx: &mut TestAppContext) {
+    let source = "<div><!-- </div> -->**inside**</div>";
+    assert_user_bubble_copy(cx, source, source, Some(1.), 1.);
+}
+
+#[gpui::test]
+fn user_bubble_folded_html_keeps_content_literal(cx: &mut TestAppContext) {
+    let source = "<div>\n**one**\n**two**\n**three**\n**four**\n**five**\n**six**\n**seven**\n**eight**\n**nine**\n</div>";
+    let expected = "<div>\n**one**\n**two**\n**three**\n**four**\n**five**\n**six**\n**seven**";
+    assert_user_bubble_copy(cx, source, expected, Some(1.), 1.);
+}
+
+#[gpui::test]
+fn user_bubble_html_indented_content_has_no_escape_backslashes(cx: &mut TestAppContext) {
+    let source = "<div>\n\n    **literal**\n</div>";
+    assert_user_bubble_copy(cx, source, source, Some(1.), 1.);
+}
+
+#[gpui::test]
+fn user_bubble_html_tab_indentation_is_literal(cx: &mut TestAppContext) {
+    let source = "<div>\n\n\t**literal**\n</div>";
+    assert_user_bubble_copy(cx, source, source, Some(1.), 1.);
+}
+
+#[gpui::test]
+fn user_bubble_raw_html_is_visible(cx: &mut TestAppContext) {
+    assert_user_bubble_copy(
+        cx,
+        "<span title=\"**important**\">text</span>",
+        "<span title=\"**important**\">text</span>",
+        Some(1.),
+        1.,
+    );
+    assert_user_bubble_copy(
+        cx,
+        "hello <div>world</div>",
+        "hello <div>world</div>",
+        Some(1.),
+        1.,
+    );
+    assert_user_bubble_copy(
+        cx,
+        "<div>\nhello\n</div>",
+        "<div>\nhello\n</div>",
+        Some(1.),
+        1.,
+    );
+    assert_user_bubble_copy(
+        cx,
+        "**bold** `<div>` [link](https://example.com) &amp;",
+        "bold <div> link &",
+        Some(1.),
+        1.,
+    );
+}
+
+#[gpui::test]
+fn user_bubble_container_fenced_code_copy(cx: &mut TestAppContext) {
+    assert_user_bubble_copy(
+        cx,
+        "- item\n\n  ```\n  one\n  two\n  ```",
+        "item\none\ntwo",
+        None,
+        8.,
+    );
+}
+
+#[gpui::test]
+fn user_bubble_triple_backtick_inline_copy(cx: &mut TestAppContext) {
+    assert_user_bubble_copy(
+        cx,
+        "```code```\nnext\nlast",
+        "code\nnext\nlast",
+        Some(1.),
+        8.,
+    );
+}
+
+#[gpui::test]
+fn user_bubble_backslash_hard_break_copy(cx: &mut TestAppContext) {
+    assert_user_bubble_copy(cx, "one\\\ntwo", "one\ntwo", Some(1.), 1.);
 }
 
 /// ↑ and ↓ in the composer walk the prompts sent before and come back to

@@ -210,8 +210,14 @@ fn item_row_weight(
 impl TranscriptList {
     pub(in crate::features::session) fn new() -> Self {
         let shape = Shape::default();
+        // The list keeps the latest output in view on every layout, however
+        // the rows grew since (streamed text, code highlighted later, a
+        // row measured past its estimate); a scroll up stops it and coming
+        // back to the bottom picks it up again.
+        let state = ListState::new(shape.len(), ListAlignment::Top, px(600.));
+        state.set_follow_mode(FollowMode::Tail);
         Self {
-            state: ListState::new(shape.len(), ListAlignment::Top, px(600.)),
+            state,
             shape,
             header: None,
             prepared: HashMap::new(),

@@ -333,6 +333,25 @@ pub fn fresh_id<'a>(existing: impl IntoIterator<Item = &'a str>) -> String {
 
 pub const VERSION: u32 = 1;
 
+/// How a workspace root is compared: canonical, so a folder reached through
+/// a symlink, `..` or another drive-letter case finds the same workspace as
+/// `gsd` (which passes canonical paths). Unresolvable paths stay as given.
+pub fn root_key(path: PathBuf) -> PathBuf {
+    dunce::canonicalize(&path).unwrap_or(path)
+}
+
+/// The position of the root that is `folder` (already a [`root_key`]),
+/// comparing saved roots canonically too: older saves and other entry points
+/// may hold a root reached another way.
+pub fn find_root<'a>(
+    roots: impl Iterator<Item = &'a PathBuf>,
+    folder: &std::path::Path,
+) -> Option<usize> {
+    roots
+        .map(|root| root_key(root.clone()))
+        .position(|root| root == folder)
+}
+
 pub fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

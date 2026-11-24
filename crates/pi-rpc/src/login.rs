@@ -160,6 +160,7 @@ impl LoginHelper {
         let mut child = command
             .spawn()
             .context("failed to start the sign-in helper")?;
+        crate::job::contain(&child);
         let stdin = child.stdin.take().context("helper stdin")?;
         let stdout = child.stdout.take().context("helper stdout")?;
         let (tx, rx) = async_channel::unbounded();

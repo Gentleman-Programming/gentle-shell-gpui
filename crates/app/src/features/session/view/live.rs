@@ -1,11 +1,14 @@
 //! Estado exclusivamente visual y temporizadores vivos de una sesión.
 
+use std::cell::OnceCell;
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui_kit::*;
+
+use super::BubbleText;
 
 /// What the view tracks beside the transcript: when running things started
 /// (live timers), the prompt Pi has not picked up yet, picker and dialog
@@ -115,6 +118,8 @@ impl Span {
 /// A prompt sent while idle, shown right away until Pi's own events arrive.
 pub(super) struct Pending {
     pub(super) text: String,
+    /// `text` as its bubble shows it, made when it first shows.
+    pub(super) bubble: OnceCell<BubbleText>,
     /// The attachments it carries, shown until Pi echoes them.
     pub(super) images: Vec<Arc<Image>>,
     /// Transcript length when it was sent: Pi's user message lands here.
@@ -135,6 +140,7 @@ impl Live {
     ) {
         self.pending = Some(Pending {
             text: text.trim().to_string(),
+            bubble: OnceCell::new(),
             images,
             base,
             since: Instant::now(),

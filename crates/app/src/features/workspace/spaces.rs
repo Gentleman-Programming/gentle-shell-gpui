@@ -19,49 +19,21 @@ impl Workspace {
         self.spaces.len() - 1
     }
 
-    /// Build a restored workspace's panes; with `fill`, give an empty one an
-    /// agent tab.
+    /// Give workspace `index` an agent tab when it has none. Restored tabs
+    /// stay unbuilt until shown.
     pub(super) fn ensure_open(
         &mut self,
         index: usize,
-        fill: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let previous = self.current;
-        self.current = index;
-        if let Some((tabs, active)) = self.spaces[index].saved.take() {
-            for saved in tabs {
-                let leaves = saved.layout.leaves();
-                let mut built = Vec::new();
-                let tree = saved.layout.filter_map(&mut |pane: &SavedPane| {
-                    let id = self.restore_pane(pane, window, cx);
-                    built.push(id);
-                    id
-                });
-                let Some(tree) = tree else { continue };
-                let focused = built
-                    .get(saved.focused.min(leaves.len().saturating_sub(1)))
-                    .copied()
-                    .flatten()
-                    .or_else(|| tree.leaves().first().copied())
-                    .unwrap_or_default();
-                let id = self.alloc_id();
-                self.spaces[index].tabs.push(Tab {
-                    id,
-                    tree,
-                    focused,
-                    pinned: saved.pinned,
-                });
-            }
-            let space = &mut self.spaces[index];
-            space.active = active.min(space.tabs.len().saturating_sub(1));
-        }
-        if fill && self.spaces[index].tabs.is_empty() {
+        if self.spaces[index].tabs.is_empty() {
+            let previous = self.current;
+            self.current = index;
             let root = self.spaces[index].root.clone();
             self.open_tab(PaneKind::Agent, root, None, None, window, cx);
+            self.current = previous;
         }
-        self.current = previous;
     }
 
     pub(super) fn switch_workspace(
@@ -73,17 +45,24 @@ impl Workspace {
         if index >= self.spaces.len() {
             return;
         }
-        self.ensure_open(index, true, window, cx);
+        self.close_popups(window, cx);
+        // Selection belongs to the shown workspace; it does not survive a switch.
+        self.clear_tab_selection(cx);
+        // A rename left by switching keeps its name, like a blur.
+        self.finish_workspace_rename(true, window, cx);
         let changed = index != self.current;
         self.current = index;
+        self.ensure_open(index, window, cx);
+        if !self.space().tabs.is_empty() {
+            let active = self.space().active;
+            self.activate(active, window, cx);
+        }
         if changed {
             // A search in the previous project must not hide this one's tabs.
             self.tab_search
                 .update(cx, |input, cx| input.set_value("", window, cx));
         }
         self.space_mut().last_active = workspaces::now();
-        self.focus_active(window, cx);
-        self.start_shown(window, cx);
         if changed {
             cx.emit(WorkspaceEvent::RootChanged(self.space().root.clone()));
         }
@@ -104,7 +83,7 @@ impl Workspace {
 
     pub(super) fn pick_workspace_folder(
         &mut self,
-        name: String,
+        name: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -120,7 +99,7 @@ impl Workspace {
             };
             let Some(path) = paths.pop() else { return };
             let _ = this.update_in(cx, |this, window, cx| {
-                this.create_workspace(Some(name), path, window, cx)
+                this.create_workspace(name, path, window, cx)
             });
         })
         .detach();
@@ -261,7 +240,7 @@ impl Workspace {
             return;
         }
         let title = format!("Delete workspace \u{201c}{}\u{201d}?", space.name);
-        let tabs = space.tab_count();
+        let tabs = space.tabs.len();
         let description = format!(
             "Its {tabs} {} close and any running agent in them stops. Files and conversations stay on disk.",
             if tabs == 1 { "tab" } else { "tabs" }
@@ -291,6 +270,8 @@ impl Workspace {
         if index >= self.spaces.len() || self.spaces.len() < 2 {
             return;
         }
+        self.close_popups(window, cx);
+        self.finish_workspace_rename(false, window, cx);
         if index == self.current {
             let next = (0..self.spaces.len())
                 .filter(|i| *i != index)
@@ -301,7 +282,7 @@ impl Workspace {
         let space = self.spaces.remove(index);
         self.forget_closed_in(index);
         for tab in space.tabs {
-            for pane in tab.tree.leaves() {
+            for pane in tab.leaves() {
                 // Dropping a session drops its PiProcess, which shuts the backend down.
                 self.panes.remove(&pane);
             }
@@ -309,6 +290,60 @@ impl Workspace {
         if self.current > index {
             self.current -= 1;
         }
+        // Workspace-indexed state follows the shift, or goes with the workspace.
+        self.tab_selection = self.tab_selection.take().and_then(|sel| {
+            let moved =
+                gentle_core::workspaces::adjust_workspace_index_after_delete(sel.space, index);
+            super::tab_panel::remap_selection_space(Some(sel), moved)
+        });
+        self.schedule_save(cx);
+        cx.notify();
+    }
+
+    /// Drag a workspace row in the vertical sidebar to reorder workspaces.
+    /// The shown workspace is tracked by identity and every
+    /// workspace-indexed state is remapped (dropped when it has no new
+    /// index). Open menus and the badge picker close, since they hold
+    /// workspace indexes.
+    pub(super) fn move_workspace(
+        &mut self,
+        from: usize,
+        to: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if from == to || from >= self.spaces.len() || to >= self.spaces.len() {
+            return;
+        }
+        self.close_popups(window, cx);
+        let order = gentle_core::workspaces::reorder_workspaces(self.spaces.len(), from, to);
+        let remap = gentle_core::workspaces::workspace_index_remap(&order);
+
+        let mut old: Vec<Option<Space>> = self.spaces.drain(..).map(Some).collect();
+        self.spaces = order
+            .iter()
+            .filter_map(|old_index| old.get_mut(*old_index).and_then(Option::take))
+            .collect();
+
+        self.current = remap.get(self.current).copied().unwrap_or(0);
+        self.workspace_rename = self.workspace_rename.take().and_then(|mut rename| {
+            rename.index = *remap.get(rename.index)?;
+            Some(rename)
+        });
+        self.closed
+            .retain_mut(|closed| match remap.get(closed.space) {
+                Some(new) => {
+                    closed.space = *new;
+                    true
+                }
+                None => false,
+            });
+        let selection_space = self
+            .tab_selection
+            .as_ref()
+            .and_then(|sel| remap.get(sel.space).copied());
+        self.tab_selection =
+            super::tab_panel::remap_selection_space(self.tab_selection.take(), selection_space);
         self.schedule_save(cx);
         cx.notify();
     }

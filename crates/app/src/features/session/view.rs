@@ -18,6 +18,7 @@ use gpui_kit::*;
 use super::attachments;
 use super::state::BackendStatus;
 use super::{CONTEXT, SessionView};
+use crate::shared::overlay::LiveSlots;
 use crate::shared::ui;
 use gentle_core::input_style::InputStyle;
 use gentle_core::tools;
@@ -31,6 +32,7 @@ mod dialogs;
 mod effort;
 mod live;
 mod model_picker;
+mod paths;
 mod permissions;
 mod plan_limits;
 mod rail;
@@ -43,6 +45,7 @@ pub(super) use activity::parse_rate_limit;
 pub(super) use cards::markdown_custom;
 pub(super) use live::{Live, RateLimit};
 use live::{Span, TICK, label_stamp, ticker_needed, track};
+pub(super) use paths::PathLookup;
 pub(super) use transcript_list::TranscriptList;
 use transcript_list::{GroupRow, HeaderKey, Prepared, Row, Tail};
 
@@ -346,14 +349,15 @@ impl SessionView {
     }
 
     /// A Markdown block of the conversation: its drawn Mermaid diagrams as
-    /// images, and under it the renderer's banner while they can't be drawn
-    /// (`id` names its button).
+    /// images, code spans naming a file as paths ([`paths`]), and under it
+    /// the renderer's banner while diagrams can't be drawn (`id` names its
+    /// button).
     pub(super) fn markdown_view(
         &self,
         state: &Entity<TextViewState>,
         text: &str,
         id: impl Into<ElementId>,
-        cx: &App,
+        cx: &Context<Self>,
     ) -> Div {
         let diagrams = self.diagrams.clone();
         let blocks = if has_mermaid(text) {
@@ -367,8 +371,14 @@ impl SessionView {
                 TextView::new(state)
                     .selectable(true)
                     .style(ui::prose_style())
+                    .list_style(ui::prose_list_style())
+                    .code_block_actions(|block, _, cx| code_block_header(block, cx))
                     .image_source(move |uri| {
                         diagrams.image(uri).unwrap_or_else(|| uri.clone().into())
+                    })
+                    .plugin(paths::AnswerPaths {
+                        lookup: self.paths.clone(),
+                        view: cx.entity().downgrade(),
                     }),
             )
             .children(crate::features::files::mermaid_banner(blocks, id, cx))
@@ -719,13 +729,17 @@ impl SessionView {
             BackendStatus::Starting => {
                 return Some(
                     h_flex()
-                        .gap_2()
                         .pt(rems(24. / 16.))
                         .justify_center()
-                        .text_size(rems(13. / 16.))
-                        .text_color(ui::muted())
-                        .child(ui::spinner(Size::Small, ui::accent()))
-                        .child(ui::shimmer("Starting gentle-shell…", ui::muted(), ui::fg()))
+                        .child(self.live_slots.slot("starting", || {
+                            h_flex()
+                                .gap_2()
+                                .text_size(rems(13. / 16.))
+                                .text_color(ui::muted())
+                                .child(ui::spinner(Size::Small, ui::accent()))
+                                .child(ui::shimmer("Starting gentle-shell…", ui::muted(), ui::fg()))
+                                .into_any_element()
+                        }))
                         .into_any_element(),
                 );
             }
@@ -806,7 +820,7 @@ impl SessionView {
                 let key = fold_key(ix, 0, OUTPUT);
                 let open = self.expanded.contains(&key);
                 let toggle = self.bubble_toggle(shown, key, open, cx);
-                let bubble = user_bubble(ix, shown, images, open, toggle);
+                let bubble = user_bubble(ix, shown, images, open, toggle, &self.bubble_images);
                 if text.trim().is_empty() {
                     return bubble.into_any_element();
                 }
@@ -862,32 +876,20 @@ impl SessionView {
                 }
                 if *streaming && !has_text && !thinking_live {
                     let since = self.live.turn.map(|t| t.elapsed());
-                    column = column.child(working_indicator("Working…", since));
+                    column = column.child(working_indicator(
+                        &self.live_slots,
+                        ("working", ix),
+                        "Working…",
+                        since,
+                    ));
                 }
                 if let Some(error) = error {
                     column = column.child(notice_card(NoticeLevel::Error, error));
                 }
-                // While the agent writes, a soft rose dot breathes after the
-                // text; when it's done, the dot fades with the line.
+                // While the agent writes, the petal line beside the answer
+                // marks it live (the composer's orbit is the turn's one
+                // moving indicator); when it's done, the line fades.
                 let settle = self.answer_settle(ix, *streaming);
-                if has_text {
-                    match settle {
-                        Some(_) if *streaming => {
-                            column = column.child(ui::pulse(
-                                div().size(rems(7. / 16.)).rounded_full().bg(ui::petal()),
-                            ))
-                        }
-                        Some(k) if k < 1. => {
-                            column = column.child(
-                                div()
-                                    .size(rems(7. / 16.))
-                                    .rounded_full()
-                                    .bg(ui::petal().opacity(1. - ease_out_quint()(k))),
-                            )
-                        }
-                        _ => {}
-                    }
-                }
                 if !*streaming && has_text {
                     column = column
                         .group("assistant")
@@ -1033,11 +1035,9 @@ impl SessionView {
                     .text_color(ui::muted())
                     .hover(|s| s.text_color(ui::fg()))
                     .on_click(cx.listener(move |this, _, _, cx| this.toggle(key, cx)))
-                    .child(if live {
-                        ui::pulse(star).into_any_element()
-                    } else {
-                        star.into_any_element()
-                    })
+                    .child(star)
+                    // Live, its time counts up once a second.
+                    .when(live, |this| this.child(ui::each_second()))
                     .child(if live { "Thinking…" } else { "Thought" })
                     .when_some(elapsed, |this, d| {
                         this.child(
@@ -1358,7 +1358,7 @@ impl SessionView {
 
     /// A collapsed step: one quiet line, no card around it. The icon takes
     /// its kind's tint ([`step_tone`]; danger's cross when the step failed,
-    /// pulsing while it runs),
+    /// pulsing on the live overlay while it runs),
     /// the rest is today's header restyled: title, subject, +n/−n, duration
     /// and a chevron. Clicking it unfolds the whole step when `fold` (its
     /// key and whether the chevron points up) is given.
@@ -1371,22 +1371,16 @@ impl SessionView {
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
         let failed = spec.status == ToolStatus::Failed;
-        let running = spec.status == ToolStatus::Running;
         let icon = if failed { IconName::CircleX } else { spec.icon };
         let icon_color = if failed {
             ui::danger()
         } else {
             step_tone(spec.icon)
         };
-        let icon = if running {
-            ui::pulse(div().child(Icon::new(icon).small().text_color(icon_color)))
-                .into_any_element()
-        } else {
-            Icon::new(icon)
-                .small()
-                .text_color(icon_color)
-                .into_any_element()
-        };
+        let icon = Icon::new(icon)
+            .small()
+            .text_color(icon_color)
+            .into_any_element();
         self.step_row(
             ("step", ix),
             spec,
@@ -1859,30 +1853,35 @@ impl SessionView {
                 let Some(pending) = &self.live.pending else {
                     return div().into_any_element();
                 };
-                let shown = BubbleText::new(&pending.text);
+                let shown = pending
+                    .bubble
+                    .get_or_init(|| BubbleText::new(&pending.text));
                 // Keyed like the item its echo becomes, so it opens the same.
                 let key = fold_key(base, 0, OUTPUT);
                 let open = self.expanded.contains(&key);
-                let toggle = self.bubble_toggle(&shown, key, open, cx);
+                let toggle = self.bubble_toggle(shown, key, open, cx);
                 let bubble = user_bubble(
                     base,
-                    &shown,
+                    shown,
                     pending.images.iter().cloned().map(Some).collect(),
                     open,
                     toggle,
+                    &self.bubble_images,
                 );
                 self.list
                     .appear(("item", base), now, div().w_full().child(bubble))
             }
             Row::Tail(Tail::Pending(base)) => {
                 let since = self.live.pending.as_ref().map(|p| p.since.elapsed());
-                let indicator = working_indicator("Thinking…", since);
+                let indicator =
+                    working_indicator(&self.live_slots, ("pending", base), "Thinking…", since);
                 self.list
                     .appear(("pending", base), now, div().w_full().child(indicator))
             }
             Row::Tail(Tail::Between(count)) => {
                 let since = self.live.turn.map(|t| t.elapsed());
-                let indicator = working_indicator("Working…", since);
+                let indicator =
+                    working_indicator(&self.live_slots, ("between", count), "Working…", since);
                 self.list
                     .appear(("between", count), now, div().w_full().child(indicator))
             }
@@ -1933,6 +1932,8 @@ impl SessionView {
 impl Render for SessionView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         crate::shared::diagnostics::render("SessionView");
+        // Its indicators on the live layer are placed again as it draws.
+        self.live_slots.clear(cx.entity_id());
         // A tab starts its backend once shown.
         self.ensure_started(window, cx);
         self.sync_view(cx);
@@ -2006,9 +2007,6 @@ impl Render for SessionView {
                         // A wheel or trackpad scroll takes over from a glide and
                         // shows the rail's thumb.
                         .on_scroll(cx.listener(|this, _, _, cx| this.on_user_scroll(cx)))
-                        // Text over a busy theme backdrop: dim it behind
-                        // the reading column (as wide as a row's column).
-                        .child(ui::reading_veil(rems(760. / 16.)))
                         .child(
                             list(
                                 self.list.state(),
@@ -2019,6 +2017,28 @@ impl Render for SessionView {
                             .size_full(),
                         )
                         .children(self.render_rail(&scroll, cx))
+                        // Text fades out as it reaches the composer, after
+                        // Tern's, instead of cutting off on a hard edge. As
+                        // tall as the column's bottom padding, so the last
+                        // line, scrolled to the end, stays clear. Only on an
+                        // opaque pane: GPUI can't mask, so the fade is the
+                        // pane's color laid over the text, and over glass
+                        // that color doubles up into a dark band.
+                        .when(ui::panel().a > 0.99, |d| {
+                            d.child(
+                                div()
+                                    .absolute()
+                                    .left_0()
+                                    .right_0()
+                                    .bottom_0()
+                                    .h(rems(32. / 16.))
+                                    .bg(linear_gradient(
+                                        180.,
+                                        linear_color_stop(ui::panel().opacity(0.), 0.),
+                                        linear_color_stop(ui::panel(), 1.),
+                                    )),
+                            )
+                        })
                         .children(self.render_jump_down(cx)),
                 ),
             })
@@ -2029,12 +2049,9 @@ impl Render for SessionView {
                 let dock = super::input_style::style(cx) == InputStyle::Bar;
                 main.child(
                     h_flex()
-                        .relative()
                         .w_full()
                         .justify_center()
                         .map(|d| if narrow { d.px_3() } else { d.px_6() })
-                        // The activity line's icons sit on glass too.
-                        .when(!dock, |d| d.child(ui::reading_veil(rems(760. / 16.))))
                         .when(dock, |d| {
                             d.pt_3()
                                 .border_t_1()
@@ -2057,7 +2074,7 @@ impl Render for SessionView {
                     .flatten(),
                 |this, island| this.child(island),
             )
-            .children(self.genui.render_templates(cx));
+            .children(self.genui.render_templates(self.live_slots.cover(), cx));
 
         h_flex()
             .key_context(CONTEXT)
@@ -2154,34 +2171,42 @@ impl CodeLine {
     }
 }
 
-/// A message's text as its bubble shows it: image tokens as `🖼 #N`, and a
-/// long one's folded start.
+/// A message as its bubble shows it: the Markdown it renders
+/// ([`gentle_core::markdown::sent_message`], image tokens as `🖼 #N`) and a
+/// long one's folded start. Made once per message: every frame hands the
+/// text view the same strings, which it recognizes without parsing again.
 struct BubbleText {
-    text: SharedString,
-    /// The first [`USER_LINES`] lines of `text` and how many more it has,
-    /// when it is long enough to fold.
+    markdown: SharedString,
+    /// The first [`USER_LINES`] lines of `markdown` and how many more it
+    /// has, when it is long enough to fold. Cut from the whole message's
+    /// Markdown, so HTML closed past the fold still shows literally.
     folded: Option<(SharedString, usize)>,
 }
 
 impl BubbleText {
     fn new(text: &str) -> Self {
-        let shown = attachments::chip_text(text);
-        let lines = line_count(&shown);
+        let markdown = gentle_core::markdown::sent_message(&attachments::chip_text(text));
+        let lines = line_count(&markdown);
         let folded = (lines > USER_LINES + USER_SLACK).then(|| {
-            let (head, hidden) = head_slice(&shown, lines, USER_LINES);
-            (SharedString::from(head.to_string()), hidden)
+            let (head, _) = head_slice(&markdown, lines, USER_LINES);
+            let head = gentle_core::markdown::trim_folded(head);
+            // The blank lines trimmed off its end are hidden too.
+            (
+                SharedString::from(head.to_string()),
+                lines - line_count(head),
+            )
         });
         Self {
-            text: shown.into(),
+            markdown: markdown.into(),
             folded,
         }
     }
 
-    /// What the bubble shows, `open` or not.
-    fn visible(&self, open: bool) -> SharedString {
+    /// The Markdown the bubble shows, `open` or not.
+    fn visible(&self, open: bool) -> &SharedString {
         match &self.folded {
-            Some((head, _)) if !open => head.clone(),
-            _ => self.text.clone(),
+            Some((head, _)) if !open => head,
+            _ => &self.markdown,
         }
     }
 }
@@ -2550,6 +2575,7 @@ fn clock(elapsed: Duration) -> String {
     }
 }
 
+/// A tool card's last line: how it ended, or "Running" while it runs.
 fn status_footer(status: ToolStatus, duration: Option<Duration>) -> Div {
     let (icon, label, color) = match status {
         ToolStatus::Running => (None, "Running", ui::info()),
@@ -2562,10 +2588,7 @@ fn status_footer(status: ToolStatus, duration: Option<Duration>) -> Div {
         .gap_1p5()
         .text_size(rems(12. / 16.))
         .text_color(color)
-        .map(|this| match icon {
-            Some(icon) => this.child(Icon::new(icon).xsmall()),
-            None => this.child(ui::spinner(Size::XSmall, ui::info())),
-        })
+        .when_some(icon, |this, icon| this.child(Icon::new(icon).xsmall()))
         .child(label)
         .when_some(duration, |this, d| {
             this.child(
@@ -2582,15 +2605,18 @@ fn status_footer(status: ToolStatus, duration: Option<Duration>) -> Div {
 /// over the text, tokens shown as `🖼 #N`, a long text folded unless
 /// `open`, with its `toggle`. `None` is an image that could not be decoded.
 /// The text is selectable and copies with the platform shortcut, like an
-/// answer's; `ix` keys its selection.
+/// answer's; `ix` keys its selection. Images its Markdown shows load only
+/// from `data:` URLs (decoded into `embedded`) and local files: one linked
+/// on the network shows nothing, so a message fetches nothing.
 fn user_bubble(
     ix: usize,
     shown: &BubbleText,
     images: Vec<Option<Arc<Image>>>,
     open: bool,
     toggle: Option<Stateful<Div>>,
+    embedded: &Arc<crate::features::files::EmbeddedImages>,
 ) -> Div {
-    let text = shown.visible(open);
+    let markdown = shown.visible(open);
     // min_w_0 on both levels: without it the bubble's minimum width is its
     // unwrapped text, so in a narrow pane it overflows (clipped on the left).
     h_flex().w_full().min_w_0().justify_end().child(
@@ -2612,11 +2638,25 @@ fn user_bubble(
                     }),
                 ))
             })
-            .when(!text.trim().is_empty(), |this| {
+            .when(!markdown.trim().is_empty(), |this| {
                 this.child(
                     div()
                         .debug_selector(move || format!("user-text-{ix}"))
-                        .child(gpui_kit::base::SelectableText::new(("user-text", ix), text)),
+                        .child(
+                            // The answers' prose style; the bubble's own
+                            // text size and color, inherited.
+                            TextView::markdown(("user-text", ix), markdown.clone())
+                                .selectable(true)
+                                .style(ui::prose_style())
+                                .list_style(ui::prose_list_style())
+                                .image_source({
+                                    let embedded = embedded.clone();
+                                    move |uri| {
+                                        crate::features::files::offline_image(&embedded, uri)
+                                            .unwrap_or_else(no_image)
+                                    }
+                                }),
+                        ),
                 )
             })
             // The toggle's own padding, undone so its label lines up with the text.
@@ -2624,6 +2664,14 @@ fn user_bubble(
                 toggle.map(|toggle| div().ml(rems(-12. / 16.)).mt(rems(-4. / 16.)).child(toggle)),
             ),
     )
+}
+
+/// An image source that fails at once, without loading anything: the
+/// image shows nothing.
+fn no_image() -> ImageSource {
+    ImageSource::Custom(Arc::new(|_, _| {
+        Some(Err(ImageCacheError::Asset("not loaded".into())))
+    }))
 }
 
 /// A rounded, cropped image (or a placeholder) for attachment strips.
@@ -2704,22 +2752,66 @@ fn notice_card(level: NoticeLevel, text: &str) -> Div {
         )
 }
 
-/// The petal-and-shimmer "agent is on it" row.
-fn working_indicator(label: &'static str, elapsed: Option<Duration>) -> Div {
+/// Along the top of a fenced block in an answer, after Tern's: its
+/// language, then Copy, which puts the code on the clipboard and says so.
+/// In the interface's font, not the code's.
+fn code_block_header(block: &gpui_kit::base::text::CodeBlock, cx: &App) -> Div {
+    use gpui_kit::component::WindowExt as _;
+    let code = block.code();
+    h_flex()
+        .gap_3()
+        .px_1()
+        .font_family(cx.theme().font_family.clone())
+        .text_size(rems(12. / 16.))
+        .text_color(ui::muted())
+        .children(block.lang().filter(|lang| !lang.is_empty()))
+        .child(
+            div()
+                .id("copy")
+                .cursor_pointer()
+                .hover(|s| s.text_color(ui::fg()))
+                .child("Copy")
+                .on_click(move |_, window, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(code.to_string()));
+                    window.push_notification(
+                        gpui_kit::component::notification::Notification::success(
+                            "Copied to the clipboard.",
+                        ),
+                        cx,
+                    );
+                }),
+        )
+}
+
+/// The petal-and-shimmer "agent is on it" row, its clock counting up once
+/// a second. With the composer's orbit, the turn's only moving indicators:
+/// the petal and the label move on the live overlay, under `key`.
+fn working_indicator(
+    slots: &LiveSlots,
+    key: impl Into<ElementId>,
+    label: &'static str,
+    elapsed: Option<Duration>,
+) -> Div {
     h_flex()
         .gap_2()
         .items_center()
-        .child(ui::pulse(
-            div()
-                .text_size(rems(15. / 16.))
-                .text_color(ui::petal())
-                .child("✿"),
-        ))
-        .child(
-            ui::shimmer(label, ui::muted(), ui::fg())
-                .text_size(rems(13. / 16.))
-                .italic(),
-        )
+        .child(slots.slot(key, move || {
+            h_flex()
+                .gap_2()
+                .items_center()
+                .child(ui::pulse(
+                    div()
+                        .text_size(rems(15. / 16.))
+                        .text_color(ui::petal())
+                        .child("✿"),
+                ))
+                .child(
+                    ui::shimmer(label, ui::muted(), ui::fg())
+                        .text_size(rems(13. / 16.))
+                        .italic(),
+                )
+                .into_any_element()
+        }))
         .when_some(elapsed, |this, d| {
             this.child(
                 div()
@@ -2728,6 +2820,7 @@ fn working_indicator(label: &'static str, elapsed: Option<Duration>) -> Div {
                     .text_color(ui::faint())
                     .child(clock(d)),
             )
+            .child(ui::each_second())
         })
 }
 
@@ -2871,6 +2964,221 @@ mod tests {
         }
     }
 
+    #[gpui::test]
+    fn user_bubble_selection_changes_and_text_updates(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::{
+            AppContext as _, InteractiveElement as _, Modifiers, MouseButton, ParentElement as _,
+            Render, Styled as _, base::TextSelection, point, px,
+        };
+
+        struct Bubble {
+            text: &'static str,
+            focus: gpui_kit::FocusHandle,
+        }
+        impl Render for Bubble {
+            fn render(
+                &mut self,
+                _: &mut gpui_kit::Window,
+                _: &mut gpui_kit::Context<Self>,
+            ) -> impl gpui_kit::IntoElement {
+                gpui_kit::div()
+                    .id("focus")
+                    .track_focus(&self.focus)
+                    .size_full()
+                    .child(super::user_bubble(
+                        0,
+                        &super::BubbleText::new(self.text),
+                        Vec::new(),
+                        true,
+                        None,
+                        &Default::default(),
+                    ))
+            }
+        }
+        cx.update(gpui_kit::init);
+        let (root, cx) = cx.add_window_view(|window, cx| {
+            let focus = cx.focus_handle();
+            window.focus(&focus, cx);
+            let view = cx.new(|_| Bubble {
+                text: "hello `café` world",
+                focus,
+            });
+            gpui_kit::base::Root::new(view, window, cx)
+        });
+        let view = root.read_with(cx, |root, _| {
+            root.view().clone().downcast::<Bubble>().unwrap()
+        });
+        cx.run_until_parked();
+        let bounds = cx.debug_bounds("user-text-0").unwrap();
+        let start = point(bounds.left() + px(1.), bounds.center().y);
+        let end = point(bounds.right() - px(1.), bounds.center().y);
+        let drag = |cx: &mut gpui_kit::VisualTestContext, end| {
+            cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::none());
+            cx.simulate_mouse_move(end, Some(MouseButton::Left), Modifiers::none());
+            cx.simulate_mouse_up(end, MouseButton::Left, Modifiers::none());
+        };
+        let copy = |cx: &mut gpui_kit::VisualTestContext| {
+            cx.update(|_, cx| {
+                cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string("sentinel".into()))
+            });
+            cx.simulate_keystrokes(if cfg!(target_os = "macos") {
+                "cmd-c"
+            } else {
+                "ctrl-c"
+            });
+            cx.run_until_parked();
+            cx.update(|_, cx| {
+                cx.read_from_clipboard()
+                    .and_then(|item| item.text())
+                    .unwrap_or_default()
+            })
+        };
+        drag(cx, end);
+        // TextView's selection API includes a block separator; the copy action
+        // omits that separator from the clipboard.
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+            assert_eq!(
+                TextSelection::selected_text(window, cx),
+                "hello café world\n"
+            );
+        });
+        assert_eq!(copy(cx), "hello café world");
+        drag(cx, point(bounds.left() + px(35.), bounds.center().y));
+        let partial = cx.update(TextSelection::selected_text);
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        let after = cx.update(TextSelection::selected_text);
+        assert_eq!(partial, after);
+        assert_eq!(after, "hell\n");
+        assert_eq!(copy(cx), "hell");
+        view.update(cx, |view, cx| {
+            view.text = "replacement `é` text";
+            cx.notify();
+        });
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+            assert_eq!(TextSelection::selected_text(window, cx), "");
+        });
+        cx.update(TextSelection::clear);
+        cx.update(|window, cx| assert_eq!(TextSelection::selected_text(window, cx), ""));
+        assert_eq!(copy(cx), "sentinel");
+        cx.run_until_parked();
+        let replacement = cx.debug_bounds("user-text-0").unwrap();
+        let replacement_start = point(replacement.left() + px(1.), replacement.center().y);
+        let replacement_end = point(replacement.right() - px(1.), replacement.center().y);
+        cx.simulate_mouse_down(replacement_start, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_move(replacement_end, Some(MouseButton::Left), Modifiers::none());
+        cx.simulate_mouse_up(replacement_end, MouseButton::Left, Modifiers::none());
+        assert_eq!(copy(cx), "replacement é text");
+    }
+
+    #[gpui::test]
+    fn user_bubble_wrapped_selection_copies_visible_text(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::{
+            Modifiers, MouseButton, ParentElement as _, Render, Styled as _, base::TextSelection,
+            point, px,
+        };
+        const TEXT: &str =
+            "first `café code followed by enough words to wrap onto several lines` end";
+        struct Bubble;
+        impl Render for Bubble {
+            fn render(
+                &mut self,
+                _: &mut gpui_kit::Window,
+                _: &mut gpui_kit::Context<Self>,
+            ) -> impl gpui_kit::IntoElement {
+                gpui_kit::div()
+                    .size_full()
+                    .child(gpui_kit::base::TextSelectionLayer)
+                    .child(gpui_kit::div().w(px(180.)).child(super::user_bubble(
+                        0,
+                        &super::BubbleText::new(TEXT),
+                        Vec::new(),
+                        true,
+                        None,
+                        &Default::default(),
+                    )))
+            }
+        }
+        cx.update(gpui_kit::init);
+        let (_, cx) = cx.add_window_view(|_, _| Bubble);
+        cx.run_until_parked();
+        let bounds = cx.debug_bounds("user-text-0").unwrap();
+        assert!(bounds.size.height > px(30.), "fixture must wrap");
+        let start = point(bounds.left() + px(1.), bounds.top() + px(5.));
+        let end = point(bounds.right() - px(1.), bounds.bottom() - px(5.));
+        cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_move(end, Some(MouseButton::Left), Modifiers::none());
+        cx.simulate_mouse_up(end, MouseButton::Left, Modifiers::none());
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+            assert_eq!(
+                TextSelection::selected_text(window, cx),
+                "first café code followed by enough words to wrap onto several lines end\n"
+            );
+        });
+        cx.simulate_keystrokes(if cfg!(target_os = "macos") {
+            "cmd-c"
+        } else {
+            "ctrl-c"
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            cx.update(|_, cx| cx
+                .read_from_clipboard()
+                .and_then(|item| item.text())
+                .unwrap_or_default()),
+            "first café code followed by enough words to wrap onto several lines end"
+        );
+    }
+
+    #[gpui::test]
+    fn user_bubble_backticks_paint_code_background(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::{ParentElement as _, Render, Styled as _};
+
+        struct Bubble;
+        impl Render for Bubble {
+            fn render(
+                &mut self,
+                _: &mut gpui_kit::Window,
+                _: &mut gpui_kit::Context<Self>,
+            ) -> impl gpui_kit::IntoElement {
+                gpui_kit::div()
+                    .size_full()
+                    .child(gpui_kit::base::TextSelectionLayer)
+                    .child(super::user_bubble(
+                        0,
+                        &super::BubbleText::new("hello `café` world"),
+                        Vec::new(),
+                        true,
+                        None,
+                        &Default::default(),
+                    ))
+            }
+        }
+        cx.update(gpui_kit::init);
+        let (_, cx) = cx.add_window_view(|_, _| Bubble);
+        cx.run_until_parked();
+        // The answers' inline code backing, not a style of the bubble's own.
+        let backing: gpui_kit::Background = crate::shared::ui::prose_style()
+            .inline_code
+            .background_color
+            .expect("prose code has a backing")
+            .into();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+            assert!(
+                window
+                    .painted_quads()
+                    .into_iter()
+                    .any(|quad| quad.background == backing),
+                "inline code backing must be painted"
+            );
+        });
+    }
+
     fn step(name: &str, status: ToolStatus) -> Item {
         Item::Tool {
             call_id: format!("{name}-1"),
@@ -2952,11 +3260,30 @@ mod tests {
         let bubble = BubbleText::new(&long);
         let (head, hidden) = bubble.folded.clone().unwrap();
         assert_eq!(hidden, USER_SLACK + 1);
-        assert_eq!(head.as_ref(), message(USER_LINES, "\r\n"));
+        assert_eq!(
+            head.lines().map(str::trim_end).collect::<Vec<_>>(),
+            message(USER_LINES, "\n").lines().collect::<Vec<_>>()
+        );
         assert!(!head.ends_with('\r'));
         // Open, the whole text shows; folded, the head.
-        assert_eq!(bubble.visible(true), bubble.text);
-        assert_eq!(bubble.visible(false), head);
+        assert!(bubble.visible(true).starts_with(head.as_ref()));
+        assert_eq!(bubble.visible(false), &head);
+
+        // The head is cut from the whole message's Markdown: a tag closed
+        // past the fold still shows literally.
+        let html = format!("<div>\n{}\n</div>", message(USER_LINES + USER_SLACK, "\n"));
+        let (head, _) = BubbleText::new(&html).folded.unwrap();
+        assert!(head.starts_with(r"\<div\>"), "{head}");
+        // A blank line inside it, last before the fold, is no stray `\`:
+        // it is hidden with the rest.
+        let gap = format!(
+            "<div>\n{}\n\n{}\n</div>",
+            message(USER_LINES - 2, "\n"),
+            message(USER_SLACK + 2, "\n")
+        );
+        let (head, hidden) = BubbleText::new(&gap).folded.unwrap();
+        assert!(head.ends_with("line 6"), "{head}");
+        assert_eq!(hidden, USER_SLACK + 4);
     }
 
     #[test]

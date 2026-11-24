@@ -1,6 +1,8 @@
 //! Title bar chrome, tabs, pane tree and pane rendering.
 
 use super::badge::{Mark, workspace_avatar};
+use super::menu::WorkspaceMenuSource;
+use super::tab_panel::TabMenu;
 use super::*;
 use gpui_kit::component::Selectable as _;
 
@@ -10,17 +12,16 @@ impl Workspace {
     // The chrome reads each pane's `title`/`running` snapshot, never the
     // views themselves: see `Pane::title`.
     pub(super) fn tab_running(&self, tab: &Tab) -> bool {
-        tab.tree
-            .leaves()
+        tab.leaves()
             .iter()
             .any(|id| self.panes.get(id).is_some_and(|p| p.running))
     }
 
-    /// What the agents of `space` do. A workspace not shown yet since launch
-    /// has no panes, so it counts as idle.
+    /// What the agents of `space` do. A tab not built yet has no
+    /// panes, so it counts as idle.
     pub(super) fn space_activity(&self, space: &Space) -> Activity {
         let mut activity = Activity::default();
-        for id in space.tabs.iter().flat_map(|tab| tab.tree.leaves()) {
+        for id in space.tabs.iter().flat_map(|tab| tab.leaves()) {
             match self.panes.get(&id) {
                 Some(pane) if pane.needs_you => activity.needs_you += 1,
                 Some(pane) if pane.running => activity.working += 1,
@@ -85,7 +86,9 @@ impl Workspace {
             .text_size(rems(12.5 / 16.))
             .cursor_pointer()
             .hover(|s| s.bg(ui::popover_bg().opacity(0.8)))
-            .tooltip(move |window, cx| Tooltip::new(tip).build(window, cx))
+            .when(!self.popups_open(), |chip| {
+                chip.tooltip(move |window, cx| Tooltip::new(tip).build(window, cx))
+            })
             // Keep clicks on the chip from turning into window drags: `occlude`
             // hides the title bar's drag area from Windows' hit test, and
             // stopping the mouse-down keeps TitleBar from starting a move.
@@ -94,18 +97,40 @@ impl Workspace {
             .on_click(cx.listener(|this, _, window, cx| {
                 this.open_palette(Category::Workspaces, window, cx)
             }))
-            .child(workspace_avatar(&Mark::of(self.space())))
-            .map(|chip| self.with_badge_picker(chip, self.current, cx))
-            .child(
-                div()
-                    .max_w(rems(160. / 16.))
-                    .overflow_hidden()
-                    .text_ellipsis()
-                    .whitespace_nowrap()
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(ui::fg())
-                    .child(name),
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    this.open_workspace_menu(
+                        this.current,
+                        WorkspaceMenuSource::Chip,
+                        event.position,
+                        window,
+                        cx,
+                    );
+                }),
             )
+            .child(workspace_avatar(&Mark::of(self.space())))
+            .map(|chip| {
+                if self.renaming_workspace(self.current, WorkspaceMenuSource::Chip) {
+                    chip.child(
+                        div()
+                            .w(rems(160. / 16.))
+                            .child(self.workspace_rename_input(cx)),
+                    )
+                } else {
+                    chip.child(
+                        div()
+                            .max_w(rems(160. / 16.))
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .whitespace_nowrap()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(ui::fg())
+                            .child(name),
+                    )
+                }
+            })
             .when_some(dot, |d, color| {
                 d.child(
                     div()
@@ -125,8 +150,6 @@ impl Workspace {
     pub(super) fn render_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let space = self.space();
         let weak = cx.entity().downgrade();
-        let placement = weak.clone();
-        let layout = self.tab_layout;
         h_flex()
             .id("horizontal-tab-strip")
             .gap(px(2.))
@@ -134,20 +157,34 @@ impl Workspace {
             .children(space.tabs.iter().enumerate().map(|(i, tab)| {
                 let active = i == space.active;
                 let running = self.tab_running(tab);
-                let kind = self
-                    .panes
-                    .get(&tab.focused)
-                    .map(|p| p.item.kind)
-                    .unwrap_or(PaneKind::Agent);
-                let count = tab.tree.len();
+                let focused = tab.focused();
+                let saved = tab.state.saved_focused();
+                let kind = match (&focused, &saved) {
+                    (Some(id), _) => self.panes.get(id).map(|p| p.item.kind),
+                    (None, Some(saved)) => Some(saved.kind),
+                    _ => None,
+                }
+                .unwrap_or(PaneKind::Agent);
+                let count = tab.state.len();
+                let title = match (&focused, &saved) {
+                    (Some(id), _) => self.pane_title(*id),
+                    (None, Some(saved)) => sidebars::saved_title(saved),
+                    _ => SharedString::default(),
+                };
                 let icon_color = if active { ui::petal() } else { ui::faint() };
+                let is_tab_selected = self.is_tab_selected(self.current, tab.id);
                 let drag = TabDrag {
                     tab: tab.id,
-                    title: self
-                        .panes
-                        .get(&tab.focused)
-                        .map(|p| p.title.clone())
-                        .unwrap_or_default(),
+                    title: title.clone(),
+                };
+                let tab_menu = TabMenu {
+                    space: self.current,
+                    id: tab.id,
+                    can_rename: kind == PaneKind::Agent && tab.is_built(),
+                    pinned: tab.pinned,
+                    can_up: false,
+                    can_down: false,
+                    compact: true,
                 };
                 let item = h_flex()
                     .min_w_0()
@@ -166,7 +203,8 @@ impl Workspace {
                     // carries the accent. The fill is the opaque popover layer
                     // with a hairline, so it reads over a see-through window
                     // and a busy backdrop alike; every tab keeps the border's
-                    // width so none shifts when another is picked.
+                    // width so none shifts when another is picked. A selected
+                    // tab, the active one included, is ringed in petal.
                     .border_1()
                     .when(active, |this| {
                         this.bg(ui::popover_bg().opacity(0.92))
@@ -174,22 +212,31 @@ impl Workspace {
                             .shadow_sm()
                             .text_color(ui::fg())
                     })
-                    .when(!active, |this| {
+                    .when(!active && is_tab_selected, |this| {
+                        this.bg(ui::raised()).text_color(ui::fg())
+                    })
+                    .when(!active && !is_tab_selected, |this| {
                         this.border_color(gpui_kit::transparent_black())
                             .text_color(ui::muted())
                             .hover(|s| s.bg(ui::surface_hover().opacity(0.6)).text_color(ui::fg()))
+                    })
+                    .when(is_tab_selected, |this| {
+                        this.border_color(ui::petal().opacity(0.45))
                     })
                     // Keep clicks on tabs from turning into window drags (see the
                     // workspace chip).
                     .occlude()
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                            cx.stop_propagation();
+                            this.open_tab_menu(tab_menu, event.position, window, cx);
+                        }),
+                    )
                     // A double-click on an agent tab renames its session.
                     .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
-                        if event.click_count() >= 2 {
-                            this.start_tab_rename(i, window, cx);
-                        } else {
-                            this.activate(i, window, cx);
-                        }
+                        this.on_tab_click(i, event, None, window, cx);
                     }))
                     // Drag a tab onto another to put it there.
                     .on_drag(drag, |drag, _, _, cx| {
@@ -226,7 +273,7 @@ impl Workspace {
                             }),
                     )
                     .child(
-                        match self.renaming.as_ref().filter(|r| r.pane == tab.focused) {
+                        match self.renaming.as_ref().filter(|r| Some(r.pane) == focused) {
                             Some(rename) => div()
                                 .w(rems(160. / 16.))
                                 .h(rems(20. / 16.))
@@ -241,7 +288,7 @@ impl Workspace {
                                 .child(Input::new(&rename.input).appearance(false).xsmall())
                                 .into_any_element(),
                             None => {
-                                let title = self.pane_title(tab.focused);
+                                let title = title.clone();
                                 div()
                                     .id(("tab-title", tab.id))
                                     .min_w_0()
@@ -250,11 +297,11 @@ impl Workspace {
                                     .text_ellipsis()
                                     .whitespace_nowrap()
                                     .when(active, |d| d.font_weight(FontWeight::MEDIUM))
-                                    .tooltip({
+                                    .when(!self.popups_open(), |d| {
                                         let title = title.clone();
-                                        move |window, cx| {
+                                        d.tooltip(move |window, cx| {
                                             Tooltip::new(title.clone()).build(window, cx)
-                                        }
+                                        })
                                     })
                                     .child(title)
                                     .into_any_element()
@@ -306,6 +353,7 @@ impl Workspace {
                     .ml(px(2.))
                     .occlude()
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
                     .child(
                         title_button("new-tab", IconName::Plus)
                             .dropdown_menu(move |menu, window, _| {
@@ -316,9 +364,13 @@ impl Workspace {
                             }),
                     ),
             )
-            .context_menu(move |menu, _, _| {
-                Self::tab_placement_menu(menu, layout, placement.clone())
-            })
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    this.open_empty_area_menu(event.position, window, cx);
+                }),
+            )
     }
 
     /// One title-bar button for the focused pane's layout: tile, split and
@@ -572,7 +624,9 @@ impl Workspace {
                             let path = here.clone();
                             if let Some(tab) = this.tab_mut()
                                 && tab.id == tab_id
-                                && tab.tree.set_ratio(&path, share)
+                                && tab
+                                    .built_tree_mut()
+                                    .is_some_and(|tree| tree.set_ratio(&path, share))
                             {
                                 this.schedule_save(cx);
                                 cx.notify();
@@ -617,8 +671,8 @@ impl Workspace {
         let Some(pane) = self.panes.get(&id) else {
             return div().into_any_element();
         };
-        let tiled = tab.tree.len() > 1;
-        let focused = tiled && tab.focused == id;
+        let tiled = tab.state.len() > 1;
+        let focused = tiled && tab.focused() == Some(id);
         let title = pane.title.clone();
         let body = div()
             .id(("pane", id))
@@ -641,10 +695,10 @@ impl Workspace {
             .overflow_hidden()
             .capture_any_mouse_down(cx.listener(move |this, _, _, cx| {
                 if let Some(tab) = this.tab_mut()
-                    && tab.focused != id
-                    && tab.tree.contains(&id)
+                    && tab.focused() != Some(id)
+                    && tab.state.contains(&id)
                 {
-                    tab.focused = id;
+                    tab.state.set_focused(id);
                     cx.notify();
                 }
             }))
@@ -693,6 +747,13 @@ impl Workspace {
                         .clone()
                         .cached(StyleRefinement::default().size_full()),
                 ),
+            )
+            // An agent's live indicators, over it: their frames redraw the
+            // layer and this window, while the agent's view stays cached.
+            .children(
+                pane.session
+                    .as_ref()
+                    .map(|session| session.read(cx).live_layer()),
             )
             .children(
                 self.drop_hint
@@ -757,10 +818,14 @@ impl Workspace {
 
     pub(super) fn render_body(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         match self.tab() {
-            Some(tab) => {
-                let mut path = Vec::new();
-                self.render_tree(tab, &tab.tree, &mut path, window, cx)
-            }
+            Some(tab) => match tab.built_tree() {
+                Some(tree) => {
+                    let mut path = Vec::new();
+                    self.render_tree(tab, tree, &mut path, window, cx)
+                }
+                // `activate` builds the shown tab before it is drawn.
+                None => div().into_any_element(),
+            },
             None => v_flex()
                 .size_full()
                 .items_center()

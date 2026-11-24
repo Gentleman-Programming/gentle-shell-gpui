@@ -189,6 +189,7 @@ fn bind_keys(cx: &mut App) {
         ),
         KeyBinding::new(key!("n"), session::NewSession, Some(session::CONTEXT)),
         KeyBinding::new(key!("k"), workspace::OpenPalette, None),
+        KeyBinding::new(key!("o"), workspace::OpenExplorer, None),
         KeyBinding::new(workspaces, workspace::OpenWorkspaces, None),
         KeyBinding::new(key!("shift-o"), workspace::OpenSessions, None),
         KeyBinding::new(key!(","), workspace::OpenSettings, None),

@@ -17,9 +17,9 @@ pub(super) struct TabEntry {
     pub space: usize,
     /// Its index among its workspace's tabs.
     pub index: usize,
-    /// The live tab; `None` while its workspace hasn't been opened since launch.
-    pub id: Option<usize>,
-    /// The focused pane of a live tab.
+    /// The tab's id.
+    pub id: usize,
+    /// The focused pane of a built tab; `None` while it is unbuilt.
     pub pane: Option<PaneId>,
     pub title: SharedString,
     pub kind: PaneKind,
@@ -110,7 +110,7 @@ impl SpaceEntry {
 }
 
 /// What a tab not built yet shows: its file, or its kind and folder.
-fn saved_title(pane: &SavedPane) -> SharedString {
+pub(super) fn saved_title(pane: &SavedPane) -> SharedString {
     let name = |path: &Path| {
         path.file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -146,89 +146,91 @@ impl Workspace {
                 mark: Mark::of(space),
                 current: index == self.current,
                 activity: self.space_activity(space),
-                tabs: space.tab_count(),
+                tabs: space.tabs.len(),
             })
             .collect()
     }
 
-    /// The tabs of workspace `index`: live ones with their panes' titles and
-    /// state, restored ones not built yet from what was saved.
+    /// The tabs of workspace `index`: built ones with their panes' titles and
+    /// state, unbuilt ones from what was saved (idle, no live pane).
     pub(super) fn sidebar_tabs(&self, index: usize) -> Vec<TabEntry> {
         let Some(space) = self.spaces.get(index) else {
             return Vec::new();
         };
         let current = index == self.current;
-        if let Some((saved, _)) = &space.saved {
-            return saved
-                .iter()
-                .enumerate()
-                .map(|(i, tab)| {
-                    let leaves = tab.layout.leaves();
-                    let focused = leaves.get(tab.focused.min(leaves.len().saturating_sub(1)));
-                    TabEntry {
-                        space: index,
-                        index: i,
-                        id: None,
-                        pane: None,
-                        title: focused.map(saved_title).unwrap_or_default(),
-                        kind: focused.map_or(PaneKind::Agent, |p| p.kind),
-                        shown: false,
-                        pinned: tab.pinned,
-                        running: false,
-                        needs_you: false,
-                        panes: leaves.len(),
-                    }
-                })
-                .collect();
-        }
         space
             .tabs
             .iter()
             .enumerate()
             .map(|(i, tab)| {
-                let leaves = tab.tree.leaves();
                 let shown = current && i == space.active;
-                TabEntry {
-                    space: index,
-                    index: i,
-                    id: Some(tab.id),
-                    pane: Some(tab.focused),
-                    title: self.pane_title(tab.focused),
-                    kind: self
-                        .panes
-                        .get(&tab.focused)
-                        .map_or(PaneKind::Agent, |p| p.item.kind),
-                    shown,
-                    pinned: tab.pinned,
-                    running: self.tab_running(tab),
-                    needs_you: leaves
-                        .iter()
-                        .any(|pane| self.panes.get(pane).is_some_and(|p| p.needs_you)),
-                    panes: leaves.len(),
+                match &tab.state {
+                    TabState::Unbuilt(saved) => {
+                        let focused = tab.state.saved_focused();
+                        TabEntry {
+                            space: index,
+                            index: i,
+                            id: tab.id,
+                            pane: None,
+                            title: focused.map(saved_title).unwrap_or_default(),
+                            kind: focused.map_or(PaneKind::Agent, |p| p.kind),
+                            shown,
+                            pinned: tab.pinned,
+                            running: false,
+                            needs_you: false,
+                            panes: saved.layout.len(),
+                        }
+                    }
+                    TabState::Built { tree, focused } => {
+                        let leaves = tree.leaves();
+                        TabEntry {
+                            space: index,
+                            index: i,
+                            id: tab.id,
+                            pane: Some(*focused),
+                            title: self.pane_title(*focused),
+                            kind: self
+                                .panes
+                                .get(focused)
+                                .map_or(PaneKind::Agent, |p| p.item.kind),
+                            shown,
+                            pinned: tab.pinned,
+                            running: self.tab_running(tab),
+                            needs_you: leaves
+                                .iter()
+                                .any(|pane| self.panes.get(pane).is_some_and(|p| p.needs_you)),
+                            panes: leaves.len(),
+                        }
+                    }
                 }
             })
             .collect()
     }
 
     /// A click on a tab of any workspace: switch there first, then show it;
-    /// a double-click on one of the shown workspace renames it.
+    /// a double-click on one of the shown workspace renames it. Modifier
+    /// clicks in the shown workspace update the multi-selection instead.
     pub(super) fn open_sidebar_tab(
         &mut self,
         space: usize,
         index: usize,
-        clicks: usize,
+        event: &ClickEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if space != self.current {
-            self.switch_workspace(space, window, cx);
-            if self.current == space {
-                self.activate(index, window, cx);
+            // Make the clicked tab the target's active one first, so only it
+            // is built when the workspace opens.
+            if let Some(target) = self.spaces.get_mut(space)
+                && index < target.tabs.len()
+            {
+                target.active = index;
             }
-        } else if clicks >= 2 {
-            self.start_tab_rename(index, window, cx);
+            self.switch_workspace(space, window, cx);
         } else {
-            self.activate(index, window, cx);
+            // Ranges follow the tabs the search leaves visible.
+            let visible: Vec<usize> = self.visible_tabs(space, cx).iter().map(|t| t.id).collect();
+            self.on_tab_click(index, event, Some(visible), window, cx);
         }
     }
 
@@ -259,24 +261,34 @@ impl Workspace {
         tab: &TabEntry,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let (space, index) = (tab.space, tab.index);
+        let (space, index, id) = (tab.space, tab.index, tab.id);
         let row = row.cursor_pointer().on_click(cx.listener(
             move |this, event: &ClickEvent, window, cx| {
-                this.open_sidebar_tab(space, index, event.click_count(), window, cx)
+                this.open_sidebar_tab(space, index, event, window, cx)
             },
         ));
-        let Some(id) = tab.id.filter(|_| space == self.current) else {
-            return row.into_any_element();
-        };
-        let tabs = &self.space().tabs;
+        let tabs = &self.spaces[space].tabs;
         let actions = TabMenu {
+            space,
             id,
-            kind: tab.kind,
+            can_rename: tab.kind == PaneKind::Agent && tab.pane.is_some() && space == self.current,
             pinned: tab.pinned,
             can_up: index > 0 && tabs[index - 1].pinned == tab.pinned,
             can_down: index + 1 < tabs.len() && tabs[index + 1].pinned == tab.pinned,
+            compact: false,
         };
-        let weak = cx.entity().downgrade();
+        // The menu works on any tab, built or not, in any workspace: it only
+        // reorders, pins or closes. Dragging reorders within the shown one.
+        let row = row.on_mouse_down(
+            MouseButton::Right,
+            cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                cx.stop_propagation();
+                this.open_tab_menu(actions, event.position, window, cx);
+            }),
+        );
+        if space != self.current {
+            return row.into_any_element();
+        }
         row.on_drag(
             TabDrag {
                 tab: id,
@@ -286,7 +298,6 @@ impl Workspace {
         )
         .drag_over::<TabDrag>(|style, _, _, _| style.bg(ui::petal().opacity(0.18)))
         .on_drop(cx.listener(move |this, drag: &TabDrag, _, cx| this.move_tab(drag.tab, index, cx)))
-        .context_menu(move |menu, _, _| Self::tab_actions_menu(menu, weak.clone(), actions))
         .into_any_element()
     }
 
@@ -347,6 +358,7 @@ impl Workspace {
             .icon(Icon::new(IconName::Plus))
             .when_some(label, |b, label| b.label(label))
             .tooltip("New tab")
+            .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
             .dropdown_menu(move |menu, window, _| new_tab_menu(menu, weak.clone(), window))
             .on_open_change(move |open, window, cx| {
                 crate::features::browser::popover_open(id, *open, window, cx)

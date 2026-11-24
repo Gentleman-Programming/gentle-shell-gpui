@@ -205,7 +205,9 @@ impl SessionView {
                 },
             ])
             .child(body)
-            .child(pill);
+            .child(pill)
+            // The conversation's live indicators don't show through it.
+            .child(self.live_slots.cover());
 
         // Slip in the first time tasks arrive, never on every task update.
         Some(

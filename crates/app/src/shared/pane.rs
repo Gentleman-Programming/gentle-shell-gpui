@@ -334,6 +334,21 @@ impl<L: Clone + PartialEq> PaneTree<L> {
             PaneTree::Split { first, second, .. } => first.len() + second.len(),
         }
     }
+
+    /// The `n`th leaf in reading order.
+    pub fn leaf(&self, n: usize) -> Option<&L> {
+        fn walk<'a, L>(tree: &'a PaneTree<L>, n: &mut usize) -> Option<&'a L> {
+            match tree {
+                PaneTree::Leaf(l) if *n == 0 => Some(l),
+                PaneTree::Leaf(_) => {
+                    *n -= 1;
+                    None
+                }
+                PaneTree::Split { first, second, .. } => walk(first, n).or_else(|| walk(second, n)),
+            }
+        }
+        walk(self, &mut { n })
+    }
 }
 
 #[cfg(test)]
@@ -352,6 +367,18 @@ mod tests {
         assert!(tree.insert(&1, 3, SplitAxis::Vertical, false));
         assert_eq!(tree.leaves(), vec![2, 1, 3]);
         assert!(!tree.insert(&9, 4, SplitAxis::Vertical, true));
+    }
+
+    #[test]
+    fn leaf_counts_in_reading_order() {
+        // [1 | [3 / 2]]
+        let mut tree = leaf(1);
+        tree.split(&1, 2, SplitAxis::Horizontal);
+        tree.insert(&2, 3, SplitAxis::Vertical, true);
+        assert_eq!(tree.leaf(0), Some(&1));
+        assert_eq!(tree.leaf(1), Some(&3));
+        assert_eq!(tree.leaf(2), Some(&2));
+        assert_eq!(tree.leaf(3), None);
     }
 
     #[test]

@@ -39,7 +39,8 @@ struct ShowIgnored {
 
 impl Global for ShowIgnored {}
 
-const REVEAL: &str = if cfg!(target_os = "macos") {
+/// The platform's name for showing a file in its folder.
+pub const REVEAL: &str = if cfg!(target_os = "macos") {
     "Reveal in Finder"
 } else if cfg!(target_os = "windows") {
     "Reveal in File Explorer"

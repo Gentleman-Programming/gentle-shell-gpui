@@ -1417,27 +1417,46 @@ fn restore_scroll(restore: &Cell<Option<(ListOffset, usize)>>, list: &ListState)
 }
 
 /// Decoded `data:` images by URL, so a frame doesn't decode them again.
-type EmbeddedImages = Mutex<HashMap<SharedUri, Option<Arc<Image>>>>;
+pub type EmbeddedImages = Mutex<HashMap<SharedUri, Option<Arc<Image>>>>;
 
 /// Where a preview image loads from: relative paths against the file's
 /// directory, `data:` URLs decoded, anything else as the URL it is.
 fn image_source(dir: &Path, embedded: &EmbeddedImages, uri: &SharedUri) -> ImageSource {
     let url: &str = uri;
     if url.starts_with("data:") {
-        let mut cache = embedded.lock().unwrap_or_else(PoisonError::into_inner);
-        // Typing inside a data URL makes a new one per keystroke.
-        if cache.len() >= 32 && !cache.contains_key(uri) {
-            cache.clear();
-        }
-        if let Some(image) = cache.entry(uri.clone()).or_insert_with(|| data_image(url)) {
-            return ImageSource::Image(image.clone());
-        }
-        return uri.clone().into();
+        return embedded_image(embedded, uri).unwrap_or_else(|| uri.clone().into());
     }
     match local_target(dir, url) {
         Some(path) => path.into(),
         None => uri.clone().into(),
     }
+}
+
+/// The image a `data:` URL carries, decoded the first time it is asked for.
+fn embedded_image(embedded: &EmbeddedImages, uri: &SharedUri) -> Option<ImageSource> {
+    let mut cache = embedded.lock().unwrap_or_else(PoisonError::into_inner);
+    // Typing inside a data URL makes a new one per keystroke.
+    if cache.len() >= 32 && !cache.contains_key(uri) {
+        cache.clear();
+    }
+    let image = cache.entry(uri.clone()).or_insert_with(|| data_image(uri));
+    image.clone().map(ImageSource::Image)
+}
+
+/// An image that loads without the network: a `data:` URL's, or a local
+/// file's (an absolute path or a `file:` URL). `None` for anything else,
+/// network shares (`//host/share`, `\\host\share`) included.
+pub fn offline_image(embedded: &EmbeddedImages, uri: &SharedUri) -> Option<ImageSource> {
+    if uri.starts_with("data:") {
+        return embedded_image(embedded, uri);
+    }
+    local_target(Path::new(""), uri)
+        .filter(|path| {
+            let bytes = path.as_os_str().as_encoded_bytes();
+            let share = bytes.len() >= 2 && bytes[..2].iter().all(|b| matches!(b, b'/' | b'\\'));
+            path.is_absolute() && !share
+        })
+        .map(Into::into)
 }
 
 /// Above a preview with Mermaid blocks and no renderer: what the blocks
@@ -1840,10 +1859,12 @@ mod tests {
     use std::io;
     use std::path::PathBuf;
 
+    use gpui_kit::{ImageSource, Resource, SharedUri};
+
     use super::{
-        Outside, Rope, atomic_write, data_image, has_scheme, is_markdown, line_count, local_target,
-        looks_binary, outside_write, parse_patch, percent_decode, rope_lines, save_rope,
-        scroll_share, status_label, untracked_patch,
+        EmbeddedImages, Outside, Rope, atomic_write, data_image, has_scheme, is_markdown,
+        line_count, local_target, looks_binary, offline_image, outside_write, parse_patch,
+        percent_decode, rope_lines, save_rope, scroll_share, status_label, untracked_patch,
     };
 
     fn temp_dir(tag: &str) -> PathBuf {
@@ -2049,6 +2070,35 @@ Binary files a/logo.png and b/logo.png differ
         assert!(!has_scheme("C:/repo/a.md") && !has_scheme("a.md"));
         assert_eq!(percent_decode("%E2%9C%93 100%"), "✓ 100%");
         assert_eq!(percent_decode("%FF"), "%FF");
+    }
+
+    #[test]
+    fn offline_images_never_reach_the_network() {
+        let embedded = EmbeddedImages::default();
+        let image = |url: &'static str| offline_image(&embedded, &SharedUri::from(url));
+        assert!(matches!(
+            image("data:image/png;base64,iVBORw0KGgo="),
+            Some(ImageSource::Image(_))
+        ));
+        let file = if cfg!(windows) {
+            "C:\\a.png"
+        } else {
+            "file:///tmp/a.png"
+        };
+        assert!(matches!(
+            image(file),
+            Some(ImageSource::Resource(Resource::Path(_)))
+        ));
+        for url in [
+            "https://example.com/a.png",
+            "//example.com/a.png",
+            "file:////host/share/a.png",
+            "\\\\host\\share\\a.png",
+            "a.png",
+            "data:text/plain,hi",
+        ] {
+            assert!(image(url).is_none(), "{url}");
+        }
     }
 
     #[test]

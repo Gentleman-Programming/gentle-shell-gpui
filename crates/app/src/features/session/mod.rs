@@ -108,8 +108,13 @@ pub struct SessionView {
     /// the shown text already pushed and how many Mermaid diagrams it showed
     /// drawn (a new drawing replaces source, so the text is set again).
     markdown: HashMap<(usize, usize), (Entity<TextViewState>, usize, usize)>,
+    /// Which code spans in the answers name a file under `cwd` (see
+    /// `view::paths`); remade with `cwd`.
+    paths: std::sync::Arc<view::PathLookup>,
     /// The conversation's Mermaid diagrams, drawn by the diagram renderer.
     diagrams: std::sync::Arc<crate::features::files::MermaidDiagrams>,
+    /// The `data:` images messages you sent show, decoded once.
+    bubble_images: std::sync::Arc<crate::features::files::EmbeddedImages>,
     expanded: HashSet<usize>,
     /// Generative UI surfaces the agent showed (`gentle_ui`), rebuilt
     /// from the transcript.
@@ -178,6 +183,10 @@ pub struct SessionView {
     _banner_anim: Task<()>,
     /// The conversation's virtualized list and its per-item display caches.
     list: view::TranscriptList,
+    /// Where the live indicators of the conversation and the composer sit,
+    /// and the layer that draws them moving (see [`crate::shared::overlay`]).
+    live_slots: crate::shared::overlay::LiveSlots,
+    live_layer: Entity<crate::shared::overlay::LiveLayer>,
     /// What the window was last told about: see [`SessionEvent::ChromeChanged`].
     chrome: Option<Chrome>,
     /// The pane's own width, measured each frame; narrow layouts adapt to it.
@@ -307,6 +316,9 @@ impl SessionView {
             // Configuration › Appearance › Input style changed: draw in it.
             input_style::follow(cx),
         ];
+        let live_slots = crate::shared::overlay::LiveSlots::default();
+        let live_layer = cx.new(|_| crate::shared::overlay::LiveLayer::new(live_slots.clone()));
+        let paths = std::sync::Arc::new(view::PathLookup::new(cwd.clone()));
         let mut this = Self {
             cwd,
             backend: state::Backend::new(prompt),
@@ -314,7 +326,9 @@ impl SessionView {
             permission: state::desktop::permission::Permission::default(),
             transcript: Transcript::default(),
             markdown: HashMap::new(),
+            paths,
             diagrams: Default::default(),
+            bubble_images: Default::default(),
             expanded: HashSet::new(),
             genui: Default::default(),
             genui_mode: crate::features::genui::mode::mode(cx),
@@ -356,6 +370,8 @@ impl SessionView {
             banner_reveal: 0.0,
             _banner_anim: Task::ready(()),
             list: view::TranscriptList::new(),
+            live_slots,
+            live_layer,
             chrome: None,
             focus_handle: cx.focus_handle(),
             _io: Task::ready(()),
@@ -372,6 +388,16 @@ impl SessionView {
             this.ensure_started(window, cx);
         }
         this
+    }
+
+    /// The layer this view's live indicators move on (pulses, shimmers,
+    /// spinners, the composer's orbit; see [`crate::shared::overlay`]).
+    /// Whatever draws this view draws the layer right after it, over its
+    /// bounds, outside this view: a frame of the layer then redraws the
+    /// layer and the views above it, and this view is reused from cache.
+    /// Without it the indicators don't show.
+    pub fn live_layer(&self) -> Entity<crate::shared::overlay::LiveLayer> {
+        self.live_layer.clone()
     }
 
     pub fn title(&self) -> String {

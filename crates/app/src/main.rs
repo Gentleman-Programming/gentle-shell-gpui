@@ -22,13 +22,10 @@ fn main() {
         ),
         _ => {}
     }
-    // An explicit folder selects (or creates) the workspace rooted there;
-    // without one the last workspace is restored.
+    // An explicit folder (or `--cwd`, which `gsd` passes) selects or creates
+    // the workspace rooted there; without one the last workspace is restored.
     let cli = cli::parse_cli();
-    let folder = cli
-        .folder
-        .filter(|p| p.is_dir())
-        .and_then(|p| dunce::canonicalize(p).ok());
+    let folder = cli::requested_folder(&cli);
     let prompt = cli.prompt;
     let url = cli.url;
     if let Some(url) = url.as_deref()
@@ -56,9 +53,26 @@ fn main() {
         }
         instance::Role::Primary(requests) => requests,
     };
+    // Windows can't rename a folder a process works in, and a shortcut may
+    // start the app in its install folder: work from a neutral folder so an
+    // update can replace the install. The first tab still opens where the
+    // app was launched (`cli::default_cwd`).
+    cli::remember_launch_dir();
+    #[cfg(windows)]
+    {
+        if let Some(dir) = pi_rpc::neutral_dir()
+            && let Err(error) = std::env::set_current_dir(dir)
+        {
+            eprintln!(
+                "Could not leave the launch folder for {}: {error}",
+                dir.display()
+            );
+        }
+    }
     // `gentle-open` and `gentle-device` live in the toolchain folder the
     // agents get on PATH; create them before that PATH is computed.
     platform::shims::install();
+    platform::gsd::refresh();
     // What every agent is told about opening pages and devices in the app.
     pi_rpc::set_system_prompt(features::devices::agent_instructions(
         setup::devices::prefs(),

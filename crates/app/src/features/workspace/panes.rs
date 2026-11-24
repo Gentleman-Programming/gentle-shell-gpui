@@ -13,12 +13,13 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(tab) = self.tab() else {
+        let Some(tab) = self.tab().filter(|t| t.is_built()) else {
             self.push_pane_tab(new, window, cx);
             return;
         };
         let kind = self.panes.get(&new).map(|p| p.item.kind);
-        let preview = tab.tree.leaves().into_iter().find(|id| {
+        let tree = tab.built_tree().unwrap();
+        let preview = tree.leaves().into_iter().find(|id| {
             *id != new
                 && self
                     .panes
@@ -50,8 +51,8 @@ impl Workspace {
             self.push_pane_tab(new, window, cx);
             return;
         }
-        if let Some(tab) = self.tab_mut() {
-            tab.tree.split(&target, new, axis);
+        if let Some(tree) = self.tab_mut().and_then(|t| t.built_tree_mut()) {
+            tree.split(&target, new, axis);
         }
         self.focus_pane(new, window, cx);
         self.schedule_save(cx);
@@ -68,9 +69,11 @@ impl Workspace {
         let space = self.space_mut();
         space.tabs.push(Tab {
             id,
-            tree: PaneTree::Leaf(pane),
-            focused: pane,
             pinned: false,
+            state: TabState::Built {
+                tree: PaneTree::Leaf(pane),
+                focused: pane,
+            },
         });
         let index = space.tabs.len() - 1;
         self.activate(index, window, cx);
@@ -95,8 +98,8 @@ impl Workspace {
         let w = (f32::from(viewport.width) - 12. - left - right).max(0.);
         let h = f32::from(viewport.height) - rem(super::render::TITLE_BAR_HEIGHT) - 6.;
         let mut out = Vec::new();
-        if let Some(tab) = self.tab() {
-            leaf_sizes(&tab.tree, w, h, &mut out);
+        if let Some(tree) = self.tab().and_then(|t| t.built_tree()) {
+            leaf_sizes(tree, w, h, &mut out);
         }
         out
     }
@@ -249,6 +252,18 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<PaneId> {
+        let root = self.space().root.clone();
+        self.new_factory_pane_at(kind, target, &root, window, cx)
+    }
+
+    fn new_factory_pane_at(
+        &mut self,
+        kind: PaneKind,
+        target: PathBuf,
+        root: &Path,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<PaneId> {
         let factories = PaneFactories::get(cx);
         let factory = match kind {
             PaneKind::Terminal => factories.terminal,
@@ -289,11 +304,11 @@ impl Workspace {
                 target
                     .parent()
                     .map(Path::to_path_buf)
-                    .unwrap_or_else(|| self.space().root.clone()),
+                    .unwrap_or_else(|| root.to_path_buf()),
                 Some(target),
             ),
             PaneKind::Canvas => (
-                canvas_cwd.unwrap_or_else(|| self.space().root.clone()),
+                canvas_cwd.unwrap_or_else(|| root.to_path_buf()),
                 Some(target),
             ),
             _ => (target, None),
@@ -405,16 +420,18 @@ impl Workspace {
         }
     }
 
-    pub(super) fn restore_pane(
+    pub(super) fn restore_pane_in_space(
         &mut self,
+        space: usize,
         saved: &SavedPane,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<PaneId> {
+        let root = self.spaces[space].root.clone();
         let cwd = if saved.cwd.is_dir() {
             saved.cwd.clone()
-        } else if self.space().root.is_dir() {
-            self.space().root.clone()
+        } else if root.is_dir() {
+            root.clone()
         } else {
             crate::cli::default_cwd()
         };
@@ -426,25 +443,25 @@ impl Workspace {
             }
             PaneKind::Terminal => {
                 PaneFactories::get(cx).terminal.as_ref()?;
-                self.new_factory_pane(PaneKind::Terminal, cwd, window, cx)
+                self.new_factory_pane_at(PaneKind::Terminal, cwd, &root, window, cx)
             }
             PaneKind::File => {
                 let path = saved.path.clone().filter(|p| p.is_file())?;
                 PaneFactories::get(cx).file.as_ref()?;
-                self.new_factory_pane(PaneKind::File, path, window, cx)
+                self.new_factory_pane_at(PaneKind::File, path, &root, window, cx)
             }
             PaneKind::Tower => {
                 PaneFactories::get(cx).tower.as_ref()?;
-                self.new_factory_pane(PaneKind::Tower, cwd, window, cx)
+                self.new_factory_pane_at(PaneKind::Tower, cwd, &root, window, cx)
             }
             PaneKind::History => {
                 PaneFactories::get(cx).history.as_ref()?;
-                self.new_factory_pane(PaneKind::History, cwd, window, cx)
+                self.new_factory_pane_at(PaneKind::History, cwd, &root, window, cx)
             }
             PaneKind::Canvas => {
                 let path = saved.path.clone()?;
                 PaneFactories::get(cx).canvas.as_ref()?;
-                let id = self.new_factory_pane(PaneKind::Canvas, path, window, cx)?;
+                let id = self.new_factory_pane_at(PaneKind::Canvas, path, &root, window, cx)?;
                 // Its agent works in the folder it had and picks up its
                 // conversation the next time it opens.
                 let resume = saved.session.clone().filter(|p| p.exists());
@@ -480,9 +497,76 @@ impl Workspace {
         self.push_pane_tab(pane, window, cx);
     }
 
+    /// Build tab `tab_index` of workspace `space_index` if it is still an
+    /// unbuilt placeholder.
+    pub(super) fn ensure_tab_built(
+        &mut self,
+        space_index: usize,
+        tab_index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let saved = self
+            .spaces
+            .get(space_index)
+            .and_then(|space| space.tabs.get(tab_index))
+            .and_then(|tab| tab.state.unbuilt())
+            .cloned();
+        let Some(saved) = saved else {
+            return;
+        };
+        let leaves = saved.layout.leaves();
+        let mut built = Vec::new();
+        let tree = saved.layout.filter_map(&mut |pane: &SavedPane| {
+            let id = self.restore_pane_in_space(space_index, pane, window, cx);
+            built.push(id);
+            id
+        });
+        let Some(tree) = tree else {
+            // Nothing in this tab could be restored; drop it and start fresh.
+            self.spaces[space_index].tabs.remove(tab_index);
+            self.prune_tab_selection(cx);
+            let len = self.spaces[space_index].tabs.len();
+            if len == 0 {
+                let root = self.spaces[space_index].root.clone();
+                let previous = self.current;
+                self.current = space_index;
+                self.open_tab(PaneKind::Agent, root, None, None, window, cx);
+                self.current = previous;
+            } else {
+                self.spaces[space_index].active =
+                    self.spaces[space_index].active.min(len.saturating_sub(1));
+            }
+            return;
+        };
+        let focused = built
+            .get(saved.focused.min(leaves.len().saturating_sub(1)))
+            .copied()
+            .flatten()
+            .or_else(|| tree.leaves().first().copied())
+            .unwrap_or_default();
+        if let Some(tab) = self.spaces[space_index].tabs.get_mut(tab_index) {
+            tab.state.set_built(tree, focused);
+        }
+    }
+
     pub(super) fn activate(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let space_index = self.current;
         let space = self.space_mut();
         space.active = index.min(space.tabs.len().saturating_sub(1));
+        // A tab that restores nothing (its file is gone) is dropped and the
+        // next one takes its place, so the shown tab is always built.
+        loop {
+            let active = self.spaces[space_index].active;
+            if !self.spaces[space_index]
+                .tabs
+                .get(active)
+                .is_some_and(|t| !t.is_built())
+            {
+                break;
+            }
+            self.ensure_tab_built(space_index, active, window, cx);
+        }
         self.focus_active(window, cx);
         self.start_shown(window, cx);
         self.schedule_save(cx);
@@ -493,7 +577,7 @@ impl Workspace {
     /// first time they are shown rather than all at launch.
     pub(super) fn start_shown(&self, window: &mut Window, cx: &mut App) {
         let Some(tab) = self.tab() else { return };
-        for id in tab.tree.leaves() {
+        for id in tab.leaves() {
             if let Some(session) = self.panes.get(&id).and_then(|p| p.session.as_ref()) {
                 session.update(cx, |s, cx| s.ensure_started(window, cx));
             }
@@ -509,9 +593,9 @@ impl Workspace {
 
     pub(super) fn focus_pane(&mut self, pane: PaneId, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(tab) = self.tab_mut()
-            && tab.tree.contains(&pane)
+            && tab.state.contains(&pane)
         {
-            tab.focused = pane;
+            tab.state.set_focused(pane);
         }
         self.focus_active(window, cx);
         cx.notify();
@@ -528,16 +612,19 @@ impl Workspace {
             space
                 .tabs
                 .iter()
-                .position(|tab| tab.tree.contains(&pane))
+                .position(|tab| tab.state.contains(&pane))
                 .map(|t| (s, t))
         });
         let Some((space, tab)) = found else {
             return;
         };
         if space != self.current {
+            // Switch directly to the tab holding the pane, not the old selection.
+            self.spaces[space].active = tab;
             self.switch_workspace(space, window, cx);
+        } else {
+            self.activate(tab, window, cx);
         }
-        self.activate(tab, window, cx);
         self.focus_pane(pane, window, cx);
     }
 
@@ -579,8 +666,8 @@ impl Workspace {
             self.push_pane_tab(pane, window, cx);
             return;
         }
-        if let Some(tab) = self.tab_mut() {
-            tab.tree.split(&focused, pane, axis);
+        if let Some(tree) = self.tab_mut().and_then(|t| t.built_tree_mut()) {
+            tree.split(&focused, pane, axis);
         }
         self.focus_pane(pane, window, cx);
         self.schedule_save(cx);
@@ -639,10 +726,12 @@ impl Workspace {
         if moving == target {
             return;
         }
-        if let Some(tab) = self.tab_mut() {
-            let tree = std::mem::replace(&mut tab.tree, PaneTree::Leaf(moving));
-            tab.tree = tree.moved(&moving, &target, axis, before);
-            tab.focused = moving;
+        if let Some(tab) = self.tab_mut()
+            && let Some(tree) = tab.built_tree_mut()
+        {
+            let new_tree = std::mem::replace(tree, PaneTree::Leaf(moving));
+            *tree = new_tree.moved(&moving, &target, axis, before);
+            tab.state.set_focused(moving);
         }
         self.schedule_save(cx);
         cx.notify();
@@ -763,25 +852,27 @@ impl Workspace {
             .space()
             .tabs
             .iter()
-            .position(|t| t.tree.contains(&pane))
+            .position(|t| t.state.contains(&pane))
         else {
             return;
         };
-        if self.space().tabs[index].tree.len() == 1 {
+        if self.space().tabs[index].state.len() == 1 {
             self.close_tab_now(index, window, cx);
             return;
         }
-        self.remember_close(index, &[pane], cx);
+        let space = self.current;
+        self.remember_close(space, index, &[pane], cx);
         let active = index == self.space().active;
         let tab = &mut self.space_mut().tabs[index];
-        let next = tab.tree.focus_after_close(&pane);
-        if let Some(tree) = tab.tree.clone().without(&pane) {
-            tab.tree = tree;
+        let tree = tab.built_tree_mut().expect("pane belongs to a built tab");
+        let next = tree.focus_after_close(&pane);
+        if let Some(new_tree) = tree.clone().without(&pane) {
+            *tree = new_tree;
         }
-        if tab.focused == pane
+        if tab.state.focused() == Some(pane)
             && let Some(next) = next
         {
-            tab.focused = next;
+            tab.state.set_focused(next);
         }
         // Dropping a session drops its PiProcess, which shuts the backend down.
         self.panes.remove(&pane);
@@ -796,22 +887,78 @@ impl Workspace {
     /// Close tab `index`, asking first when any of its panes holds unsaved
     /// edits or an agent at work.
     pub(super) fn close_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(tab) = self.space().tabs.get(index) else {
+        self.close_tab_in_space(self.current, index, window, cx);
+    }
+
+    /// Close tab `index` of workspace `space`. Unbuilt tabs close without
+    /// a confirmation and can be reopened from the closed tab stack.
+    pub(super) fn close_tab_in_space(
+        &mut self,
+        space: usize,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab) = self.spaces.get(space).and_then(|s| s.tabs.get(index)) else {
             return;
         };
-        let unsaved = self.unsaved_titles(tab.tree.leaves(), cx);
-        let busy = self.busy_titles(tab.tree.leaves());
+        if !tab.is_built() {
+            self.close_unbuilt_tab(space, index, window, cx);
+            return;
+        }
+        let leaves = tab.leaves();
+        let unsaved = self.unsaved_titles(leaves.clone(), cx);
+        let busy = self.busy_titles(leaves);
         if unsaved.is_empty() && busy.is_empty() {
-            self.close_tab_now(index, window, cx);
+            self.close_tab_now_in_space(space, index, window, cx);
         } else {
             let id = tab.id;
             self.confirm_close(unsaved, busy, window, cx, move |this, window, cx| {
                 // The tab may have moved while the dialog was open.
-                if let Some(index) = this.space().tabs.iter().position(|t| t.id == id) {
-                    this.close_tab_now(index, window, cx);
+                let index = this
+                    .spaces
+                    .get(space)
+                    .and_then(|s| s.tabs.iter().position(|t| t.id == id));
+                if let Some(index) = index {
+                    this.close_tab_now_in_space(space, index, window, cx);
                 }
             });
         }
+    }
+
+    fn close_unbuilt_tab(
+        &mut self,
+        space: usize,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (saved, tab_id, pinned) = {
+            let tab = self.spaces.get(space).and_then(|s| s.tabs.get(index));
+            let saved = tab.and_then(|t| t.state.unbuilt()).cloned();
+            let id = tab.map(|t| t.id).unwrap_or(0);
+            let pinned = tab.map(|t| t.pinned).unwrap_or(false);
+            (saved, id, pinned)
+        };
+        let Some(saved) = saved else { return };
+        let title = saved
+            .layout
+            .leaves()
+            .get(
+                saved
+                    .focused
+                    .min(saved.layout.leaves().len().saturating_sub(1)),
+            )
+            .map(super::sidebars::saved_title)
+            .unwrap_or_default();
+        if let Some(closed) = closed::Closed::unbuilt(space, tab_id, index, pinned, saved, title) {
+            if self.closed.len() == closed::KEEP {
+                self.closed.remove(0);
+            }
+            self.closed.push(closed);
+        }
+        self.spaces[space].tabs.remove(index);
+        self.finish_tab_close(space, index, window, cx);
     }
 
     pub(super) fn close_tab_now(
@@ -820,27 +967,51 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if index >= self.space().tabs.len() {
+        self.close_tab_now_in_space(self.current, index, window, cx);
+    }
+
+    fn close_tab_now_in_space(
+        &mut self,
+        space: usize,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if index >= self.spaces[space].tabs.len() {
             return;
         }
-        let leaves = self.space().tabs[index].tree.leaves();
-        self.remember_close(index, &leaves, cx);
-        let tab = self.space_mut().tabs.remove(index);
-        for pane in tab.tree.leaves() {
+        let leaves = self.spaces[space].tabs[index].leaves();
+        self.remember_close(space, index, &leaves, cx);
+        let tab = self.spaces[space].tabs.remove(index);
+        for pane in tab.leaves() {
             self.panes.remove(&pane);
         }
+        self.finish_tab_close(space, index, window, cx);
+    }
+
+    fn finish_tab_close(
+        &mut self,
+        space: usize,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        tab_panel::after_removal(&mut self.spaces[space], index);
+        self.prune_tab_selection(cx);
         self.announce_close(window, cx);
-        if self.space().tabs.is_empty() {
-            // Closing the last pane never closes the window (⌘Q quits):
-            // the workspace starts over with a fresh agent tab.
-            let root = self.space().root.clone();
-            self.open_tab(PaneKind::Agent, root, None, None, window, cx);
-            self.save_now(cx);
-            return;
+        if space == self.current {
+            if self.space().tabs.is_empty() {
+                // Only the shown workspace needs a replacement tab right now.
+                let root = self.space().root.clone();
+                self.open_tab(PaneKind::Agent, root, None, None, window, cx);
+                self.save_now(cx);
+            } else {
+                self.activate(self.space().active, window, cx);
+            }
+        } else {
+            self.schedule_save(cx);
+            cx.notify();
         }
-        let active = self.space().active;
-        let next = if active > index { active - 1 } else { active };
-        self.activate(next, window, cx);
     }
 
     pub(super) fn swap_panes(&mut self, a: PaneId, b: PaneId, cx: &mut Context<Self>) {
@@ -848,10 +1019,11 @@ impl Workspace {
             return;
         }
         if let Some(tab) = self.tab_mut()
-            && tab.tree.contains(&a)
-            && tab.tree.contains(&b)
+            && let Some(tree) = tab.built_tree_mut()
+            && tree.contains(&a)
+            && tree.contains(&b)
         {
-            tab.tree.swap(&a, &b);
+            tree.swap(&a, &b);
             self.schedule_save(cx);
             cx.notify();
         }

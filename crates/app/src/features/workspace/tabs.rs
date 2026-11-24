@@ -21,7 +21,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(pane) = self.space().tabs.get(index).map(|t| t.focused) else {
+        let Some(pane) = self.space().tabs.get(index).and_then(|t| t.state.focused()) else {
             return;
         };
         if self.panes.get(&pane).is_none_or(|p| p.session.is_none()) {
@@ -124,6 +124,6 @@ impl Workspace {
     }
 
     pub(super) fn focused_pane(&self) -> Option<PaneId> {
-        self.tab().map(|t| t.focused)
+        self.tab().and_then(|t| t.focused())
     }
 }

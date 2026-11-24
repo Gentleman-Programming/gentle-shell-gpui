@@ -11,6 +11,11 @@ use std::path::PathBuf;
 
 const OVERRIDE: &str = "GENTLE_SHELL_GPUI_DATA_DIR";
 
+/// Whether this build runs as an isolated copy (`GENTLE_SHELL_GPUI_DATA_DIR`).
+pub fn overridden() -> bool {
+    std::env::var_os(OVERRIDE).is_some_and(|dir| !dir.is_empty())
+}
+
 /// The app's folder; `None` when the system has no data directory.
 pub fn app() -> Option<PathBuf> {
     match std::env::var_os(OVERRIDE) {

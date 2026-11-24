@@ -10,15 +10,15 @@ impl Render for Workspace {
         crate::shared::diagnostics::render("Workspace");
         // Follow keyboard focus into panes (a terminal focused by its own click).
         if let Some(tab) = self.tab()
-            && let Some(inside) = tab.tree.leaves().into_iter().find(|id| {
+            && let Some(inside) = tab.leaves().into_iter().find(|id| {
                 self.panes
                     .get(id)
                     .is_some_and(|p| p.item.focus.contains_focused(window, cx))
             })
-            && inside != tab.focused
+            && Some(inside) != tab.focused()
             && let Some(tab) = self.tab_mut()
         {
-            tab.focused = inside;
+            tab.state.set_focused(inside);
         }
         let files_sidebar = self.sidebar.clone().filter(|_| self.sidebar_visible);
         let has_files_sidebar = self.sidebar.is_some();
@@ -82,6 +82,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_open_palette))
             .on_action(cx.listener(Self::on_open_settings))
             .on_action(cx.listener(Self::on_open_workspaces))
+            .on_action(cx.listener(Self::on_open_explorer))
             .on_action(cx.listener(Self::on_close_overlay))
             .key_context("GentleWorkspace")
             .relative()
@@ -106,12 +107,20 @@ impl Render for Workspace {
                             .justify_between()
                             .child(
                                 h_flex()
+                                    .id("title-bar-chip-strip")
                                     .gap_2()
                                     .flex_1()
                                     // Width 0: the tabs take what the buttons leave.
                                     .w_0()
                                     .min_w_0()
                                     .overflow_hidden()
+                                    .on_mouse_down(
+                                        MouseButton::Right,
+                                        cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                                            cx.stop_propagation();
+                                            this.open_empty_area_menu(event.position, window, cx);
+                                        }),
+                                    )
                                     .child(self.render_workspace_chip(cx))
                                     .child(
                                         div()
@@ -129,6 +138,9 @@ impl Render for Workspace {
                                     // Without this, Windows answers clicks on these
                                     // buttons as title-bar drags (HTCAPTION).
                                     .occlude()
+                                    .on_mouse_down(MouseButton::Right, |_, _, cx| {
+                                        cx.stop_propagation()
+                                    })
                                     // Tern keeps pane layout in the title bar, so
                                     // panes carry no header: one menu acts on the
                                     // focused pane, each entry with its shortcut.
@@ -248,19 +260,31 @@ impl Render for Workspace {
                     .gap_1p5()
                     // The vertical tab navigator remains independent of the Files panel.
                     .when(vertical_tabs, |row| {
-                        row.child(ui::appear(
-                            "tabs-sidebar-in",
+                        row.child(
                             div()
+                                .id("vertical-tab-panel")
                                 .w(rems(SIDEBAR_WIDTH / 16.))
                                 .flex_none()
                                 .h_full()
-                                .rounded_xl()
-                                .bg(ui::panel())
-                                .border_1()
-                                .border_color(gpui_kit::transparent_black())
-                                .overflow_hidden()
-                                .child(self.render_tab_sidebar(cx)),
-                        ))
+                                .on_mouse_down(
+                                    MouseButton::Right,
+                                    cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                                        cx.stop_propagation();
+                                        this.open_empty_area_menu(event.position, window, cx);
+                                    }),
+                                )
+                                .child(ui::appear(
+                                    "tabs-sidebar-in",
+                                    div()
+                                        .size_full()
+                                        .rounded_xl()
+                                        .bg(ui::panel())
+                                        .border_1()
+                                        .border_color(gpui_kit::transparent_black())
+                                        .overflow_hidden()
+                                        .child(self.render_tab_sidebar(cx)),
+                                )),
+                        )
                     })
                     .child(
                         div()
@@ -293,13 +317,15 @@ impl Render for Workspace {
                     }),
             )
             .children(self.stages.iter().filter_map(Stage::element))
-            .children(self.render_badge_picker(cx))
+            .children(self.render_badge_picker(window, cx))
+            .children(self.render_context_menu(cx))
             .when(devices_floating, |root| root.child(self.devices.clone()))
             .children(self.overlay.as_ref().map(|(overlay, _)| {
                 let (view, full_window) = match overlay {
                     Overlay::Providers(view) => (view.clone().into_any_element(), false),
                     Overlay::Sessions(view) => (view.clone().into_any_element(), false),
                     Overlay::Palette(view) => (view.clone().into_any_element(), false),
+                    Overlay::Explorer(view) => (view.clone().into_any_element(), false),
                     Overlay::Usage(view) => (view.clone().into_any_element(), false),
                     Overlay::Memory(view) => (view.clone().into_any_element(), false),
                     Overlay::Docs(view) => (view.clone().into_any_element(), false),

@@ -34,7 +34,6 @@ impl SessionView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let follow = self.list.at_bottom();
         for incoming in batch {
             self.handle(incoming, window, cx);
             if self.backend.restart_pending
@@ -47,9 +46,6 @@ impl SessionView {
             }
         }
         self.sync_view(cx);
-        if follow {
-            self.list.scroll_to_end();
-        }
         self.sync_chrome(cx);
         cx.notify();
     }

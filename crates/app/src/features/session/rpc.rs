@@ -1073,12 +1073,8 @@ impl SessionView {
         cx.spawn(async move |this, cx| {
             cx.background_executor().timer(builtins::OUTPUT_GRACE).await;
             let _ = this.update(cx, |this, cx| {
-                let follow = this.list.at_bottom();
                 if this.finish_capture(id) {
                     this.sync_view(cx);
-                    if follow {
-                        this.list.scroll_to_end();
-                    }
                     cx.notify();
                 }
             });

@@ -8,6 +8,7 @@ pub mod diagnostics;
 pub mod floating;
 pub mod gentle_state;
 pub mod kisses;
+pub mod overlay;
 pub mod pane;
 pub mod surge;
 pub mod themes;

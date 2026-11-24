@@ -864,8 +864,13 @@ pub fn scrim(id: impl Into<ElementId>) -> AnimationElement<Div> {
 // asks for a frame at the display's rate (120 Hz on ProMotion), and every frame
 // re-renders the view it sits in and its ancestors, the whole conversation
 // included. These draw from one app clock instead and ask their view for the
-// next frame after `SLOW_FRAME`: ~30 fps, smooth for slow motion, a quarter of
-// the work.
+// next frame `SLOW_FRAME` after it last drew: ~30 fps, smooth for slow motion,
+// a quarter of the work. A view that draws for another reason meanwhile (a
+// streamed answer, a sidebar pulse) has already moved its indicators along, so
+// the frame waits again rather than drawing on top: indicators and streaming
+// share frames instead of adding up. The conversation's own indicators go
+// further: they draw on a live overlay ([`crate::shared::overlay`]), so their
+// frames redraw the overlay and not the conversation under it.
 
 /// How often live indicators redraw.
 const SLOW_FRAME: Duration = Duration::from_millis(33);
@@ -906,50 +911,90 @@ pub(crate) fn request_frame_in(delay: Duration, window: &mut Window, cx: &mut Ap
     request_frame_from(std::panic::Location::caller(), delay, window, cx);
 }
 
-/// [`request_frame_in`], counted under `at`.
+/// [`request_frame_in`], counted under `at`. Every draw of the view moves its
+/// pending frame to `delay` after that draw. Each delay keeps its own frame,
+/// so a clock's second doesn't hold back a spinner's step.
 fn request_frame_from(
     at: &'static std::panic::Location<'static>,
     delay: Duration,
     window: &mut Window,
     cx: &mut App,
 ) {
+    type Pending = std::collections::HashMap<(EntityId, Duration), std::time::Instant>;
     thread_local! {
-        static PENDING: std::cell::RefCell<std::collections::HashSet<EntityId>> =
-            Default::default();
+        /// Frames on the way, by view and delay, with when the view last
+        /// asked (drew).
+        static PENDING: std::cell::RefCell<Pending> = Default::default();
     }
     if cx.reduce_motion() {
         return;
     }
     crate::shared::diagnostics::frame_at(at);
-    let view = window.current_view();
-    if !PENDING.with(|pending| pending.borrow_mut().insert(view)) {
+    let key = (window.current_view(), delay);
+    let now = std::time::Instant::now();
+    if PENDING.with(|pending| pending.borrow_mut().insert(key, now).is_some()) {
         return;
     }
     cx.spawn(async move |cx| {
-        cx.background_executor().timer(delay).await;
-        PENDING.with(|pending| pending.borrow_mut().remove(&view));
-        cx.update(|cx| cx.notify(view));
+        let mut wait = delay;
+        loop {
+            cx.background_executor().timer(wait).await;
+            let since = PENDING.with(|pending| pending.borrow().get(&key).map(|at| at.elapsed()));
+            match since {
+                Some(since) if since < delay => wait = delay - since,
+                _ => break,
+            }
+        }
+        PENDING.with(|pending| pending.borrow_mut().remove(&key));
+        cx.update(|cx| cx.notify(key.0));
     })
     .detach();
 }
 
-/// A zero-size element that keeps its view redrawing at the slow rate while
+thread_local! {
+    /// Set while [`still`] builds: indicators built then ask for no frames.
+    static STILL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Builds with `build` indicators that ask for no frames: a still copy
+/// that only holds an indicator's place (see [`crate::shared::overlay`]).
+pub(crate) fn still<R>(build: impl FnOnce() -> R) -> R {
+    let was = STILL.with(|still| still.replace(true));
+    let built = build();
+    STILL.with(|still| still.set(was));
+    built
+}
+
+/// A zero-size element that keeps its view redrawing every `delay` while
 /// it's on screen, counted under the line that placed the indicator.
+/// Nothing when built [`still`].
 #[track_caller]
-fn slow_frames() -> impl IntoElement {
+fn frames_every(delay: Duration) -> impl IntoElement {
     let at = std::panic::Location::caller();
+    let still = STILL.with(std::cell::Cell::get);
     canvas(
-        move |_, window, cx| request_frame_from(at, SLOW_FRAME, window, cx),
+        move |_, window, cx| {
+            if !still {
+                request_frame_from(at, delay, window, cx)
+            }
+        },
         |_, _, _, _| {},
     )
     .size_0()
+}
+
+/// Keeps a clock counting whole seconds current: one redraw a second,
+/// for rows where nothing else moves.
+#[track_caller]
+pub(crate) fn each_second() -> impl IntoElement {
+    frames_every(Duration::from_secs(1))
 }
 
 /// A soft breathing pulse for live indicators.
 #[track_caller]
 pub fn pulse(element: Div) -> Div {
     let breath = gpui_kit::pulsating_between(0.35, 1.0)(live_phase(1.4));
-    element.opacity(breath).child(slow_frames())
+    element.opacity(breath).child(frames_every(SLOW_FRAME))
 }
 
 /// A loading spinner (the Loader icon turning), for rows that stay on screen
@@ -966,25 +1011,64 @@ pub fn spinner(size: impl Into<gpui_kit::component::Size>, color: Hsla) -> Div {
                     live_phase(0.8),
                 ))),
         )
-        .child(slow_frames())
+        .child(frames_every(SLOW_FRAME))
 }
 
-/// Markdown the agent writes: more air between blocks than the reader's
-/// default, so a glance finds where each part starts, and code spans
-/// (paths, commands, names) in their own tint, so they stand out of the
-/// prose as landmarks. Their backing is solid (the popover color with a
-/// touch of the tint): the panes are glass, and a translucent wash over a
-/// busy theme backdrop lets the code get lost. The tint goes through the
-/// highlight every code span takes, table cells included.
+/// Markdown the agent writes, after Tern's: more air between blocks than
+/// the reader's default, so a glance finds where each part starts, and
+/// code spans (paths, commands, names) in their own tint, so they stand
+/// out of the prose as landmarks. The tint darkens on a light theme, where
+/// the theme's teal is too pale to read. Their backing is solid (the
+/// popover color with a touch of the tint): the panes are glass, and a
+/// translucent wash over a busy theme backdrop lets the code get lost.
+/// It goes through the highlight every code span takes, table cells
+/// included.
 pub fn prose_style() -> gpui_kit::component::text::TextViewStyle {
-    let backing = solid_mix(popover_bg(), teal(), 0.14);
     gpui_kit::component::text::TextViewStyle::default()
         .paragraph_gap(rems(1.))
         .inline_code(gpui_kit::HighlightStyle {
-            color: Some(teal()),
-            background_color: Some(backing),
+            color: Some(code_tint()),
+            background_color: Some(code_backing()),
             ..Default::default()
         })
+        .code_block(prose_code_block())
+}
+
+/// The solid backing of the agent's code spans (see [`prose_style`]),
+/// path spans included.
+pub fn code_backing() -> Hsla {
+    solid_mix(popover_bg(), code_tint(), 0.14)
+}
+
+/// A fenced block in the agent's Markdown, after Tern's: rounded on a
+/// hairline, its language and Copy along the top (the block's actions,
+/// see `SessionView::markdown_view`), lines with room to read plain text.
+fn prose_code_block() -> gpui_kit::StyleRefinement {
+    gpui_kit::StyleRefinement::default()
+        .pt(rems(36. / 16.))
+        .rounded_lg()
+        .border_color(border())
+        .line_height(gpui_kit::relative(1.7))
+}
+
+/// The code spans' tint: the theme's teal, darker on a light theme.
+fn code_tint() -> Hsla {
+    let teal = teal();
+    if popover_bg().l > 0.5 {
+        Hsla {
+            l: teal.l * 0.55,
+            s: (teal.s * 1.2).min(1.),
+            ..teal
+        }
+    } else {
+        teal
+    }
+}
+
+/// List markers (bullets, numbers) in the agent's Markdown: tinted, so a
+/// list's items are found at a glance down its edge.
+pub fn prose_list_style() -> gpui_kit::StyleRefinement {
+    gpui_kit::StyleRefinement::default().text_color(info())
 }
 
 /// `base` moved `t` of the way to `tint`, fully opaque.
@@ -998,36 +1082,6 @@ fn solid_mix(base: Hsla, tint: Hsla, t: f32) -> Hsla {
         a: 1.,
     }
     .into()
-}
-
-/// A soft layer of the solid popover color behind a reading column `width`
-/// wide, fading out over `FADE` on each side: the panes are glass, and a
-/// busy theme backdrop under the text makes it hard to read. The backdrop
-/// still shows at the sides and, dimmed, behind the text. Place it first
-/// in a `relative` container; it takes no input.
-pub fn reading_veil(width: Rems) -> Div {
-    const FADE: f32 = 48.;
-    let veil = popover_bg().opacity(0.55);
-    let fade = |from: Hsla, to: Hsla| {
-        div()
-            .flex_none()
-            .w(px(FADE))
-            .h_full()
-            .bg(gpui_kit::linear_gradient(
-                90.,
-                gpui_kit::linear_color_stop(from, 0.),
-                gpui_kit::linear_color_stop(to, 1.),
-            ))
-    };
-    div().absolute().inset_0().flex().justify_center().child(
-        div()
-            .flex()
-            .h_full()
-            .max_w_full()
-            .child(fade(veil.opacity(0.), veil))
-            .child(div().w(width).flex_shrink(1.).min_w_0().h_full().bg(veil))
-            .child(fade(veil, veil.opacity(0.))),
-    )
 }
 
 /// `text` with a soft highlight sweeping across it, from `base` to
@@ -1062,24 +1116,18 @@ pub fn shimmer(text: impl Into<SharedString>, base: Hsla, highlight: Hsla) -> Di
         .min_w_0()
         .text_color(base)
         .child(gpui_kit::StyledText::new(text).with_highlights(runs))
-        .child(slow_frames())
+        .child(frames_every(SLOW_FRAME))
 }
 
-/// A short bright streak orbiting a rounded box's border clockwise, its
-/// tail fading out, for a box whose work is in progress (the composer while
-/// the agent works). Place it inside a `relative` box with a 1px border;
-/// `radius` is the box's corner radius.
+/// A short bright streak orbiting a rounded box clockwise, its tail fading
+/// out, for work in progress (round the composer's action button while the
+/// agent works). It fills its bounds; `radius` is their corner radius,
+/// clamped to half the shorter side, so a large one runs a circle.
 #[track_caller]
 pub fn orbit(color: Hsla, radius: Rems) -> Div {
     let phase = live_phase(2.4);
-    // Over the border: `absolute` insets start inside it.
-    let edge = px(-1.);
     div()
-        .absolute()
-        .top(edge)
-        .left(edge)
-        .right(edge)
-        .bottom(edge)
+        .size_full()
         .child(
             canvas(
                 |_, _, _| (),
@@ -1090,7 +1138,7 @@ pub fn orbit(color: Hsla, radius: Rems) -> Div {
             )
             .size_full(),
         )
-        .child(slow_frames())
+        .child(frames_every(SLOW_FRAME))
 }
 
 /// [`orbit`]'s streak: its head `phase` of the way round the border, the

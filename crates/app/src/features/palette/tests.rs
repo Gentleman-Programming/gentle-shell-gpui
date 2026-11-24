@@ -67,6 +67,7 @@ fn recent_workspaces_keep_original_indices_and_search_behavior(cx: &mut TestAppC
         pick_folder: true,
     };
     let mut expected = switches(&[3, 2, 4, 5, 6, 7, 0, 1]);
+    expected.push(PaletteAction::OpenExplorer);
     expected.push(folder.clone());
     assert_eq!(actions(&view, cx), expected);
 
@@ -98,6 +99,7 @@ fn recent_workspaces_keep_original_indices_and_search_behavior(cx: &mut TestAppC
         pick_folder: false,
     }];
     filtered.extend(switches(&[0, 1, 2, 3, 4, 5, 6, 7]));
+    filtered.push(PaletteAction::OpenExplorer);
     filtered.push(PaletteAction::CreateWorkspace {
         name: "Workspace".into(),
         pick_folder: true,
@@ -112,7 +114,11 @@ fn recent_workspaces_keep_original_indices_and_search_behavior(cx: &mut TestAppC
     cx.run_until_parked();
     assert_eq!(
         actions(&view, cx),
-        vec![PaletteAction::SwitchWorkspace(1), folder]
+        vec![
+            PaletteAction::SwitchWorkspace(1),
+            PaletteAction::OpenExplorer,
+            folder,
+        ]
     );
 
     update(&view, cx, |view, window, cx| {

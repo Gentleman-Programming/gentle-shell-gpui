@@ -1,7 +1,14 @@
-//! Markdown helpers for previews: where the Mermaid diagrams are, so the
-//! app can draw them in place of their source.
+//! Markdown helpers: where a preview's Mermaid diagrams are, so the app can
+//! draw them in place of their source, a sent message as the Markdown its
+//! bubble renders ([`sent_message`]), and the code spans of an answer that
+//! name a file ([`paths`]).
 
 use std::ops::Range;
+
+pub mod paths;
+mod sent;
+
+pub use sent::{sent_message, trim_folded};
 
 /// A fenced ` ```mermaid ` block.
 #[derive(Debug, Clone, PartialEq, Eq)]

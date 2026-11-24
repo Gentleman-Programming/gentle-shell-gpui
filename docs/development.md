@@ -50,17 +50,20 @@ cargo build --profile dist -p gentle-shell-gpui   # as in a release
 
 ### CLI
 
-`crates/app/src/cli.rs`: `gentle-shell-gpui [FOLDER] [-p|--prompt TEXT]`.
+`crates/app/src/cli.rs`: `gentle-shell-gpui [FOLDER] [--cwd] [-p|--prompt TEXT]`.
 
 | Argument | Effect |
 | --- | --- |
 | `FOLDER` | Selects (or creates) the workspace with that root. Ignored if it is not a directory. Without a folder, the last workspace is restored. |
+| `--cwd` | Without `FOLDER`, opens the folder the app was launched in (`cli::launch_dir`) as a workspace instead of restoring the last one. It is what `gsd` passes; a plain launch (Start menu, Finder, Dock) never uses its launch folder this way. A `FOLDER` that doesn't exist is ignored without falling back to the launch folder. |
 | `-p TEXT`, `--prompt TEXT` | Opens a new agent tab and, once the backend starts, runs the text as if it had been typed in the composer (`SessionView::run_text` in `features/session/submit.rs`). |
 | `-p "!cmd"` | Runs `cmd` as a shell command in that tab; `-p "!!cmd"` keeps it out of the context (Pi convention). |
 | `--diagnostics` | Records resource diagnostics for this run, like `GENTLE_SHELL_GPUI_DIAGNOSTICS=1` (see [Diagnostics](#diagnostics)). |
 | `--diagnostics-report [FILE]` | Prints the ranking of a recording (the newest one without `FILE`) and exits. |
 
 `-p` is useful during development to bring the app to a specific state without typing into it.
+
+`gsd` (`crates/app/src/platform/gsd.rs`) is the user's command for this: a generated shim that runs `<app> --cwd "$@"` in the background (`start "" "<app>" --cwd %*` in a `.cmd` on Windows) and returns to the prompt. Unlike the agents' shims it lives on the user's own PATH, and only when they ask: the Windows installer ships `{app}\bin\gsd.cmd` and adds `{app}\bin` to `HKCU\Environment\Path` (removed on uninstall); ⌘K → Install `gsd` command writes `~/.local/bin/gsd` (macOS, Linux) or `<app data dir>\bin\gsd.cmd` plus that folder on the user PATH (Windows, read and written as the raw `REG_EXPAND_SZ` value so `%VAR%` entries survive). A marker line makes a `gsd` file the app's own: startup refreshes only that one (the executable moves on update), and the install refuses to overwrite anyone else's. An isolated copy (`GENTLE_SHELL_GPUI_DATA_DIR`) never refreshes it.
 
 ### Single instance
 
@@ -97,7 +100,7 @@ Everything the app stores lives under `dirs::data_dir()/gentle-shell-gpui/`, or 
 | `GENTLE_PI_BACKGROUND_SUBAGENTS` | `features/settings/snapshot.rs` | Source of the background subagents policy shown in Settings. |
 | `GENTLE_SHELL_GENTLE_AI_PIN` | `features/setup/gentle.rs` | Gentle AI pin used by the setup check. |
 | `ENGRAM_URL`, `ENGRAM_PORT`, `ENGRAM_HTTP_TOKEN` | `features/memory/client.rs` | Engram server (default port `7437`). |
-| `ENGRAM_BIN` | `features/setup/extras.rs` | Engram binary for the check. |
+| `ENGRAM_BIN` | `features/setup/extras.rs` | Engram binary for the check, ahead of the PATH. Resolved the way it is run (a bare name on the PATH counts); when nothing it names can be run the check fails with that path and Install and Update stop, since a download can't fix it. Only for Engram on this computer: in a backend, Setup looks for Engram there. |
 | `SHELL` | `launch.rs` (`login_shell_path`), `features/terminal/mod.rs` | Login shell whose PATH is combined (Unix), and the shell for terminal panels. |
 | `GOBIN`, `GOPATH` | `launch.rs` (`go_bin_dir`) | Where `go install` puts programs (default `~/go/bin`), added at the end of the combined PATH when it exists. |
 | `GENTLE_SHELL_GPUI_DATA_DIR` | `shared/data_dir.rs` | Replaces the app's data folder (`<data dir>/gentle-shell-gpui`). Gentle Shell's homes still come from `HOME`. |
@@ -222,7 +225,7 @@ They are in [`architecture.md`](architecture.md); the essentials:
 
 The app must idle at ~0 % CPU and stay cheap during a long agent turn on any machine. What GPUI does, and the rules that follow:
 
-- **A frame re-renders every ancestor.** `request_animation_frame` (which every repeating `with_animation`, `ui::pulse` and `Spinner` calls) notifies the view it sits in, and a dirty view dirties all its ancestors. A pulsing dot in a conversation therefore re-renders the whole `SessionView` (and the `Workspace`) on every frame of a turn. Moving the dot into its own view doesn't help; making that render cheap does.
+- **A frame re-renders every ancestor.** `request_animation_frame` (which every repeating `with_animation`, `ui::pulse` and `Spinner` calls) notifies the view it sits in, and a dirty view dirties all its ancestors. A cached view (`.cached(..)`) that re-renders also rebuilds every cached view inside it (GPUI refreshes its subtree), so caching a child of a view that redraws buys nothing. A pulsing dot drawn in a conversation would re-render the whole `SessionView` on every frame of a turn; an agent's indicators therefore move on its live layer (`shared/overlay.rs`), a view drawn after the agent's, outside it: their frames redraw only the layer and the window root, and the cached agent pane is reused.
 - **`render` does no O(transcript) work.** Anything derived from all items (scroll estimate, rail marks, card text, line counts) is computed when the transcript changes (`sync_view` → `TranscriptList::prepare`) and cached; `render` reads the cache. Draw many marks in one `canvas` with one hitbox, not one interactive element each (`session/view/rail.rs`).
 - **No copies of long text per frame.** Keep bodies as `SharedString`s built in `prepare` and clone those; find tails from the end (`rfind`), never by scanning from the start.
 - **Animations stop.** Looping indicators only while something truly runs: a backend that exits mid-turn settles its stream and tools (`Transcript::interrupt`). One-shot animations run on their own clock and request frames only while they last, and skip when `cx.reduce_motion()` is set.
@@ -236,7 +239,7 @@ To measure, run the release build in an isolated `HOME` and sample it: `ps -o %c
 For a report from someone else's machine ("it eats CPU with many agents", "this theme is heavy"), the app records itself. In **Configuration › General › Diagnostics** the person presses *Start recording*, reproduces the problem, and presses *Stop and show file*, which reveals the file in Finder or Explorer to drag into the issue (`features/settings/diagnostics.rs`). To record from launch instead, quit the app and start it with `GENTLE_SHELL_GPUI_DIAGNOSTICS=1` or `--diagnostics` (a launch while it runs is forwarded and records nothing). Every second `features/diagnostics/` appends one JSON line to `<data dir>/gentle-shell-gpui/diagnostics/diagnostics-<UTC>.jsonl`:
 
 - **The app process:** CPU, memory, windows, the active theme and its scene motion.
-- **Frames requested by source line:** `ui::request_animation_frame` (call it instead of `window.request_animation_frame`), `ui::request_frame_in`, `ui::request_slow_frame` and the live indicators (`ui::pulse`, `ui::spinner`, `ui::shimmer`), counted with `#[track_caller]`; renders of `Workspace`, `SessionView` and `TerminalView`; wakeups of the poll loops that call `shared::diagnostics::tick()`. A repeating `with_animation` isn't counted by line; it shows in the renders.
+- **Frames requested by source line:** `ui::request_animation_frame` (call it instead of `window.request_animation_frame`), `ui::request_frame_in`, `ui::request_slow_frame` and the live indicators (`ui::pulse`, `ui::spinner`, `ui::shimmer`, `ui::orbit`), counted with `#[track_caller]` (an indicator on an agent's live layer counts under the line that builds it); renders of `Workspace`, `SessionView`, `LiveLayer` and `TerminalView`; wakeups of the poll loops that call `shared::diagnostics::tick()`. A repeating `with_animation` isn't counted by line; it shows in the renders.
 - **Every tab:** its subagents and jobs (total and running), conversation items, the RPC records and kilobytes its backend sends per second, and the whole process tree under the backend (subagents, jobs, tools): process count, summed CPU and memory, the heaviest executables.
 - **The app's other children** (terminals, the device hub) with their trees.
 

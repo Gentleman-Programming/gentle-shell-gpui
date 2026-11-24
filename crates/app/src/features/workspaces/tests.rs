@@ -272,3 +272,33 @@ fn an_unreadable_file_is_copied_aside() {
     );
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn a_folder_reached_another_way_keys_the_same_workspace() {
+    let base = std::env::temp_dir().join(format!("ws-key-test-{}", std::process::id()));
+    std::fs::create_dir_all(base.join("a")).unwrap();
+    let canonical = dunce::canonicalize(base.join("a")).unwrap();
+    // The explorer builds `dir.join(name)`; `gsd` passes a canonical path.
+    assert_eq!(
+        super::root_key(base.join("a").join("..").join("a")),
+        canonical
+    );
+    assert_eq!(super::root_key(canonical.clone()), canonical);
+    // A folder that can't be resolved keeps its path.
+    let missing = base.join("missing");
+    assert_eq!(super::root_key(missing.clone()), missing);
+    std::fs::remove_dir_all(&base).unwrap();
+}
+
+#[test]
+fn a_workspace_saved_with_a_non_canonical_root_is_still_found() {
+    let base = std::env::temp_dir().join(format!("ws-find-test-{}", std::process::id()));
+    std::fs::create_dir_all(base.join("a")).unwrap();
+    std::fs::create_dir_all(base.join("b")).unwrap();
+    // Saved before roots were canonical: `a/../a`.
+    let roots = [base.join("b"), base.join("a").join("..").join("a")];
+    let canonical = dunce::canonicalize(base.join("a")).unwrap();
+    assert_eq!(super::find_root(roots.iter(), &canonical), Some(1));
+    assert_eq!(super::find_root(roots.iter(), &base.join("missing")), None);
+    std::fs::remove_dir_all(&base).unwrap();
+}

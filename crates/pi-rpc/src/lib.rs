@@ -8,6 +8,7 @@
 pub mod desktop_rpc;
 pub mod file_cache;
 mod home;
+mod job;
 mod launch;
 mod login;
 mod record;
@@ -18,10 +19,14 @@ pub use home::{
 };
 pub use login::{AuthEvent, AuthPrompt, LoginHelper, LoginMessage, PromptOption, ProviderInfo};
 
+pub use job::contain;
+#[cfg(windows)]
+pub use launch::neutral_dir;
 pub use launch::{
     BundledInstall, LaunchSpec, backend_version, child_path, command, find_program, forget_cached,
-    forget_versions, output_within, remote_backend, resolve_backend, resolve_node, set_extensions,
-    set_extra_path, set_system_prompt, split_args, version_output, version_stderr,
+    forget_versions, managed_install_root, output_within, remote_backend, resolve_backend,
+    resolve_node, set_extensions, set_extra_path, set_system_prompt, split_args, version_output,
+    version_stderr,
 };
 pub use record::{Record, Response, UiMethod, UiRequest, parse_record};
 
@@ -95,6 +100,9 @@ impl PiProcess {
         let mut child = command
             .spawn()
             .with_context(|| format!("failed to start {}", spec.program.display()))?;
+        // Windows: it and every process it starts (tools, an extension's
+        // `engram serve`) end with the app even when `shutdown` never runs.
+        job::contain(&child);
         let stdin = child.stdin.take().context("child stdin unavailable")?;
         let stdout = child.stdout.take().context("child stdout unavailable")?;
         let stderr = child.stderr.take().context("child stderr unavailable")?;

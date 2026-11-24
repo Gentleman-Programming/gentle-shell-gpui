@@ -28,84 +28,137 @@ use gentle_core::input_style::InputStyle;
 use gentle_core::transcript::format_tokens;
 
 impl SessionView {
-    /// The context line, after Tern's: a thin line just over the
-    /// composer's top edge that fills as the conversation uses its window,
-    /// the percent riding the fill's end and the window's size at the
-    /// line's. Quiet until it matters (a faint fill, faint captions), then
-    /// amber past the alert threshold and red near the end. Work in
-    /// progress is the composer's [`ui::orbit`], not this line. It stays
-    /// clear of the composer: drawn over its edge, the composer (painted
-    /// after) would cover it.
-    fn render_context_bar(&self, cx: &App) -> Option<Div> {
+    /// How full the context is (0..=100) and its tone, by band
+    /// ([`ContextFill`]): faint while calm, amber while filling, red when
+    /// full; `None` while calm.
+    fn context_level(&self) -> Option<(f32, Option<Hsla>)> {
+        use gentle_core::usage::context::ContextFill;
         let percent = self
             .usage
             .context_percent
             .map(|p| p.clamp(0.0, 100.0) as f32)?;
-        let alert = if percent >= 90. {
-            Some(ui::danger())
-        } else if f64::from(percent) >= crate::features::alerts::context_threshold(cx) {
-            Some(ui::warning())
-        } else {
-            None
+        let tone = match ContextFill::of(f64::from(percent)) {
+            ContextFill::Calm => None,
+            ContextFill::Filling => Some(ui::warning()),
+            ContextFill::Full => Some(ui::danger()),
         };
-        let fill = alert.unwrap_or(ui::fg().opacity(0.35));
-        let tone = alert.unwrap_or(ui::faint());
+        Some((percent, tone))
+    }
+
+    /// While the agent works a light runs round the composer's action
+    /// button (stop, or send while you steer), just outside it, on the live
+    /// overlay. Round buttons get a round lap (the orbit's corner radius
+    /// clamps to a circle); Bar's framed Stop follows its corners; Prompt's
+    /// words get none.
+    fn action_ring(&self, style: InputStyle) -> Option<Div> {
+        /// How far outside the button the light runs.
+        const GAP: f32 = 3.;
+        let radius = match style {
+            InputStyle::Prompt => return None,
+            InputStyle::Bar => rems((6. + GAP) / 16.),
+            _ => rems(99.),
+        };
+        self.busy().then(|| {
+            self.live_slots
+                .slot("action-ring", move || {
+                    ui::orbit(ui::petal(), radius).into_any_element()
+                })
+                .absolute()
+                .top(px(-GAP))
+                .left(px(-GAP))
+                .right(px(-GAP))
+                .bottom(px(-GAP))
+        })
+    }
+
+    /// The context, after Tern's, drawn as part of the composer's own top
+    /// border (one line, not two): from past the box's left corner the
+    /// border fills as the conversation uses its window, in the band's
+    /// color ([`Self::context_level`]), its percent riding the fill's end
+    /// just above the box. The window's size closes the activity line
+    /// ([`Self::render_context_caption`]). Work in progress is the light
+    /// round the action button ([`Self::action_ring`]), not this line.
+    /// Place it in the box (`relative`, 1 px border); `radius` is the box's
+    /// corner radius.
+    fn render_context_edge(&self, radius: Rems) -> Option<Div> {
+        let (percent, alert) = self.context_level()?;
+        let fill = alert.unwrap_or(ui::fg().opacity(0.45));
         let used = percent / 100.;
-        let window = self
-            .models
+        let tip = self.context_tip(percent);
+        Some(
+            div()
+                .absolute()
+                // On the border's own line: `absolute` insets start inside it.
+                .top(px(-1.))
+                .left(radius)
+                .right(radius)
+                .h(px(1.))
+                .child(div().h_full().w(relative(used)).bg(fill))
+                .when(percent >= 1., |d| {
+                    d.child(
+                        div()
+                            .id("context-percent")
+                            .absolute()
+                            .bottom(px(4.))
+                            .left(relative(used))
+                            .ml(rems(-16. / 16.))
+                            .w(rems(32. / 16.))
+                            .text_center()
+                            .font_family(ui::mono())
+                            .text_size(ui::code_rems(9.))
+                            .line_height(rems(11. / 16.))
+                            .text_color(alert.unwrap_or(ui::faint()))
+                            .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+                            .child(format!("{percent:.0}%")),
+                    )
+                }),
+        )
+    }
+
+    /// The current model's context window, in tokens.
+    fn context_window(&self) -> Option<u64> {
+        self.models
             .current
             .as_ref()
             .map(|m| m.context_window)
             .filter(|w| *w > 0)
-            .map(format_tokens);
-        let caption = |d: Div| {
-            d.absolute()
-                .top_0()
-                .font_family(ui::mono())
-                .text_size(ui::code_rems(10.))
-                .line_height(rems(12. / 16.))
-                .text_color(tone)
-        };
+    }
+
+    /// The hover on the context's figures: "Context used: 60K of 1M
+    /// tokens (6%)". The tokens are the percent of the window: the backend
+    /// reports only the percent.
+    fn context_tip(&self, percent: f32) -> SharedString {
+        match self.context_window() {
+            Some(window) => {
+                let used = (window as f64 * f64::from(percent) / 100.).round() as u64;
+                format!(
+                    "Context used: {} of {} tokens ({percent:.0}%)",
+                    format_tokens(used),
+                    format_tokens(window)
+                )
+            }
+            None => format!("Context used: {percent:.0}%"),
+        }
+        .into()
+    }
+
+    /// The window's size at the activity line's end, over the context
+    /// line's end: "1M", faint until the band's tone takes it; its hover
+    /// says how much is used.
+    pub(super) fn render_context_caption(&self) -> Option<Stateful<Div>> {
+        let (percent, alert) = self.context_level()?;
+        let window = format_tokens(self.context_window()?);
+        let tip = self.context_tip(percent);
         Some(
             div()
-                .relative()
-                .w_full()
-                .h(rems(1.))
-                // Its line just over the composer's top edge.
-                .mb(rems(-3. / 16.))
-                .child(
-                    div()
-                        .absolute()
-                        .left(rems(18. / 16.))
-                        .right(rems(18. / 16.))
-                        .top_0()
-                        .bottom_0()
-                        .child(
-                            div()
-                                .absolute()
-                                .left_0()
-                                .right_0()
-                                .bottom_0()
-                                .h(px(2.))
-                                .rounded_full()
-                                .overflow_hidden()
-                                .bg(ui::fg().opacity(0.1))
-                                .child(div().h_full().w(relative(used)).bg(fill)),
-                        )
-                        .when(percent >= 1., |d| {
-                            d.child(
-                                caption(div())
-                                    .left(relative(used))
-                                    .ml(rems(-16. / 16.))
-                                    .w(rems(32. / 16.))
-                                    .text_center()
-                                    .child(format!("{percent:.0}%")),
-                            )
-                        })
-                        .when_some(window, |d, window| {
-                            d.child(caption(div()).right_0().child(window))
-                        }),
-                ),
+                .id("context-window")
+                .flex_none()
+                .px_1()
+                .font_family(ui::mono())
+                .text_size(ui::code_rems(10.))
+                .text_color(alert.unwrap_or(ui::faint()))
+                .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+                .child(window),
         )
     }
 
@@ -402,8 +455,7 @@ impl SessionView {
             })
             .bg(ui::surface())
             .shadow_lg()
-            // While the agent works a light runs round the box.
-            .when(self.busy(), |d| d.child(ui::orbit(ui::petal(), rems(1.))))
+            .children(self.render_context_edge(rems(1.)))
     }
 
     /// The composer in the chosen input style, and for Prompt the status
@@ -498,7 +550,11 @@ impl SessionView {
             .then(|| self.render_usage_chip())
             .flatten()
             .map(|chip| div().flex_shrink_0().child(chip));
-        let action = div().flex_shrink_0().child(action_button);
+        let action = div()
+            .relative()
+            .flex_shrink_0()
+            .child(action_button)
+            .children(self.action_ring(style));
         let spacer = || div().flex_1().min_w_0();
         let row = || h_flex().w_full().min_w_0().gap_1p5().items_center();
         // The line or frame a focused composer lights up.
@@ -626,7 +682,7 @@ impl SessionView {
                     .border_1()
                     .border_color(edge(ui::border_strong()))
                     .bg(ui::well())
-                    .when(busy, |d| d.child(ui::orbit(ui::petal(), rems(6. / 16.))))
+                    .children(self.render_context_edge(rems(6. / 16.)))
                     .font_family(ui::mono())
                     // On the text's first line: the text area's own top
                     // padding, then a line as tall as its lines.
@@ -666,7 +722,7 @@ impl SessionView {
                         .border_1()
                         .border_color(edge(ui::border()))
                         .bg(ui::surface())
-                        .when(busy, |d| d.child(ui::orbit(ui::petal(), rems(22. / 16.))))
+                        .children(self.render_context_edge(rems(22. / 16.)))
                         // Attach and send sit centered on the last line of
                         // text: each in a box as tall as one line with the
                         // text area's padding.
@@ -698,7 +754,7 @@ impl SessionView {
                     .border_1()
                     .border_color(edge(ui::border()))
                     .bg(ui::surface())
-                    .when(busy, |d| d.child(ui::orbit(ui::petal(), rems(20. / 16.))))
+                    .children(self.render_context_edge(rems(20. / 16.)))
                     .children(attachments.map(|a| div().px_2p5().pt_2().child(a)))
                     .child(div().min_h(rems(56. / 16.)).child(text))
                     .child(
@@ -722,7 +778,6 @@ impl SessionView {
             .children(self.render_dialog(cx))
             .children(self.render_review_confirm(cx))
             .child(self.render_activity(rem_size, cx))
-            .children(self.render_context_bar(cx))
             .child(composer)
             .children(self.render_kisses());
         (main.into_any_element(), strip)

@@ -11,7 +11,7 @@ use std::time::Duration;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
 use gpui_kit::component::input::{Escape, Input, InputEvent, InputState};
-use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem};
+use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Icon, Sizable as _, TitleBar, WindowExt as _, h_flex, v_flex};
@@ -20,6 +20,7 @@ use gpui_kit::*;
 
 use crate::features::canvas::{CanvasEvent, CanvasView};
 use crate::features::docs::{DocsEvent, DocsView};
+use crate::features::explorer::{ExplorerEvent, ExplorerView};
 use crate::features::memory::{MemoryEvent, MemoryView};
 use crate::features::notices::{self, Notices};
 use crate::features::onboarding::{OnboardingEvent, OnboardingView, Probe};
@@ -49,6 +50,7 @@ mod actions;
 mod badge;
 mod closed;
 mod layout;
+mod menu;
 mod overlays;
 mod panes;
 mod persistence;
@@ -59,6 +61,8 @@ mod stages;
 mod tab_panel;
 mod tabs;
 mod view;
+
+use menu::{OpenMenu, WorkspaceRename};
 
 use crate::features::devices::{DevicePanel, DevicePanelEvent};
 use crate::features::music::{Music, MusicChanged};
@@ -89,6 +93,7 @@ actions!(
         OpenPalette,
         OpenWorkspaces,
         OpenSettings,
+        OpenExplorer,
         CloseOverlay,
         Quit
     ]
@@ -109,6 +114,7 @@ enum Overlay {
     Providers(Entity<ProvidersView>),
     Sessions(Entity<SessionsView>),
     Palette(Entity<PaletteView>),
+    Explorer(Entity<ExplorerView>),
     Usage(Entity<UsageView>),
     Memory(Entity<MemoryView>),
     Docs(Entity<DocsView>),
@@ -156,11 +162,112 @@ impl Pane {
     }
 }
 
+/// A tab is either restored but not yet built (it holds its saved layout
+/// until first shown), or has live panes.
+pub(super) enum TabState {
+    Unbuilt(SavedTab),
+    Built {
+        tree: PaneTree<PaneId>,
+        focused: PaneId,
+    },
+}
+
+impl TabState {
+    pub(super) fn is_built(&self) -> bool {
+        matches!(self, TabState::Built { .. })
+    }
+
+    /// Live panes; none while unbuilt.
+    pub(super) fn leaves(&self) -> Vec<PaneId> {
+        self.built_tree().map(PaneTree::leaves).unwrap_or_default()
+    }
+
+    /// Number of panes the tab tiles, built or not.
+    pub(super) fn len(&self) -> usize {
+        match self {
+            TabState::Built { tree, .. } => tree.len(),
+            TabState::Unbuilt(saved) => saved.layout.len(),
+        }
+    }
+
+    pub(super) fn contains(&self, pane: &PaneId) -> bool {
+        self.built_tree().is_some_and(|t| t.contains(pane))
+    }
+
+    pub(super) fn focused(&self) -> Option<PaneId> {
+        match self {
+            TabState::Built { focused, .. } => Some(*focused),
+            TabState::Unbuilt(_) => None,
+        }
+    }
+
+    /// The focused pane of an unbuilt tab, as saved.
+    pub(super) fn saved_focused(&self) -> Option<&SavedPane> {
+        let TabState::Unbuilt(saved) = self else {
+            return None;
+        };
+        let last = saved.layout.len().saturating_sub(1);
+        saved.layout.leaf(saved.focused.min(last))
+    }
+
+    pub(super) fn built_tree(&self) -> Option<&PaneTree<PaneId>> {
+        match self {
+            TabState::Built { tree, .. } => Some(tree),
+            TabState::Unbuilt(_) => None,
+        }
+    }
+
+    pub(super) fn built_tree_mut(&mut self) -> Option<&mut PaneTree<PaneId>> {
+        match self {
+            TabState::Built { tree, .. } => Some(tree),
+            TabState::Unbuilt(_) => None,
+        }
+    }
+
+    pub(super) fn unbuilt(&self) -> Option<&SavedTab> {
+        match self {
+            TabState::Unbuilt(saved) => Some(saved),
+            TabState::Built { .. } => None,
+        }
+    }
+
+    pub(super) fn set_built(&mut self, tree: PaneTree<PaneId>, focused: PaneId) {
+        *self = TabState::Built { tree, focused };
+    }
+
+    pub(super) fn set_focused(&mut self, pane: PaneId) {
+        if let TabState::Built { focused, .. } = self {
+            *focused = pane;
+        }
+    }
+}
+
 struct Tab {
     id: usize,
-    tree: PaneTree<PaneId>,
-    focused: PaneId,
     pinned: bool,
+    state: TabState,
+}
+
+impl Tab {
+    fn is_built(&self) -> bool {
+        self.state.is_built()
+    }
+
+    fn leaves(&self) -> Vec<PaneId> {
+        self.state.leaves()
+    }
+
+    fn focused(&self) -> Option<PaneId> {
+        self.state.focused()
+    }
+
+    fn built_tree(&self) -> Option<&PaneTree<PaneId>> {
+        self.state.built_tree()
+    }
+
+    fn built_tree_mut(&mut self) -> Option<&mut PaneTree<PaneId>> {
+        self.state.built_tree_mut()
+    }
 }
 
 /// One named workspace.
@@ -171,9 +278,6 @@ struct Space {
     last_active: u64,
     tabs: Vec<Tab>,
     active: usize,
-    /// Restored layout not built yet: workspaces start their panes the first
-    /// time they are shown.
-    saved: Option<(Vec<SavedTab>, usize)>,
     /// The badge's chosen icon and color.
     badge: Badge,
 }
@@ -187,15 +291,7 @@ impl Space {
             last_active: workspaces::now(),
             tabs: Vec::new(),
             active: 0,
-            saved: None,
             badge: Badge::default(),
-        }
-    }
-
-    fn tab_count(&self) -> usize {
-        match &self.saved {
-            Some((tabs, _)) => tabs.len(),
-            None => self.tabs.len(),
         }
     }
 }
@@ -220,6 +316,24 @@ struct PaneDrag {
 struct TabDrag {
     tab: usize,
     title: SharedString,
+}
+
+/// Dragged by a workspace row in the vertical sidebar: dropped on another
+/// workspace row it reorders the workspaces.
+#[derive(Clone)]
+struct WorkspaceDrag {
+    index: usize,
+    name: SharedString,
+}
+
+/// A multi-selection of tabs in the shown workspace. Ids are stable while
+/// indices move, so the selection survives pin/reorder/close of non-selected
+/// tabs and is cleared when one of its tabs disappears.
+#[derive(Clone)]
+struct TabSelection {
+    space: usize,
+    anchor: usize,
+    selected: std::collections::HashSet<usize>,
 }
 
 /// The inline name field of an agent tab being renamed (double-click).
@@ -278,6 +392,13 @@ pub struct Workspace {
     sidebar_open_spaces: HashMap<String, bool>,
     /// The workspace whose badge picker is open, and where it opened.
     badge_picker: Option<(usize, Point<Pixels>)>,
+    /// A right-click context menu owned by the workspace so its open state
+    /// can suppress tooltips and hide native web views under it.
+    open_menu: Option<OpenMenu>,
+    /// Inline rename of a workspace, with the place it started (chip, header
+    /// or sidebar row) so the text field draws there.
+    workspace_rename: Option<WorkspaceRename>,
+    tab_selection: Option<TabSelection>,
     tab_search: Entity<InputState>,
     save_task: Option<Task<()>>,
     /// Re-reads every pane's title and busy state once a second (non-agent
@@ -324,18 +445,21 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> Self {
         let saved = workspaces::load();
+        let mut restored = Vec::new();
         let spaces: Vec<Space> = saved
             .workspaces
             .into_iter()
-            .map(|w| Space {
-                id: w.id,
-                name: w.name,
-                root: w.root,
-                last_active: w.last_active,
-                tabs: Vec::new(),
-                active: 0,
-                saved: Some((w.tabs, w.active_tab)),
-                badge: w.badge,
+            .map(|w| {
+                restored.push((w.tabs, w.active_tab));
+                Space {
+                    id: w.id,
+                    name: w.name,
+                    root: w.root,
+                    last_active: w.last_active,
+                    tabs: Vec::new(),
+                    active: 0,
+                    badge: w.badge,
+                }
             })
             .collect();
         let tab_search = cx.new(|cx| InputState::new(window, cx).placeholder("Search tabs"));
@@ -401,6 +525,9 @@ impl Workspace {
             tab_layout: saved.tab_layout,
             sidebar_open_spaces: HashMap::new(),
             badge_picker: None,
+            open_menu: None,
+            workspace_rename: None,
+            tab_selection: None,
             tab_search,
             save_task: None,
             notices: cx.new(|_| Notices::default()),
@@ -426,6 +553,21 @@ impl Workspace {
             }),
             _lifecycle: lifecycle,
         };
+        // Restore every workspace's tab list as cheap unbuilt placeholders now,
+        // so the sidebar, counts, search and menus see one model everywhere.
+        for (index, (tabs, active)) in restored.into_iter().enumerate() {
+            let tabs: Vec<Tab> = tabs
+                .into_iter()
+                .map(|saved| Tab {
+                    id: this.alloc_id(),
+                    pinned: saved.pinned,
+                    state: TabState::Unbuilt(saved),
+                })
+                .collect();
+            let space = &mut this.spaces[index];
+            space.active = active.min(tabs.len().saturating_sub(1));
+            space.tabs = tabs;
+        }
         let target = match folder {
             Some(folder) => match this.spaces.iter().position(|s| s.root == folder) {
                 Some(index) => index,
@@ -435,17 +577,18 @@ impl Workspace {
             None => this.current,
         };
         this.current = target;
-        this.ensure_open(target, prompt.is_none(), window, cx);
         if let Some(prompt) = prompt {
             let root = this.space().root.clone();
             this.open_tab(PaneKind::Agent, root, Some(prompt), None, window, cx);
+        } else {
+            this.ensure_open(target, window, cx);
+            let active = this.space().active;
+            this.activate(active, window, cx);
         }
         if let Some(url) = url {
             this.open_web(url, None, false, window, cx);
         }
         this.space_mut().last_active = workspaces::now();
-        this.focus_active(window, cx);
-        this.start_shown(window, cx);
         this.schedule_save(cx);
         // First run: the welcome screen, from the very first frame (it looks
         // at the machine itself while its banner writes in), so the chat
@@ -488,11 +631,7 @@ impl Workspace {
             device,
         } = request;
         if let Some(folder) = folder {
-            let index = match self.spaces.iter().position(|s| s.root == folder) {
-                Some(index) => index,
-                None => self.push_space(None, folder),
-            };
-            self.switch_workspace(index, window, cx);
+            self.show_folder(folder, window, cx);
         }
         if let Some(prompt) = prompt {
             let root = self.space().root.clone();
@@ -621,6 +760,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        self.ensure_agent_built(window, cx);
         let Some(session) = self.active_session() else {
             return false;
         };

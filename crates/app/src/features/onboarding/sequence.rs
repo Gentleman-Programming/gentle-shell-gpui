@@ -278,15 +278,25 @@ impl OnboardingView {
                                 .text_color(ui::fg())
                                 .child(check.title),
                         )
-                        .child(
-                            div()
+                        // A failed check says why where its summary sits
+                        // (an ENGRAM_BIN that names nothing, say): it has
+                        // no action, so the row is the only place to tell.
+                        .child(match &check.status {
+                            Status::Failed(why) => div()
+                                .flex_1()
+                                .min_w_0()
+                                .whitespace_normal()
+                                .text_xs()
+                                .text_color(ui::danger())
+                                .child(why.clone()),
+                            _ => div()
                                 .flex_1()
                                 .min_w_0()
                                 .truncate()
                                 .text_xs()
                                 .text_color(ui::muted())
                                 .child(check.summary),
-                        )
+                        })
                         .children(self.render_action(check, index, cx)),
                 )
                 .when(step == Step::Installing, |d| d.child(shimmer(index)))

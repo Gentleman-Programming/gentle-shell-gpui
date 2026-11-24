@@ -9,6 +9,8 @@ publish.workspace = true
 name = "gentle_core"
 
 [dependencies]
+# A sent message's HTML fragments, found as the Markdown renderer sees them.
+markdown = "1"
 regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true

@@ -35,8 +35,11 @@ pub fn work_tree(toplevel: &Path) -> Option<WorkTree> {
     Some(tree)
 }
 
+/// Run `args` on `paths`, which are file names from `git status`: taken
+/// literally, so a name with `[`, `*` or `?` never matches other files.
 fn run_with(cwd: &Path, args: &[&str], paths: &[String]) -> Result<(), String> {
-    let mut all: Vec<&str> = args.to_vec();
+    let mut all: Vec<&str> = vec!["--literal-pathspecs"];
+    all.extend(args);
     all.push("--");
     all.extend(paths.iter().map(String::as_str));
     run(cwd, &all).map(drop)
@@ -177,4 +180,72 @@ pub fn staged_diff(toplevel: &Path, max: usize) -> Result<String, String> {
         ],
     )?;
     Ok(truncate_diff(&diff, max))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A fresh repository under the temp folder, named after `test`: the
+    /// clock alone can repeat across tests running at once (macOS keeps
+    /// microseconds), and two `git init`s in one folder collide.
+    fn repo(test: &str) -> Option<std::path::PathBuf> {
+        pi_rpc::command("git").arg("--version").output().ok()?;
+        let dir = std::env::temp_dir().join(format!(
+            "gentle-git-changes-{test}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        run(&dir, &["init", "-q", "-b", "main"]).unwrap();
+        Some(dir)
+    }
+
+    /// A file name is a name, not a pattern: discarding `notes[1].txt`
+    /// leaves `notes1.txt`, which the brackets would match as a glob.
+    #[test]
+    fn discarding_an_untracked_file_leaves_the_files_its_name_matches_as_a_glob() {
+        let Some(dir) = repo("discard") else { return };
+        for name in ["notes[1].txt", "notes1.txt"] {
+            std::fs::write(dir.join(name), "text\n").unwrap();
+        }
+        let tree = work_tree(&dir).unwrap();
+        let entry = tree
+            .entries
+            .iter()
+            .find(|entry| entry.path == "notes[1].txt")
+            .unwrap();
+
+        discard(&dir, entry, false).unwrap();
+
+        assert!(!dir.join("notes[1].txt").exists());
+        assert!(
+            dir.join("notes1.txt").exists(),
+            "discarding one file deleted another"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Staging takes the same literal names.
+    #[test]
+    fn staging_a_file_leaves_the_files_its_name_matches_as_a_glob() {
+        let Some(dir) = repo("stage") else { return };
+        for name in ["notes[1].txt", "notes1.txt"] {
+            std::fs::write(dir.join(name), "text\n").unwrap();
+        }
+
+        stage(&dir, &["notes[1].txt".to_string()]).unwrap();
+
+        let tree = work_tree(&dir).unwrap();
+        let kind = |path: &str| {
+            let entry = tree.entries.iter().find(|entry| entry.path == path);
+            entry.unwrap().kind
+        };
+        assert_eq!(kind("notes[1].txt"), EntryKind::Tracked);
+        assert_eq!(kind("notes1.txt"), EntryKind::Untracked);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

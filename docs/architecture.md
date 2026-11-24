@@ -50,7 +50,7 @@ flowchart TD
 | `profiles`: routing model, `profiles.json` format, pins, agent frontmatter, notes | `profiles/`: homes and agent discovery, atomic writes, saved and materialized routing, Pi settings, pin and worktree files, Make default. |
 | `hydration`: the water reminder's settings (`hydration` in the app's `settings.json`) and when the next one is due | `hydration/`: the clock from launch, the timer, saving the setting, the drops animation. |
 | `diagnostics`: a recording's lines (header, sample per tab and process tree), grouping a process table into the trees under the app, rates, file names and retention, and the report that ranks a recording | `diagnostics/`: the sampler (`sysinfo`, the tabs, writing the file), `--diagnostics-report`; `shared/diagnostics.rs`: the frame, render and poll counters every view calls. |
-| `markdown`: where the Mermaid blocks are in a document | `files/mermaid.rs`: drawing them with merman's CLI (installed on demand by `setup`), measured with the system sans font, light or dark theme, and swapping them for images in the file preview and the conversation (`session/view.rs`: `shown_markdown`, `markdown_view`), with the install banner where they can't be drawn yet. |
+| `markdown`: where the Mermaid blocks are in a document; a sent message as the Markdown its bubble renders (`sent_message`: HTML fragments literal, line breaks kept; `trim_folded`) | `files/mermaid.rs`: drawing them with merman's CLI (installed on demand by `setup`), measured with the system sans font, light or dark theme, and swapping them for images in the file preview and the conversation (`session/view.rs`: `shown_markdown`, `markdown_view`), with the install banner where they can't be drawn yet; `session/view.rs`: the bubble (`BubbleText`, `user_bubble`), its images only from `data:` URLs and local files (`files::offline_image`). |
 | `docs`: the skill's `docs-check` report, each document's standing and front-matter title | `docs/`: the Architecture docs screen, installing the skill (`gentle-shell install`), running `docs-check` with Node, listing `docs/`. |
 | `fuzzy`: fuzzy scoring and file ranking | `palette/`: walking files, reading branches with git. |
 | `prompt_history`: the composer's sent prompts and where ↑/↓ are in them (draft kept, seeded from a resumed conversation) | `session/submit.rs`: recording at send, the ↑/↓ keystrokes (first and last line, `/` menu first) and putting a prompt in the composer. |
@@ -60,7 +60,7 @@ flowchart TD
 | `git`: status parsers (v1 and v2), numstat, refs, stash, worktrees (and where a new one goes), submodules, ahead/behind; `log` records, the commit graph's lanes and the Git pane's filter; `activity` the Git pane's year of commits as a grid of days (weeks, shades, month labels); `ops` pull modes, reset modes, the command git stopped in (merge, rebase, cherry-pick, revert) and how to continue or abort it, a commit's changed files, rewording a summary; diff trimming | `git/`: running `git`, counting lines of untracked files, stage, commit, push and branch operations, reading the commits a scope reaches (`log.rs`) and the last year's for the activity strip (`mod.rs`), the Git pane's actions (`ops.rs`); `history/`: the Git pane and painting the graph. |
 | `version`: stable versions, comparison and Gentle Shell update offer | `updates/`: launcher cache, npm query, clock. |
 | `engram`: observation model and query encoding | `memory/`: HTTP requests to Engram. |
-| `workspaces`: unique workspace names | `workspaces/`: saved model (uses `PaneTree`), reading and writing `workspaces.json`. |
+| `workspaces`: unique workspace names; tab multi-selection rules (toggle, range, pin decision, active index after multiple closes); workspace reordering and index remapping | `workspaces/`: saved model (uses `PaneTree`), reading and writing `workspaces.json`; `workspace/tab_panel.rs`: tab placement, pinning, closing and multi-selection menus. |
 | `genui`: the `gentle_ui` diagram spec (parsing, limits, normalization), its layered auto-layout and hit testing, the change list between two versions (diff, apply, human-readable sentences), the `/gentle-ui:event` command line and the Agent UI mode (`mode`: saved value, launch variable, mode command) | `genui/`: the Pi extension it ships (`gentle-ui.ts`, written by `extension.rs`), surfaces rebuilt from the transcript (`GenUi`), the diagram view (`DiagramView`: viewport, pointer and keyboard edits, undo, send) and its painting; `mode.rs`: the Agent UI choice every tab follows. |
 | `canvas`: canvas tabs' whiteboard model after Tern's canvas blocks (shapes, Tern's 16-color palette, fill, pen types and sizes, the file format), perfect-freehand ink outlines (`freehand`), geometry, hit testing, lasso and box selection, the camera, copy and paste, the undo history, and what its agent reads, edits and sees of it (`agent`: the flat shape form, ops applied all or nothing, the SVG of an area) | `canvas/`: the view (`CanvasView`: tools, gestures, keys, saving the file), painting (shapes tessellated once in page units, only moved onto the screen each frame), the tool bar, zoom pill, style panel and minimap, and the agent floating over it (`agent.rs`: a `SessionView` in a card, started with the `gentle-canvas.ts` extension it installs; answering its requests, rasterizing shots). The workspace handles that agent's events as an agent pane's (`on_session_event`) and saves its conversation with the canvas pane. |
 | `commands`: `/gentle:tower` routes to the Tower tab (`Screen::Tower`) | `tower/`: Gentle Tower in a tab (`TowerView`): runs `gentle-shell tower --no-open`, shows its page in a `WebSurface`, shown or hidden by the workspace's `sync_web_views` like agents' web views. |
@@ -74,14 +74,14 @@ crates/
 │   └── src/
 │       ├── main.rs              # startup: CLI, single instance, toolchain PATH, config adoption
 │       ├── app/                 # composition root (mod.rs): GPUI, themes, shortcuts, menus, window; integration.rs registers panels and sidebar
-│       ├── cli.rs               # arguments (`[FOLDER] [-p TEXT]`) and initial folder
+│       ├── cli.rs               # arguments (`[FOLDER] [--cwd] [-p TEXT]`) and initial folder
 │       ├── features/            # one folder per feature; its entry point is mod.rs
 │       │   ├── session/  workspace/  workspaces/  sessions/  palette/  profiles/  settings/  usage/  setup/
 │       │   ├── browser/  devices/  music/  files/  terminal/  git/  history/  providers/  memory/  onboarding/  notices/  alerts/  hydration/  docs/
 │       │   └── app_update/  updates/  welcome/  genui/  diagnostics/  canvas/  tower/  review/
 │       ├── platform/            # OS integration: single instance, agent command shims, Dock and window icons, installed editors, power state
 │       └── shared/              # pieces used by several features, with no logic of their own:
-│                                # ui, floating, themes, backdrop (theme scenes), assets, banner, surge, pane, gentle_state
+│                                # ui, overlay (live indicators' layer), floating, themes, backdrop (theme scenes), assets, banner, surge, pane, gentle_state
 ├── core/                        # shared pure logic (gentle-core)
 └── pi-rpc/
 ```
@@ -161,6 +161,7 @@ workspace/
 ├── panes.rs        # create, split, focus and close panes
 ├── closed.rs       # reopening closed panes and tabs where they were
 ├── spaces.rs       # named workspaces
+├── menu.rs         # right-click menus (workspace, tab, empty area) and inline workspace rename
 ├── tabs.rs         # tabs and renaming
 ├── persistence.rs  # snapshot and saving
 ├── actions.rs      # shortcut handlers
@@ -248,6 +249,8 @@ alerts/             # mod.rs: fire, context_threshold; policy.rs, sound.rs, tone
 updates/            # mod.rs: check and skip; cache.rs (launcher config), registry.rs (npm)
 workspaces/         # mod.rs: saved model; store.rs (workspaces.json), tests.rs
 ```
+
+Tabs are `Tab { id, pinned, state }`: `TabState::Unbuilt(SavedTab)` until first shown (`ensure_tab_built`, called by `activate`, the one path that makes a tab the shown one), then `TabState::Built { tree, focused }`. Opening a workspace builds only its active tab; every workspace's tabs exist as unbuilt tabs from launch, so the sidebar, counts, search and menus see one model, and `persistence.rs` `saved_tab` writes an unbuilt tab back unchanged.
 
 ## Data flow
 

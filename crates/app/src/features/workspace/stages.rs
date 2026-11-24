@@ -409,7 +409,7 @@ impl Workspace {
     pub(super) fn sync_web_views(&mut self, covered: bool, cx: &mut App) {
         let in_tab: std::collections::HashSet<PaneId> = self
             .tab()
-            .map(|tab| tab.tree.leaves().into_iter().collect())
+            .map(|tab| tab.leaves().into_iter().collect())
             .unwrap_or_default();
         for (id, pane) in &self.panes {
             if pane.item.kind == PaneKind::Tower

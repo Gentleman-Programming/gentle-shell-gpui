@@ -17,8 +17,8 @@ pub use mermaid::{
     draw as draw_mermaid, install as install_diagram_renderer, ready_cli as diagram_renderer_cli,
     renderer as diagram_renderer,
 };
-pub use tree::{FileTreeEvent, FileTreeView};
-pub use viewer::FileView;
+pub use tree::{FileTreeEvent, FileTreeView, REVEAL};
+pub use viewer::{EmbeddedImages, FileView, offline_image};
 
 use std::path::Path;
 

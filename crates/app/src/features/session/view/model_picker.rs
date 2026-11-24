@@ -4,7 +4,7 @@ use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::Input;
 use gpui_kit::component::popover::Popover;
-use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, Size, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
@@ -124,7 +124,6 @@ impl SessionView {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let weak = cx.entity().downgrade();
-        let busy = self.busy();
         let label = self
             .models
             .current
@@ -141,15 +140,7 @@ impl SessionView {
             .xsmall()
             .text_color(ui::info())
             .tooltip("Choose model")
-            .child(if busy {
-                ui::spinner(Size::XSmall, ui::info()).into_any_element()
-            } else {
-                div()
-                    .size(rems(7. / 16.))
-                    .rounded_full()
-                    .bg(dot)
-                    .into_any_element()
-            })
+            .child(div().size(rems(7. / 16.)).rounded_full().bg(dot))
             .child(
                 div()
                     .min_w_0()

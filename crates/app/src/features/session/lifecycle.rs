@@ -87,6 +87,7 @@ impl SessionView {
 
     /// Restart the backend in another folder; the conversation starts fresh.
     pub fn change_cwd(&mut self, cwd: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        self.paths = std::sync::Arc::new(super::view::PathLookup::new(cwd.clone()));
         self.cwd = cwd;
         // A conversation still waiting to be resumed belongs to the old folder.
         self.backend.pending_session = None;

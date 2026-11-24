@@ -545,7 +545,8 @@ impl GenUi {
     }
 
     /// The templates manager over the top of the conversation, while open.
-    pub fn render_templates(&self, cx: &App) -> Option<AnyElement> {
+    /// `cover` goes in its island (see `LiveSlots::cover`).
+    pub fn render_templates(&self, cover: impl IntoElement, cx: &App) -> Option<AnyElement> {
         let view = self.templates()?.clone();
         Some(
             div()
@@ -559,7 +560,8 @@ impl GenUi {
                     crate::shared::ui::island(cx)
                         .w(rems(440. / 16.))
                         .p_3()
-                        .child(view),
+                        .child(view)
+                        .child(cover),
                 )
                 .into_any_element(),
         )

@@ -311,7 +311,15 @@ impl CanvasView {
                             ),
                         ),
                 )
-                .child(div().flex_1().min_h_0().child(agent.session.clone()))
+                // Its live indicators, over it (see `SessionView::live_layer`).
+                .child(
+                    div()
+                        .relative()
+                        .flex_1()
+                        .min_h_0()
+                        .child(agent.session.clone())
+                        .child(agent.session.read(cx).live_layer()),
+                )
                 .into_any_element(),
         )
     }

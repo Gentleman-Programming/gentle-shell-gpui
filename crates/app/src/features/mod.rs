@@ -8,6 +8,7 @@ pub mod canvas;
 pub mod devices;
 pub mod diagnostics;
 pub mod docs;
+pub mod explorer;
 pub mod files;
 pub mod genui;
 pub mod git;
