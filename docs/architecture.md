@@ -29,7 +29,7 @@ flowchart TD
 | --- | --- |
 | `crates/app` | Binary, composition, feature state, GPUI views, and the effects (files, processes, sound) of the logic that lives in `core`. |
 | `crates/core` (`gentle-core`) | Pure logic with no GPUI or IO: transcript and subagent activity models, tool summaries, permission mode, jobs and ODD phase, `/` command routing, `notifications.json` policy, usage and statistics models, and the profile and model routing model. |
-| `crates/pi-rpc` | Backend resolution and launch, JSONL transport, authentication and protocol types. |
+| `crates/pi-rpc` | Backend resolution and launch, JSONL transport (a child's stdio, or a Gentle Shell server's HTTP and event stream), authentication and protocol types. |
 | `packaging` | Packaging and distribution integration per operating system. |
 
 `crates/pi-rpc` is a stable boundary: it knows nothing about GPUI, windows, tabs or visual components. `crates/app` depends on it, never the other way around.
@@ -56,7 +56,7 @@ flowchart TD
 | `docs`: the skill's `docs-check` report, each document's standing and front-matter title | `docs/`: the Architecture docs screen, installing the skill (`gentle-shell install`), running `docs-check` with Node, listing `docs/`. |
 | `fuzzy`: fuzzy scoring and file ranking | `palette/`: walking files, reading branches with git. |
 | `prompt_history`: the composer's sent prompts and where ↑/↓ are in them (draft kept, seeded from a resumed conversation) | `session/submit.rs`: recording at send, the ↑/↓ keystrokes (first and last line, `/` menu first) and putting a prompt in the composer. |
-| `backend`: where agents, terminals, git and Setup run (this computer, a WSL distro, a command), its `settings.json` value, the WSL distro a folder implies, host ↔ backend paths both ways, the launch and terminal argv, the login PATH probe and `wsl.exe --list --verbose` | `backend/`: reading and saving the choice, probing the backend, staging the app's files there, `git` and `gentle-shell` commands through it, the backend's homes, listing WSL's distros; `setup/remote.rs`: Setup's checks there; `settings/runs_on.rs`: the Configuration section. |
+| `backend`: where agents, terminals, git and Setup run (this computer, a WSL distro, a command, a Gentle Shell server), its `settings.json` value, the WSL distro a folder implies, host ↔ backend paths both ways, the launch and terminal argv, the login PATH probe and `wsl.exe --list --verbose`; `serve`: a Gentle Shell server's address rules, error wording, SSE framing, stream cursor and response dedupe | `backend/`: reading and saving the choice, probing the backend, staging the app's files there, `git` and `gentle-shell` commands through it, the backend's homes, listing WSL's distros, pairing with a server and its device token (`backend/server.rs`); `setup/remote.rs`: Setup's checks there; `settings/runs_on.rs`: the Configuration section. |
 | `ides`: code editors and IDEs (VS Code and its forks, Zed, Sublime Text, Xcode, Visual Studio, Android Studio, JetBrains, …), where each installs per OS, versioned-folder matching and the launch command | `platform/ides.rs`: probing those folders and the PATH, launching the editor; `files/tree.rs` and `history/view.rs`: the ⋯ menus' "Open in …". |
 | `web_browsers`: where agents' pages open (`agentPages` in the app's `settings.json`: inside the app, the default, or in the user's browser) and which browser (`externalBrowser`: the system's default or a catalogued one — Safari, Chrome, Chromium, Arc, Dia, Firefox, Zen, LibreWolf, Brave, Edge, Opera, Vivaldi, Orion, …), where each installs per OS, which choice applies, the http(s)-only URL check and the launch command (`open -a <App> <url>` on macOS, the browser's program with the URL elsewhere, never a shell) | `platform/browsers.rs`: probing those folders, the PATH and Flatpak exports (with `platform::ides`' lookup), starting the browser; `browser/external.rs`: the saved choices and opening a page outside the app (the card's ↗; falls back to the system's default when the chosen browser is gone); `workspace/stages.rs`: routing agents' pages (`gentle-open`, dev-server URLs, the design canvas; each picked-out URL opens outside once per window); `settings/browser.rs`: Configuration › Devices › Browser. |
 | `sessions`: session summary, folder name from cwd, ordering, ISO dates and relative time | `sessions/`: finding and reading `.jsonl` files (line scanning is tied to reading), cache. |
@@ -272,7 +272,7 @@ Effects must not hide state changes. Results return to the feature so it decides
 
 ## Dependency rules
 
-1. `pi-rpc` **does not depend** on `app` or GPUI.
+1. `pi-rpc` **does not depend** on `app` or GPUI; it may use `core`'s pure rules (a server's protocol, `core::serve`).
 2. `app` may depend on `pi-rpc` and `core`; the reverse direction is forbidden.
 3. `core` **does not depend** on anything in the project (`app`, `pi-rpc`), nor on GPUI, the filesystem, processes, the clock or system APIs.
 4. A feature consumes another through its public API; it does not access its private modules.

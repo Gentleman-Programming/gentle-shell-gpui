@@ -526,9 +526,11 @@ Beside the permission chip, with a Gentle Shell newer than 4.8.0: "Review on / o
 
 ---
 
-### Where agents run — WSL2, a Linux VM or a container
+### Where agents run — WSL2, a Linux VM, a container or a Gentle Shell server
 
 Configuration → General → **Where agents run** keeps the app as the native frontend and runs your agents, terminals, git and Setup elsewhere: on **WSL** (Windows: pick a distro; the ones with `gentle-shell` are marked, and the default one that has it is suggested) or through a **Command** that reaches another environment (OrbStack `orb -m dev --`, Lima `limactl shell dev`, a container `docker exec -i dev`). A project opened from `\\wsl.localhost\<distro>\` always runs in that distro. Setup checks Node.js, Gentle Shell and your providers there and opens a terminal there to fix what's missing; signing in to a provider is `/login` in that terminal. Engram, Maestro, Gentle Tower and the music player install and run there too. In WSL, Configuration, sessions and usage read the distro's own Gentle Shell home. Open agent tabs stay where they started.
+
+A **Gentle Shell server** runs your agents on another machine (your Linux PC, say) and keeps them running while the app is closed. Start it there with `gentle-shell serve --listen <address>:8787` and run `gentle-shell serve pair` for a one-time code; in the app, pick Gentle Shell server, type the server's address (`http://pc.local:8787`, or `http://127.0.0.1:8787` through `ssh -L`) and the code, and press Pair. The device token stays in an owner-only file in the app's folder, never in `settings.json`; Unpair forgets it. New agent tabs then start sessions on the server, in folders typed as the server sees them: in ⌘K's Workspaces, type an absolute path such as `/home/you/project` and pick "Open … on <server>". Closing a tab stops its session; quitting the app leaves the sessions running, and the next launch reattaches every tab to its own. The server has no files, git or terminals for the app yet, so those views say "Not available on a Gentle Shell server yet."; sign in to providers with `/login` on the server.
 
 ---
 
