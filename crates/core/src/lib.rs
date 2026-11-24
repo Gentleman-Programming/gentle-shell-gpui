@@ -33,6 +33,7 @@ pub mod profiles;
 pub mod prompt_history;
 pub mod screen;
 pub mod scroll;
+pub mod serve;
 pub mod sessions;
 pub mod setup;
 pub mod text;
