@@ -373,22 +373,16 @@ impl Workspace {
             )
     }
 
-    /// One title-bar button for the focused pane's layout: tile, split and
-    /// close, each named with its shortcut (the menu takes arrow keys too).
+    /// One title-bar button for the focused pane's layout: tile and split
+    /// (the menu takes arrow keys too). Closing lives on each pane.
     pub(super) fn render_layout_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let weak = cx.entity().downgrade();
-        let target = self
-            .focused_pane()
-            .map(|id| self.pane_title(id))
-            .unwrap_or_default()
-            .trim_end_matches(" •")
-            .to_string();
         div()
             // Clicks here are not title-bar drags.
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .child(
                 title_button("title-layout", IconName::LayoutDashboard)
-                    .tooltip("Panes: tile, split or close the focused one")
+                    .tooltip("Panes: tile or split the focused one")
                     .dropdown_menu(move |menu, window, _| {
                         type Act = fn(&mut Workspace, &mut Window, &mut Context<Workspace>);
                         let entry = |icon: IconName,
@@ -401,31 +395,6 @@ impl Workspace {
                                 .on_click(move |_, window, cx| {
                                     let _ = weak.update(cx, |this, cx| act(this, window, cx));
                                 })
-                        };
-                        let close = {
-                            let weak = weak.clone();
-                            let target = target.clone();
-                            PopupMenuItem::element(move |_, _| {
-                                h_flex()
-                                    .gap_2p5()
-                                    .py_0p5()
-                                    .w_full()
-                                    .child(Icon::new(IconName::X).small().text_color(ui::danger()))
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .min_w_0()
-                                            .truncate()
-                                            .text_sm()
-                                            .child(format!("Close \u{201c}{target}\u{201d}")),
-                                    )
-                                    .child(ui::kbd(ui::platform_shortcut("⌘W", "Ctrl+W")))
-                            })
-                            .on_click(move |_, window, cx| {
-                                let _ = weak.update(cx, |this, cx| {
-                                    this.on_close_pane(&ClosePane, window, cx)
-                                });
-                            })
                         };
                         menu.min_w(rems(280. / 16.).to_pixels(window.rem_size()))
                             .item(entry(
@@ -451,8 +420,6 @@ impl Workspace {
                                 ui::platform_shortcut("⌘⇧D", "Ctrl+Shift+E"),
                                 |this, window, cx| this.on_split_down(&SplitDown, window, cx),
                             ))
-                            .separator()
-                            .item(close)
                     })
                     .on_open_change(|open, window, cx| {
                         crate::features::browser::popover_open("title-layout", *open, window, cx)
@@ -671,6 +638,11 @@ impl Workspace {
         let tiled = tab.state.len() > 1;
         let focused = tiled && tab.focused() == Some(id);
         let title = pane.title.clone();
+        // The file viewer already has a close button in its own toolbar.
+        let has_close_button = pane.item.kind != PaneKind::File;
+        // Agents have clear space in this corner. Other views may have text
+        // or controls there, so reserve a small strip rather than cover them.
+        let reserve_close_space = has_close_button && pane.item.kind != PaneKind::Agent;
         let body = div()
             .id(("pane", id))
             .relative()
@@ -738,12 +710,16 @@ impl Workspace {
             // Cached: a notify elsewhere (another pane, the chrome) reuses this
             // pane's last frame instead of rebuilding it.
             .child(
-                div().flex_1().min_h_0().child(
-                    pane.item
-                        .view
-                        .clone()
-                        .cached(StyleRefinement::default().size_full()),
-                ),
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .when(reserve_close_space, |d| d.pt(rems(30. / 16.)))
+                    .child(
+                        pane.item
+                            .view
+                            .clone()
+                            .cached(StyleRefinement::default().size_full()),
+                    ),
             )
             // An agent's live indicators, over it: their frames redraw the
             // layer and this window, while the agent's view stays cached.
@@ -752,6 +728,32 @@ impl Workspace {
                     .as_ref()
                     .map(|session| session.read(cx).live_layer()),
             )
+            .when(has_close_button, |d| {
+                d.child(
+                    div()
+                        .id(("close-pane", id))
+                        .absolute()
+                        .top(rems(4. / 16.))
+                        .right(rems(6. / 16.))
+                        .size(rems(24. / 16.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_md()
+                        .bg(ui::panel())
+                        .text_color(ui::muted())
+                        .cursor_pointer()
+                        .hover(|s| s.bg(ui::surface_hover()).text_color(ui::danger()))
+                        .occlude()
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .tooltip(|window, cx| Tooltip::new("Close pane").build(window, cx))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            cx.stop_propagation();
+                            this.close_pane(id, window, cx);
+                        }))
+                        .child(Icon::new(IconName::X).small()),
+                )
+            })
             .children(
                 self.drop_hint
                     .filter(|(pane, _)| *pane == id && cx.has_active_drag())
