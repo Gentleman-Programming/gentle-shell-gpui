@@ -313,9 +313,10 @@ impl SessionView {
         let helpers = self.helpers();
         let jobs = self.job_rows();
         crate::features::diagnostics::TabResources {
-            backend: self.process().map(|p| {
+            // A server's session has no process here.
+            backend: self.process().and_then(|p| {
                 let (records, bytes) = p.traffic();
-                (p.pid(), records, bytes)
+                Some((p.pid()?, records, bytes))
             }),
             agents: helpers.len(),
             agents_running: helpers.iter().filter(|h| h.is_active()).count(),

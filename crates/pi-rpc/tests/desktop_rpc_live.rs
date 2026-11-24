@@ -313,6 +313,8 @@ impl Probe {
                 }
                 PumpItem::Message(Incoming::Ui(ui)) => return Ok(LiveRecord::Ui(ui)),
                 PumpItem::Message(Incoming::Event(_)) => return Ok(LiveRecord::Event),
+                // Only a server's stream asks for one; a child never does.
+                PumpItem::Message(Incoming::Resync) => {}
                 PumpItem::Closed => anyhow::bail!("backend closed"),
                 PumpItem::Timeout => anyhow::bail!("timed out waiting for backend output"),
             }
@@ -489,7 +491,7 @@ impl Probe {
                     }
                     None => {}
                 },
-                PumpItem::Message(Incoming::Event(_)) => continue,
+                PumpItem::Message(Incoming::Event(_) | Incoming::Resync) => continue,
                 PumpItem::Closed => anyhow::bail!("backend closed"),
                 PumpItem::Timeout => return Ok(()),
             }

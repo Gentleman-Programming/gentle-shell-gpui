@@ -9,8 +9,13 @@ publish.workspace = true
 anyhow.workspace = true
 async-channel.workspace = true
 dunce = "1"
+# A Gentle Shell server's protocol rules (`gentle_core::serve`).
+gentle-core = { path = "../core" }
 serde.workspace = true
 serde_json.workspace = true
+# A Gentle Shell server's session (`serve`): plain HTTP and its event stream.
+# The version the app already locks; TLS is the app's (servers speak HTTP).
+ureq = { version = "3", default-features = false }
 which = "8"
 
 # Windows: the neutral folder children start in (the user's profile, read

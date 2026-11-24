@@ -3,7 +3,9 @@
 //! The protocol is strict JSONL over the child's stdin/stdout: commands go in,
 //! `response` records (correlated by `id`), session events and
 //! `extension_ui_request` records come out. Records are split on LF only, never
-//! on Unicode line separators, which are valid inside JSON strings.
+//! on Unicode line separators, which are valid inside JSON strings. A Gentle
+//! Shell server's session carries the same records over HTTP and an event
+//! stream ([`serve`]); [`PiProcess`] is the same for both.
 
 pub mod desktop_rpc;
 pub mod file_cache;
@@ -12,6 +14,7 @@ mod job;
 mod launch;
 mod login;
 mod record;
+pub mod serve;
 
 pub use home::{
     Homes, adopt_standalone_config, backend_homes, gentle_pi_root, launcher_config_path,
@@ -39,7 +42,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// Everything the child process reports that is not a correlated response.
+/// Everything the backend reports that is not a correlated response.
 #[derive(Debug, Clone)]
 pub enum Incoming {
     /// A session event (`agent_start`, `message_update`, `tool_execution_end`, …).
@@ -48,27 +51,42 @@ pub enum Incoming {
     Ui(UiRequest),
     /// One diagnostic line from stderr. Never protocol data.
     Stderr(String),
+    /// Records the backend printed since the last one received are gone (a
+    /// Gentle Shell server's replay window passed them while the stream was
+    /// reconnecting): read the whole state again.
+    Resync,
     /// The child exited; `None` when it was killed by a signal.
     Exited(Option<i32>),
 }
 
 type Pending = Arc<Mutex<HashMap<String, async_channel::Sender<Response>>>>;
 
-/// A running Pi RPC child process.
+/// A running Pi RPC backend: a child process, or a Gentle Shell server's
+/// session ([`Self::serve`]).
 pub struct PiProcess {
-    stdin: Mutex<Option<ChildStdin>>,
-    child: Arc<Mutex<Child>>,
+    io: Io,
     pending: Pending,
     next_id: AtomicU64,
-    /// Set by the first [`Self::shutdown`], so Drop after an explicit
-    /// shutdown doesn't signal and reap twice.
+    /// Set by the first [`Self::shutdown`] (or [`Self::detach`]), so Drop
+    /// after an explicit shutdown doesn't signal and reap twice.
     stopping: AtomicBool,
-    pid: u32,
     traffic: Arc<Traffic>,
 }
 
+/// Where commands go and what ends the backend.
+enum Io {
+    /// A child process: JSONL on its stdin.
+    Child {
+        stdin: Mutex<Option<ChildStdin>>,
+        child: Arc<Mutex<Child>>,
+        pid: u32,
+    },
+    /// A session of a Gentle Shell server.
+    Server(serve::Remote),
+}
+
 /// What a backend has sent so far, for the app's diagnostics: two relaxed
-/// counters per stdout line.
+/// counters per stdout line (per stream record from a server).
 #[derive(Debug, Default)]
 struct Traffic {
     records: AtomicU64,
@@ -142,20 +160,26 @@ impl PiProcess {
         }
 
         let process = Arc::new(Self {
-            stdin: Mutex::new(Some(stdin)),
-            child,
+            io: Io::Child {
+                stdin: Mutex::new(Some(stdin)),
+                child,
+                pid,
+            },
             pending,
             next_id: AtomicU64::new(1),
             stopping: AtomicBool::new(false),
-            pid,
             traffic,
         });
         Ok((process, rx))
     }
 
-    /// The backend's process id (the root of its process tree).
-    pub fn pid(&self) -> u32 {
-        self.pid
+    /// The backend's process id (the root of its process tree); `None` for
+    /// a server's session, which runs on another machine.
+    pub fn pid(&self) -> Option<u32> {
+        match &self.io {
+            Io::Child { pid, .. } => Some(*pid),
+            Io::Server(_) => None,
+        }
     }
 
     /// Records and bytes received from the backend since it started.
@@ -198,7 +222,7 @@ impl PiProcess {
         object.insert("id".into(), Value::String(id.clone()));
         let (tx, rx) = async_channel::bounded(1);
         self.pending.lock().unwrap().insert(id.clone(), tx);
-        if let Err(error) = self.write(&command) {
+        if let Err(error) = self.write(command) {
             self.pending.lock().unwrap().remove(&id);
             return Err(error);
         }
@@ -218,13 +242,17 @@ impl PiProcess {
                 json!({"type": "extension_ui_response", "id": id, "cancelled": true})
             }
         };
-        self.write(&record)
+        self.write(record)
     }
 
-    fn write(&self, record: &Value) -> Result<()> {
-        let mut line = serde_json::to_vec(record)?;
+    fn write(&self, record: Value) -> Result<()> {
+        let stdin = match &self.io {
+            Io::Child { stdin, .. } => stdin,
+            Io::Server(remote) => return remote.send(record),
+        };
+        let mut line = serde_json::to_vec(&record)?;
         line.push(b'\n');
-        let mut guard = self.stdin.lock().unwrap();
+        let mut guard = stdin.lock().unwrap();
         let stdin = guard
             .as_mut()
             .ok_or_else(|| anyhow!("gentle-shell is shutting down"))?;
@@ -237,15 +265,19 @@ impl PiProcess {
     /// SIGTERM: the launcher forwards it to Pi, whose handler stops the
     /// detached processes its agents started. Elsewhere it closes stdin.
     /// Once the backend exits, or after `grace`, whatever is left of it is
-    /// killed (see [`kill_tree`]) and the child reaped. Only the first call
-    /// acts.
+    /// killed (see [`kill_tree`]) and the child reaped. A server's session
+    /// is stopped and forgotten there (`DELETE`). Only the first call acts.
     pub fn shutdown(&self, grace: Duration) {
         if self.stopping.swap(true, Ordering::AcqRel) {
             return;
         }
+        let (stdin, child) = match &self.io {
+            Io::Child { stdin, child, .. } => (stdin, child),
+            Io::Server(remote) => return remote.stop(),
+        };
         // Taken now so nothing more is written.
-        let stdin = self.stdin.lock().unwrap().take();
-        let child = self.child.clone();
+        let stdin = stdin.lock().unwrap().take();
+        let child = child.clone();
         // Under the lock nothing reaps the child, so its pid (and group id)
         // is still its own when signalled. One that already exited was just
         // reaped here; its pid may be reused, so nothing is signalled.
@@ -284,6 +316,19 @@ impl PiProcess {
                 kill_tree(&mut child.lock().unwrap());
             });
     }
+
+    /// The app is quitting: a server's session is left running, so the next
+    /// launch reattaches to it (`true`); this client just stops following
+    /// it. A child process can't outlive the app (`false`): shut it down.
+    pub fn detach(&self) -> bool {
+        let Io::Server(remote) = &self.io else {
+            return false;
+        };
+        if !self.stopping.swap(true, Ordering::AcqRel) {
+            remote.detach();
+        }
+        true
+    }
 }
 
 impl Drop for PiProcess {
@@ -317,32 +362,43 @@ fn read_records(
                 traffic.bytes.fetch_add(n as u64, Ordering::Relaxed);
             }
         }
-        let incoming = match parse_record(&line) {
-            Ok(Record::Response(response)) => {
-                let sender = response
-                    .id
-                    .as_ref()
-                    .and_then(|id| pending.lock().unwrap().remove(id));
-                if let Some(sender) = sender {
-                    let _ = sender.send_blocking(response);
-                } else if !response.success {
-                    let error = response.error.unwrap_or_default();
-                    let _ = tx.send_blocking(Incoming::Stderr(format!(
-                        "{} failed: {error}",
-                        response.command
-                    )));
-                }
-                continue;
-            }
-            Ok(Record::Ui(request)) => Incoming::Ui(request),
-            Ok(Record::Event(event)) => Incoming::Event(event),
-            Ok(Record::Empty) => continue,
-            Err(error) => Incoming::Stderr(format!("unparseable RPC record: {error}")),
-        };
-        if tx.send_blocking(incoming).is_err() {
+        if !dispatch(parse_record(&line), pending, tx) {
             return;
         }
     }
+}
+
+/// Route one record: a response to the caller waiting for it (a failure
+/// nobody waits for becomes a diagnostic line), anything else to `tx`.
+/// `false` once nobody listens any more.
+fn dispatch(
+    record: Result<Record>,
+    pending: &Pending,
+    tx: &async_channel::Sender<Incoming>,
+) -> bool {
+    let incoming = match record {
+        Ok(Record::Response(response)) => {
+            let sender = response
+                .id
+                .as_ref()
+                .and_then(|id| pending.lock().unwrap().remove(id));
+            if let Some(sender) = sender {
+                let _ = sender.send_blocking(response);
+            } else if !response.success {
+                let error = response.error.unwrap_or_default();
+                let _ = tx.send_blocking(Incoming::Stderr(format!(
+                    "{} failed: {error}",
+                    response.command
+                )));
+            }
+            return true;
+        }
+        Ok(Record::Ui(request)) => Incoming::Ui(request),
+        Ok(Record::Event(event)) => Incoming::Event(event),
+        Ok(Record::Empty) => return true,
+        Err(error) => Incoming::Stderr(format!("unparseable RPC record: {error}")),
+    };
+    tx.send_blocking(incoming).is_ok()
 }
 
 fn wait_child(child: &Mutex<Child>) -> Option<i32> {

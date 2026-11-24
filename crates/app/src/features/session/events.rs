@@ -60,6 +60,13 @@ impl SessionView {
                 }
                 self.backend.stderr.push_back(line);
             }
+            // A server's stream reconnected past what it still keeps: the
+            // conversation is read again, as after opening a session.
+            Incoming::Resync => {
+                self.reset_conversation();
+                self.reset_desktop_channel();
+                self.refresh_state(cx);
+            }
             Incoming::Exited(code) => {
                 self.backend.status = BackendStatus::Exited(code);
                 self.usage.compacting = false;
