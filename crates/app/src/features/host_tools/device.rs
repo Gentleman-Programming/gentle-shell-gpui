@@ -521,11 +521,17 @@ mod tests {
                 app: Source::Url("https://ci.example/app.zip".into())
             })
         );
+        // An absolute path on the system the app runs on.
+        let local = if cfg!(windows) {
+            r"C:\Users\me\App.app"
+        } else {
+            "/Users/me/App.app"
+        };
         assert_eq!(
-            on(json!({"action": "install", "app": "/Users/me/App.app"})),
+            on(json!({"action": "install", "app": local})),
             Ok(Op::Install {
                 device: "iPhone 17".into(),
-                app: Source::Path("/Users/me/App.app".into())
+                app: Source::Path(local.into())
             })
         );
     }
