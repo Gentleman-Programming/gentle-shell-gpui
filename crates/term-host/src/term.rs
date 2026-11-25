@@ -1,6 +1,6 @@
-//! One terminal: its PTY (alacritty's `tty`), the I/O thread that drives it,
-//! the headless emulator fed the same bytes for snapshots, and the replay
-//! ring of its recent output.
+//! One terminal: its PTY (alacritty's `tty`: a Unix PTY, or ConPTY on
+//! Windows), the I/O thread that drives it, the headless emulator fed the
+//! same bytes for snapshots, and the replay ring of its recent output.
 
 use std::collections::VecDeque;
 use std::io::{ErrorKind, Read, Write};
@@ -34,7 +34,12 @@ const CLOSE_GRACE: Duration = Duration::from_secs(3);
 /// Largest read batch turned into one `output` event.
 const BATCH_BYTES: usize = 256 << 10;
 
+/// The key alacritty's `tty` gives the PTY's read/write events (its own,
+/// whatever we register with); child events come with another.
+#[cfg(unix)]
 const PTY_TOKEN: usize = 0;
+#[cfg(windows)]
+const PTY_TOKEN: usize = tty::PTY_READ_WRITE_TOKEN;
 
 pub struct Spec {
     pub cwd: String,
@@ -201,12 +206,15 @@ impl TermHandle {
         env.extend(spec.env);
         let options = tty::Options {
             shell: Some(tty::Shell::new(
-                spec.argv[0].clone(),
+                program(&spec.argv[0]),
                 spec.argv[1..].to_vec(),
             )),
             working_directory: Some(spec.cwd.clone().into()),
             drain_on_exit: true,
             env,
+            // The arguments as given, quoted for the command line.
+            #[cfg(windows)]
+            escape_args: true,
         };
         let mut pty = tty::new(&options, window_size(spec.cols, spec.rows), 0)?;
         let poller = Arc::new(Poller::new()?);
@@ -241,7 +249,7 @@ impl TermHandle {
         let (commands, receiver) = std::sync::mpsc::channel();
         let term = Arc::new(Self {
             id,
-            pid: pty.child().id(),
+            pid: child_pid(&pty),
             cwd: spec.cwd,
             argv: spec.argv,
             created_at,
@@ -311,16 +319,23 @@ impl TermHandle {
         Ok(())
     }
 
-    /// SIGHUP now, SIGKILL after [`CLOSE_GRACE`] if it's still running.
+    /// SIGHUP now, SIGKILL after [`CLOSE_GRACE`] if it's still running; on
+    /// Windows the program is ended at once.
     pub fn close(&self) {
         self.command(Command::Close);
     }
 
-    /// SIGHUP, for the host shutting down.
+    /// SIGHUP (on Windows, the end), for the host shutting down.
     pub fn hang_up(&self) {
         if self.alive() {
             // SAFETY: plain kill(2).
-            unsafe { libc::kill(self.pid as i32, libc::SIGHUP) };
+            #[cfg(unix)]
+            unsafe {
+                libc::kill(self.pid as i32, libc::SIGHUP)
+            };
+            // The PTY's thread holds the process handle.
+            #[cfg(windows)]
+            self.command(Command::Close);
         }
     }
 
@@ -455,9 +470,9 @@ impl TermHandle {
                     Ok(Command::Write(data)) => input.extend(data),
                     Ok(Command::Resize(cols, rows)) => pty.on_resize(window_size(cols, rows)),
                     Ok(Command::Close) => {
-                        // SAFETY: plain kill(2).
-                        unsafe { libc::kill(self.pid as i32, libc::SIGHUP) };
-                        kill_at.get_or_insert(Instant::now() + CLOSE_GRACE);
+                        if hang_up(&pty, self.pid) {
+                            kill_at.get_or_insert(Instant::now() + CLOSE_GRACE);
+                        }
                     }
                     Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
                 }
@@ -468,11 +483,7 @@ impl TermHandle {
 
             let now = Instant::now();
             if kill_at.is_some_and(|at| at <= now) {
-                // SAFETY: plain kill(2); the child leads its process group.
-                unsafe {
-                    libc::kill(-(self.pid as i32), libc::SIGKILL);
-                    libc::kill(self.pid as i32, libc::SIGKILL);
-                }
+                kill(&pty, self.pid);
                 kill_at = None;
             }
             if sync_at.is_some_and(|at| at <= now) {
@@ -480,8 +491,7 @@ impl TermHandle {
             }
 
             if let Some(status) = exited {
-                // What the child wrote before exiting.
-                self.read(&mut pty, &mut buf, &mut input);
+                self.drain(&mut pty, &mut buf, &mut input);
                 break 'run status;
             }
 
@@ -498,12 +508,37 @@ impl TermHandle {
         self.finish(status.map_or(-1, exit_code));
     }
 
-    /// Reads what's available. False once the PTY is closed.
+    /// What the child wrote before exiting. A Unix PTY has all of it;
+    /// ConPTY's output comes through a reader thread and may still be on
+    /// its way, so it's read until it's quiet a moment (half a second at
+    /// most).
+    fn drain(&self, pty: &mut Pty, buf: &mut [u8], input: &mut VecDeque<u8>) {
+        self.read(pty, buf, input);
+        #[cfg(windows)]
+        {
+            let deadline = Instant::now() + Duration::from_millis(500);
+            let mut quiet = 0;
+            while quiet < 3 && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(25));
+                let before = lock(&self.state).ring.end;
+                self.read(pty, buf, input);
+                quiet = if lock(&self.state).ring.end == before {
+                    quiet + 1
+                } else {
+                    0
+                };
+            }
+        }
+    }
+
+    /// Reads what's available. False once the PTY is closed (on Windows,
+    /// where a read of nothing only means nothing yet, the child's exit
+    /// tells).
     fn read(&self, pty: &mut Pty, buf: &mut [u8], input: &mut VecDeque<u8>) -> bool {
         let mut batch = Vec::new();
         let open = loop {
             match pty.reader().read(buf) {
-                Ok(0) => break false,
+                Ok(0) => break cfg!(windows),
                 Ok(n) => {
                     batch.extend_from_slice(&buf[..n]);
                     if batch.len() >= BATCH_BYTES {
@@ -527,6 +562,8 @@ fn write_input(pty: &mut Pty, input: &mut VecDeque<u8>) {
     while !input.is_empty() {
         let (front, _) = input.as_slices();
         match pty.writer().write(front) {
+            // Full (ConPTY's writer says so with 0).
+            Ok(0) => return,
             Ok(n) => {
                 input.drain(..n);
             }
@@ -551,12 +588,82 @@ fn output_line(term: &str, offset: u64, data: &[u8]) -> Arc<[u8]> {
 }
 
 /// The exit status as a shell reports it: the code, or 128 + the signal.
+#[cfg(unix)]
 fn exit_code(status: ExitStatus) -> i32 {
     use std::os::unix::process::ExitStatusExt as _;
     status
         .code()
         .or_else(|| status.signal().map(|signal| 128 + signal))
         .unwrap_or(-1)
+}
+
+#[cfg(windows)]
+fn exit_code(status: ExitStatus) -> i32 {
+    status.code().unwrap_or(-1)
+}
+
+#[cfg(unix)]
+fn child_pid(pty: &Pty) -> u32 {
+    pty.child().id()
+}
+
+#[cfg(windows)]
+fn child_pid(pty: &Pty) -> u32 {
+    pty.child_watcher()
+        .pid()
+        .map_or(0, std::num::NonZeroU32::get)
+}
+
+/// The program as the PTY runs it. On Windows it starts a command line,
+/// where a path with spaces needs quotes.
+#[cfg(unix)]
+fn program(program: &str) -> String {
+    program.to_string()
+}
+
+#[cfg(windows)]
+fn program(program: &str) -> String {
+    if program.contains([' ', '\t']) && !program.starts_with('"') {
+        format!("\"{program}\"")
+    } else {
+        program.to_string()
+    }
+}
+
+/// Asks the program to end: SIGHUP, with a kill to follow (true). A ConPTY's
+/// program gets no hangup short of closing its console, which the PTY's
+/// thread does once it has exited: on Windows it's ended at once (false).
+#[cfg(unix)]
+fn hang_up(_pty: &Pty, pid: u32) -> bool {
+    // SAFETY: plain kill(2).
+    unsafe { libc::kill(pid as i32, libc::SIGHUP) };
+    true
+}
+
+#[cfg(windows)]
+fn hang_up(pty: &Pty, pid: u32) -> bool {
+    kill(pty, pid);
+    false
+}
+
+/// Ends the program: SIGKILL to it and its process group (it leads one);
+/// on Windows, TerminateProcess (closing the pseudoconsole after its exit
+/// ends what else ran in it).
+#[cfg(unix)]
+fn kill(_pty: &Pty, pid: u32) {
+    // SAFETY: plain kill(2).
+    unsafe {
+        libc::kill(-(pid as i32), libc::SIGKILL);
+        libc::kill(pid as i32, libc::SIGKILL);
+    }
+}
+
+#[cfg(windows)]
+fn kill(pty: &Pty, _pid: u32) {
+    // SAFETY: the process handle the PTY keeps open while it lives.
+    unsafe {
+        windows_sys::Win32::System::Threading::TerminateProcess(pty.child_watcher().raw_handle(), 1)
+    };
 }
 
 #[cfg(test)]

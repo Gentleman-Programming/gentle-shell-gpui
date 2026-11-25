@@ -3,8 +3,6 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
-use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -14,11 +12,17 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use serde_json::{Value, json};
 
 use crate::term::{Spec, TermHandle, event_line, lock};
+use crate::transport::{Endpoint, Stream};
 
 pub const PROTOCOL: u32 = 1;
 
 /// Longest request line: a `write` of a large paste, base64.
 const MAX_LINE: u64 = 32 << 20;
+
+/// Longest line before a TCP connection has authenticated, and how long it
+/// has to send it.
+const AUTH_LINE: u64 = 4 << 10;
+const AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 
 const MAX_COLS: u64 = 1000;
 const MAX_ROWS: u64 = 500;
@@ -137,19 +141,16 @@ pub struct Host {
     terms: Mutex<HashMap<String, Arc<TermHandle>>>,
     connections: AtomicUsize,
     next_connection: AtomicU64,
-    socket: PathBuf,
-    /// The socket's inode, so exiting removes only our own.
-    socket_ino: u64,
+    endpoint: Endpoint,
 }
 
 impl Host {
-    pub fn new(socket: PathBuf, socket_ino: u64) -> Self {
+    pub fn new(endpoint: Endpoint) -> Self {
         Self {
             terms: Mutex::default(),
             connections: AtomicUsize::new(0),
             next_connection: AtomicU64::new(1),
-            socket,
-            socket_ino,
+            endpoint,
         }
     }
 
@@ -158,19 +159,17 @@ impl Host {
         self.connections.load(Ordering::SeqCst) == 0 && lock(&self.terms).is_empty()
     }
 
-    /// Removes the socket (if it's still ours) and exits.
+    /// Removes the socket or token file (if it's still ours) and exits.
     pub fn exit(&self) -> ! {
-        use std::os::unix::fs::MetadataExt as _;
-        if std::fs::symlink_metadata(&self.socket).is_ok_and(|m| m.ino() == self.socket_ino) {
-            let _ = std::fs::remove_file(&self.socket);
-        }
+        self.endpoint.remove();
         crate::log("exiting");
         std::process::exit(0)
     }
 
-    /// Serves one connection until it closes.
-    pub fn serve(self: &Arc<Self>, stream: UnixStream) {
-        let Ok(write_half) = stream.try_clone() else {
+    /// Serves one connection until it closes. Over TCP, its first line must
+    /// authenticate.
+    pub fn serve<S: Stream>(self: &Arc<Self>, stream: S) {
+        let (Ok(read_half), Ok(write_half)) = (stream.try_clone(), stream.try_clone()) else {
             return;
         };
         self.connections.fetch_add(1, Ordering::SeqCst);
@@ -180,7 +179,7 @@ impl Host {
         let writer = std::thread::Builder::new()
             .name(format!("conn {conn} writer"))
             .spawn(move || {
-                let mut writer = BufWriter::new(&write_half);
+                let mut writer = BufWriter::new(write_half);
                 while let Some(lines) = writer_out.take() {
                     let sent = lines
                         .iter()
@@ -188,22 +187,31 @@ impl Host {
                         .and_then(|()| writer.flush());
                     if sent.is_err() {
                         writer_out.close();
-                        let _ = write_half.shutdown(std::net::Shutdown::Both);
+                        writer.get_ref().shutdown();
                     }
                 }
             });
 
+        let mut token = self.endpoint.token();
+        if token.is_some() {
+            stream.set_read_timeout(Some(AUTH_TIMEOUT));
+        }
+        let refuse = |id: Value, code: &str, message: &str| {
+            out.send(event_line(&json!({ "id": id, "ok": false, "error": {
+                "code": code, "message": message } })));
+            // Said before hanging up.
+            out.drain(Duration::from_secs(1));
+        };
         let mut attached: HashMap<String, Arc<TermHandle>> = HashMap::new();
-        let mut reader = BufReader::new(&stream);
+        let mut reader = BufReader::new(read_half);
         let mut line = Vec::new();
         loop {
             line.clear();
-            match reader.by_ref().take(MAX_LINE).read_until(b'\n', &mut line) {
+            let max = if token.is_some() { AUTH_LINE } else { MAX_LINE };
+            match reader.by_ref().take(max).read_until(b'\n', &mut line) {
                 Ok(0) | Err(_) => break,
-                Ok(_) if !line.ends_with(b"\n") && line.len() as u64 >= MAX_LINE => {
-                    let error = json!({ "id": null, "ok": false, "error": {
-                        "code": "bad_request", "message": "request line too long" } });
-                    out.send(event_line(&error));
+                Ok(_) if !line.ends_with(b"\n") && line.len() as u64 >= max => {
+                    refuse(Value::Null, "bad_request", "request line too long");
                     break;
                 }
                 Ok(_) => {}
@@ -211,14 +219,31 @@ impl Host {
             if line.trim_ascii().is_empty() {
                 continue;
             }
-            let request: Value = match serde_json::from_slice(&line) {
-                Ok(request @ Value::Object(_)) => request,
-                _ => {
-                    let error = json!({ "id": null, "ok": false, "error": {
-                        "code": "bad_request", "message": "not a JSON object" } });
-                    out.send(event_line(&error));
-                    continue;
+            let request = serde_json::from_slice(&line).ok().filter(Value::is_object);
+            if let Some(expected) = token {
+                let request = request.unwrap_or_default();
+                let given = request["token"].as_str().unwrap_or_default();
+                let id = request.get("id").cloned().unwrap_or(Value::Null);
+                if request["op"] != "auth"
+                    || !crate::sys::same_secret(given.as_bytes(), expected.as_bytes())
+                {
+                    refuse(
+                        id,
+                        "unauthorized",
+                        "authenticate first: {\"op\": \"auth\", \"token\"}",
+                    );
+                    break;
                 }
+                token = None;
+                stream.set_read_timeout(None);
+                out.send(event_line(&json!({ "id": id, "ok": true })));
+                continue;
+            }
+            let Some(request) = request else {
+                let error = json!({ "id": null, "ok": false, "error": {
+                    "code": "bad_request", "message": "not a JSON object" } });
+                out.send(event_line(&error));
+                continue;
             };
             let id = request.get("id").cloned().unwrap_or(Value::Null);
             let shutdown = request["op"] == "shutdown";
@@ -245,7 +270,7 @@ impl Host {
             term.detach(conn);
         }
         out.close();
-        let _ = stream.shutdown(std::net::Shutdown::Both);
+        stream.shutdown();
         if let Ok(writer) = writer {
             let _ = writer.join();
         }
@@ -410,6 +435,7 @@ fn size(request: &Value) -> Result<(u16, u16), ProtoError> {
 }
 
 /// The user's login shell, as a login shell.
+#[cfg(unix)]
 fn login_shell() -> Vec<String> {
     let shell = std::env::var("SHELL")
         .ok()
@@ -419,6 +445,17 @@ fn login_shell() -> Vec<String> {
     vec![shell, "-l".to_string()]
 }
 
+/// PowerShell: the newer `pwsh.exe` when it's on `PATH`, else the one
+/// Windows ships.
+#[cfg(windows)]
+fn login_shell() -> Vec<String> {
+    let pwsh = std::env::var_os("PATH")
+        .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join("pwsh.exe").is_file()));
+    let shell = if pwsh { "pwsh.exe" } else { "powershell.exe" };
+    vec![shell.to_string(), "-NoLogo".to_string()]
+}
+
+#[cfg(unix)]
 fn passwd_shell() -> Option<String> {
     let mut buf = vec![0 as libc::c_char; 4096];
     // SAFETY: getpwuid_r writes `pwd` and strings into `buf`, both alive
@@ -443,10 +480,7 @@ fn passwd_shell() -> Option<String> {
 
 fn random_hex() -> String {
     let mut bytes = [0u8; 8];
-    if std::fs::File::open("/dev/urandom")
-        .and_then(|mut f| f.read_exact(&mut bytes))
-        .is_err()
-    {
+    if crate::sys::random_bytes(&mut bytes).is_err() {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos());
