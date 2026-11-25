@@ -56,8 +56,9 @@ pub struct SavedTab {
 pub struct SavedWorkspace {
     pub name: String,
     pub root: PathBuf,
-    /// The Gentle Shell server (its address) whose folder `root` is;
-    /// absent for a folder on this computer.
+    /// The Gentle Shell server whose folder `root` is, by its server id (by
+    /// its address when saved before ids were kept); absent for a folder on
+    /// this computer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server: Option<String>,
     #[serde(default)]
@@ -346,7 +347,7 @@ pub fn root_key(path: PathBuf, on_server: bool) -> PathBuf {
 }
 
 /// The position of the workspace that is `folder` (already a
-/// [`root_key`]) on `server` (the Gentle Shell server's address; `None` for
+/// [`root_key`]) on `server` (what names the Gentle Shell server; `None` for
 /// this computer), among `(root, server)` pairs: only a workspace of the
 /// same server matches, and its root is compared the same way as `folder`,
 /// since older saves and other entry points may hold a root reached another

@@ -213,6 +213,20 @@ impl Fake {
         }
         let (path, query) = target.split_once('?').unwrap_or((&target, ""));
         match (method.as_str(), path) {
+            ("DELETE", "/api/devices/self") => {
+                reply(&mut stream, 200, &json!({"revoked": "dev_1"}));
+            }
+            ("POST", "/api/devices/self/replace") => {
+                if body["token"] == "gss_earlier" {
+                    reply(&mut stream, 200, &json!({"replaced": "dev_0"}));
+                } else {
+                    reply(
+                        &mut stream,
+                        404,
+                        &json!({"error": {"code": "not_found", "message": "No paired device has that token"}}),
+                    );
+                }
+            }
             ("POST", "/api/sessions") => {
                 assert_eq!(body["cwd"], "/srv/project");
                 reply(&mut stream, 201, &json!({"session": session(true)}));
@@ -692,6 +706,39 @@ fn a_revoked_token_says_so() {
         .err()
         .unwrap();
     assert!(error.to_string().contains("Pair it again"), "{error}");
+}
+
+#[test]
+fn unpairing_asks_the_server_to_remove_this_device() {
+    let fake = Fake::start();
+    fake.client().unpair().unwrap();
+    assert!(
+        fake.log()
+            .iter()
+            .any(|line| line == "DELETE /api/devices/self"),
+        "{:?}",
+        fake.log()
+    );
+    // A token the server no longer accepts: removed there already.
+    let error = ServeClient::new(&fake.url, Some("gss_revoked".into()))
+        .unpair()
+        .unwrap_err();
+    assert_eq!(error.status, Some(401));
+}
+
+#[test]
+fn pairing_again_replaces_the_earlier_pairing_on_the_server() {
+    let fake = Fake::start();
+    fake.client().replace("gss_earlier").unwrap();
+    assert!(
+        fake.log()
+            .iter()
+            .any(|line| line == "POST /api/devices/self/replace"),
+        "{:?}",
+        fake.log()
+    );
+    let gone = fake.client().replace("gss_nobody").unwrap_err();
+    assert_eq!(gone.status, Some(404));
 }
 
 /// A connection code for the fake: its port at `hosts`.

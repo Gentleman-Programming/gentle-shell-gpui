@@ -16,6 +16,7 @@ fn sample() -> SavedState {
         server: Some(gentle_core::serve::ServerSession {
             url: "http://127.0.0.1:8787".into(),
             id: "ses_1".into(),
+            server_id: "srv_1".into(),
         }),
         terminal: None,
     };

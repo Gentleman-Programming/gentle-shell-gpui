@@ -15,8 +15,8 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use pi_rpc::serve::ServerInfo;
 
-use super::SettingsView;
 use super::layout::{control, row, section};
+use super::{SettingsEvent, SettingsView};
 use crate::features::backend;
 use crate::shared::ui;
 
@@ -83,6 +83,12 @@ pub(super) struct RunsOn {
     /// Where the saved server answers now, when it was asked: its paired
     /// address, or the one it was found at since.
     address: Option<String>,
+    /// Asking the server to remove this device, then forgetting its token.
+    unpairing: bool,
+    unpair: Task<()>,
+    /// What the last Unpair did (the server removed this device, or why it
+    /// still lists it), shown where the server was.
+    unpaired: Option<String>,
 }
 
 impl RunsOn {
@@ -112,8 +118,14 @@ impl RunsOn {
         let connect = cx.new(|cx| ServerConnect::new(url, window, cx));
         let paired = cx.subscribe(&connect, |this, _, event: &ConnectEvent, cx| {
             let ConnectEvent::Paired(choice, info) = event;
+            this.runs_on.unpaired = None;
             this.choose_runs_on(choice.clone(), cx);
             this.runs_on.server = Some(Ok(info.clone()));
+            // The window's tabs on it (a server paired again: the ones that
+            // let go of it) start there, as after pairing on first run.
+            cx.emit(SettingsEvent::Setup(
+                crate::features::onboarding::OnboardingEvent::RunsOnChanged,
+            ));
             cx.notify();
         });
         Self {
@@ -131,6 +143,9 @@ impl RunsOn {
             _connect: paired,
             server: None,
             address: None,
+            unpairing: false,
+            unpair: Task::ready(()),
+            unpaired: None,
         }
     }
 }
@@ -470,17 +485,71 @@ impl SettingsView {
         cx.notify();
     }
 
-    /// Forget this device's token for the saved server and run agents on
-    /// this computer again. The server keeps the device until it is revoked
-    /// there; its sessions keep running.
+    /// Unpair this device from the saved server and run agents on this
+    /// computer again: the server is asked to remove it, then its token is
+    /// forgotten here (also when the server doesn't answer: it then still
+    /// lists the device, and says how to remove it there). The window's
+    /// tabs and terminals on it let go of it; its sessions keep running
+    /// there.
     fn unpair_server(&mut self, cx: &mut Context<Self>) {
-        if let Backend::Server { url, .. } = &self.runs_on.choice
-            && let Err(err) = backend::server::forget(url)
-        {
-            eprintln!("gentle-shell-gpui: could not forget the server's token: {err}");
+        let choice = self.runs_on.choice.clone();
+        let Backend::Server { url, name, .. } = &choice else {
+            return;
+        };
+        if self.runs_on.unpairing {
+            return;
         }
-        self.choose_runs_on(Backend::Local, cx);
-        self.runs_on.kind = Kind::Server;
+        let name = if name.trim().is_empty() {
+            url.clone()
+        } else {
+            name.clone()
+        };
+        let server = backend::server::key(&choice).unwrap_or_else(|| url.clone());
+        self.runs_on.unpairing = true;
+        self.runs_on.unpaired = None;
+        self.runs_on.unpair = cx.spawn(async move |this, cx| {
+            let unpaired = cx
+                .background_executor()
+                .spawn({
+                    let choice = choice.clone();
+                    async move { backend::server::unpair(&choice) }
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.runs_on.unpairing = false;
+                let unpairing = match unpaired {
+                    Ok(unpairing) => unpairing,
+                    Err(err) => {
+                        this.runs_on.unpaired = Some(format!(
+                            "Couldn't forget this computer's token for {name}: {err}"
+                        ));
+                        cx.notify();
+                        return;
+                    }
+                };
+                let revoked = unpairing.still_listed.is_none();
+                this.runs_on.unpaired = Some(match unpairing.still_listed {
+                    None => format!(
+                        "Unpaired from {name}, which no longer lists this computer and closed \
+                         its terminals there. Its agent sessions keep running; this window's \
+                         tabs let go of them."
+                    ),
+                    Some(why) => format!(
+                        "Unpaired here. {why} Its sessions and terminals keep running there; \
+                         this window's tabs let go of them."
+                    ),
+                });
+                cx.emit(SettingsEvent::ServerUnpaired {
+                    server,
+                    addresses: unpairing.addresses,
+                    name,
+                    revoked,
+                });
+                this.choose_runs_on(Backend::Local, cx);
+                this.runs_on.kind = Kind::Server;
+                cx.notify();
+            });
+        });
         cx.notify();
     }
 
@@ -615,16 +684,35 @@ impl SettingsView {
                             .small()
                             .ghost()
                             .icon(Icon::new(IconName::Unlink))
-                            .label("Unpair")
+                            .label(if self.runs_on.unpairing {
+                                "Unpairing…"
+                            } else {
+                                "Unpair"
+                            })
+                            .loading(self.runs_on.unpairing)
+                            .disabled(self.runs_on.unpairing)
                             .tooltip(
-                                "Forget this computer's token and run agents here. Revoke the \
-                                 device on the server with gentle-shell serve devices --revoke.",
+                                "Remove this computer from the server and run agents here. Its \
+                                 sessions and terminals keep running there.",
                             )
                             .on_click(cx.listener(|this, _, _, cx| this.unpair_server(cx))),
                     ),
                 );
         }
-        v_flex().child(self.runs_on.connect.clone())
+        v_flex()
+            .when_some(self.runs_on.unpaired.clone(), |this, unpaired| {
+                this.child(
+                    h_flex()
+                        .pt_2()
+                        .gap_2()
+                        .items_start()
+                        .text_xs()
+                        .text_color(ui::muted())
+                        .child(Icon::new(IconName::Info).xsmall())
+                        .child(div().min_w_0().child(unpaired)),
+                )
+            })
+            .child(self.runs_on.connect.clone())
     }
 
     fn render_distros(&self, cx: &mut Context<Self>) -> Div {

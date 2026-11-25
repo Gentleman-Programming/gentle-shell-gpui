@@ -599,6 +599,28 @@ impl ServeClient {
             .map(drop)
     }
 
+    /// `DELETE /api/devices/self` (capability `unpair`): the server forgets
+    /// this device; its token stops working there, its streams close.
+    pub fn unpair(&self) -> Result<(), ServeError> {
+        self.call(&self.agent, "DELETE", "/api/devices/self", None)
+            .map(drop)
+    }
+
+    /// `POST /api/devices/self/replace { token }` (capability `unpair`):
+    /// this device, just paired again, takes the place of its earlier
+    /// pairing, whose token it shows: that device's terminals are this
+    /// one's now, and it is revoked.
+    pub fn replace(&self, token: &str) -> Result<(), ServeError> {
+        let body = json!({"token": token});
+        self.call(
+            &self.agent,
+            "POST",
+            "/api/devices/self/replace",
+            Some(&body),
+        )
+        .map(drop)
+    }
+
     /// `POST /api/sessions/:id/rpc`: the answer's status and body.
     fn rpc(&self, id: &str, command: &Value) -> Result<(u16, Vec<u8>), ServeError> {
         let (status, mut response) = self.call(

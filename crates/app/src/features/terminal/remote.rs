@@ -693,6 +693,53 @@ impl TerminalView {
         }
     }
 
+    /// This device was unpaired from the server this pane's terminal runs
+    /// on (named `name`): the pane lets go of it and says what became of
+    /// it. A server that removed this device (`revoked`) closed its
+    /// terminals; one that still lists it keeps them running, and a pairing
+    /// made again picks this one up ([`Self::follow_pairing`]).
+    pub fn server_unpaired(&mut self, name: &str, revoked: bool, cx: &mut Context<Self>) {
+        if !self.on_server {
+            return;
+        }
+        if let Some(Pty::Server(remote)) = self.pty.take() {
+            self.resume = remote.id().or(self.resume.take());
+            remote.detach();
+        }
+        if revoked {
+            self.resume = None;
+        }
+        self.start_on_layout = false;
+        self.start_settle = None;
+        self.remote_status = Task::ready(());
+        self.blocked = None;
+        let what = if revoked {
+            "It closed this terminal with the pairing."
+        } else {
+            "The terminal keeps running there."
+        };
+        self.error = Some(format!("This computer was unpaired from {name}. {what}").into());
+        self.exited = true;
+        cx.notify();
+    }
+
+    /// The server `server` names was paired again: this device's earlier
+    /// pairing, whose token this terminal used, is gone, and its terminals
+    /// are the new pairing's. A terminal of that server, open or let go of
+    /// at an unpair, reattaches through the new pairing.
+    pub fn follow_pairing(&mut self, server: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.on_server || self.server.as_deref() != Some(server) {
+            return;
+        }
+        if let Some(Pty::Server(remote)) = &self.pty {
+            self.resume = remote.id().or(self.resume.take());
+        } else if self.resume.is_none() {
+            return;
+        }
+        self.exited = false;
+        self.start_remote(window, cx);
+    }
+
     /// The pane was laid out at a new size before its server terminal
     /// opened: open it once no other size came for [`RESIZE_SETTLE`]. A
     /// window still taking its saved bounds lays the pane out at a passing
@@ -720,6 +767,7 @@ impl TerminalView {
         }
         self.blocked = None;
         self.error = None;
+        self.server = server::key(&backend::for_tab(&self.cwd));
         let (status, statuses) = async_channel::unbounded();
         self.pty = Some(Pty::Server(Remote::start(
             self.cwd.clone(),
@@ -795,17 +843,17 @@ impl TerminalView {
             |this, _, event: &ConnectEvent, window, cx| {
                 let ConnectEvent::Paired(choice, _) = event;
                 // The same server keeps the name the user knows it by.
-                let choice = match (backend::saved(), choice) {
-                    (
+                let saved = backend::saved();
+                let choice = match (&saved, choice) {
+                    (Backend::Server { name, .. }, Backend::Server { url, device, .. })
+                        if server::key(&saved) == server::key(choice) =>
+                    {
                         Backend::Server {
-                            url: saved, name, ..
-                        },
-                        Backend::Server { url, device, .. },
-                    ) if saved == *url => Backend::Server {
-                        name,
-                        url: url.clone(),
-                        device: device.clone(),
-                    },
+                            name: name.clone(),
+                            url: url.clone(),
+                            device: device.clone(),
+                        }
+                    }
                     (_, choice) => choice.clone(),
                 };
                 if let Err(err) = backend::save(&choice) {
@@ -813,6 +861,7 @@ impl TerminalView {
                 }
                 server::forget_info(&choice);
                 this.start_remote(window, cx);
+                cx.emit(TerminalEvent::Paired);
             },
         );
         (connect, paired)

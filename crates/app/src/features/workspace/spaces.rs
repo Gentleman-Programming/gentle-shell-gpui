@@ -62,19 +62,18 @@ impl Workspace {
         self.switch_workspace(index, window, cx);
     }
 
-    /// The address of the Gentle Shell server agents run on; `None` when
-    /// they run elsewhere.
+    /// What names the Gentle Shell server agents run on in workspaces (its
+    /// server id once known, `server::key`); `None` when they run
+    /// elsewhere.
     pub(super) fn agents_server() -> Option<String> {
-        match crate::features::backend::saved() {
-            gentle_core::backend::Backend::Server { url, .. } => Some(url),
-            _ => None,
-        }
+        crate::features::backend::server::key(&crate::features::backend::saved())
     }
 
     /// The workspace rooted at `folder` on `server` (`None`: this
-    /// computer), created when there is none. A folder of a Gentle Shell
-    /// server is compared by its text alone and only with that server's
-    /// workspaces; one on this computer is compared canonically
+    /// computer; else what names the server, [`Self::agents_server`]),
+    /// created when there is none. A folder of a Gentle Shell server is
+    /// compared by its text alone and only with that server's workspaces;
+    /// one on this computer is compared canonically
     /// ([`workspaces::root_key`]) with this computer's.
     pub(super) fn space_for(&mut self, folder: PathBuf, server: Option<String>) -> usize {
         let folder = workspaces::root_key(folder, server.is_some());
@@ -107,7 +106,8 @@ impl Workspace {
     /// its home folder (else where a new agent would start): the workspace
     /// of the folder picked opens.
     pub(super) fn open_server_folder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(url) = Self::agents_server() else {
+        let gentle_core::backend::Backend::Server { url, .. } = crate::features::backend::saved()
+        else {
             return;
         };
         if self.overlay.is_some() {
@@ -136,11 +136,14 @@ impl Workspace {
         // Agents on a Gentle Shell server: a workspace not opened there
         // starts them in the server's home.
         if kind == PaneKind::Agent
-            && let gentle_core::backend::Backend::Server { url, .. } =
-                crate::features::backend::saved()
+            && let choice @ gentle_core::backend::Backend::Server { url, .. } =
+                &crate::features::backend::saved()
         {
-            let there = space.server.as_deref() == Some(url.as_str());
-            let home = crate::features::backend::server::known_home(&url);
+            let there = space
+                .server
+                .as_deref()
+                .is_some_and(|server| crate::features::backend::server::same(server, choice));
+            let home = crate::features::backend::server::known_home(url);
             root = gentle_core::serve::tab_folder(&root, there, home.as_deref());
         }
         if index != self.current {

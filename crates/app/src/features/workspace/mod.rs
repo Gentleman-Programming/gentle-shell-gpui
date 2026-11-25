@@ -509,13 +509,19 @@ impl Workspace {
             .into_iter()
             .map(|w| {
                 // Before workspaces named their server, one whose agents
-                // followed a server's sessions was opened there.
-                let server = w.server.or_else(|| {
-                    w.tabs
-                        .iter()
-                        .flat_map(|tab| tab.layout.leaves())
-                        .find_map(|pane| pane.server.as_ref().map(|s| s.url.clone()))
-                });
+                // followed a server's sessions was opened there. A server
+                // saved by address (before ids were kept) is named by its id
+                // once a pairing knows it, so pairing it again elsewhere
+                // keeps its workspaces.
+                let server = w
+                    .server
+                    .or_else(|| {
+                        w.tabs
+                            .iter()
+                            .flat_map(|tab| tab.layout.leaves())
+                            .find_map(|pane| pane.server.as_ref().map(|s| s.server().to_string()))
+                    })
+                    .map(|server| crate::features::backend::server::key_of(&server));
                 restored.push((w.tabs, w.active_tab));
                 Space {
                     name: w.name,
@@ -659,7 +665,7 @@ impl Workspace {
                     match crate::features::backend::server::known_home(&url) {
                         Some(home) => {
                             let index = this.push_space(None, home.into());
-                            this.spaces[index].server = Some(url);
+                            this.spaces[index].server = Self::agents_server();
                             index
                         }
                         None => this.push_space(None, crate::cli::default_cwd()),

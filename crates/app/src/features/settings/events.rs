@@ -28,4 +28,14 @@ pub enum SettingsEvent {
     /// An action from the Setup & requirements checklist (sign in, a
     /// terminal command, an install that finished) for the window to carry out.
     Setup(crate::features::onboarding::OnboardingEvent),
+    /// This device was unpaired from a Gentle Shell server (what names it,
+    /// every address it was paired or reached at, its name, and whether
+    /// the server removed this device, closing its terminals): open tabs
+    /// and terminals on it let go of it, leaving its sessions running there.
+    ServerUnpaired {
+        server: String,
+        addresses: Vec<String>,
+        name: String,
+        revoked: bool,
+    },
 }

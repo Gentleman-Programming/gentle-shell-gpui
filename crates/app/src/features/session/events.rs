@@ -71,6 +71,16 @@ impl SessionView {
                 self.dialog_resolved(&id, refused, window, cx);
             }
             Incoming::Exited(code) => {
+                // A server session this tab lost hold of (its pairing was
+                // replaced or revoked) may still run there: Start again picks
+                // it up when it does.
+                if self
+                    .runs_on
+                    .as_ref()
+                    .is_some_and(|runs_on| runs_on.is_server())
+                {
+                    self.backend.attach = self.server_session();
+                }
                 self.backend.status = BackendStatus::Exited(code);
                 self.usage.compacting = false;
                 self.transcript.interrupt();

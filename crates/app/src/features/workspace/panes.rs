@@ -365,6 +365,7 @@ impl Workspace {
                             TerminalEvent::Exited => this.close_pane_now(id, window, cx),
                             TerminalEvent::CloseRequested => this.close_pane(id, window, cx),
                             TerminalEvent::Attached => this.schedule_save(cx),
+                            TerminalEvent::Paired => this.follow_pairing(Some(id), window, cx),
                             TerminalEvent::TitleChanged => {}
                         }
                     },
@@ -514,7 +515,10 @@ impl Workspace {
                 // Started once its tab is shown (see `start_shown`).
                 let id = self.new_agent_pane(cwd, None, resume, false, window, cx);
                 // Its server session kept running while the app was closed.
-                if let Some(server) = saved.server.clone()
+                if let Some(server) = saved
+                    .server
+                    .clone()
+                    .map(crate::features::backend::server::with_key)
                     && let Some(session) = self.panes.get(&id).and_then(|p| p.session.clone())
                 {
                     session.update(cx, |session, _| session.attach_server_session(server));
@@ -562,7 +566,10 @@ impl Workspace {
                     pane.session_file = resume.clone();
                 }
                 if let Some(canvas) = self.canvas_view(id) {
-                    let server = saved.server.clone();
+                    let server = saved
+                        .server
+                        .clone()
+                        .map(crate::features::backend::server::with_key);
                     canvas.update(cx, |canvas, cx| {
                         canvas.set_cwd(cwd);
                         if let Some(resume) = resume {

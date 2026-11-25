@@ -17,18 +17,19 @@ impl Workspace {
     /// ([`gentle_core::serve::tab_folder`]), never a path on this computer.
     pub(super) fn new_agent_cwd(&self, cx: &App) -> PathBuf {
         let cwd = self.active_cwd(cx);
-        let gentle_core::backend::Backend::Server { url, .. } = crate::features::backend::saved()
-        else {
+        let choice = crate::features::backend::saved();
+        let gentle_core::backend::Backend::Server { url, .. } = &choice else {
             return cwd;
         };
+        let on_it = |server: &str| crate::features::backend::server::same(server, &choice);
         let focused_there = self
             .focused_pane()
             .and_then(|id| self.panes.get(&id))
             .and_then(|pane| pane.session.as_ref())
             .and_then(|session| session.read(cx).server_session())
-            .is_some_and(|session| session.url == url);
-        let opened_there = self.space().server.as_deref() == Some(url.as_str());
-        let home = crate::features::backend::server::known_home(&url);
+            .is_some_and(|session| on_it(session.server()));
+        let opened_there = self.space().server.as_deref().is_some_and(on_it);
+        let home = crate::features::backend::server::known_home(url);
         gentle_core::serve::tab_folder(&cwd, focused_there || opened_there, home.as_deref())
     }
 

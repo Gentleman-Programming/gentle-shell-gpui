@@ -38,12 +38,27 @@ const UNCLAIMED: usize = 64;
 const SEEN_DIALOGS: usize = 256;
 
 /// A server session an agent tab is attached to, saved with the tab so the
-/// next launch reattaches to it: the server's address and its session id
-/// (`ses_…`).
+/// next launch reattaches to it: the server's address then, its server id
+/// (what names the server for good: a tab saved before ids were kept has
+/// none) and its session id (`ses_…`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServerSession {
     pub url: String,
     pub id: String,
+    #[serde(default, rename = "serverId", skip_serializing_if = "String::is_empty")]
+    pub server_id: String,
+}
+
+impl ServerSession {
+    /// The server it runs on as workspaces and tabs name one: its id, else
+    /// (saved before ids were kept) its address.
+    pub fn server(&self) -> &str {
+        if self.server_id.is_empty() {
+            &self.url
+        } else {
+            &self.server_id
+        }
+    }
 }
 
 /// `input` as the base URL requests are made against: `http://host[:port]`
@@ -1385,6 +1400,28 @@ pub fn server_page(url: &str) -> ServerPage {
     ServerPage::Loopback { port, path }
 }
 
+/// `url` without the single-use `gs_ticket` a forwarded page's first visit
+/// trades for a cookie (the forward answers it with a `303` to the same
+/// address without it): what the page's address is once it shows.
+pub fn without_ticket(url: &str) -> String {
+    let (rest, fragment) = match url.find('#') {
+        Some(at) => url.split_at(at),
+        None => (url, ""),
+    };
+    let Some((base, query)) = rest.split_once('?') else {
+        return url.to_string();
+    };
+    let kept: Vec<&str> = query
+        .split('&')
+        .filter(|pair| !pair.is_empty() && pair.split('=').next() != Some("gs_ticket"))
+        .collect();
+    if kept.is_empty() {
+        format!("{base}{fragment}")
+    } else {
+        format!("{base}?{}{fragment}", kept.join("&"))
+    }
+}
+
 /// The folder a new agent tab starts in while agents run on a Gentle Shell
 /// server: `cwd` when it is known to be a folder there (`there`: the
 /// focused agent runs there, or the workspace was opened there), else the
@@ -1492,6 +1529,49 @@ mod tests {
                 .unwrap_err()
                 .contains("(https://host:port)")
         );
+    }
+
+    #[test]
+    fn a_forwarded_pages_address_shows_without_its_ticket() {
+        for (link, shown) in [
+            (
+                "http://127.0.0.1:50001/?gs_ticket=abc",
+                "http://127.0.0.1:50001/",
+            ),
+            (
+                "http://127.0.0.1:50001/app?x=1&gs_ticket=abc&y=2#top",
+                "http://127.0.0.1:50001/app?x=1&y=2#top",
+            ),
+            (
+                "http://127.0.0.1:50001/a?gs_ticket=t#h",
+                "http://127.0.0.1:50001/a#h",
+            ),
+            ("http://h/?gs_tickets=1", "http://h/?gs_tickets=1"),
+            ("https://example.com/a", "https://example.com/a"),
+        ] {
+            assert_eq!(without_ticket(link), shown, "{link}");
+        }
+    }
+
+    /// A tab saved before server ids were kept names its server by address;
+    /// one saved since, by id.
+    #[test]
+    fn a_saved_server_session_names_its_server_by_id_once_known() {
+        let old: ServerSession =
+            serde_json::from_value(json!({"url": "http://pc:8787", "id": "ses_1"})).unwrap();
+        assert_eq!(old.server(), "http://pc:8787");
+        assert_eq!(
+            serde_json::to_value(&old).unwrap(),
+            json!({"url": "http://pc:8787", "id": "ses_1"})
+        );
+        let new = ServerSession {
+            server_id: "srv_1".into(),
+            ..old
+        };
+        assert_eq!(new.server(), "srv_1");
+        let saved = serde_json::to_value(&new).unwrap();
+        assert_eq!(saved["serverId"], "srv_1");
+        assert_eq!(serde_json::from_value::<ServerSession>(saved).unwrap(), new);
     }
 
     #[test]

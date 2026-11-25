@@ -59,6 +59,10 @@ pub enum TerminalEvent {
     /// The pane opened, or reattached to, its terminal on a Gentle Shell
     /// server: save [`TerminalView::server_terminal`] with the pane.
     Attached,
+    /// The pane paired this device with its server again (its device
+    /// lacked the terminal scope): the window's tabs on that server follow
+    /// the new pairing, the earlier one being gone.
+    Paired,
 }
 
 /// Forwards PTY/terminal events from the I/O thread to the view.
@@ -166,6 +170,9 @@ pub struct TerminalView {
     on_server: bool,
     /// The server terminal a restored pane had, to reattach to.
     resume: Option<String>,
+    /// What names the server the terminal opened on (`server::key`): a
+    /// pairing with it made again reattaches the terminal through it.
+    server: Option<String>,
     /// The server terminal opens (or reattaches) once the pane's laid-out
     /// size holds ([`Self::settle_start`]): the shell must not start at the
     /// 80×24 the emulator starts with, nor a running one pass through the
@@ -377,6 +384,7 @@ impl TerminalView {
             cwd,
             on_server,
             resume: None,
+            server: None,
             start_on_layout: on_server,
             start_settle: None,
             blocked: None,
