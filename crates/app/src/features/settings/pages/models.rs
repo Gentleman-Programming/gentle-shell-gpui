@@ -14,8 +14,12 @@ pub(super) fn render(
     let sign_in = view.server_sign_in_section(cx);
     v_flex()
         .gap_3()
-        .child(models::models_section(snapshot))
+        .child(models::models_section(view, snapshot, cx))
         .child(models::providers_section(snapshot, sign_in.is_some(), cx))
         .children(sign_in)
+        .children(
+            view.server()
+                .map(|server| view.server_custom_models(server, cx)),
+        )
         .children(view.bridge_section(snapshot, cx))
 }

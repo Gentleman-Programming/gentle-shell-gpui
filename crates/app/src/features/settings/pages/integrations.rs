@@ -9,7 +9,6 @@ use super::super::{
     SettingsView,
     layout::{row, section},
     navigation::SettingsPage,
-    remote::note,
     snapshot::Snapshot,
 };
 use crate::shared::ui;
@@ -20,10 +19,8 @@ pub(super) fn render(
     cx: &mut Context<SettingsView>,
 ) -> Div {
     let mcp = match view.server() {
-        // Pi's mcp.json has no Desktop RPC store.
-        Some(server) => section(IconName::Bot, "MCP servers").child(note(
-            server.act("edit mcp.json in its Gentle Shell agent folder"),
-        )),
+        // Its Gentle Shell's `mcp_servers` store, edited there.
+        Some(server) => view.server_mcp(server, cx),
         None => section(IconName::Bot, "MCP servers")
             .child(row(
                 "Configured servers",

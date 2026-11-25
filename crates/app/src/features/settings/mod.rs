@@ -35,6 +35,7 @@ mod reading_desk;
 pub(crate) mod remote;
 mod runs_on;
 pub(crate) use runs_on::{ConnectEvent, ServerConnect};
+mod server_documents;
 mod server_packages;
 mod server_sign_in;
 mod server_upgrade;
@@ -123,6 +124,12 @@ pub struct SettingsView {
     server_packages: server_packages::ServerPackages,
     /// Updates on a server: whether this device may upgrade it, and how.
     server_upgrade: server_upgrade::ServerUpgradeUi,
+    /// The control session's model list as last shown (the server's
+    /// default-model menu offers it).
+    server_models_rev: u64,
+    /// Models › Custom models and Integrations › MCP servers on a server:
+    /// the document open in the editor.
+    server_documents: server_documents::ServerDocuments,
 }
 
 impl EventEmitter<SettingsEvent> for SettingsView {}
@@ -201,6 +208,8 @@ impl SettingsView {
             server_sign_in: server_sign_in::ServerSignIn::new(window, cx),
             server_packages: server_packages::ServerPackages::default(),
             server_upgrade: server_upgrade::ServerUpgradeUi::default(),
+            server_models_rev: 0,
+            server_documents: server_documents::ServerDocuments::default(),
         };
         this.reload(cx);
         this.refresh_maestro(cx);
@@ -229,6 +238,12 @@ impl SettingsView {
         self.navigate_to(SettingsPage::Updates, cx);
     }
 
+    /// Open on the Models page, where a server's sign-ins are (the
+    /// Providers screen of a server folder).
+    pub fn show_models(&mut self, cx: &mut Context<Self>) {
+        self.navigate_to(SettingsPage::Models, cx);
+    }
+
     /// Reuse a single navigation path for the sidebar, compact picker and search.
     fn navigate_to(&mut self, page: SettingsPage, cx: &mut Context<Self>) {
         self.compact_categories_open = false;
@@ -254,6 +269,20 @@ impl SettingsView {
         self.sign_ins_changed(cx);
         self.permission_changed(cx);
         self.server_accounts_changed(cx);
+        self.server_models_changed(cx);
+    }
+
+    /// The server's models came in (or changed): the default-model menu
+    /// shows them.
+    fn server_models_changed(&mut self, cx: &mut Context<Self>) {
+        let Some(session) = self.session.as_ref().filter(|_| self.server().is_some()) else {
+            return;
+        };
+        let rev = session.read(cx).models_rev();
+        if rev != self.server_models_rev {
+            self.server_models_rev = rev;
+            cx.notify();
+        }
     }
 
     /// The server agents run on, when they do: what Configuration can't do

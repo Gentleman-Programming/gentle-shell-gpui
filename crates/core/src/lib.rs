@@ -3,6 +3,7 @@
 //! no OS APIs (see docs/adr/0002-nucleo-puro-incremental.md).
 
 pub mod activity;
+pub mod agent_config;
 pub mod alert_timing;
 pub mod backend;
 pub mod browser;
@@ -26,6 +27,7 @@ pub mod ides;
 pub mod input_style;
 pub mod interface_size;
 pub mod markdown;
+pub mod model_defaults;
 pub mod music;
 pub mod notifications;
 pub mod preview;

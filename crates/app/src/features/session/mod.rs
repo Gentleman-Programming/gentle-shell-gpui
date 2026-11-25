@@ -569,6 +569,11 @@ impl SessionView {
         models
     }
 
+    /// Bumped whenever [`Self::model_choices`] may have changed.
+    pub fn models_rev(&self) -> u64 {
+        self.models.rev
+    }
+
     pub fn model_choices(&self) -> Vec<(String, String, String, bool)> {
         self.ordered_models()
             .iter()

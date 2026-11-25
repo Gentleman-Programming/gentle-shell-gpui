@@ -4,8 +4,9 @@
 //! methods, or one that answers `unknown_store` for a settings store (4.9.0
 //! and older), keeps the direct file read (and, for notifications, the file
 //! write) of before. Nothing here touches a file on the RPC path. On a
-//! Gentle Shell server the `profiles` store is read too (no file of it is
-//! read there), and a store it does not serve is never read or written from
+//! Gentle Shell server the `profiles` and `model_defaults` stores are read
+//! too (no file of them is read there; the model defaults are written
+//! there too), and a store it does not serve is never read or written from
 //! this computer's files.
 
 use std::collections::HashMap;
@@ -14,7 +15,7 @@ use gentle_core::notifications::{self, FileState, Policy};
 use gpui_kit::*;
 use pi_rpc::desktop_rpc::{
     ConfigErrorCode, ConfigState, ConfigStatus, ConfigStore, ConfigWrite, ConfigWriteTarget,
-    NotificationsData,
+    ModelDefaultsData, NotificationsData,
 };
 
 use super::SettingsView;
@@ -28,8 +29,15 @@ pub(super) const SETTINGS_STORES: [ConfigStore; 3] = [
 ];
 
 /// What a server's Configuration reads besides [`SETTINGS_STORES`]: the
-/// profile rows, which a local screen reads from `profiles.json`.
-const SERVER_STORES: [ConfigStore; 1] = [ConfigStore::Profiles];
+/// profile rows, which a local screen reads from `profiles.json`, and Pi's
+/// model defaults, custom models and MCP servers, which it reads from
+/// `settings.json`, `models.json` and `mcp.json`.
+const SERVER_STORES: [ConfigStore; 4] = [
+    ConfigStore::Profiles,
+    ConfigStore::ModelDefaults,
+    ConfigStore::CustomModels,
+    ConfigStore::McpServers,
+];
 
 /// The stores Configuration asks for, on a server (`server`) or not.
 fn stores_read(server: bool) -> Vec<ConfigStore> {
@@ -64,6 +72,9 @@ pub(super) struct ShellConfig {
     /// Asked while the tab's probe had not answered: asked again once it
     /// does.
     awaiting: bool,
+    /// Why the last write of a store other than `notifications` (which has
+    /// its own line) didn't land.
+    notes: HashMap<ConfigStore, String>,
 }
 
 impl ShellConfig {
@@ -76,10 +87,15 @@ impl ShellConfig {
     }
 
     /// Whether a write of `store` is waiting for its answer.
-    fn writing(&self, store: ConfigStore) -> bool {
+    pub(super) fn writing(&self, store: ConfigStore) -> bool {
         self.tickets
             .values()
             .any(|asked| *asked == Asked::Write(store))
+    }
+
+    /// Why the last write of `store` didn't land, if it didn't.
+    pub(super) fn note(&self, store: ConfigStore) -> Option<&str> {
+        self.notes.get(&store).map(String::as_str)
     }
 }
 
@@ -97,7 +113,7 @@ enum Landed {
     /// A read failed: what was shown stays.
     ReadFailed,
     /// A write was refused or lost.
-    WriteFailed(String),
+    WriteFailed(ConfigStore, String),
 }
 
 /// The store a settings write names goes to Gentle Shell only when its
@@ -128,8 +144,12 @@ fn land(shell: &mut ShellConfig, ticket: ConfigTicket, outcome: ConfigOutcome) -
                 ..
             }),
         ) => Landed::Conflict(store),
-        (Asked::Write(_), ConfigOutcome::Failed(failure)) => Landed::WriteFailed(failure.message()),
-        (Asked::Write(_), _) => Landed::WriteFailed("Gentle Shell answered something else.".into()),
+        (Asked::Write(store), ConfigOutcome::Failed(failure)) => {
+            Landed::WriteFailed(store, failure.message())
+        }
+        (Asked::Write(store), _) => {
+            Landed::WriteFailed(store, "Gentle Shell answered something else.".into())
+        }
         (Asked::Read(_), _) => Landed::ReadFailed,
     }
 }
@@ -203,6 +223,26 @@ fn policy_at(state: &ConfigState, file: std::path::PathBuf) -> Policy {
         ConfigStatus::Invalid => FileState::Invalid,
     };
     Policy::from_store(file, store, state.value.as_ref())
+}
+
+/// Why a write of `store` was refused as stale: someone changed it since
+/// it was read.
+fn conflict_note(store: ConfigStore) -> String {
+    let what = match store {
+        ConfigStore::Notifications => "notifications",
+        ConfigStore::ModelDefaults => "the model defaults",
+        // The editor keeps the text; Reload shows the server's.
+        ConfigStore::CustomModels => {
+            return "Not saved: models.json changed on the server since you opened it.".into();
+        }
+        ConfigStore::McpServers => {
+            return "Not saved: mcp.json changed on the server since you opened it.".into();
+        }
+        _ => "this setting",
+    };
+    format!(
+        "Not saved: {what} changed in Gentle Shell meanwhile. Showing the latest; choose again."
+    )
 }
 
 impl SettingsView {
@@ -280,14 +320,11 @@ impl SettingsView {
                 }
                 Landed::Files(_) => adopted = true,
                 Landed::Conflict(store) => {
-                    self.notifications.note = Some(
-                        "Not saved: notifications changed in Gentle Shell meanwhile. Showing the latest; choose again."
-                            .into(),
-                    );
+                    self.config_note(store, Some(conflict_note(store)));
                     reread.push(store);
                 }
-                Landed::WriteFailed(message) => {
-                    self.notifications.note = Some(format!("Not saved: {message}"));
+                Landed::WriteFailed(store, message) => {
+                    self.config_note(store, Some(format!("Not saved: {message}")));
                 }
             }
         }
@@ -308,6 +345,7 @@ impl SettingsView {
         if adopted {
             self.adopt_shell(cx);
         }
+        self.documents_changed(cx);
     }
 
     /// The server's Gentle Shell won't report `store`: it said it doesn't
@@ -388,6 +426,88 @@ impl SettingsView {
             Err(message) => self.notifications.note = Some(format!("Not saved: {message}")),
         }
         cx.notify();
+    }
+
+    /// Say why a write of `store` didn't land (`None`: it did, or it is
+    /// being written again).
+    pub(super) fn config_note(&mut self, store: ConfigStore, note: Option<String>) {
+        if store == ConfigStore::Notifications {
+            self.notifications.note = note;
+        } else if let Some(note) = note {
+            self.shell_config.notes.insert(store, note);
+        } else {
+            self.shell_config.notes.remove(&store);
+        }
+    }
+
+    /// Replace the server's model defaults (`model_defaults`, guarded by the
+    /// revision Gentle Shell reported).
+    pub(super) fn set_model_defaults(
+        &mut self,
+        defaults: &gentle_core::model_defaults::ModelDefaults,
+        cx: &mut Context<Self>,
+    ) {
+        match ModelDefaultsData::new(defaults.to_value()) {
+            Ok(data) => self.write_shell_store(ConfigWrite::ModelDefaults(data), cx),
+            Err(error) => {
+                self.config_note(
+                    ConfigStore::ModelDefaults,
+                    Some(format!("Not saved: {error}")),
+                );
+                cx.notify();
+            }
+        }
+    }
+
+    /// Send `write` over the revision of its store's last read. Only for a
+    /// store Gentle Shell reported; the answer lands in
+    /// [`Self::shell_config_changed`].
+    pub(super) fn write_shell_store(&mut self, write: ConfigWrite, cx: &mut Context<Self>) {
+        let store = write.store();
+        let Some(state) = self.shell_config.state(store) else {
+            return;
+        };
+        let Some(revision) = state.write_revision(write.write_target()) else {
+            self.config_note(
+                store,
+                Some("Gentle Shell offered no way to save this.".into()),
+            );
+            cx.notify();
+            return;
+        };
+        let revision = revision.to_string();
+        self.send_shell_write(write, revision, cx);
+        cx.notify();
+    }
+
+    /// Send `write` over `revision`, one write per store at a time; whether
+    /// it went out.
+    pub(super) fn send_shell_write(
+        &mut self,
+        write: ConfigWrite,
+        revision: String,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let store = write.store();
+        let Some(session) = self.session.clone() else {
+            return false;
+        };
+        if self.shell_config.writing(store) {
+            return false;
+        }
+        match session.update(cx, |session, cx| session.config_set(write, revision, cx)) {
+            Ok(ticket) => {
+                self.shell_config
+                    .tickets
+                    .insert(ticket, Asked::Write(store));
+                self.config_note(store, None);
+                true
+            }
+            Err(failure) => {
+                self.config_note(store, Some(format!("Not saved: {}", failure.message())));
+                false
+            }
+        }
     }
 }
 
@@ -481,7 +601,7 @@ mod tests {
             .insert(6, Asked::Write(ConfigStore::Notifications));
         assert!(matches!(
             land(&mut shell, 6, ConfigOutcome::Failed(ConfigFailure::Timeout)),
-            Landed::WriteFailed(_)
+            Landed::WriteFailed(ConfigStore::Notifications, _)
         ));
     }
 

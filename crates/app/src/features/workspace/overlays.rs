@@ -518,7 +518,14 @@ impl Workspace {
             &view,
             window,
             |this, view, event: &SettingsEvent, window, cx| match event {
-                SettingsEvent::Close => this.close_overlay(window, cx),
+                SettingsEvent::Close => {
+                    this.close_overlay(window, cx);
+                    // Signed in on a server from the welcome screen (see
+                    // `open_providers`): back to its sequence.
+                    if let Some(view) = this.resume_welcome.take() {
+                        this.attach_welcome(view, window, cx);
+                    }
+                }
                 SettingsEvent::TabLayoutChanged(layout) => this.set_tab_layout(*layout, cx),
                 SettingsEvent::OpenProfiles => this.open_profiles(window, cx),
                 SettingsEvent::Changed => {
@@ -668,7 +675,16 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Providers: on a Gentle Shell server, its sign-ins are Configuration's
+    /// (Models › Sign-ins, over Desktop RPC), so that opens instead.
     pub(super) fn open_providers(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if crate::features::backend::on_server(&self.active_cwd(cx)) {
+            self.open_settings(window, cx);
+            if let Some((Overlay::Settings(view), _)) = &self.overlay {
+                view.update(cx, |view, cx| view.show_models(cx));
+            }
+            return;
+        }
         let cwd = self.active_cwd(cx);
         let view = cx.new(|cx| ProvidersView::new(cwd, window, cx));
         let subscription = cx.subscribe_in(
