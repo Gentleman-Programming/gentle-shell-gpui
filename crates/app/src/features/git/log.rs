@@ -158,5 +158,5 @@ pub fn history(toplevel: &Path, scope: &Scope, limit: usize) -> Option<History> 
 pub fn in_progress(toplevel: &Path) -> Option<InProgress> {
     let dir = git(toplevel, &["rev-parse", "--absolute-git-dir"])?;
     let dir = backend::host_path(toplevel, dir.trim());
-    InProgress::detect(|name| dir.join(name).exists())
+    InProgress::detect(|name| backend::fs::exists(&dir.join(name)))
 }

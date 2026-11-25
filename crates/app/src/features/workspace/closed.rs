@@ -1,7 +1,8 @@
 //! Closing panes safely: an agent that is working or waiting on you asks
 //! first, and every pane or tab closed can be reopened where it was (most
 //! recent first). Agents come back with their conversation, terminals in
-//! their folder, files at their path.
+//! their folder (a new shell: a server terminal closed with its pane), files
+//! at their path.
 
 use super::*;
 
@@ -43,7 +44,7 @@ impl Closed {
     ) -> Option<Self> {
         let layout = saved
             .layout
-            .filter_map(&mut |pane: &SavedPane| Some(Slot::Closed(pane.clone())))?;
+            .filter_map(&mut |pane: &SavedPane| Some(Slot::Closed(reopened(pane.clone()))))?;
         Some(Self {
             space,
             tab,
@@ -73,7 +74,8 @@ impl Workspace {
         };
         let layout = tree.filter_map(&mut |id: &PaneId| {
             if closing.contains(id) {
-                self.saved_pane(*id, cx).map(Slot::Closed)
+                self.saved_pane(*id, cx)
+                    .map(|pane| Slot::Closed(reopened(pane)))
             } else {
                 Some(Slot::Open(*id))
             }
@@ -229,6 +231,15 @@ impl Workspace {
     }
 }
 
+/// A closed pane as it comes back: its server terminal closed with it, so
+/// a reopened terminal pane opens a new one.
+fn reopened(pane: SavedPane) -> SavedPane {
+    SavedPane {
+        terminal: None,
+        ..pane
+    }
+}
+
 /// The shortcut that reopens, as the notice and the palette show it.
 pub(super) const REOPEN_KEY: &str = ui::platform_shortcut("⌥⌘T", "Ctrl+Alt+Shift+T");
 
@@ -278,6 +289,7 @@ mod tests {
                 path,
                 session: None,
                 server: None,
+                terminal: None,
             }),
             pinned: false,
             focused: 0,

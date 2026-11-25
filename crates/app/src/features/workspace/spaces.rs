@@ -1,6 +1,7 @@
 //! Named workspaces: create, switch, rename, delete, branch switching.
 
 use super::*;
+use crate::features::explorer::Purpose;
 
 impl Workspace {
     pub(super) fn space(&self) -> &Space {
@@ -57,9 +58,17 @@ impl Workspace {
         self.switch_workspace(index, window, cx);
     }
 
+    /// The address of the Gentle Shell server agents run on; `None` when
+    /// they run elsewhere.
+    pub(super) fn agents_server() -> Option<String> {
+        match crate::features::backend::saved() {
+            gentle_core::backend::Backend::Server { url, .. } => Some(url),
+            _ => None,
+        }
+    }
+
     /// A new workspace at `root`, a folder on the Gentle Shell server agents
-    /// run on, typed as the server sees it (this computer can't browse it):
-    /// its tabs start there.
+    /// run on, as the server names it: its tabs start there.
     pub(super) fn create_server_workspace(
         &mut self,
         name: Option<String>,
@@ -67,33 +76,25 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let server = match crate::features::backend::saved() {
-            gentle_core::backend::Backend::Server { url, .. } => Some(url),
-            _ => None,
-        };
         let index = self.push_space(name.filter(|n| !n.trim().is_empty()), root);
-        self.spaces[index].server = server;
+        self.spaces[index].server = Self::agents_server();
         self.switch_workspace(index, window, cx);
     }
 
-    /// Ask for a folder on the Gentle Shell server agents run on: ⌘K on
-    /// Workspaces with the server's home folder typed, to go on from (Enter
-    /// opens a workspace there).
+    /// Browse the folders of the Gentle Shell server agents run on, from
+    /// its home folder (else where a new agent would start): the workspace
+    /// of the folder picked opens.
     pub(super) fn open_server_folder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let home = match crate::features::backend::saved() {
-            gentle_core::backend::Backend::Server { url, .. } => {
-                crate::features::backend::server::known_home(&url)
-            }
-            _ => return,
+        let Some(url) = Self::agents_server() else {
+            return;
         };
-        if matches!(self.overlay, Some((Overlay::Palette(_), _))) {
+        if self.overlay.is_some() {
             self.close_overlay(window, cx);
         }
-        self.open_palette(Category::Workspaces, window, cx);
-        if let Some((Overlay::Palette(view), _)) = &self.overlay {
-            let typed = format!("{}/", home.unwrap_or_default().trim_end_matches('/'));
-            view.update(cx, |view, cx| view.set_query(&typed, window, cx));
-        }
+        let home = crate::features::backend::server::known_home(&url)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| self.new_agent_cwd(cx));
+        self.show_explorer(home, Purpose::Open, |_, _, _, _| {}, window, cx);
     }
 
     /// Open a new tab in a specific workspace, using its root rather than
@@ -128,15 +129,26 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Ask for the folder of a new workspace named `name`: this computer's
+    /// folder picker, or the explorer over the folders of the Gentle Shell
+    /// server agents run on.
     pub(super) fn pick_workspace_folder(
         &mut self,
         name: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // A Gentle Shell server's folders can't be browsed from here.
-        if crate::features::backend::saved().is_server() {
-            return self.open_server_folder(window, cx);
+        if Self::agents_server().is_some() {
+            let dir = self.new_agent_cwd(cx);
+            return self.show_explorer(
+                dir,
+                Purpose::Choose("Create Workspace"),
+                move |this, folder, window, cx| {
+                    this.create_server_workspace(name.clone(), folder, window, cx)
+                },
+                window,
+                cx,
+            );
         }
         let paths = cx.prompt_for_paths(PathPromptOptions {
             files: false,
@@ -156,14 +168,18 @@ impl Workspace {
         .detach();
     }
 
-    /// Point the shown workspace at another folder: the sidebar re-roots on
+    /// Point the shown workspace at another folder (an existing one: its
+    /// pickers and `gsd workspace set-root` checked), marked as the Gentle
+    /// Shell server's where agents run on one: the sidebar re-roots on
     /// [`WorkspaceEvent::RootChanged`] and new tabs open there. Open tabs
     /// keep their own folders.
     pub(super) fn set_root(&mut self, root: PathBuf, cx: &mut Context<Self>) {
-        if self.space().root == root || !root.is_dir() {
+        if self.space().root == root {
             return;
         }
-        self.space_mut().root = root.clone();
+        let space = self.space_mut();
+        space.root = root.clone();
+        space.server = Self::agents_server();
         cx.emit(WorkspaceEvent::RootChanged(root));
         self.schedule_save(cx);
         cx.notify();
@@ -174,10 +190,22 @@ impl Workspace {
         self.open_palette(Category::Files, window, cx);
     }
 
-    /// The sidebar header: pick a folder, [`Self::set_root`] to it and move
-    /// the focused agent there too, so the files shown are the ones it works
-    /// on. An agent with a conversation asks first (it restarts fresh).
+    /// The sidebar header: pick a folder (this computer's picker, or the
+    /// explorer over the folders of the Gentle Shell server agents run on),
+    /// [`Self::set_root`] to it and move the focused agent there too, so
+    /// the files shown are the ones it works on. An agent with a
+    /// conversation asks first (it restarts fresh).
     pub fn choose_root(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if Self::agents_server().is_some() {
+            let dir = self.new_agent_cwd(cx);
+            return self.show_explorer(
+                dir,
+                Purpose::Choose("Open Folder"),
+                |this, folder, window, cx| this.move_root(folder, window, cx),
+                window,
+                cx,
+            );
+        }
         let paths = cx.prompt_for_paths(PathPromptOptions {
             files: false,
             directories: true,
@@ -333,9 +361,13 @@ impl Workspace {
         let space = self.spaces.remove(index);
         self.forget_closed_in(index);
         for tab in space.tabs {
-            for pane in tab.leaves() {
-                // Dropping a session drops its PiProcess, which shuts the backend down.
-                self.panes.remove(&pane);
+            match tab.state.unbuilt() {
+                Some(saved) => Self::discard_saved_tab(saved, cx),
+                None => {
+                    for pane in tab.leaves() {
+                        self.discard_pane(pane, cx);
+                    }
+                }
             }
         }
         if self.current > index {

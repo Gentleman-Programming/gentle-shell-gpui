@@ -35,6 +35,10 @@ pub struct SavedPane {
     /// running while the app is closed, and the pane reattaches to it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server: Option<gentle_core::serve::ServerSession>,
+    /// The Gentle Shell server terminal (`t_…`) a terminal pane showed: it
+    /// keeps running while the app is closed, and the pane reattaches to it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

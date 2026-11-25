@@ -1,8 +1,13 @@
 //! A real terminal pane: the user's login shell in a PTY (alacritty_terminal's
-//! `tty` + `EventLoop` + `Term`), painted cell-accurately with GPUI.
+//! `tty` + `EventLoop` + `Term`), painted cell-accurately with GPUI. On a
+//! Gentle Shell server the shell is one of the server's persistent terminals
+//! instead ([`remote`]), drawn by the same `Term`.
 
 mod colors;
 mod keys;
+mod remote;
+
+pub use remote::close_on_server;
 
 use std::borrow::Cow;
 use std::cell::RefCell;
@@ -51,6 +56,9 @@ pub enum TerminalEvent {
     Exited,
     /// Ctrl+C twice at an idle prompt: close the pane like ⌘W would.
     CloseRequested,
+    /// The pane opened, or reattached to, its terminal on a Gentle Shell
+    /// server: save [`TerminalView::server_terminal`] with the pane.
+    Attached,
 }
 
 /// Forwards PTY/terminal events from the I/O thread to the view.
@@ -116,12 +124,52 @@ impl Geometry {
     }
 }
 
+/// Where a pane's keystrokes go and its output comes from.
+#[derive(Clone)]
+enum Pty {
+    /// A PTY on this computer, run by alacritty's event loop.
+    Local(EventLoopSender),
+    /// A persistent terminal on a Gentle Shell server.
+    Server(remote::Remote),
+}
+
+impl Pty {
+    fn input(&self, bytes: Cow<'static, [u8]>) {
+        match self {
+            Pty::Local(sender) => {
+                let _ = sender.send(Msg::Input(bytes));
+            }
+            Pty::Server(remote) => remote.input(bytes.into_owned()),
+        }
+    }
+
+    fn resize(&self, size: WindowSize) {
+        match self {
+            Pty::Local(sender) => {
+                let _ = sender.send(Msg::Resize(size));
+            }
+            Pty::Server(remote) => remote.resize(size.num_cols, size.num_lines),
+        }
+    }
+}
+
 pub struct TerminalView {
     term: Arc<FairMutex<Term<Listener>>>,
-    pty: Option<EventLoopSender>,
+    /// What the `Term` reports goes to the view through it; a server
+    /// terminal's threads report there too.
+    listener: Listener,
+    pty: Option<Pty>,
     error: Option<SharedString>,
     focus_handle: FocusHandle,
     cwd: PathBuf,
+    /// `cwd` is a folder on a Gentle Shell server, where the shell runs.
+    on_server: bool,
+    /// The server terminal a restored pane had, to reattach to.
+    resume: Option<String>,
+    /// What keeps a server terminal from showing, with the ways out.
+    blocked: Option<remote::Blocked>,
+    /// Follows what the server terminal's threads say.
+    remote_status: Task<()>,
     osc_title: Option<String>,
     exited: bool,
     geometry: Rc<RefCell<Geometry>>,
@@ -133,8 +181,8 @@ pub struct TerminalView {
     /// Dead-key / IME composition in progress.
     marked: Option<String>,
     /// Tells whether the shell is idle at its prompt; `None` when it can't
-    /// be told (a backend's shell, a PTY that didn't start), and then a
-    /// double Ctrl+C never closes the pane.
+    /// be told (a backend's shell, a server's terminal, a PTY that didn't
+    /// start), and then a double Ctrl+C never closes the pane.
     shell_idle: Option<ShellIdle>,
     /// A first Ctrl+C at an idle prompt, waiting for the second.
     double_interrupt: DoubleInterrupt,
@@ -150,10 +198,17 @@ impl Focusable for TerminalView {
     }
 }
 
+/// A local shell ends with its pane; a server terminal keeps running there
+/// (quitting the app detaches from it): [`TerminalView::close`] is what
+/// closes it.
 impl Drop for TerminalView {
     fn drop(&mut self) {
-        if let Some(pty) = &self.pty {
-            let _ = pty.send(Msg::Shutdown);
+        match &self.pty {
+            Some(Pty::Local(sender)) => {
+                let _ = sender.send(Msg::Shutdown);
+            }
+            Some(Pty::Server(remote)) => remote.detach(),
+            None => {}
         }
     }
 }
@@ -185,18 +240,14 @@ fn login_shell() -> (String, Vec<String>) {
 
 /// Starts the PTY and its I/O thread. Also a way to ask whether the shell is
 /// idle, for the local login shell only: a backend's shell (`wsl.exe`,
-/// `ssh`) runs its jobs where this machine can't see them.
+/// `ssh`) runs its jobs where this machine can't see them. Not for a Gentle
+/// Shell server's folder ([`remote`]).
 fn spawn_pty(
     cwd: &Path,
     term: Arc<FairMutex<Term<Listener>>>,
     listener: Listener,
     size: WindowSize,
 ) -> anyhow::Result<(EventLoopSender, Option<ShellIdle>)> {
-    // A Gentle Shell server has no terminals for its clients yet, and its
-    // folders aren't this computer's.
-    if crate::features::backend::on_server(cwd) {
-        anyhow::bail!(crate::features::backend::server::UNAVAILABLE);
-    }
     // Where the project's agents run, the backend's login shell in the
     // project folder; there the folder is the backend's, so the PTY starts
     // from the user's home here.
@@ -272,9 +323,18 @@ impl TerminalView {
             cell,
             dims,
         };
-        let (pty, shell_idle, error) =
-            match spawn_pty(&cwd, term.clone(), listener, geometry.window_size()) {
-                Ok((sender, shell_idle)) => (Some(sender), shell_idle, None),
+        let on_server = crate::features::backend::on_server(&cwd);
+        let (pty, shell_idle, error) = if on_server {
+            // Started once built, so a restored pane says first which
+            // terminal to reattach to ([`Self::resume_server_terminal`]).
+            cx.spawn_in(window, async move |this, cx| {
+                let _ = this.update_in(cx, |this, window, cx| this.start_remote(window, cx));
+            })
+            .detach();
+            (None, None, None)
+        } else {
+            match spawn_pty(&cwd, term.clone(), listener.clone(), geometry.window_size()) {
+                Ok((sender, shell_idle)) => (Some(Pty::Local(sender)), shell_idle, None),
                 Err(err) => (
                     None,
                     None,
@@ -282,7 +342,8 @@ impl TerminalView {
                         "Could not start the shell: {err}"
                     ))),
                 ),
-            };
+            }
+        };
 
         cx.spawn(async move |this, cx| {
             while let Ok(event) = rx.recv().await {
@@ -305,10 +366,15 @@ impl TerminalView {
 
         Self {
             term,
+            listener,
             pty,
             error,
             focus_handle: cx.focus_handle(),
             cwd,
+            on_server,
+            resume: None,
+            blocked: None,
+            remote_status: Task::ready(()),
             osc_title: None,
             exited: false,
             geometry: Rc::new(RefCell::new(geometry)),
@@ -322,14 +388,20 @@ impl TerminalView {
         }
     }
 
-    /// OSC title if the shell set one, otherwise `user@cwd-leaf`.
+    /// OSC title if the shell (or the server, for its terminal) set one,
+    /// otherwise `user@cwd-leaf`; on a server just the leaf, since this
+    /// computer's user isn't the one the shell runs as there.
     pub fn title(&self) -> SharedString {
         if let Some(title) = self.osc_title.as_ref().filter(|t| !t.trim().is_empty()) {
             return title.clone().into();
         }
-        let user = std::env::var("USER")
-            .or_else(|_| std::env::var("USERNAME"))
-            .unwrap_or_default();
+        let user = if self.on_server {
+            String::new()
+        } else {
+            std::env::var("USER")
+                .or_else(|_| std::env::var("USERNAME"))
+                .unwrap_or_default()
+        };
         let leaf = self
             .cwd
             .file_name()
@@ -375,7 +447,7 @@ impl TerminalView {
             return;
         }
         if let Some(pty) = &self.pty {
-            let _ = pty.send(Msg::Input(bytes));
+            pty.input(bytes);
         }
     }
 
@@ -1069,6 +1141,9 @@ fn paint_frame(frame: Frame, font_size: Pixels, window: &mut Window, cx: &mut Ap
 impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         crate::shared::diagnostics::render("TerminalView");
+        if let Some(blocked) = &self.blocked {
+            return self.render_blocked(blocked, cx).into_any_element();
+        }
         let cell = self.cell_size(window);
         let font_size = font_size(window);
         let focused = self.focus_handle.is_focused(window);
@@ -1092,7 +1167,7 @@ impl Render for TerminalView {
                     geometry.dims = TermDims { columns, lines };
                     term.resize(geometry.dims);
                     if let Some(pty) = &pty {
-                        let _ = pty.send(Msg::Resize(geometry.window_size()));
+                        pty.resize(geometry.window_size());
                     }
                 }
                 build_frame(&term, bounds.origin, cell, focused)
@@ -1149,6 +1224,7 @@ impl Render for TerminalView {
             .when(self.double_interrupt.armed().is_some(), |this| {
                 this.child(close_hint(self.close_hints, cx.theme().font_family.clone()))
             })
+            .into_any_element()
     }
 }
 

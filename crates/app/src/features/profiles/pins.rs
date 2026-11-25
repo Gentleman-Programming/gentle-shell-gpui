@@ -6,7 +6,6 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 
 use gentle_core::profiles::{PinRead, PinStatus, is_valid_profile_name, parse_pin, serialize_pin};
 use pi_rpc::desktop_rpc::{ConfigLayerSource, ConfigState, ConfigStatus, ConfigWrite, PinSource};
@@ -37,27 +36,21 @@ pub(super) fn clear_pin(path: &Path) -> io::Result<()> {
 fn worktree_identity(cwd: &Path) -> Option<(PathBuf, PathBuf)> {
     let git = |arg: &str| -> Option<PathBuf> {
         let output = crate::features::backend::git(cwd, &[])
-            .ok()?
             .args([
                 "--no-optional-locks",
                 "rev-parse",
                 "--path-format=absolute",
                 arg,
             ])
-            .env_remove("GIT_DIR")
-            .env_remove("GIT_WORK_TREE")
-            .env_remove("GIT_COMMON_DIR")
-            .env_remove("GIT_INDEX_FILE")
-            .stdin(Stdio::null())
-            .stderr(Stdio::null())
+            .clean_env()
             .output()
             .ok()?;
-        if !output.status.success() {
+        if !output.success {
             return None;
         }
         let text = String::from_utf8(output.stdout).ok()?;
         let path = crate::features::backend::host_path(cwd, text.trim_end_matches(['\n', '\r']));
-        dunce::canonicalize(path).ok()
+        crate::features::backend::fs::canonicalize(&path).ok()
     };
     Some((git("--show-toplevel")?, git("--git-common-dir")?))
 }

@@ -105,6 +105,9 @@ impl Workspace {
                 .session
                 .as_ref()
                 .and_then(|session| session.read(cx).server_session()),
+            terminal: self
+                .terminal_view(id)
+                .and_then(|terminal| terminal.read(cx).server_terminal()),
         })
     }
 
@@ -215,6 +218,7 @@ mod tests {
             path: None,
             session: None,
             server: None,
+            terminal: None,
         }
     }
 

@@ -69,9 +69,8 @@ impl PaletteView {
                 current: w.current,
             })
             .collect();
-        // A Gentle Shell server's folders have no picker here: typed as the
-        // server sees them (a path), or from its home folder. Both show in
-        // All too.
+        // A Gentle Shell server's folders: typed as the server sees them (a
+        // path), or browsed from its home folder. Both show in All too.
         let runs_on = crate::features::backend::saved();
         let server = runs_on.is_server().then(|| runs_on.label());
         let typed_folder = server
@@ -96,7 +95,7 @@ impl PaletteView {
                 icon: IconName::Server,
                 title,
                 meta: String::new(),
-                detail: "A workspace in a folder there, typed from its home folder".into(),
+                detail: "Browse its folders for a workspace".into(),
                 group: "Workspaces",
                 action: PaletteAction::OpenServerFolder,
                 workspace: None,

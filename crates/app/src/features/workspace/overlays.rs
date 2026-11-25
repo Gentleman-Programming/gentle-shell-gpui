@@ -3,6 +3,7 @@
 //! device cards live in `stages.rs`.
 
 use super::*;
+use crate::features::explorer::Purpose;
 
 impl Workspace {
     // ── Screens ─────────────────────────────────────────────────────────────
@@ -171,26 +172,49 @@ impl Workspace {
     }
 
     /// The folder explorer (⌘O / Ctrl+O), from the focused pane's folder.
+    /// Where agents run on a Gentle Shell server it browses the server's
+    /// folders, from where a new agent would start.
     pub(super) fn open_explorer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some((Overlay::Explorer(_), _)) = &self.overlay {
             self.close_overlay(window, cx);
             return;
         }
-        let dir = self.active_cwd(cx);
-        let view = cx.new(|cx| ExplorerView::new(dir, window, cx));
+        let dir = self.new_agent_cwd(cx);
+        self.show_explorer(dir, Purpose::Open, |_, _, _, _| {}, window, cx);
+    }
+
+    /// The folder explorer at `dir` for `purpose`: a folder chosen for
+    /// [`Purpose::Choose`] goes to `chosen`. A Gentle Shell server's folder
+    /// opened from it is marked as that server's ([`Self::show_server_folder`]).
+    pub(super) fn show_explorer(
+        &mut self,
+        dir: PathBuf,
+        purpose: Purpose,
+        chosen: impl Fn(&mut Self, PathBuf, &mut Window, &mut Context<Self>) + 'static,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let server = Self::agents_server();
+        let view = cx.new(|cx| ExplorerView::new(dir, purpose, window, cx));
         let subscription = cx.subscribe_in(
             &view,
             window,
-            |this, _, event: &ExplorerEvent, window, cx| {
+            move |this, _, event: &ExplorerEvent, window, cx| {
                 this.close_overlay(window, cx);
+                let show = |this: &mut Self,
+                            folder: PathBuf,
+                            window: &mut Window,
+                            cx: &mut Context<Self>| match &server {
+                    Some(url) => this.show_server_folder(folder, url.clone(), window, cx),
+                    None => this.show_folder(folder, window, cx),
+                };
                 match event {
-                    ExplorerEvent::OpenAgent(folder) => {
-                        this.show_folder(folder.clone(), window, cx)
-                    }
+                    ExplorerEvent::OpenAgent(folder) => show(this, folder.clone(), window, cx),
                     ExplorerEvent::OpenTerminal(folder) => {
-                        this.show_folder(folder.clone(), window, cx);
+                        show(this, folder.clone(), window, cx);
                         this.open_tab(PaneKind::Terminal, folder.clone(), None, None, window, cx);
                     }
+                    ExplorerEvent::Choose(folder) => chosen(this, folder.clone(), window, cx),
                     ExplorerEvent::OpenFile(path) => this.open_file(path.clone(), window, cx),
                     ExplorerEvent::Close => {}
                 }
@@ -198,6 +222,24 @@ impl Workspace {
         );
         self.overlay = Some((Overlay::Explorer(view), subscription));
         cx.notify();
+    }
+
+    /// [`Self::show_folder`] for `folder` on the Gentle Shell server at
+    /// `url`, as the server names it (never resolved on this computer): its
+    /// workspace, marked as that server's so tabs there start in it.
+    fn show_server_folder(
+        &mut self,
+        folder: PathBuf,
+        url: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let index = match self.spaces.iter().position(|space| space.root == folder) {
+            Some(index) => index,
+            None => self.push_space(None, folder),
+        };
+        self.spaces[index].server = Some(url);
+        self.switch_workspace(index, window, cx);
     }
 
     /// Show the workspace rooted at `folder`, creating it (a new workspace

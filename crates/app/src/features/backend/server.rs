@@ -6,16 +6,83 @@
 //! the device id and the server's name): it lives in `server-tokens.json` in
 //! the app's folder, owner-only (`0600`), keyed by server address.
 
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex};
 
 use gentle_core::backend::Backend;
 use gentle_core::serve::{ConnectionCode, Nearby, ServerPage, ServerSession};
 use pi_rpc::serve::{Paired, ServeClient, ServerInfo};
 use serde_json::{Map, Value, json};
 
-/// What a server tab can't do yet: the server has no terminals, files or
-/// git for its clients (Gentle Shell's serve phase 1).
-pub const UNAVAILABLE: &str = "Not available on a Gentle Shell server yet.";
+/// What a server can't do for its devices: its `gentle-shell serve` is
+/// older than the feature (its `GET /api/server` doesn't offer it).
+pub const UNAVAILABLE: &str =
+    "This Gentle Shell server can't do that yet: upgrade Gentle Shell there.";
+
+/// What only runs on this computer or a backend the app drives itself
+/// (Setup, a one-off `gentle-shell` run): a server runs only its sessions.
+pub const NOT_ON_SERVER: &str = "Not available on a Gentle Shell server.";
+
+/// What each server said about itself last, by address ([`info`]).
+static INFOS: LazyLock<Mutex<HashMap<String, ServerInfo>>> = LazyLock::new(Mutex::default);
+
+/// The server work rooted at `cwd` runs on, with this device's client;
+/// `None` when it runs elsewhere (this computer, a WSL distro, a command).
+pub fn at(cwd: &Path) -> Option<anyhow::Result<ServeClient>> {
+    let choice = super::for_tab(cwd);
+    choice.is_server().then(|| client(&choice))
+}
+
+/// The home folder of the server work rooted at `cwd` runs on, as it last
+/// said (without asking); `None` off a server.
+pub fn known_home_of(cwd: &Path) -> Option<String> {
+    match super::for_tab(cwd) {
+        Backend::Server { url, .. } => known_home(&url),
+        _ => None,
+    }
+}
+
+/// What `choice` (a server) says about itself: the last answer this run,
+/// else asked ([`info`]). Blocking the first time.
+pub fn known_info(choice: &Backend) -> Option<ServerInfo> {
+    let Backend::Server { url, .. } = choice else {
+        return None;
+    };
+    if let Some(info) = INFOS.lock().unwrap().get(url) {
+        return Some(info.clone());
+    }
+    info(choice).ok()
+}
+
+/// Whether `choice` (a server) offers `capability` (`files`, `git`,
+/// `uploads`, `terminals`, `services`, …), as it last said. Blocking the
+/// first time.
+pub fn offers(choice: &Backend, capability: &str) -> bool {
+    known_info(choice).is_some_and(|info| info.has(capability))
+}
+
+/// Whether the server work rooted at `cwd` runs on offers `capability`, as
+/// it already said this run, without asking: `None` off a server or before
+/// it said. For views that word what's missing while they draw.
+pub fn said(cwd: &Path, capability: &str) -> Option<bool> {
+    let Backend::Server { url, .. } = super::for_tab(cwd) else {
+        return None;
+    };
+    INFOS
+        .lock()
+        .unwrap()
+        .get(&url)
+        .map(|info| info.has(capability))
+}
+
+/// Ask `choice` what it offers again next time (a terminal host was
+/// installed, the device paired again).
+pub fn forget_info(choice: &Backend) {
+    if let Backend::Server { url, .. } = choice {
+        INFOS.lock().unwrap().remove(url);
+    }
+}
 
 fn tokens_path() -> Option<PathBuf> {
     crate::shared::data_dir::app().map(|dir| dir.join("server-tokens.json"))
@@ -182,6 +249,9 @@ pub fn info(choice: &Backend) -> Result<ServerInfo, String> {
                 eprintln!("gentle-shell-gpui: could not save the server's home folder: {err}");
             }
         }
+    }
+    if let Backend::Server { url, .. } = choice {
+        INFOS.lock().unwrap().insert(url.clone(), info.clone());
     }
     Ok(info)
 }

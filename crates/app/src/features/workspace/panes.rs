@@ -348,7 +348,8 @@ impl Workspace {
             _ => (target, None),
         };
         // A terminal whose shell exits (`exit`, Ctrl-D) closes its pane; a
-        // double Ctrl+C at its idle prompt closes it as ⌘W does.
+        // double Ctrl+C at its idle prompt closes it as ⌘W does. A server
+        // terminal's id is saved with the pane once it has one.
         let subscriptions = item
             .view
             .clone()
@@ -363,6 +364,7 @@ impl Workspace {
                         match event {
                             TerminalEvent::Exited => this.close_pane_now(id, window, cx),
                             TerminalEvent::CloseRequested => this.close_pane(id, window, cx),
+                            TerminalEvent::Attached => this.schedule_save(cx),
                             TerminalEvent::TitleChanged => {}
                         }
                     },
@@ -414,6 +416,35 @@ impl Workspace {
     /// The canvas pane `id` shows, if it is one.
     pub(super) fn canvas_view(&self, id: PaneId) -> Option<Entity<CanvasView>> {
         self.panes.get(&id)?.item.view.clone().downcast().ok()
+    }
+
+    /// The terminal pane `id` shows, if it is one.
+    pub(super) fn terminal_view(
+        &self,
+        id: PaneId,
+    ) -> Option<Entity<crate::features::terminal::TerminalView>> {
+        self.panes.get(&id)?.item.view.clone().downcast().ok()
+    }
+
+    /// Remove pane `id` for good: a terminal on a Gentle Shell server is
+    /// closed there too (quitting the app leaves it running, to reattach),
+    /// as a local shell ends with its pane. Dropping a session drops its
+    /// PiProcess, which shuts the backend down.
+    pub(super) fn discard_pane(&mut self, id: PaneId, cx: &App) {
+        if let Some(view) = self.terminal_view(id) {
+            view.read(cx).close(cx);
+        }
+        self.panes.remove(&id);
+    }
+
+    /// A tab closed without ever being built: the server terminals its
+    /// terminal panes had are closed there, as if they had been shown.
+    pub(super) fn discard_saved_tab(saved: &SavedTab, cx: &App) {
+        for pane in saved.layout.leaves() {
+            if let Some(id) = pane.terminal.clone() {
+                crate::features::terminal::close_on_server(&pane.cwd, id, cx);
+            }
+        }
     }
 
     /// A pane for an already built file view of `path`.
@@ -470,7 +501,7 @@ impl Workspace {
         let root = self.spaces[space].root.clone();
         // A Gentle Shell server's folder is a path there, not on this computer.
         let on_server = saved.server.is_some() || crate::features::backend::on_server(&saved.cwd);
-        let cwd = if saved.cwd.is_dir() || on_server {
+        let cwd = if on_server || saved.cwd.is_dir() {
             saved.cwd.clone()
         } else if root.is_dir() {
             root.clone()
@@ -492,10 +523,20 @@ impl Workspace {
             }
             PaneKind::Terminal => {
                 PaneFactories::get(cx).terminal.as_ref()?;
-                self.new_factory_pane_at(PaneKind::Terminal, cwd, &root, window, cx)
+                let id = self.new_factory_pane_at(PaneKind::Terminal, cwd, &root, window, cx)?;
+                // Its server terminal kept running while the app was closed.
+                if let Some(terminal) = saved.terminal.clone()
+                    && let Some(view) = self.terminal_view(id)
+                {
+                    view.update(cx, |view, _| view.resume_server_terminal(terminal));
+                }
+                Some(id)
             }
             PaneKind::File => {
-                let path = saved.path.clone().filter(|p| p.is_file())?;
+                let path = saved
+                    .path
+                    .clone()
+                    .filter(|p| crate::features::backend::fs::is_file(p))?;
                 PaneFactories::get(cx).file.as_ref()?;
                 self.new_factory_pane_at(PaneKind::File, path, &root, window, cx)
             }
@@ -917,8 +958,7 @@ impl Workspace {
         {
             tab.state.set_focused(next);
         }
-        // Dropping a session drops its PiProcess, which shuts the backend down.
-        self.panes.remove(&pane);
+        self.discard_pane(pane, cx);
         if active {
             self.focus_active(window, cx);
         }
@@ -984,6 +1024,7 @@ impl Workspace {
             (saved, id, pinned)
         };
         let Some(saved) = saved else { return };
+        Self::discard_saved_tab(&saved, cx);
         let title = saved
             .layout
             .leaves()
@@ -1027,7 +1068,7 @@ impl Workspace {
         self.remember_close(space, index, &leaves, cx);
         let tab = self.spaces[space].tabs.remove(index);
         for pane in tab.leaves() {
-            self.panes.remove(&pane);
+            self.discard_pane(pane, cx);
         }
         self.finish_tab_close(space, index, window, cx);
     }

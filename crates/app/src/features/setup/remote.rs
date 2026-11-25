@@ -21,7 +21,7 @@ pub(super) fn backend() -> Option<Backend> {
 /// instead of running them anywhere (never on this computer).
 pub(super) fn refuse_server() -> Result<(), String> {
     match backend() {
-        Some(choice) if choice.is_server() => Err(backend::server::UNAVAILABLE.to_string()),
+        Some(choice) if choice.is_server() => Err(backend::server::NOT_ON_SERVER.to_string()),
         _ => Ok(()),
     }
 }

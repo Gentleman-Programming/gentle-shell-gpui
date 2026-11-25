@@ -1,14 +1,18 @@
 //! The project sidebar: the lazily loaded file tree (Tern-style context menu,
 //! inline create and rename, keyboard navigation), the working-tree changes
-//! and the branches, switched with icon tabs.
+//! and the branches, switched with icon tabs. A Gentle Shell server's folder
+//! shows the same, through its API: what the server doesn't offer says so,
+//! and its changes stream in ([`ServerWatch`]).
 
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::rc::Rc;
-use std::time::Duration;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use gpui_kit::assets::IconName;
-use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
 use gpui_kit::component::input::{Escape, Input, InputEvent, InputState};
 use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::notification::Notification;
@@ -17,12 +21,14 @@ use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Icon, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+use pi_rpc::serve::WatchEvent;
 
 use super::changes::{ChangesEvent, ChangesView};
 use super::listing::{Entry, list_dir};
 use super::ops::{self, ClipMode};
 use super::refs::{RefsEvent, RefsView};
 use super::{file_icon, status_color};
+use crate::features::backend::{self, server};
 use crate::features::git::GitSnapshot;
 use crate::platform::ides;
 use crate::shared::{themes, ui};
@@ -31,6 +37,10 @@ const CONTEXT: &str = "FileTree";
 const ROW_HEIGHT: f32 = 26.;
 const INDENT: f32 = 14.;
 const POLL: Duration = Duration::from_secs(3);
+/// How long a server folder's change stream waits before connecting again,
+/// doubled after each failure up to [`WATCH_RETRY_MAX`].
+const WATCH_RETRY: Duration = Duration::from_secs(1);
+const WATCH_RETRY_MAX: Duration = Duration::from_secs(30);
 
 struct ShowIgnored {
     value: bool,
@@ -38,6 +48,37 @@ struct ShowIgnored {
 }
 
 impl Global for ShowIgnored {}
+
+/// What the sidebar may show for its folder: a Gentle Shell server says what
+/// it offers (`files`, `git`); this computer has it all.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Offered {
+    files: bool,
+    git: bool,
+}
+
+/// What changed under a server folder, as its change stream tells.
+enum Changed {
+    /// These paths (files or folders, there or gone).
+    Paths(Vec<PathBuf>),
+    /// Too much to name, or the stream was down a while: look again at
+    /// everything.
+    All,
+}
+
+/// A server folder's changes (`GET /api/fs/watch`), followed on a thread of
+/// its own ([`follow_server`]) and applied to the tree as they come.
+/// Dropping it ends the thread (within the stream's 20 s heartbeat).
+struct ServerWatch {
+    stop: Arc<AtomicBool>,
+    _apply: Task<()>,
+}
+
+impl Drop for ServerWatch {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+    }
+}
 
 /// The platform's name for showing a file in its folder.
 pub const REVEAL: &str = if cfg!(target_os = "macos") {
@@ -209,6 +250,14 @@ pub struct FileTreeView {
     refs: Entity<RefsView>,
     /// Code editors installed here, for the ⋯ menu's "Open in …".
     ides: Rc<Vec<ides::Installed>>,
+    /// The folder is a Gentle Shell server's: no Trash, file manager or
+    /// apps of this computer's apply to it.
+    server: bool,
+    /// What the folder's server offers the sidebar (everything until it
+    /// answers, and on this computer).
+    offered: Offered,
+    /// A server folder's change stream, while the Files tab shows.
+    watch: Option<ServerWatch>,
     _poll: Task<()>,
     _subscriptions: Vec<Subscription>,
 }
@@ -246,6 +295,7 @@ impl FileTreeView {
                 RefsEvent::Changed => cx.notify(),
             }),
         ];
+        let server = backend::on_server(&root);
         let mut this = Self {
             root,
             name,
@@ -266,11 +316,20 @@ impl FileTreeView {
             changes,
             refs,
             ides: Rc::default(),
+            server,
+            offered: Offered {
+                files: true,
+                git: true,
+            },
+            watch: None,
             _poll: Task::ready(()),
             _subscriptions: subscriptions,
         };
         this.sync_panels(cx);
         this.load_dir(this.root.clone(), cx);
+        if server {
+            this.ask_offered(cx);
+        }
         cx.spawn(async move |this, cx| {
             let found = cx
                 .background_executor()
@@ -286,7 +345,7 @@ impl FileTreeView {
                 let Ok(due) = this.update_in(cx, |this, window, _| {
                     (this.visible
                         && this.tab == Tab::Files
-                        && !this.on_server()
+                        && this.offered.git
                         && window.is_window_active())
                     .then(|| this.git_job())
                 }) else {
@@ -324,14 +383,21 @@ impl FileTreeView {
         self.sync_panels(cx);
     }
 
-    /// Only the shown Git panel polls.
+    /// Only the shown Git panel polls, and only the shown tree follows a
+    /// server folder's changes.
     fn sync_panels(&mut self, cx: &mut Context<Self>) {
-        let shown = self.visible && !self.on_server();
+        let shown = self.visible && self.offered.git;
         let changes = shown && self.tab == Tab::Changes;
         let refs = shown && self.tab == Tab::Branches;
         self.changes
             .update(cx, |view, cx| view.set_visible(changes, cx));
         self.refs.update(cx, |view, cx| view.set_visible(refs, cx));
+        let follow = self.server && self.visible && self.tab == Tab::Files && self.offered.files;
+        if !follow {
+            self.watch = None;
+        } else if self.watch.is_none() {
+            self.watch = Some(self.follow(cx));
+        }
     }
 
     fn set_tab(&mut self, tab: Tab, window: &mut Window, cx: &mut Context<Self>) {
@@ -347,14 +413,78 @@ impl FileTreeView {
         cx.notify();
     }
 
-    /// Whether the folder is a Gentle Shell server's: nothing here can read
-    /// it, so the tree, Changes and Branches say so instead.
-    fn on_server(&self) -> bool {
-        crate::features::backend::on_server(&self.root)
+    /// Ask the folder's server what it offers (blocking the first time this
+    /// run, so off the UI thread); what it lacks says so instead.
+    fn ask_offered(&mut self, cx: &mut Context<Self>) {
+        let choice = backend::for_tab(&self.root);
+        cx.spawn(async move |this, cx| {
+            let offered = cx
+                .background_executor()
+                .spawn(async move {
+                    Offered {
+                        files: server::offers(&choice, "files"),
+                        git: server::offers(&choice, "git"),
+                    }
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.offered != offered {
+                    this.offered = offered;
+                    this.sync_panels(cx);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Follow the server folder's changes: a thread reads the stream, and
+    /// what changed is listed again here.
+    fn follow(&self, cx: &mut Context<Self>) -> ServerWatch {
+        let stop = Arc::new(AtomicBool::new(false));
+        let (sender, changes) = async_channel::unbounded();
+        let (root, flag) = (self.root.clone(), stop.clone());
+        std::thread::spawn(move || follow_server(&root, &flag, &sender));
+        let apply = cx.spawn(async move |this, cx| {
+            while let Ok(changed) = changes.recv().await {
+                if this
+                    .update(cx, |this, cx| this.apply_changes(changed, cx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        ServerWatch {
+            stop,
+            _apply: apply,
+        }
+    }
+
+    /// List again the shown folders `changed` touches: a changed path's
+    /// folder (an entry came, went or changed there) and the path itself
+    /// when it is a shown folder. Changes inside `.git` show nowhere.
+    fn apply_changes(&mut self, changed: Changed, cx: &mut Context<Self>) {
+        let paths = match changed {
+            Changed::All => return self.reload_listings(cx),
+            Changed::Paths(paths) => paths,
+        };
+        let in_git = |path: &Path| {
+            path.strip_prefix(&self.root).is_ok_and(|rel| {
+                rel.components()
+                    .any(|c| c == Component::Normal(".git".as_ref()))
+            })
+        };
+        let dirs: HashSet<PathBuf> = paths
+            .iter()
+            .filter(|path| !in_git(path))
+            .flat_map(|path| [path.to_path_buf(), parent_of(path)])
+            .collect();
+        self.reload_dirs(dirs, cx);
     }
 
     fn refresh_git(&mut self, cx: &mut Context<Self>) {
-        if self.on_server() {
+        if !self.offered.git {
             return;
         }
         let job = self.git_job();
@@ -383,9 +513,6 @@ impl FileTreeView {
     }
 
     fn load_dir(&mut self, dir: PathBuf, cx: &mut Context<Self>) {
-        if self.on_server() {
-            return;
-        }
         let show_ignored = self.show_ignored;
         cx.spawn(async move |this, cx| {
             let listed = dir.clone();
@@ -660,14 +787,18 @@ impl FileTreeView {
         }
     }
 
+    /// This computer's app for the file; nothing for a server's file (no app
+    /// here can open it).
     fn open_with_default_app(
         &mut self,
         _: &OpenWithDefaultApp,
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let (path, _) = self.target();
-        cx.open_with_system(&path);
+        if !self.server {
+            let (path, _) = self.target();
+            cx.open_with_system(&path);
+        }
     }
 
     fn insert_path(&mut self, _: &InsertPath, _: &mut Window, cx: &mut Context<Self>) {
@@ -691,9 +822,12 @@ impl FileTreeView {
         )));
     }
 
+    /// The entry in this computer's file manager; nothing for a server's.
     fn reveal(&mut self, _: &RevealInFinder, _: &mut Window, cx: &mut Context<Self>) {
-        let (path, _) = self.target();
-        cx.reveal_path(&path);
+        if !self.server {
+            let (path, _) = self.target();
+            cx.reveal_path(&path);
+        }
     }
 
     fn new_file(&mut self, _: &NewFile, window: &mut Window, cx: &mut Context<Self>) {
@@ -733,8 +867,8 @@ impl FileTreeView {
         self.run(
             vec![parent],
             move || {
-                let dest = ops::copy_name(&path, is_dir, |p| p.symlink_metadata().is_ok());
-                ops::copy_all(&path, &dest)
+                let dest = ops::copy_name(&path, is_dir, backend::fs::entry_exists);
+                backend::fs::copy_all(&path, &dest)
                     .map(|_| dest)
                     .map_err(|e| format!("Couldn't duplicate “{}”: {e}", file_name(&path)))
             },
@@ -775,17 +909,18 @@ impl FileTreeView {
         self.run(
             dirs,
             move || {
-                let exists = |p: &Path| p.symlink_metadata().is_ok();
+                let exists = backend::fs::entry_exists;
                 if !exists(&source) {
                     return Err(format!("“{}” no longer exists", file_name(&source)));
                 }
+                let source_is_dir = backend::fs::is_dir(&source);
                 let Some(dest) =
-                    ops::paste_destination(&source, source.is_dir(), &into, mode, exists)?
+                    ops::paste_destination(&source, source_is_dir, &into, mode, exists)?
                 else {
                     return Ok(None);
                 };
                 match mode {
-                    ClipMode::Copy => ops::copy_all(&source, &dest),
+                    ClipMode::Copy => backend::fs::copy_all(&source, &dest),
                     ClipMode::Cut => ops::move_entry(&source, &dest),
                 }
                 .map_err(|e| format!("Couldn't paste “{}”: {e}", file_name(&source)))?;
@@ -811,10 +946,44 @@ impl FileTreeView {
         );
     }
 
+    /// Into the Trash; on a server, which has none, deleted for good once
+    /// confirmed.
     fn move_to_trash(&mut self, _: &MoveToTrash, window: &mut Window, cx: &mut Context<Self>) {
         let Some((path, _)) = self.target_entry() else {
             return;
         };
+        if self.server {
+            self.confirm_delete(path, window, cx);
+        } else {
+            self.remove_entry(path, window, cx);
+        }
+    }
+
+    /// Ask before deleting `path` on a server for good.
+    fn confirm_delete(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let title = format!("Delete \u{201c}{}\u{201d}?", file_name(&path));
+        let this = cx.entity().downgrade();
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let (this, path) = (this.clone(), path.clone());
+            alert
+                .title(title.clone())
+                .description(
+                    "The server has no Trash: it is deleted for good. This can't be undone.",
+                )
+                .ok_text("Delete")
+                .ok_variant(ButtonVariant::Danger)
+                .show_cancel(true)
+                .on_ok(move |_, window, cx| {
+                    let path = path.clone();
+                    let _ = this.update(cx, |this, cx| this.remove_entry(path, window, cx));
+                    true
+                })
+        });
+    }
+
+    /// Move `path` to the Trash (on a server: delete it) and select the row
+    /// that takes its place.
+    fn remove_entry(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         let parent = parent_of(&path);
         // Keep the place in the list: the next row, else the previous one.
         let next = self.row_index(&path).and_then(|ix| {
@@ -828,12 +997,19 @@ impl FileTreeView {
                 _ => None,
             }
         });
+        let server = self.server;
         self.run(
             vec![parent],
             move || {
-                ops::trash(&path)
-                    .map(|_| path.clone())
-                    .map_err(|e| format!("Couldn't move “{}” to the Trash: {e}", file_name(&path)))
+                if server {
+                    backend::fs::remove_all(&path)
+                        .map(|_| path.clone())
+                        .map_err(|e| format!("Couldn't delete “{}”: {e}", file_name(&path)))
+                } else {
+                    ops::trash(&path).map(|_| path.clone()).map_err(|e| {
+                        format!("Couldn't move “{}” to the Trash: {e}", file_name(&path))
+                    })
+                }
             },
             move |this, path, _, cx| {
                 this.forget(&path);
@@ -1016,7 +1192,7 @@ impl FileTreeView {
                 self.run(
                     vec![parent_of(&from)],
                     move || {
-                        ops::rename(&from, &to)
+                        backend::fs::rename(&from, &to)
                             .map(|_| (from.clone(), to))
                             .map_err(|e| format!("Couldn't rename “{}”: {e}", file_name(&from)))
                     },
@@ -1296,7 +1472,8 @@ impl FileTreeView {
 
     /// The right-click menu for the target entry, Tern's layout: open,
     /// paths, reveal, edit, trash. Items dispatch the tree's actions, so the
-    /// shortcuts show beside them.
+    /// shortcuts show beside them. A server's entry has no app or file
+    /// manager here, and is deleted instead of trashed.
     fn context_menu(&self, menu: PopupMenu, rem_size: Pixels) -> PopupMenu {
         let (_, is_dir) = self.target();
         let entry = self.target_entry().is_some();
@@ -1316,7 +1493,8 @@ impl FileTreeView {
                     Box::new(NewFolder),
                 ))
         } else {
-            menu.item(item("Open", IconName::File, Box::new(Open)))
+            let menu = menu
+                .item(item("Open", IconName::File, Box::new(Open)))
                 .item(item(
                     "Open to the Side",
                     IconName::Columns2,
@@ -1326,12 +1504,16 @@ impl FileTreeView {
                     "Open in New Tab",
                     IconName::Plus,
                     Box::new(OpenInNewTab),
-                ))
-                .item(item(
+                ));
+            if self.server {
+                menu
+            } else {
+                menu.item(item(
                     "Open with Default App",
                     IconName::ArrowUpRight,
                     Box::new(OpenWithDefaultApp),
                 ))
+            }
         };
         let menu = menu
             .separator()
@@ -1346,13 +1528,17 @@ impl FileTreeView {
                 IconName::Copy,
                 Box::new(CopyRelativePath),
             ))
-            .separator()
-            .item(item(
+            .separator();
+        let menu = if self.server {
+            menu
+        } else {
+            menu.item(item(
                 REVEAL,
                 IconName::FolderInput,
                 Box::new(RevealInFinder),
             ))
-            .separator();
+            .separator()
+        };
         let menu = if entry {
             menu.item(item("Rename…", IconName::Pencil, Box::new(Rename)))
                 .item(item("Duplicate", IconName::CopyPlus, Box::new(Duplicate)))
@@ -1366,17 +1552,20 @@ impl FileTreeView {
                 .disabled(self.clipboard.is_none()),
         );
         if entry {
-            menu.separator().item(item(
-                "Move to Trash",
-                IconName::Trash,
-                Box::new(MoveToTrash),
-            ))
+            let delete = if self.server {
+                "Delete…"
+            } else {
+                "Move to Trash"
+            };
+            menu.separator()
+                .item(item(delete, IconName::Trash, Box::new(MoveToTrash)))
         } else {
             menu
         }
     }
 
-    /// The ⋯ menu: view options for the whole tree.
+    /// The ⋯ menu: view options for the whole tree (a server's folder has no
+    /// file manager or code editor here).
     fn more_menu(&self, menu: PopupMenu, tree: WeakEntity<Self>, rem_size: Pixels) -> PopupMenu {
         let act = |f: fn(&mut Self, &mut Context<Self>)| {
             let tree = tree.clone();
@@ -1396,8 +1585,11 @@ impl FileTreeView {
                 PopupMenuItem::new("Collapse All")
                     .icon(Icon::new(IconName::ChevronsDownUp))
                     .on_click(act(Self::collapse_all)),
-            )
-            .item(
+            );
+        let menu = if self.server {
+            menu
+        } else {
+            menu.item(
                 PopupMenuItem::new(REVEAL)
                     .icon(Icon::new(IconName::FolderInput))
                     .on_click({
@@ -1405,8 +1597,10 @@ impl FileTreeView {
                         move |_, _, cx| cx.reveal_path(&root)
                     }),
             )
-            .separator();
-        let menu = self.ides.iter().fold(menu, |menu, ide| {
+        }
+        .separator();
+        let editors: &[ides::Installed] = if self.server { &[] } else { &self.ides };
+        let menu = editors.iter().fold(menu, |menu, ide| {
             let (ide, root) = (ide.clone(), root.clone());
             menu.item(
                 PopupMenuItem::new(format!("Open in {}", ide.name))
@@ -1421,7 +1615,7 @@ impl FileTreeView {
                     }),
             )
         });
-        let menu = if self.ides.is_empty() {
+        let menu = if editors.is_empty() {
             menu
         } else {
             menu.separator()
@@ -1495,8 +1689,7 @@ impl FileTreeView {
 
 impl Render for FileTreeView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let server = self.on_server();
-        let files = self.tab == Tab::Files && !server;
+        let files = self.tab == Tab::Files && self.offered.files;
         let tree = cx.entity().downgrade();
         let header = h_flex()
             .h(rems(40. / 16.))
@@ -1665,14 +1858,16 @@ impl Render for FileTreeView {
             .size_full()
             .min_h_0()
             .child(header)
-            .when(!server, |d| d.child(tabs))
+            .child(tabs)
             .children(search)
             .child(match self.tab {
-                _ if server => empty_state(
-                    IconName::Server,
-                    crate::features::backend::server::UNAVAILABLE,
-                )
-                .into_any_element(),
+                // A server whose `gentle-shell serve` predates what this tab needs.
+                Tab::Files if !self.offered.files => {
+                    empty_state(IconName::Server, server::UNAVAILABLE).into_any_element()
+                }
+                Tab::Changes | Tab::Branches if !self.offered.git => {
+                    empty_state(IconName::Server, server::UNAVAILABLE).into_any_element()
+                }
                 Tab::Files => self.render_files(cx),
                 Tab::Changes => div()
                     .flex_1()
@@ -1745,6 +1940,51 @@ fn paths(state: &GitState) -> Vec<&str> {
 
 fn show_toplevel(root: &Path) -> Option<PathBuf> {
     crate::features::git::toplevel(root)
+}
+
+/// Follow `root`'s changes on its Gentle Shell server, sending them to
+/// `changes` as they come, until `stop` is set or nobody listens. A dropped
+/// stream connects again after [`WATCH_RETRY`], waiting twice as long after
+/// each failure (up to [`WATCH_RETRY_MAX`]); once back, everything is looked
+/// at again, since changes meanwhile went unseen. Blocking: a thread's own.
+fn follow_server(root: &Path, stop: &AtomicBool, changes: &async_channel::Sender<Changed>) {
+    let mut retry = WATCH_RETRY;
+    let mut missed = false;
+    while !stop.load(Ordering::Acquire) {
+        let stream = server::at(root)
+            .and_then(Result::ok)
+            .and_then(|client| client.fs_watch(&backend::fs::server_path(root)).ok());
+        if let Some(mut stream) = stream {
+            while let Some(event) = stream.next(stop) {
+                let changed = match event {
+                    WatchEvent::Ready => {
+                        retry = WATCH_RETRY;
+                        if !std::mem::take(&mut missed) {
+                            continue;
+                        }
+                        Changed::All
+                    }
+                    WatchEvent::Changes { overflow: true, .. } => Changed::All,
+                    WatchEvent::Changes { paths, .. } => {
+                        Changed::Paths(paths.into_iter().map(PathBuf::from).collect())
+                    }
+                    WatchEvent::Error(_) => break,
+                };
+                if changes.send_blocking(changed).is_err() {
+                    return;
+                }
+            }
+        }
+        missed = true;
+        let until = Instant::now() + retry;
+        while Instant::now() < until {
+            if stop.load(Ordering::Acquire) || changes.is_closed() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        retry = (retry * 2).min(WATCH_RETRY_MAX);
+    }
 }
 
 /// What a click on a tree row does, by click count.

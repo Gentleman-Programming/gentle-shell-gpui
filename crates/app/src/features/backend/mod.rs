@@ -2,9 +2,11 @@
 //! `settings.json`, the WSL distro a project folder implies, that
 //! environment's login PATH and Gentle Shell homes, the WSL distros on this
 //! computer, and what runs through it: `gentle-shell` (agent tabs and its
-//! commands), terminals and `git`. A Gentle Shell server ([`server`]) runs
-//! only its sessions: everything else answers [`server::UNAVAILABLE`] there.
+//! commands), terminals, files ([`fs`]) and `git`. On a Gentle Shell server
+//! ([`server`]) sessions, files, git and terminals go through its API; what
+//! a server doesn't offer answers [`server::UNAVAILABLE`].
 
+pub mod fs;
 pub mod server;
 
 use std::collections::{HashMap, HashSet};
@@ -63,10 +65,9 @@ pub fn for_tab(cwd: &Path) -> Backend {
     Backend::for_folder(&cwd.to_string_lossy()).unwrap_or_else(saved)
 }
 
-/// Whether work rooted at `cwd` runs on a Gentle Shell server, where the
-/// app has no terminals, files, git or Setup (only agent sessions): the
-/// views that read a folder show [`server::UNAVAILABLE`] instead of
-/// reading this computer's.
+/// Whether work rooted at `cwd` runs on a Gentle Shell server, where its
+/// files, git and terminals are the server's (through its API), never this
+/// computer's.
 pub fn on_server(cwd: &Path) -> bool {
     for_tab(cwd).is_server()
 }
@@ -94,7 +95,7 @@ pub fn launch_spec(
 ) -> Result<pi_rpc::LaunchSpec> {
     // A server starts its sessions itself (`PiProcess::serve`).
     if choice.is_server() {
-        return Err(anyhow!(server::UNAVAILABLE));
+        return Err(anyhow!(server::NOT_ON_SERVER));
     }
     let folder = reach(choice, cwd)?;
     let Some(launch) = choice.launch(&folder) else {
@@ -239,7 +240,7 @@ pub fn put_dir(choice: &Backend, dir: &Path, there: &str) -> Result<(), String> 
 /// Why `choice` can't run something there: it is this computer, or a server.
 fn no_runner(choice: &Backend) -> String {
     if choice.is_server() {
-        server::UNAVAILABLE.to_string()
+        server::NOT_ON_SERVER.to_string()
     } else {
         "Agents run on this computer.".to_string()
     }
@@ -333,33 +334,147 @@ pub fn home_shell_spec() -> Result<pi_rpc::LaunchSpec> {
 }
 
 /// `git` for the repository at `cwd`, run where `cwd`'s agents run (in a
-/// WSL distro instead of over `\\wsl.localhost`, which is slow), with `env`
-/// set; the caller adds the arguments. A folder the backend can't reach
-/// runs on this computer, the only place that can read it. On a Gentle
-/// Shell server nothing runs: [`server::UNAVAILABLE`].
-pub fn git(cwd: &Path, env: &[(&str, &str)]) -> std::io::Result<Command> {
-    let choice = for_tab(cwd);
-    if choice.is_server() {
-        return Err(std::io::Error::other(server::UNAVAILABLE));
+/// WSL distro instead of over `\\wsl.localhost`, which is slow; on a Gentle
+/// Shell server through `POST /api/git`), with `env` set; the caller adds
+/// the arguments and runs it ([`Git::output`]). A folder the backend can't
+/// reach runs on this computer, the only place that can read it.
+pub fn git(cwd: &Path, env: &[(&str, &str)]) -> Git {
+    Git {
+        cwd: cwd.to_path_buf(),
+        env: env
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+        args: Vec::new(),
+        clean: false,
     }
-    let launch = reach(&choice, cwd)
-        .ok()
-        .and_then(|folder| choice.launch(&folder));
-    match launch.as_deref() {
-        Some([program, args @ ..]) => {
-            let mut command = pi_rpc::command(program);
-            command
-                .args(args)
-                .arg("env")
-                .args(env.iter().map(|(key, value)| format!("{key}={value}")))
-                .arg("git");
-            Ok(command)
+}
+
+/// One `git` command, built by [`git`].
+pub struct Git {
+    cwd: PathBuf,
+    env: Vec<(String, String)>,
+    args: Vec<String>,
+    /// Leave out the `GIT_DIR`-style variables this app inherited.
+    clean: bool,
+}
+
+/// What a `git` command printed, and whether it succeeded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitOutput {
+    pub success: bool,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+}
+
+/// The variables a server lets a client set for git; it sets
+/// `GIT_TERMINAL_PROMPT=0` itself.
+const SERVER_GIT_ENV: [&str; 18] = [
+    "GIT_AUTHOR_NAME",
+    "GIT_AUTHOR_EMAIL",
+    "GIT_AUTHOR_DATE",
+    "GIT_COMMITTER_NAME",
+    "GIT_COMMITTER_EMAIL",
+    "GIT_COMMITTER_DATE",
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_NAMESPACE",
+    "GIT_LITERAL_PATHSPECS",
+    "GIT_GLOB_PATHSPECS",
+    "GIT_NOGLOB_PATHSPECS",
+    "GIT_ICASE_PATHSPECS",
+    "GIT_REFLOG_ACTION",
+    "GIT_MERGE_AUTOEDIT",
+    "GIT_MERGE_VERBOSITY",
+    "GIT_OPTIONAL_LOCKS",
+];
+
+impl Git {
+    pub fn args<I, S>(&mut self, args: I) -> &mut Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        self.args
+            .extend(args.into_iter().map(|a| a.as_ref().to_string()));
+        self
+    }
+
+    /// Without the `GIT_DIR`, `GIT_WORK_TREE`, `GIT_COMMON_DIR` and
+    /// `GIT_INDEX_FILE` this app may have inherited (a server never passes
+    /// its own on).
+    pub fn clean_env(&mut self) -> &mut Self {
+        self.clean = true;
+        self
+    }
+
+    /// Run it, without input, to its end. On a server a failure to reach
+    /// it is the error, in words.
+    pub fn output(&self) -> std::io::Result<GitOutput> {
+        let choice = for_tab(&self.cwd);
+        if choice.is_server() {
+            if !server::offers(&choice, "git") {
+                return Err(std::io::Error::other(server::UNAVAILABLE));
+            }
+            let client = server::client(&choice).map_err(std::io::Error::other)?;
+            let env: Vec<(String, String)> = self
+                .env
+                .iter()
+                .filter(|(k, _)| SERVER_GIT_ENV.contains(&k.as_str()))
+                .cloned()
+                .collect();
+            let out = client
+                .git(&self.cwd.to_string_lossy(), &self.args, &env, None)
+                .map_err(fs::io_error)?;
+            return Ok(GitOutput {
+                success: out.success(),
+                stdout: out.stdout,
+                stderr: out.stderr,
+            });
         }
-        _ => {
-            let mut command = pi_rpc::command("git");
-            command.current_dir(cwd).envs(env.iter().copied());
-            Ok(command)
+        let launch = reach(&choice, &self.cwd)
+            .ok()
+            .and_then(|folder| choice.launch(&folder));
+        let mut command = match launch.as_deref() {
+            Some([program, args @ ..]) => {
+                let mut command = pi_rpc::command(program);
+                command
+                    .args(args)
+                    .arg("env")
+                    .args(self.env.iter().map(|(key, value)| format!("{key}={value}")))
+                    .arg("git");
+                command
+            }
+            _ => {
+                let mut command = pi_rpc::command("git");
+                command
+                    .current_dir(&self.cwd)
+                    .envs(self.env.iter().map(|(k, v)| (k, v)));
+                command
+            }
+        };
+        if self.clean {
+            for name in [
+                "GIT_DIR",
+                "GIT_WORK_TREE",
+                "GIT_COMMON_DIR",
+                "GIT_INDEX_FILE",
+            ] {
+                command.env_remove(name);
+            }
         }
+        let out = command
+            .args(&self.args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()?;
+        Ok(GitOutput {
+            success: out.status.success(),
+            stdout: out.stdout,
+            stderr: out.stderr,
+        })
     }
 }
 

@@ -17,6 +17,7 @@ fn sample() -> SavedState {
             url: "http://127.0.0.1:8787".into(),
             id: "ses_1".into(),
         }),
+        terminal: None,
     };
     let terminal = SavedPane {
         kind: PaneKind::Terminal,
@@ -24,6 +25,7 @@ fn sample() -> SavedState {
         path: None,
         session: None,
         server: None,
+        terminal: Some("t_abc123".into()),
     };
     let file = SavedPane {
         kind: PaneKind::File,
@@ -31,6 +33,7 @@ fn sample() -> SavedState {
         path: Some(PathBuf::from("/tmp/project/README.md")),
         session: None,
         server: None,
+        terminal: None,
     };
     SavedState {
         version: VERSION,
@@ -155,6 +158,25 @@ fn json_round_trip() {
     assert_eq!(old.tabs_sidebar_width, 260.);
     assert_eq!(old.files_sidebar_width, 260.);
     assert_eq!(SavedState::default().sidebar, minimal.sidebar);
+}
+
+/// A server terminal pane keeps its terminal's id; a pane saved before
+/// terminals ran on servers (no `terminal` key) loads without one, and a pane
+/// without one writes none.
+#[test]
+fn terminal_panes_keep_their_server_terminal() {
+    let json = serde_json::to_value(sample()).unwrap();
+    let terminal =
+        &json["workspaces"][1]["tabs"][0]["layout"]["split"]["second"]["split"]["first"]["leaf"];
+    assert_eq!(terminal["terminal"], "t_abc123");
+    let agent = &json["workspaces"][0]["tabs"][0]["layout"]["leaf"];
+    assert_eq!(agent["kind"], "agent");
+    assert!(agent.get("terminal").is_none());
+    let old: SavedPane =
+        serde_json::from_str(r#"{"kind":"terminal","cwd":"/home/ana/proj"}"#).unwrap();
+    assert_eq!(old.terminal, None);
+    let back: SavedPane = serde_json::from_value(terminal.clone()).unwrap();
+    assert_eq!(back.terminal.as_deref(), Some("t_abc123"));
 }
 
 /// The tabs sidebar's width saved as `sidebar_width` (before the Files
