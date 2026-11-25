@@ -106,6 +106,7 @@ mod background;
 mod binding;
 mod changes;
 mod definitions;
+mod host_tools;
 mod output;
 mod review;
 mod session_state;
@@ -127,6 +128,13 @@ pub use changes::{ChangeDiff, ChangeRoot, ChangeStatus, ChangedFile, Changes};
 pub use definitions::{
     AgentDefinition, AgentDefinitionProblems, AgentDefinitionScope, AgentDefinitionSource,
     AgentDefinitions, DefaultOrchestrator, OrchestratorStatus, SubagentDefaults,
+};
+pub use host_tools::{
+    HOST_TOOL_CALL, HOST_TOOL_CANCEL, HostTool, HostToolCall, HostToolCancel, HostToolContent,
+    HostToolResultAck, MAX_DESCRIPTION_CHARS, MAX_GUIDELINE_CHARS, MAX_GUIDELINES,
+    MAX_HOST_TOOL_RESULT_BYTES, MAX_HOST_TOOLS, MAX_LABEL_CHARS, MAX_PARAMETERS_BYTES,
+    MAX_PROVIDER_CHARS, MAX_RESULT_CONTENT_BYTES, MAX_SET_HOST_TOOLS_BYTES, RejectedHostTool,
+    SetHostToolsResult, valid_tool_name,
 };
 pub use output::{JobOutput, SubagentThread, ThreadItem};
 pub use review::{
@@ -209,13 +217,15 @@ pub enum DesktopMethod {
     ClearProfileBinding,
     GetAuthStatus,
     ReloadCredentials,
+    SetHostTools,
+    HostToolResult,
 }
 
 impl DesktopMethod {
     /// Every method this client knows, in the order `capabilities` lists
     /// them on Gentle Shell 5.0.0. Which ones a peer offers is only what its
     /// `capabilities` say: Gentle Shell 4.8.0 offers fourteen of them.
-    pub const ALL: [Self; 32] = [
+    pub const ALL: [Self; 34] = [
         Self::Capabilities,
         Self::GetSnapshot,
         Self::GetConfig,
@@ -248,6 +258,8 @@ impl DesktopMethod {
         Self::ClearProfileBinding,
         Self::GetAuthStatus,
         Self::ReloadCredentials,
+        Self::SetHostTools,
+        Self::HostToolResult,
     ];
 
     /// The wire name of the method.
@@ -285,6 +297,18 @@ impl DesktopMethod {
             Self::ClearProfileBinding => "clear_profile_binding",
             Self::GetAuthStatus => "get_auth_status",
             Self::ReloadCredentials => "reload_credentials",
+            Self::SetHostTools => "set_host_tools",
+            Self::HostToolResult => "host_tool_result",
+        }
+    }
+
+    /// The largest inner request of this method, in bytes: host tool
+    /// results carry screenshots and registrations carry schemas.
+    pub fn max_request_bytes(self) -> usize {
+        match self {
+            Self::HostToolResult => MAX_HOST_TOOL_RESULT_BYTES,
+            Self::SetHostTools => MAX_SET_HOST_TOOLS_BYTES,
+            _ => MAX_REQUEST_BYTES,
         }
     }
 
@@ -306,6 +330,8 @@ impl DesktopMethod {
                 | Self::GetChangeDiff
                 | Self::SetReviewMode
                 | Self::SetBackgroundSubagents
+                | Self::SetHostTools
+                | Self::HostToolResult
         )
     }
 
@@ -344,6 +370,8 @@ impl DesktopMethod {
             "clear_profile_binding" => Ok(Self::ClearProfileBinding),
             "get_auth_status" => Ok(Self::GetAuthStatus),
             "reload_credentials" => Ok(Self::ReloadCredentials),
+            "set_host_tools" => Ok(Self::SetHostTools),
+            "host_tool_result" => Ok(Self::HostToolResult),
             other => Err(DesktopRpcError::UnsupportedMethod(other.to_string())),
         }
     }
@@ -925,6 +953,37 @@ impl DesktopRequest {
         )
     }
 
+    /// The `set_host_tools` request: `provider`'s whole set of host tools
+    /// (an empty list unregisters it), each validated against the
+    /// contract's limits. A Gentle Shell server overwrites `provider` with
+    /// the calling device's id.
+    pub fn set_host_tools(
+        request_id: impl Into<String>,
+        provider: &str,
+        tools: &[HostTool],
+    ) -> Result<Self, DesktopRpcError> {
+        Self::build(
+            request_id,
+            DesktopMethod::SetHostTools,
+            host_tools::set_host_tools_params(provider, tools)?,
+        )
+    }
+
+    /// The `host_tool_result` request answering `call_id`; `is_error` is sent
+    /// only when true. Content over [`MAX_RESULT_CONTENT_BYTES`] is refused.
+    pub fn host_tool_result(
+        request_id: impl Into<String>,
+        call_id: &str,
+        content: &[HostToolContent],
+        is_error: bool,
+    ) -> Result<Self, DesktopRpcError> {
+        Self::build(
+            request_id,
+            DesktopMethod::HostToolResult,
+            host_tools::host_tool_result_params(call_id, content, is_error)?,
+        )
+    }
+
     /// A request for a known method, validated against the id and size limits
     /// before anything reaches the transport. The config methods are refused
     /// here: their params come only from [`Self::get_config`] and
@@ -961,10 +1020,11 @@ impl DesktopRequest {
             params: &params,
         })
         .map_err(|error| DesktopRpcError::MalformedPayload(error.to_string()))?;
-        if payload.len() > MAX_REQUEST_BYTES {
+        let limit = method.max_request_bytes();
+        if payload.len() > limit {
             return Err(DesktopRpcError::RequestTooLarge {
                 bytes: payload.len(),
-                limit: MAX_REQUEST_BYTES,
+                limit,
             });
         }
         Ok(Self {
@@ -1271,6 +1331,16 @@ impl DesktopResponse {
         ReloadCredentials::from_data(self.data()?)
     }
 
+    /// The response to `set_host_tools`.
+    pub fn set_host_tools(&self) -> Result<SetHostToolsResult, DesktopRpcError> {
+        SetHostToolsResult::from_data(self.data()?)
+    }
+
+    /// The response to `host_tool_result`.
+    pub fn host_tool_result(&self) -> Result<HostToolResultAck, DesktopRpcError> {
+        HostToolResultAck::from_data(self.data()?)
+    }
+
     fn data(&self) -> Result<&Value, DesktopRpcError> {
         self.result
             .as_ref()
@@ -1357,6 +1427,20 @@ impl DesktopEvent {
     pub fn profile_binding_changed(&self) -> Result<ProfileBindingChanged, DesktopRpcError> {
         expect_event(self, "profile_binding_changed")?;
         ProfileBindingChanged::from_data(&self.data)
+    }
+
+    /// Decode the data of a `host_tool_call` event, verifying the exact event
+    /// name before the shape, exactly like [`Self::agents_update`].
+    pub fn host_tool_call(&self) -> Result<HostToolCall, DesktopRpcError> {
+        expect_event(self, HOST_TOOL_CALL)?;
+        HostToolCall::from_data(&self.data)
+    }
+
+    /// Decode the data of a `host_tool_cancel` event, verifying the exact
+    /// event name before the shape.
+    pub fn host_tool_cancel(&self) -> Result<HostToolCancel, DesktopRpcError> {
+        expect_event(self, HOST_TOOL_CANCEL)?;
+        HostToolCancel::from_data(&self.data)
     }
 }
 
@@ -4073,6 +4157,12 @@ impl DesktopSession {
 pub fn decode_payload(payload: &str) -> Result<DesktopRecord, DesktopRpcError> {
     let value: Value = serde_json::from_str(payload)
         .map_err(|error| DesktopRpcError::MalformedPayload(error.to_string()))?;
+    decode_value(value)
+}
+
+/// Decode one inner record already parsed as JSON (the body a Gentle Shell
+/// server's `/desktop` endpoint answers with).
+pub fn decode_value(value: Value) -> Result<DesktopRecord, DesktopRpcError> {
     if !value.is_object() {
         return Err(DesktopRpcError::MalformedPayload(
             "record must be a JSON object".into(),

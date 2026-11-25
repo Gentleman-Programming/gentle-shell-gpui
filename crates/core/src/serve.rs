@@ -841,6 +841,12 @@ impl Stream {
                     None => Step::Ignore,
                 }
             }
+            // A host tool call still waiting for this device that the replay
+            // didn't carry: the original record, re-sent without an `id` (it
+            // never moves the cursor). The app answers each call once.
+            Some("host_tool_call") => {
+                serde_json::from_str::<Value>(&event.data).map_or(Step::Ignore, Step::Record)
+            }
             _ => Step::Ignore,
         }
     }
@@ -1079,6 +1085,24 @@ mod tests {
             id: None,
             data: data.to_string(),
         }
+    }
+
+    #[test]
+    fn a_re_sent_host_tool_call_is_a_record_that_leaves_the_cursor() {
+        let mut stream = Stream::default();
+        let record = json!({"type": "extension_ui_request", "id": "w1", "method": "setWidget"});
+        stream.step(&message(5, json!({"type": "agent_start"})));
+        assert_eq!(
+            stream.step(&named("host_tool_call", record.clone())),
+            Step::Record(record)
+        );
+        assert_eq!(stream.after(), Some(5));
+        let broken = SseEvent {
+            event: Some("host_tool_call".into()),
+            id: None,
+            data: "not json".into(),
+        };
+        assert_eq!(stream.step(&broken), Step::Ignore);
     }
 
     #[test]

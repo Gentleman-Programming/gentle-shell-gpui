@@ -591,11 +591,15 @@ impl SessionView {
     fn expire_desktop(&mut self, generation: u64, method: DesktopMethod, cx: &mut Context<Self>) {
         match method {
             // The core channel, and `get_changes`/`get_change_diff`, which
-            // the app no longer sends: a timer for either is the channel's.
+            // the app no longer sends, and the host tool methods, which go
+            // to a server's `/desktop` and never through this slot: a timer
+            // for any of them is the channel's.
             DesktopMethod::Capabilities
             | DesktopMethod::GetSnapshot
             | DesktopMethod::GetChanges
-            | DesktopMethod::GetChangeDiff => {
+            | DesktopMethod::GetChangeDiff
+            | DesktopMethod::SetHostTools
+            | DesktopMethod::HostToolResult => {
                 let sends = self.desktop.expire(generation);
                 self.send_desktop(sends, cx);
             }
@@ -670,7 +674,9 @@ impl SessionView {
             DesktopMethod::Capabilities
             | DesktopMethod::GetSnapshot
             | DesktopMethod::GetChanges
-            | DesktopMethod::GetChangeDiff => {
+            | DesktopMethod::GetChangeDiff
+            | DesktopMethod::SetHostTools
+            | DesktopMethod::HostToolResult => {
                 let applied = self.desktop.outer(generation, handled);
                 self.apply_desktop(applied, cx);
             }

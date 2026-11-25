@@ -33,6 +33,8 @@ struct State {
     running: bool,
     /// The pairing code was used.
     paired: bool,
+    /// Every `/desktop` body, in order.
+    desktop: Vec<Value>,
 }
 
 #[derive(Clone)]
@@ -196,6 +198,35 @@ impl Fake {
                 &json!({"error": {"code": "not_found", "message": "No such session"}}),
             ),
             ("POST", "/api/sessions/ses_1/rpc") => self.rpc(&mut stream, body),
+            ("POST", "/api/sessions/ses_1/desktop") => {
+                self.state.lock().unwrap().desktop.push(body.clone());
+                let answer = |ok: bool, data: Value| {
+                    let mut answer = json!({"schema": "gentle-shell.desktop-rpc/v1", "kind": "response", "requestId": "serve-desktop-1", "ok": ok});
+                    answer[if ok { "data" } else { "error" }] = data;
+                    answer
+                };
+                match (body["method"].as_str(), body["params"]["callId"].as_str()) {
+                    (Some("set_host_tools"), _) => reply(
+                        &mut stream,
+                        200,
+                        &answer(true, json!({"registered": ["open_page"], "rejected": []})),
+                    ),
+                    (_, Some("foreign")) => reply(
+                        &mut stream,
+                        403,
+                        &json!({"error": {"code": "forbidden", "message": "Another device provides that call"}}),
+                    ),
+                    (_, Some("done")) => reply(
+                        &mut stream,
+                        200,
+                        &answer(
+                            false,
+                            json!({"code": "already_answered", "message": "answered"}),
+                        ),
+                    ),
+                    _ => reply(&mut stream, 200, &answer(true, json!({"accepted": true}))),
+                }
+            }
             ("GET", "/api/sessions/ses_1/events") => self.subscribe(stream, query),
             _ => reply(&mut stream, 404, &json!({"error": {"code": "not_found"}})),
         }
@@ -392,6 +423,72 @@ fn the_app_quitting_leaves_the_session_for_the_next_launch() {
             .count(),
         2
     );
+    process.detach();
+}
+
+#[test]
+fn host_tool_requests_go_to_the_desktop_endpoint_and_calls_arrive_in_the_stream() {
+    use pi_rpc::desktop_rpc::{DesktopRequest, HostTool, HostToolContent};
+    let fake = Fake::start();
+    let (process, rx) = PiProcess::serve(fake.client(), "/srv/project", None, None).unwrap();
+    fake.wait_for("the stream", |s| !s.subscribers.is_empty());
+    let tool = HostTool {
+        name: "open_page".into(),
+        label: "Open page".into(),
+        description: "Open a page".into(),
+        parameters: json!({"type": "object"}),
+        guidelines: Vec::new(),
+    };
+    let request = DesktopRequest::set_host_tools("host-1", "desktop", &[tool]).unwrap();
+    let answer = process.desktop(&request).unwrap();
+    assert_eq!(
+        answer.set_host_tools().unwrap().registered,
+        vec!["open_page"]
+    );
+    let body = fake.state.lock().unwrap().desktop[0].clone();
+    assert_eq!(body["method"], "set_host_tools");
+    assert_eq!(body["params"]["provider"], "desktop");
+    // Nothing went through /rpc.
+    assert!(!fake.log().iter().any(|l| l.ends_with("/rpc")));
+
+    let result = |call: &str| {
+        DesktopRequest::host_tool_result("host-2", call, &[HostToolContent::text("ok")], false)
+            .unwrap()
+    };
+    assert!(
+        process
+            .desktop(&result("c1"))
+            .unwrap()
+            .host_tool_result()
+            .unwrap()
+            .accepted
+    );
+    let answered = process.desktop(&result("done")).unwrap();
+    assert_eq!(answered.error().unwrap().code, "already_answered");
+    // Another device's call: refused by the server, never "answered".
+    assert!(process.desktop(&result("foreign")).is_err());
+
+    // A call the replay didn't carry is re-sent as a named frame: it reaches
+    // the tab like any record.
+    let line = json!({"schema": "gentle-shell.desktop-rpc/v1", "kind": "event", "seq": 1, "event": "host_tool_call", "data": {"callId": "c2", "provider": "dev_1", "tool": "open_page", "args": {}}}).to_string();
+    let record = json!({"type": "extension_ui_request", "id": "w9", "method": "setWidget", "widgetKey": "gentle-desktop-rpc", "widgetLines": [line]});
+    {
+        let mut state = fake.state.lock().unwrap();
+        let frame = format!("event: host_tool_call\ndata: {record}\n\n");
+        state
+            .subscribers
+            .retain_mut(|sub| sub.write_all(frame.as_bytes()).is_ok());
+    }
+    let mut stderr = Vec::new();
+    let Incoming::Ui(request) = next(&rx, &mut stderr) else {
+        panic!("expected the re-sent call")
+    };
+    let Some(pi_rpc::desktop_rpc::DesktopRecord::Event(event)) =
+        pi_rpc::desktop_rpc::decode_widget(&request).unwrap()
+    else {
+        panic!("expected a desktop event")
+    };
+    assert_eq!(event.host_tool_call().unwrap().call_id, "c2");
     process.detach();
 }
 

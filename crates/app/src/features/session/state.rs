@@ -604,7 +604,10 @@ pub(in crate::features::session) mod desktop {
                     | Some(DesktopMethod::GetProfileBinding)
                     | Some(DesktopMethod::ClearProfileBinding)
                     | Some(DesktopMethod::GetAuthStatus)
-                    | Some(DesktopMethod::ReloadCredentials) => Applied::default(),
+                    | Some(DesktopMethod::ReloadCredentials)
+                    // Sent to a server's `/desktop`, never through this slot.
+                    | Some(DesktopMethod::SetHostTools)
+                    | Some(DesktopMethod::HostToolResult) => Applied::default(),
                     None => Applied::default(),
                 },
                 Ok(Some(DesktopRecord::Event(event))) => {

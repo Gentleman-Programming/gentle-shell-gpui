@@ -4819,7 +4819,7 @@ fn capabilities_expose_the_profile_apply_method_and_event() {
 
 /// The `capabilities` methods of Gentle Shell 5.0.0, as the spec and a live
 /// backend list them.
-const MAIN_METHODS: [&str; 32] = [
+const MAIN_METHODS: [&str; 34] = [
     "capabilities",
     "get_snapshot",
     "get_config",
@@ -4852,6 +4852,8 @@ const MAIN_METHODS: [&str; 32] = [
     "clear_profile_binding",
     "get_auth_status",
     "reload_credentials",
+    "set_host_tools",
+    "host_tool_result",
 ];
 const MAIN_EVENTS: [&str; 10] = [
     "config_changed",
@@ -4891,7 +4893,7 @@ const RELEASE_4_8_EVENTS: [&str; 7] = [
     "profile_applied",
     "agents_update",
 ];
-const NEW_METHODS: [DesktopMethod; 18] = [
+const NEW_METHODS: [DesktopMethod; 20] = [
     DesktopMethod::GetJobOutput,
     DesktopMethod::GetSubagentThread,
     DesktopMethod::ListSessions,
@@ -4910,6 +4912,8 @@ const NEW_METHODS: [DesktopMethod; 18] = [
     DesktopMethod::ClearProfileBinding,
     DesktopMethod::GetAuthStatus,
     DesktopMethod::ReloadCredentials,
+    DesktopMethod::SetHostTools,
+    DesktopMethod::HostToolResult,
 ];
 
 fn capabilities_of(methods: &[&str], events: &[&str]) -> Capabilities {
@@ -7043,4 +7047,183 @@ fn profile_binding_reads_clears_and_changes_decode_the_spec_shapes() {
             .profile_binding()
             .is_err()
     );
+}
+
+// --- host tools ------------------------------------------------------------
+
+fn host_tool(name: &str) -> pi_rpc::desktop_rpc::HostTool {
+    pi_rpc::desktop_rpc::HostTool {
+        name: name.into(),
+        label: "Open page".into(),
+        description: "Open a page in the app".into(),
+        parameters: json!({"type": "object", "properties": {"url": {"type": "string"}}}),
+        guidelines: vec!["Use it for pages the user should see.".into()],
+    }
+}
+
+#[test]
+fn set_host_tools_encodes_the_provider_and_its_whole_set() {
+    let request =
+        DesktopRequest::set_host_tools("host-1", "desktop", &[host_tool("open_page")]).unwrap();
+    assert_eq!(request.method(), DesktopMethod::SetHostTools);
+    assert_eq!(
+        request.payload(),
+        payload(
+            "host-1",
+            "set_host_tools",
+            r#"{"provider":"desktop","tools":[{"name":"open_page","label":"Open page","description":"Open a page in the app","parameters":{"type":"object","properties":{"url":{"type":"string"}}},"guidelines":["Use it for pages the user should see."]}]}"#
+        )
+    );
+    // An empty set unregisters the provider.
+    let empty = DesktopRequest::set_host_tools("host-2", "desktop", &[]).unwrap();
+    assert!(empty.payload().contains(r#""tools":[]"#));
+    // The typed constructor is the only way in.
+    assert_eq!(
+        DesktopRequest::new("x", DesktopMethod::SetHostTools, json!({})),
+        Err(DesktopRpcError::TypedParamsRequired(
+            DesktopMethod::SetHostTools
+        ))
+    );
+}
+
+#[test]
+fn set_host_tools_refuses_what_the_server_would() {
+    let refused = |tools: &[pi_rpc::desktop_rpc::HostTool]| {
+        DesktopRequest::set_host_tools("host-1", "desktop", tools).is_err()
+    };
+    for name in ["", "Open", "9page", "open-page", &"a".repeat(65)] {
+        assert!(refused(&[host_tool(name)]), "{name:?}");
+    }
+    assert!(!refused(&[host_tool(&"a".repeat(64))]));
+    assert!(refused(&[host_tool("a"), host_tool("a")]));
+    let many: Vec<_> = (0..33).map(|i| host_tool(&format!("t{i}"))).collect();
+    assert!(refused(&many));
+    assert!(!refused(&many[..32]));
+    let mut tool = host_tool("a");
+    tool.label = "l".repeat(65);
+    assert!(refused(&[tool]));
+    let mut tool = host_tool("a");
+    tool.description = "d".repeat(4097);
+    assert!(refused(&[tool]));
+    let mut tool = host_tool("a");
+    tool.parameters = json!("string");
+    assert!(refused(&[tool]));
+    let mut tool = host_tool("a");
+    tool.parameters = json!({"description": "x".repeat(16 * 1024)});
+    assert!(refused(&[tool]));
+    let mut tool = host_tool("a");
+    tool.guidelines = vec!["g".into(); 17];
+    assert!(refused(&[tool]));
+    let mut tool = host_tool("a");
+    tool.guidelines = vec!["g".repeat(513)];
+    assert!(refused(&[tool]));
+    assert!(DesktopRequest::set_host_tools("host-1", "", &[]).is_err());
+    assert!(DesktopRequest::set_host_tools("host-1", &"p".repeat(65), &[]).is_err());
+}
+
+#[test]
+fn host_tool_result_carries_text_and_images_up_to_the_content_cap() {
+    use pi_rpc::desktop_rpc::{HostToolContent, MAX_RESULT_CONTENT_BYTES};
+    let content = [
+        HostToolContent::text("Screenshot"),
+        HostToolContent::Image {
+            data: "iVBORw0=".into(),
+            mime_type: "image/png".into(),
+        },
+    ];
+    let request = DesktopRequest::host_tool_result("host-3", "call-1", &content, false).unwrap();
+    assert_eq!(
+        request.payload(),
+        payload(
+            "host-3",
+            "host_tool_result",
+            r#"{"callId":"call-1","content":[{"type":"text","text":"Screenshot"},{"type":"image","data":"iVBORw0=","mimeType":"image/png"}]}"#
+        )
+    );
+    let failed =
+        DesktopRequest::host_tool_result("host-4", "call-1", &[HostToolContent::text("no")], true)
+            .unwrap();
+    assert!(failed.payload().contains(r#""isError":true"#));
+    assert!(DesktopRequest::host_tool_result("host-5", "", &[], false).is_err());
+    // A result far over the 64 KiB of other requests still goes…
+    let big = HostToolContent::Image {
+        data: "A".repeat(MAX_RESULT_CONTENT_BYTES - 10),
+        mime_type: "image/png".into(),
+    };
+    assert!(
+        DesktopRequest::host_tool_result("host-6", "call-1", std::slice::from_ref(&big), false)
+            .is_ok()
+    );
+    // …but not over the content cap.
+    let over = [big, HostToolContent::text("x".repeat(11))];
+    assert!(matches!(
+        DesktopRequest::host_tool_result("host-7", "call-1", &over, false),
+        Err(DesktopRpcError::RequestTooLarge { .. })
+    ));
+}
+
+#[test]
+fn host_tool_answers_and_events_decode() {
+    let registered = ok_response(json!({
+        "registered": ["open_page"],
+        "rejected": [{"name": "bash", "reason": "collides with a built-in tool"}],
+    }))
+    .set_host_tools()
+    .unwrap();
+    assert_eq!(registered.registered, vec!["open_page".to_string()]);
+    assert_eq!(registered.rejected[0].name, "bash");
+    assert!(
+        ok_response(json!({"accepted": true}))
+            .host_tool_result()
+            .unwrap()
+            .accepted
+    );
+    let call = some_event(
+        4,
+        "host_tool_call",
+        json!({"callId": "c1", "provider": "dev_1", "tool": "open_page", "args": {"url": "https://x.dev"}}),
+    )
+    .host_tool_call()
+    .unwrap();
+    assert_eq!(call.call_id, "c1");
+    assert_eq!(call.provider, "dev_1");
+    assert_eq!(call.tool, "open_page");
+    assert_eq!(call.args["url"], "https://x.dev");
+    let cancel = some_event(5, "host_tool_cancel", json!({"callId": "c1"}))
+        .host_tool_cancel()
+        .unwrap();
+    assert_eq!(cancel.call_id, "c1");
+    // The exact event name is required.
+    assert!(
+        some_event(
+            6,
+            "host_tool_cancel",
+            json!({"callId": "c1", "provider": "p", "tool": "t"})
+        )
+        .host_tool_call()
+        .is_err()
+    );
+    assert!(
+        some_event(
+            7,
+            "host_tool_call",
+            json!({"callId": "", "provider": "p", "tool": "t"})
+        )
+        .host_tool_call()
+        .is_err()
+    );
+}
+
+#[test]
+fn a_server_desktop_answer_decodes_from_its_json() {
+    let answer = json!({
+        "schema": SCHEMA, "kind": "response", "requestId": "serve-desktop-3",
+        "ok": false, "error": {"code": "unknown_call", "message": "no such call"},
+    });
+    match pi_rpc::desktop_rpc::decode_value(answer).unwrap() {
+        DesktopRecord::Response(response) => {
+            assert_eq!(response.error().unwrap().code, "unknown_call")
+        }
+        other => panic!("{other:?}"),
+    }
 }

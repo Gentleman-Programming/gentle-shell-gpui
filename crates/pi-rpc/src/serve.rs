@@ -175,6 +175,18 @@ impl ServeClient {
         path: &str,
         body: Option<&Value>,
     ) -> Result<(u16, ureq::http::Response<ureq::Body>), ServeError> {
+        let body = body.map(|body| serde_json::to_vec(body).unwrap_or_default());
+        self.send(agent, method, path, body.as_deref())
+    }
+
+    /// [`Self::call`] with a body already encoded as JSON.
+    fn send(
+        &self,
+        agent: &ureq::Agent,
+        method: &str,
+        path: &str,
+        body: Option<&[u8]>,
+    ) -> Result<(u16, ureq::http::Response<ureq::Body>), ServeError> {
         let url = format!("{}{path}", self.url);
         let mut request = ureq::http::Request::builder().method(method).uri(&url);
         if let Some(token) = &self.token {
@@ -184,7 +196,7 @@ impl ServeClient {
             Some(body) => {
                 let request = request
                     .header("Content-Type", "application/json")
-                    .body(serde_json::to_vec(body).unwrap_or_default())
+                    .body(body)
                     .map_err(|e| ServeError {
                         status: None,
                         error: None,
@@ -295,6 +307,23 @@ impl ServeClient {
             .read_to_vec()
             .map_err(|e| self.unreachable(e))?;
         Ok((status, body))
+    }
+
+    /// `POST /api/sessions/:id/desktop` with an inner Desktop request
+    /// document as the body (the server reads its `method` and `params`):
+    /// the answer the server correlated, as the record it is.
+    fn desktop(&self, id: &str, payload: &str) -> Result<Value, ServeError> {
+        let (status, mut response) = self.send(
+            &self.agent,
+            "POST",
+            &session_path(id, "/desktop")?,
+            Some(payload.as_bytes()),
+        )?;
+        read_json(&mut response).map_err(|message| ServeError {
+            status: Some(status),
+            error: None,
+            message,
+        })
     }
 
     /// `GET /api/sessions/:id/events`, after `after` (live without it).
@@ -616,6 +645,28 @@ impl PiProcess {
         match &self.io {
             Io::Server(remote) => Some(&remote.session),
             Io::Child { .. } => None,
+        }
+    }
+
+    /// Send a Desktop request through the server's `/desktop` endpoint and
+    /// wait for its answer: the route `set_host_tools` and
+    /// `host_tool_result` must take there, since the server checks who
+    /// provides a tool and who answers its calls. The answer carries the
+    /// server's own `requestId`; it answers this HTTP request. A child
+    /// process has no such endpoint. Blocking.
+    pub fn desktop(
+        &self,
+        request: &crate::desktop_rpc::DesktopRequest,
+    ) -> Result<crate::desktop_rpc::DesktopResponse> {
+        let Io::Server(remote) = &self.io else {
+            return Err(anyhow!("only a Gentle Shell server session has /desktop"));
+        };
+        let answer = remote.client.desktop(&remote.session, request.payload())?;
+        match crate::desktop_rpc::decode_value(answer)? {
+            crate::desktop_rpc::DesktopRecord::Response(response) => Ok(response),
+            crate::desktop_rpc::DesktopRecord::Event(_) => {
+                Err(anyhow!("the server answered /desktop with an event"))
+            }
         }
     }
 }
