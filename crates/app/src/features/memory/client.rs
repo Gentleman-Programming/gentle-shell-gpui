@@ -79,18 +79,19 @@ static PAGES: LazyLock<Mutex<HashMap<String, ForwardedPage>>> = LazyLock::new(Mu
 /// once per server); a page the server stopped honouring (`401`, gone) is
 /// opened again once.
 fn server_get(client: &ServeClient, cwd: &Path, path: &str) -> Result<(u16, String), String> {
-    let cached = PAGES.lock().unwrap().get(client.url()).cloned();
+    let address = client.url();
+    let cached = PAGES.lock().unwrap().get(&address).cloned();
     if let Some(page) = cached {
         match page.get(path) {
             Ok((401, _)) | Err(_) => {
-                PAGES.lock().unwrap().remove(client.url());
+                PAGES.lock().unwrap().remove(&address);
             }
             Ok(answer) => return Ok(answer),
         }
     }
     let page = open_page(client, cwd)?;
     let answer = page.get(path)?;
-    PAGES.lock().unwrap().insert(client.url().to_string(), page);
+    PAGES.lock().unwrap().insert(address, page);
     Ok(answer)
 }
 

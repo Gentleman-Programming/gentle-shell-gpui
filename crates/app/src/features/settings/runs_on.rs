@@ -80,6 +80,9 @@ pub(super) struct RunsOn {
     /// What the saved server says about itself, once asked (or why it
     /// couldn't be asked).
     server: Option<Result<ServerInfo, String>>,
+    /// Where the saved server answers now, when it was asked: its paired
+    /// address, or the one it was found at since.
+    address: Option<String>,
 }
 
 impl RunsOn {
@@ -127,6 +130,7 @@ impl RunsOn {
             connect,
             _connect: paired,
             server: None,
+            address: None,
         }
     }
 }
@@ -412,16 +416,19 @@ impl SettingsView {
         }
         self.runs_on.checking = true;
         self.runs_on.check = cx.spawn(async move |this, cx| {
-            let (found, server) = cx
+            let (found, server, address) = cx
                 .background_executor()
                 .spawn({
                     let choice = choice.clone();
                     async move {
-                        if choice.is_server() {
+                        if let Backend::Server { url, .. } = &choice {
                             let info = backend::server::info(&choice);
-                            (info.is_ok(), Some(info))
+                            // Asked after the answer: where it was found, should
+                            // its address have changed.
+                            let address = backend::server::address(url);
+                            (info.is_ok(), Some(info), Some(address))
                         } else {
-                            (backend::has_gentle_shell(&choice), None)
+                            (backend::has_gentle_shell(&choice), None, None)
                         }
                     }
                 })
@@ -430,6 +437,7 @@ impl SettingsView {
                 if this.runs_on.choice == choice {
                     this.runs_on.found = Some(found);
                     this.runs_on.server = server;
+                    this.runs_on.address = address;
                     this.runs_on.checking = false;
                     cx.notify();
                 }
@@ -451,6 +459,7 @@ impl SettingsView {
         self.runs_on.choice = choice;
         self.runs_on.found = None;
         self.runs_on.server = None;
+        self.runs_on.address = None;
         self.check_runs_on(cx);
         self.runs_on.homes = cx.spawn(async move |this, cx| {
             cx.background_executor()
@@ -591,7 +600,10 @@ impl SettingsView {
                 .pt_2()
                 .gap_1()
                 .child(row("Server", name.clone()))
-                .child(row("Address", url.clone()))
+                .child(row(
+                    "Address",
+                    self.runs_on.address.clone().unwrap_or_else(|| url.clone()),
+                ))
                 .child(row("Server id", server_id))
                 .child(row("Gentle Shell", version))
                 .child(row("This device", device.clone()))

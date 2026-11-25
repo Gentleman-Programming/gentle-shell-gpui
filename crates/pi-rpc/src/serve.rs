@@ -32,7 +32,7 @@ pub use terminals::{TermEvent, TermHost, TermStream, Terminal};
 use std::io::Read as _;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex, RwLock, mpsc};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
@@ -182,7 +182,15 @@ impl SessionInfo {
     }
 }
 
+/// Where the server went when its address stopped answering: given the
+/// address that failed, the address it answers at now (checked to be the
+/// same server), or `None`. The app looks on the network and at the
+/// addresses it knows ([`find`], [`nearby`]).
+pub type Relocate = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
+
 /// The server at one address, as one paired device (or none, to pair).
+/// Clones share the address: when the server is found at another one
+/// ([`Self::relocating`]), every clone follows.
 #[derive(Clone)]
 pub struct ServeClient {
     /// Requests: answers within [`ANSWER`].
@@ -192,8 +200,9 @@ pub struct ServeClient {
     /// Work the server bounds itself (a `git fetch`, an upload, a
     /// binary): answers within [`LONG`].
     long: ureq::Agent,
-    url: String,
+    url: Arc<RwLock<String>>,
     token: Option<String>,
+    relocate: Option<Relocate>,
 }
 
 impl ServeClient {
@@ -228,20 +237,33 @@ impl ServeClient {
             agent,
             stream,
             long,
-            url: url.trim_end_matches('/').to_string(),
+            url: Arc::new(RwLock::new(url.trim_end_matches('/').to_string())),
             token,
+            relocate: None,
         }
     }
 
-    pub fn url(&self) -> &str {
-        &self.url
+    /// This client, finding the server again with `relocate` when its
+    /// address can't be connected to (the server's computer got another
+    /// address on the network): the request is sent once more at the
+    /// address `relocate` gives, which every clone uses from then on. Only
+    /// a request that never reached the server is retried, so none runs
+    /// twice.
+    pub fn relocating(mut self, relocate: Relocate) -> Self {
+        self.relocate = Some(relocate);
+        self
+    }
+
+    /// The address requests go to now.
+    pub fn url(&self) -> String {
+        self.url.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     fn unreachable(&self, error: ureq::Error) -> ServeError {
         ServeError {
             status: None,
             error: None,
-            message: format!("Couldn't reach the server at {}: {error}", self.url),
+            message: format!("Couldn't reach the server at {}: {error}", self.url()),
         }
     }
 
@@ -260,7 +282,8 @@ impl ServeClient {
 
     /// `method` on `path` with an optional body and extra headers: the
     /// answer's status and body for a 2xx, the server's error in words
-    /// otherwise.
+    /// otherwise. An address that can't be connected to is looked for
+    /// again ([`Self::relocating`]) and the request sent there.
     fn send(
         &self,
         agent: &ureq::Agent,
@@ -269,7 +292,49 @@ impl ServeClient {
         body: Option<Body<'_>>,
         headers: &[(&str, &str)],
     ) -> Result<(u16, ureq::http::Response<ureq::Body>), ServeError> {
-        let url = format!("{}{path}", self.url);
+        let base = self.url();
+        let response = match self.run(agent, &base, method, path, body, headers)? {
+            Ok(response) => response,
+            Err(error) => {
+                let moved = self
+                    .relocate
+                    .as_ref()
+                    .filter(|_| never_connected(&error))
+                    .and_then(|relocate| relocate(&base));
+                let Some(moved) = moved.map(|url| url.trim_end_matches('/').to_string()) else {
+                    return Err(self.unreachable(error));
+                };
+                *self.url.write().unwrap_or_else(|e| e.into_inner()) = moved.clone();
+                self.run(agent, &moved, method, path, body, headers)?
+                    .map_err(|e| self.unreachable(e))?
+            }
+        };
+        let status = response.status().as_u16();
+        if (200..300).contains(&status) {
+            return Ok((status, response));
+        }
+        let mut response = response;
+        let body = read_json(&mut response).unwrap_or_default();
+        let (code, message) = protocol::error_body(&body);
+        Err(ServeError {
+            status: Some(status),
+            error: code.map(str::to_string),
+            message: protocol::error_text(status, code, message),
+        })
+    }
+
+    /// One request to the server at `base`: the transport's answer or
+    /// failure; an error for a request that can't be built.
+    fn run(
+        &self,
+        agent: &ureq::Agent,
+        base: &str,
+        method: &str,
+        path: &str,
+        body: Option<Body<'_>>,
+        headers: &[(&str, &str)],
+    ) -> Result<Result<ureq::http::Response<ureq::Body>, ureq::Error>, ServeError> {
+        let url = format!("{base}{path}");
         let mut request = ureq::http::Request::builder().method(method).uri(&url);
         if let Some(token) = &self.token {
             request = request.header("Authorization", format!("Bearer {token}"));
@@ -282,7 +347,7 @@ impl ServeClient {
             error: None,
             message: format!("Bad request to {url}: {e}"),
         };
-        let response = match body {
+        Ok(match body {
             Some(Body::Json(body)) => agent.run(
                 request
                     .header("Content-Type", "application/json")
@@ -296,19 +361,6 @@ impl ServeClient {
                     .map_err(bad)?,
             ),
             None => agent.run(request.body(()).map_err(bad)?),
-        }
-        .map_err(|e| self.unreachable(e))?;
-        let status = response.status().as_u16();
-        if (200..300).contains(&status) {
-            return Ok((status, response));
-        }
-        let mut response = response;
-        let body = read_json(&mut response).unwrap_or_default();
-        let (code, message) = protocol::error_body(&body);
-        Err(ServeError {
-            status: Some(status),
-            error: code.map(str::to_string),
-            message: protocol::error_text(status, code, message),
         })
     }
 
@@ -500,9 +552,30 @@ impl ServeClient {
 /// gets [`PROBE`], the whole search [`SEARCH`]. The pairing code is sent
 /// nowhere here. Blocking.
 pub fn locate(code: &ConnectionCode) -> Result<String, String> {
+    match search(&code.server_id, &code.urls) {
+        Search::Found(index) => Ok(code.urls[index].clone()),
+        Search::OtherServer => Err(code.other_server()),
+        Search::NotFound | Search::Waiting => Err(code.not_found()),
+    }
+}
+
+/// The first of `urls` where the server `server_id` answers
+/// (`GET /.well-known/gentle-shell` at all of them at once, no token, as
+/// [`locate`] does): where a paired server went after its address changed.
+/// Blocking, [`SEARCH`] at most.
+pub fn find(server_id: &str, urls: &[String]) -> Option<String> {
+    match search(server_id, urls) {
+        Search::Found(index) => Some(urls[index].clone()),
+        _ => None,
+    }
+}
+
+/// Ask every one of `urls` who it is, at once, until the server
+/// `server_id` answers or [`SEARCH`] passes.
+fn search(server_id: &str, urls: &[String]) -> Search {
     let agent = probe_agent();
     let (tx, rx) = mpsc::channel();
-    for (index, url) in code.urls.iter().enumerate() {
+    for (index, url) in urls.iter().enumerate() {
         let (agent, tx) = (agent.clone(), tx.clone());
         let url = format!("{url}{}", protocol::IDENTITY_PATH);
         // One that can't start counts as unreachable: its sender is gone.
@@ -519,17 +592,51 @@ pub fn locate(code: &ConnectionCode) -> Result<String, String> {
         let finished = match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
             Ok(answer) => {
                 arrived.push(answer);
-                arrived.len() == code.urls.len()
+                arrived.len() == urls.len()
             }
             // Time is up, or every probe that started answered.
             Err(_) => true,
         };
-        match protocol::search(&code.server_id, &arrived, finished) {
-            Search::Found(index) => return Ok(code.urls[index].clone()),
+        match protocol::search(server_id, &arrived, finished) {
             Search::Waiting => {}
-            Search::OtherServer => return Err(code.other_server()),
-            Search::NotFound => return Err(code.not_found()),
+            done => return done,
         }
+    }
+}
+
+/// Who answers at `url` (`GET /.well-known/gentle-shell`, no token): its
+/// server id and its machine's host name. Blocking, [`PROBE`] at most.
+pub fn identify(url: &str) -> Option<(String, String)> {
+    let url = format!("{url}{}", protocol::IDENTITY_PATH);
+    let mut response = probe_agent().get(&url).call().ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let body = read_json(&mut response).ok()?;
+    let Probe::Server(id) = protocol::identity(&body) else {
+        return None;
+    };
+    Some((id, body["name"].as_str().unwrap_or_default().to_string()))
+}
+
+/// Whether a request failed before reaching the server (no such host, or
+/// nothing accepts connections at its address): sending it elsewhere can't
+/// run it twice.
+fn never_connected(error: &ureq::Error) -> bool {
+    use std::io::ErrorKind;
+    match error {
+        ureq::Error::HostNotFound | ureq::Error::ConnectionFailed => true,
+        ureq::Error::Timeout(timeout) => {
+            matches!(timeout, ureq::Timeout::Resolve | ureq::Timeout::Connect)
+        }
+        ureq::Error::Io(e) => matches!(
+            e.kind(),
+            ErrorKind::ConnectionRefused
+                | ErrorKind::HostUnreachable
+                | ErrorKind::NetworkUnreachable
+                | ErrorKind::AddrNotAvailable
+        ),
+        _ => false,
     }
 }
 

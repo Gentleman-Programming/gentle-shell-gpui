@@ -340,6 +340,44 @@ fn url_host(url: &str) -> &str {
     }
 }
 
+/// The most addresses kept for one paired server, newest last.
+pub const KNOWN_ADDRESSES: usize = 16;
+
+/// Where to look for a paired server whose address `failed` stopped
+/// answering (its computer got another address on the network): the
+/// addresses it was reached at before (`known`, newest first), then its
+/// machine's `host` name and `<host>.local` on the same port. Never `failed`
+/// itself, nor one address twice. Discovery on the local network finds it
+/// too; these are for where discovery doesn't reach.
+pub fn relocation_urls(failed: &str, known: &[String], host: Option<&str>) -> Vec<String> {
+    let port = failed
+        .rsplit_once(':')
+        .and_then(|(_, port)| port.parse::<u16>().ok());
+    let host = host.map(str::trim).filter(|host| !host.is_empty());
+    let names = port.zip(host).into_iter().flat_map(|(port, host)| {
+        let bare = host.strip_suffix(".local").unwrap_or(host);
+        [bare.to_string(), format!("{bare}.local")]
+            .into_iter()
+            .filter_map(move |name| address_url(&name, port))
+    });
+    let mut urls: Vec<String> = Vec::new();
+    for url in known.iter().rev().cloned().chain(names) {
+        if url != failed && !urls.contains(&url) {
+            urls.push(url);
+        }
+    }
+    urls
+}
+
+/// `known` (a paired server's addresses, newest last) with `url` as the
+/// newest, at most [`KNOWN_ADDRESSES`].
+pub fn remember_address(known: &mut Vec<String>, url: &str) {
+    known.retain(|known| known != url);
+    known.push(url.to_string());
+    let extra = known.len().saturating_sub(KNOWN_ADDRESSES);
+    known.drain(..extra);
+}
+
 /// A pairing code read as the server reads it (case, dashes and white
 /// space ignored, O as 0, I and L as 1, the server's alphabet), as
 /// `XXXX-XXXX`; `None` when it can't be one.
@@ -1869,5 +1907,42 @@ mod tests {
         assert!(NONE_NEARBY.contains("sudo ufw allow 8787"));
         assert!(NONE_NEARBY.contains("gsc1."));
         assert!(short_code_refused("omarchy").contains("On omarchy, run gentle-shell serve share"));
+    }
+
+    #[test]
+    fn a_moved_server_is_looked_for_at_its_other_addresses_and_names() {
+        let known = [
+            "http://192.168.1.20:8787".to_string(),
+            "http://100.101.102.103:8787".to_string(),
+            "http://192.168.1.31:8787".to_string(),
+        ];
+        // Newest first, never the one that failed, then the machine's names.
+        assert_eq!(
+            relocation_urls("http://192.168.1.31:8787", &known, Some("linux-box")),
+            [
+                "http://100.101.102.103:8787",
+                "http://192.168.1.20:8787",
+                "http://linux-box:8787",
+                "http://linux-box.local:8787",
+            ]
+        );
+        // A name already `.local` isn't doubled; a known one isn't repeated.
+        let known = ["http://linux-box.local:8787".to_string()];
+        assert_eq!(
+            relocation_urls("http://10.0.0.2:8787", &known, Some("linux-box.local")),
+            ["http://linux-box.local:8787", "http://linux-box:8787"]
+        );
+        // Without a name, only what was known.
+        assert!(relocation_urls("http://10.0.0.2:8787", &[], None).is_empty());
+
+        let mut known: Vec<String> = (0..KNOWN_ADDRESSES)
+            .map(|n| format!("http://10.0.0.{n}:8787"))
+            .collect();
+        remember_address(&mut known, "http://10.0.0.3:8787");
+        assert_eq!(known.len(), KNOWN_ADDRESSES);
+        assert_eq!(known.last().unwrap(), "http://10.0.0.3:8787");
+        remember_address(&mut known, "http://10.0.0.99:8787");
+        assert_eq!(known.len(), KNOWN_ADDRESSES);
+        assert_eq!(known[0], "http://10.0.0.1:8787");
     }
 }

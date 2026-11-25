@@ -581,6 +581,72 @@ fn a_dialog_another_device_answered_closes_here() {
     process.detach();
 }
 
+/// An address nothing listens at any more.
+fn gone() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    format!("http://{}", listener.local_addr().unwrap())
+}
+
+#[test]
+fn a_server_that_moved_is_found_by_its_id() {
+    let fake = Fake::start();
+    let gone = gone();
+    assert_eq!(
+        pi_rpc::serve::find(SERVER_ID, &[gone.clone(), fake.url.clone()]),
+        Some(fake.url.clone())
+    );
+    // Another server at a known address isn't this one.
+    assert_eq!(pi_rpc::serve::find("srv_other", &[fake.url.clone()]), None);
+    assert_eq!(pi_rpc::serve::find(SERVER_ID, &[]), None);
+    assert_eq!(
+        pi_rpc::serve::identify(&fake.url),
+        Some((SERVER_ID.to_string(), "fake".to_string()))
+    );
+    assert_eq!(pi_rpc::serve::identify(&gone), None);
+}
+
+#[test]
+fn a_client_follows_its_server_to_a_new_address() {
+    let fake = Fake::start();
+    let gone = gone();
+    let asked = Arc::new(Mutex::new(Vec::<String>::new()));
+    let relocate: pi_rpc::serve::Relocate = {
+        let (asked, to) = (asked.clone(), fake.url.clone());
+        Arc::new(move |failed: &str| {
+            asked.lock().unwrap().push(failed.to_string());
+            Some(to.clone())
+        })
+    };
+    let client = ServeClient::new(&gone, Some(TOKEN.into())).relocating(relocate.clone());
+    let copy = client.clone();
+    // The request that couldn't connect is sent again where it went.
+    assert_eq!(client.server().unwrap().server_id, SERVER_ID);
+    assert_eq!(copy.url(), fake.url, "every clone follows");
+    assert_eq!(*asked.lock().unwrap(), [gone.clone()]);
+    // Asked once: the next request goes there directly.
+    copy.server().unwrap();
+    assert_eq!(asked.lock().unwrap().len(), 1);
+
+    // A session started at the old address runs at the new one: its
+    // commands and its stream.
+    let client = ServeClient::new(&gone, Some(TOKEN.into())).relocating(relocate);
+    let (process, _rx) = PiProcess::serve(client, "/srv/project", None, None).unwrap();
+    fake.wait_for("the stream", |s| !s.subscribers.is_empty());
+    let state = pollster::block_on(process.request(json!({"type": "get_state"}))).unwrap();
+    assert_eq!(state.data["ok"], "get_state");
+    process.detach();
+
+    // An answer from the server, even an error, is never a reason to move.
+    let client = ServeClient::new(&fake.url, Some("gss_revoked".into()))
+        .relocating(Arc::new(|_: &str| panic!("the server answered")));
+    assert_eq!(client.server().unwrap_err().status, Some(401));
+    // Nowhere else to go: the failure as it was.
+    let client = ServeClient::new(&gone, Some(TOKEN.into())).relocating(Arc::new(|_: &str| None));
+    let error = client.server().unwrap_err();
+    assert!(error.message.starts_with("Couldn't reach"), "{error}");
+    assert_eq!(client.url(), gone);
+}
+
 #[test]
 fn a_revoked_token_says_so() {
     let fake = Fake::start();
