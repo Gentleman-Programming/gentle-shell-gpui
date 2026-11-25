@@ -73,7 +73,7 @@ impl NativeView {
         script: Option<&str>,
         sandbox: Option<&super::Sandbox>,
         profile: &Profile,
-        popups: Option<super::Popups>,
+        steering: super::Steering,
     ) -> Result<Self, String> {
         GTK.clone()?;
         // Each profile is a WebKit context with a data folder of its own;
@@ -91,7 +91,7 @@ impl NativeView {
         .with_initialization_script(script.unwrap_or_default())
         .with_background_color(background)
         .with_visible(false);
-        let builder = super::follow_popups(builder, popups);
+        let builder = super::steer(builder, steering);
         let webview = match sandbox {
             Some(sandbox) => super::isolate(builder, sandbox),
             None => builder,

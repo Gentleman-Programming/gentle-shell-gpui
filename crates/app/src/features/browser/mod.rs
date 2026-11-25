@@ -127,6 +127,40 @@ fn follow_popups<'a>(
     })
 }
 
+/// A login's loopback callback (`prefix`) a page must not load: a
+/// navigation there goes to `caught`, whole, instead (see
+/// [`gentle_core::sign_in`]).
+#[derive(Clone)]
+struct Redirects {
+    prefix: String,
+    caught: async_channel::Sender<String>,
+}
+
+/// Where a page's navigations may go instead of loading: new windows into
+/// the page itself ([`follow_popups`]), a login's callback to the app
+/// ([`Redirects`]).
+#[derive(Clone, Default)]
+struct Steering {
+    popups: Option<Popups>,
+    redirects: Option<Redirects>,
+}
+
+/// `builder` steered as `steering` says.
+fn steer(builder: wry::WebViewBuilder<'_>, steering: Steering) -> wry::WebViewBuilder<'_> {
+    let builder = follow_popups(builder, steering.popups);
+    let Some(redirects) = steering.redirects else {
+        return builder;
+    };
+    builder.with_navigation_handler(move |url| {
+        if gentle_core::sign_in::is_login_redirect(&redirects.prefix, &url) {
+            let _ = redirects.caught.try_send(url);
+            false
+        } else {
+            true
+        }
+    })
+}
+
 /// `builder` locked down for `sandbox` (see [`Sandbox`]).
 fn isolate<'a>(builder: wry::WebViewBuilder<'a>, sandbox: &Sandbox) -> wry::WebViewBuilder<'a> {
     let serve = sandbox.serve.clone();

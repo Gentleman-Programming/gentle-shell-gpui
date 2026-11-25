@@ -79,6 +79,9 @@ pub struct WebSurface {
     /// New-window requests (`target="_blank"`) load here; see
     /// [`Self::follow_popups`].
     popups: Option<(super::Popups, Task<()>)>,
+    /// A login's loopback callback the page must not load; see
+    /// [`Self::catch_login_redirects`].
+    redirects: Option<super::Redirects>,
 }
 
 /// The size a page out of sight is laid out at (an agent's parked page).
@@ -101,6 +104,7 @@ impl WebSurface {
             _pump: None,
             _window_moves: None,
             popups: None,
+            redirects: None,
         }
     }
 
@@ -118,6 +122,16 @@ impl WebSurface {
             }
         });
         self.popups = Some((tx, task));
+    }
+
+    /// Never load an address starting with `prefix` (a login's loopback
+    /// callback, which nothing on this computer answers): each one the page
+    /// navigates to arrives, whole, on the returned channel instead. Takes
+    /// effect on the next native view.
+    pub fn catch_login_redirects(&mut self, prefix: String) -> async_channel::Receiver<String> {
+        let (caught, rx) = async_channel::bounded::<String>(4);
+        self.redirects = Some(super::Redirects { prefix, caught });
+        rx
     }
 
     /// An isolated page served by `sandbox`, starting at `url` (one of its
@@ -322,7 +336,10 @@ impl WebSurface {
         let script = self.script.clone();
         let sandbox = self.sandbox.clone();
         let profile = self.profile.clone();
-        let popups = self.popups.as_ref().map(|(tx, _)| tx.clone());
+        let steering = super::Steering {
+            popups: self.popups.as_ref().map(|(tx, _)| tx.clone()),
+            redirects: self.redirects.clone(),
+        };
         let background = page_background();
         let handle = window.window_handle();
         cx.spawn(async move |this, cx| {
@@ -333,7 +350,7 @@ impl WebSurface {
                 script.as_deref(),
                 sandbox.as_ref(),
                 &profile,
-                popups,
+                steering,
             );
             // A surface dropped meanwhile drops the view, and its popup with
             // it; one hidden meanwhile (and not driven) drops it right here.

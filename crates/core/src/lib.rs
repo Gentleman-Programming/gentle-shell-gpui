@@ -36,6 +36,7 @@ pub mod scroll;
 pub mod serve;
 pub mod sessions;
 pub mod setup;
+pub mod sign_in;
 pub mod text;
 pub mod tools;
 pub mod tower;
