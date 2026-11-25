@@ -235,6 +235,18 @@ impl Workspace {
             SessionEvent::AgentWeb(url) => {
                 self.open_agent_page(url.clone(), Some(id), true, window, cx)
             }
+            // A server session's host tools: `gentle-open` and
+            // `gentle-browser` as the app's own commands run them. The
+            // canvas this agent floats over answers its canvas tools.
+            SessionEvent::HostTool(request) => match request {
+                crate::features::session::HostToolRequest::OpenPage(url) => {
+                    self.open_agent_page(url.clone(), Some(id), false, window, cx)
+                }
+                crate::features::session::HostToolRequest::Browser { op, reply } => {
+                    self.browser_request(op.clone(), reply.clone(), window, cx)
+                }
+                crate::features::session::HostToolRequest::Canvas { .. } => {}
+            },
             SessionEvent::Notice { level, message } => {
                 let source = self.pane_title(id);
                 let (level, message) = (*level, message.clone());

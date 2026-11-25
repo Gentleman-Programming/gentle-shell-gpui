@@ -1,9 +1,11 @@
 //! The agent floating over a canvas. The canvas' Agent button opens a
-//! conversation in a card over the page, started with `GENTLE_CANVAS_FILE`
-//! and the `gentle-canvas.ts` extension, whose tools drop requests in the
-//! canvas' `.agent` folder. The open canvas picks them up, answers through
-//! `gentle_core::canvas::agent` (edits as one undo step, pictures rasterized
-//! here) and writes the answer beside each request.
+//! conversation in a card over the page. Started on this computer, it gets
+//! `GENTLE_CANVAS_FILE` and the `gentle-canvas.ts` extension, whose tools
+//! drop requests in the canvas' `.agent` folder; the open canvas picks them
+//! up. On a Gentle Shell server it gets the same tools as host tools
+//! (`features::host_tools`), whose requests reach the canvas in-process.
+//! Either way the canvas answers through `gentle_core::canvas::agent`
+//! (edits as one undo step, pictures rasterized here).
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -13,7 +15,7 @@ use gentle_core::canvas::agent::{self, Shot};
 use serde_json::{Value, json};
 
 use super::*;
-use crate::features::session::SessionView;
+use crate::features::session::{CanvasAnswer, HostToolRequest, SessionEvent, SessionView};
 use crate::shared::ui;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{Icon, Sizable as _, h_flex, v_flex};
@@ -33,6 +35,8 @@ pub(super) struct FloatingAgent {
     pub session: Entity<SessionView>,
     /// Hidden keeps it running; the button shows it again.
     pub shown: bool,
+    /// Its host tool calls for this canvas (a server session's).
+    pub _host: Subscription,
 }
 
 /// Writes the extension to the app's data folder; its path, or `None` when
@@ -74,6 +78,12 @@ struct Answer {
     shot: Option<Shot>,
 }
 
+/// A shot's picture as PNG bytes.
+pub fn shot_png(shot: &Shot) -> Result<Vec<u8>, String> {
+    crate::shared::backdrop::preview::rasterize_at(&shot.svg, (shot.width, shot.height), shot.scale)
+        .and_then(|pixmap| pixmap.encode_png().map_err(|e| e.to_string()))
+}
+
 /// Writes `answer` beside its request: `<id>.res.json`, and `<id>.png` for a
 /// picture (named in the JSON as `image`).
 fn write_answer(answer: Answer) {
@@ -81,12 +91,7 @@ fn write_answer(answer: Answer) {
     let base = request.trim_end_matches(".req.json");
     let mut json = answer.json;
     if let Some(shot) = answer.shot {
-        let png = crate::shared::backdrop::preview::rasterize_at(
-            &shot.svg,
-            (shot.width, shot.height),
-            shot.scale,
-        )
-        .and_then(|pixmap| pixmap.encode_png().map_err(|e| e.to_string()));
+        let png = shot_png(&shot);
         let image = format!("{base}.png");
         json = match png.map(|png| std::fs::write(&image, png).map_err(|e| e.to_string())) {
             Ok(Ok(())) => {
@@ -148,13 +153,24 @@ impl CanvasView {
                 };
             }
         };
+        let (json, shot) = self.respond(&req, cx);
+        Answer {
+            request,
+            json,
+            shot,
+        }
+    }
+
+    /// Answer one request (`{"action": "read" | "edit" | "shot", …}`) on
+    /// this canvas: its JSON, and a shot's picture to rasterize.
+    fn respond(&mut self, req: &Value, cx: &mut Context<Self>) -> (Value, Option<Shot>) {
         let (w, h) = match self.size() {
             (w, h) if w >= 1. && h >= 1. => (w, h),
             _ => UNSEEN_VIEW,
         };
         let view = self.doc.camera.visible(w, h);
         let before = (req["action"] == "edit").then(|| self.doc.shapes.clone());
-        let response = agent::handle(&mut self.doc, view, paint::light(), &req);
+        let response = agent::handle(&mut self.doc, view, paint::light(), req);
         if response.changed {
             if let Some(before) = before {
                 self.history.record(before);
@@ -165,11 +181,7 @@ impl CanvasView {
             self.doc.camera = Camera::fitting(&area, w, h, 64.);
             self.camera_moved(cx);
         }
-        Answer {
-            request,
-            json: response.json,
-            shot: response.shot,
-        }
+        (response.json, response.shot)
     }
 }
 
@@ -217,9 +229,19 @@ impl CanvasView {
                 let composer = session.read(cx).composer();
                 composer.update(cx, |c, cx| c.focus(window, cx));
                 cx.emit(CanvasEvent::AgentStarted(session.clone()));
+                // A server session's canvas tools reach this canvas here.
+                let host = cx.subscribe(&session, |this, _, event: &SessionEvent, cx| {
+                    if let SessionEvent::HostTool(HostToolRequest::Canvas { request, reply }) =
+                        event
+                    {
+                        let (json, shot) = this.respond(request, cx);
+                        let _ = reply.send(CanvasAnswer { json, shot });
+                    }
+                });
                 self.agent = Some(FloatingAgent {
                     session,
                     shown: true,
+                    _host: host,
                 });
             }
         }

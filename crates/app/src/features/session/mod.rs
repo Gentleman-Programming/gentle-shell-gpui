@@ -18,6 +18,7 @@ mod agents;
 mod attachments;
 mod builtins;
 mod events;
+mod host_tools;
 pub mod input_style;
 mod lifecycle;
 mod reads;
@@ -29,6 +30,7 @@ mod view;
 mod view_tests;
 
 pub use agents::{AgentsPanel, AgentsTab};
+pub use host_tools::{CanvasAnswer, HostToolRequest};
 pub(crate) use reads::READ_DECIDE_WAIT;
 pub(crate) use state::desktop::reads::{
     ReadFailure, ReadOutcome, ReadRequest, ReadSupport, ReadTicket,
@@ -85,6 +87,10 @@ pub enum SessionEvent {
         path: std::path::PathBuf,
         line: Option<u32>,
     },
+    /// The agent (on a Gentle Shell server) called one of the app's host
+    /// tools that the window runs: show a page, drive a browser card, or
+    /// use the canvas this agent floats over.
+    HostTool(HostToolRequest),
 }
 
 /// What the window reads from a tab, to emit [`SessionEvent::ChromeChanged`]
@@ -217,6 +223,8 @@ pub struct SessionView {
     /// it had nothing to show: the chip is hidden without data, so it can't
     /// wait for its card to open (at most once per `PLAN_SEED_EVERY`).
     plan_seed_asked: std::cell::Cell<Option<std::time::Instant>>,
+    /// The app's tools offered to a server session, and its calls running.
+    host: host_tools::HostCalls,
 }
 
 impl EventEmitter<SessionEvent> for SessionView {}
@@ -391,6 +399,7 @@ impl SessionView {
             window_handle: window.window_handle(),
             local_offset: std::cell::OnceCell::new(),
             plan_seed_asked: std::cell::Cell::new(None),
+            host: host_tools::HostCalls::default(),
         };
         if start_now {
             this.ensure_started(window, cx);

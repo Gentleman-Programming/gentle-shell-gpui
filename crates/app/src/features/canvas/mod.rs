@@ -29,7 +29,7 @@ mod tests;
 use paint::GeoCache;
 use pointer::Gesture;
 
-pub use agent::{AGENT_ENV, install_extension};
+pub use agent::{AGENT_ENV, install_extension, shot_png};
 
 pub const CONTEXT: &str = "GentleCanvas";
 

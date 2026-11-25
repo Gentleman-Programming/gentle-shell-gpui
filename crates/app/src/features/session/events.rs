@@ -72,6 +72,7 @@ impl SessionView {
                 self.usage.compacting = false;
                 self.transcript.interrupt();
                 self.extension.dialogs.clear();
+                self.host.reset();
                 // Nothing the dead backend said or numbered applies any more.
                 self.desktop.reset();
                 self.permission.reset(self.desktop.session());
@@ -336,6 +337,14 @@ impl SessionView {
     /// channel (probe, sequencing, resync, and every benign foreign record).
     fn handle_desktop_ui(&mut self, request: &UiRequest, cx: &mut Context<Self>) {
         let decoded = decode_widget(request);
+        // A host tool's call or cancel is this tab's to run, whichever
+        // request is pending.
+        if let Ok(Some(DesktopRecord::Event(event))) = &decoded
+            && super::host_tools::is_host_event(event)
+        {
+            self.handle_host_event(request, event, cx);
+            return;
+        }
         // An unrelated delta leaves the merged context untouched; it is not
         // fresh context data and must not replace a compaction estimate.
         let context_changed = match &decoded {
@@ -509,6 +518,8 @@ impl SessionView {
                 self.sync_design(cx);
                 self.sync_config(cx);
                 self.sync_output(cx);
+                // The probe answered: a server session takes the app's tools.
+                self.sync_host_tools(cx);
             }
         }
         self.sync_review(cx);

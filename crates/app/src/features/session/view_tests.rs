@@ -1742,3 +1742,84 @@ fn change_cwd_drops_a_pending_resume(cx: &mut TestAppContext) {
         assert!(!view.has_conversation());
     });
 }
+
+/// A host tool's call or cancel as the server's stream carries it.
+fn host_event(seq: u64, event: &str, data: Value) -> pi_rpc::Incoming {
+    pi_rpc::Incoming::Ui(widget(json!({
+        "schema": SCHEMA, "kind": "event", "seq": seq, "event": event, "data": data,
+    })))
+}
+
+#[gpui::test]
+fn host_tool_calls_reach_their_handler_once_and_answer_unless_cancelled(cx: &mut TestAppContext) {
+    use super::{CanvasAnswer, HostToolRequest, SessionEvent};
+    use pi_rpc::desktop_rpc::HostToolContent;
+
+    let (view, cx) = tab(cx);
+    view.update(cx, |view, _| {
+        view.set_canvas(std::env::temp_dir().join("board.json"));
+        // This tab runs on a server as device dev_1.
+        view.runs_on = Some(gentle_core::backend::Backend::Server {
+            url: "http://127.0.0.1:8787".into(),
+            device: "dev_1".into(),
+            name: "pc".into(),
+        });
+    });
+    // A fake canvas, as the canvas view answers its agent's requests.
+    let asked = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let seen = asked.clone();
+    cx.update(|_, cx| {
+        cx.subscribe(&view, move |_, event: &SessionEvent, _| {
+            if let SessionEvent::HostTool(HostToolRequest::Canvas { request, reply }) = event {
+                seen.borrow_mut().push(request.clone());
+                let _ = reply.send(CanvasAnswer {
+                    json: json!({"ok": true, "shapes": [], "view": [0, 0, 10, 10]}),
+                    shot: None,
+                });
+            }
+        })
+        .detach();
+    });
+    let call = |seq: u64, id: &str, tool: &str| {
+        host_event(
+            seq,
+            "host_tool_call",
+            json!({"callId": id, "provider": "dev_1", "tool": tool, "args": {}}),
+        )
+    };
+    view.update_in(cx, |view, window, cx| {
+        view.handle_batch(
+            vec![
+                call(1, "c1", "canvas_read"),
+                // Re-sent after a reconnect, with its old sequence: once.
+                call(1, "c1", "canvas_read"),
+                call(2, "c2", "no_such_tool"),
+                call(3, "c3", "canvas_read"),
+                host_event(4, "host_tool_cancel", json!({"callId": "c3"})),
+                // Another device's tool on the same session: not this tab's.
+                host_event(
+                    5,
+                    "host_tool_call",
+                    json!({"callId": "c5", "provider": "dev_2", "tool": "canvas_read", "args": {}}),
+                ),
+            ],
+            window,
+            cx,
+        );
+    });
+    cx.run_until_parked();
+    assert_eq!(asked.borrow().len(), 2, "c1 and c3 reached the canvas");
+    assert_eq!(asked.borrow()[0], json!({"action": "read"}));
+    view.update(cx, |view, _| {
+        let sent = &view.host.sent;
+        let ids: Vec<&str> = sent.iter().map(|(id, _)| id.as_str()).collect();
+        // c2 answers at once; c1 once the canvas did; c3 was cancelled.
+        assert_eq!(ids, ["c2", "c1"]);
+        assert!(sent[0].1.is_error);
+        let HostToolContent::Text { text } = &sent[1].1.content[0] else {
+            panic!("expected text")
+        };
+        assert!(!sent[1].1.is_error);
+        assert!(text.contains("shapes"), "{text}");
+    });
+}

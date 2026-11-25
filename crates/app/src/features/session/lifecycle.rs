@@ -367,6 +367,7 @@ impl SessionView {
         // Desktop answers and event numbering are gone.
         self.desktop.reset();
         self.permission.reset(self.desktop.session());
+        self.host.reset();
         self.transcript = Transcript::default();
         self.markdown.clear();
         self.expanded.clear();

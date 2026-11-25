@@ -496,6 +496,10 @@ impl SessionView {
     /// probe.
     pub(super) fn reset_desktop_channel(&mut self) {
         self.desktop.reset();
+        // A reconnected server stream (or a switched session): offer the
+        // app's tools again once the channel is probed; calls still running
+        // keep going.
+        self.host.reconnected();
     }
 
     /// Cancel one running background job over `cancel_job`. There is no job

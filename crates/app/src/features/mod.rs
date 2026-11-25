@@ -13,6 +13,7 @@ pub mod files;
 pub mod genui;
 pub mod git;
 pub mod history;
+pub mod host_tools;
 pub mod hydration;
 pub mod memory;
 pub mod music;
