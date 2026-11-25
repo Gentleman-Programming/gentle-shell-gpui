@@ -166,6 +166,13 @@ pub struct TerminalView {
     on_server: bool,
     /// The server terminal a restored pane had, to reattach to.
     resume: Option<String>,
+    /// The server terminal opens (or reattaches) once the pane's laid-out
+    /// size holds ([`Self::settle_start`]): the shell must not start at the
+    /// 80×24 the emulator starts with, nor a running one pass through the
+    /// sizes of a window still taking its saved bounds.
+    start_on_layout: bool,
+    /// Waits for the size to hold, restarted by each change.
+    start_settle: Option<Task<()>>,
     /// What keeps a server terminal from showing, with the ways out.
     blocked: Option<remote::Blocked>,
     /// Follows what the server terminal's threads say.
@@ -325,12 +332,9 @@ impl TerminalView {
         };
         let on_server = crate::features::backend::on_server(&cwd);
         let (pty, shell_idle, error) = if on_server {
-            // Started once built, so a restored pane says first which
-            // terminal to reattach to ([`Self::resume_server_terminal`]).
-            cx.spawn_in(window, async move |this, cx| {
-                let _ = this.update_in(cx, |this, window, cx| this.start_remote(window, cx));
-            })
-            .detach();
+            // Started at the first layout (see `start_on_layout`), so a
+            // restored pane says first which terminal to reattach to
+            // ([`Self::resume_server_terminal`]).
             (None, None, None)
         } else {
             match spawn_pty(&cwd, term.clone(), listener.clone(), geometry.window_size()) {
@@ -373,6 +377,8 @@ impl TerminalView {
             cwd,
             on_server,
             resume: None,
+            start_on_layout: on_server,
+            start_settle: None,
             blocked: None,
             remote_status: Task::ready(()),
             osc_title: None,
@@ -1153,9 +1159,14 @@ impl Render for TerminalView {
         let geometry = self.geometry.clone();
         let focus_handle = self.focus_handle.clone();
         let entity = cx.entity();
+        // While the server terminal waits for a size that holds: whether
+        // the wait has begun.
+        let start = self
+            .start_on_layout
+            .then(|| (entity.clone(), self.start_settle.is_some()));
 
         let grid = canvas(
-            move |bounds, _window, _cx| {
+            move |bounds, window, cx| {
                 let columns = ((bounds.size.width / cell.width).floor() as usize).max(2);
                 let lines = ((bounds.size.height / cell.height).floor() as usize).max(1);
                 let mut geometry = geometry.borrow_mut();
@@ -1169,6 +1180,14 @@ impl Render for TerminalView {
                     if let Some(pty) = &pty {
                         pty.resize(geometry.window_size());
                     }
+                }
+                // The server terminal opens once the size holds.
+                if let Some((view, waiting)) = start
+                    && (resized || !waiting)
+                {
+                    window.defer(cx, move |window, cx| {
+                        view.update(cx, |this, cx| this.settle_start(window, cx))
+                    });
                 }
                 build_frame(&term, bounds.origin, cell, focused)
             },

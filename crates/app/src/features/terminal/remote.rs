@@ -623,6 +623,25 @@ impl TerminalView {
         }
     }
 
+    /// The pane was laid out at a new size before its server terminal
+    /// opened: open it once no other size came for [`RESIZE_SETTLE`]. A
+    /// window still taking its saved bounds lays the pane out at a passing
+    /// size first; a full-screen program reattached through it would keep a
+    /// garbled screen when the final size is the one it already had.
+    pub(super) fn settle_start(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.start_on_layout {
+            return;
+        }
+        self.start_settle = Some(cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor().timer(RESIZE_SETTLE).await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                if std::mem::take(&mut this.start_on_layout) {
+                    this.start_remote(window, cx);
+                }
+            });
+        }));
+    }
+
     /// Open the pane's server terminal (again, after its problem was
     /// solved).
     pub(super) fn start_remote(&mut self, window: &mut Window, cx: &mut Context<Self>) {
