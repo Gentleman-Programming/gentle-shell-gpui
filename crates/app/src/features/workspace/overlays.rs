@@ -211,7 +211,12 @@ impl Workspace {
                     None => this.show_folder(folder, window, cx),
                 };
                 match event {
-                    ExplorerEvent::OpenAgent(folder) => show(this, folder.clone(), window, cx),
+                    // Open Gentle Shell here: an agent in that folder, on
+                    // this computer or on the server agents run on.
+                    ExplorerEvent::OpenAgent(folder) => {
+                        show(this, folder.clone(), window, cx);
+                        this.open_tab(PaneKind::Agent, folder.clone(), None, None, window, cx);
+                    }
                     ExplorerEvent::OpenTerminal(folder) => {
                         show(this, folder.clone(), window, cx);
                         this.open_tab(PaneKind::Terminal, folder.clone(), None, None, window, cx);
