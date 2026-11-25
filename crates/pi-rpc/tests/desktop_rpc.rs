@@ -10,27 +10,27 @@ use pi_rpc::desktop_rpc::{
     ClearBindingStatus, ClearProfileBindingResult, CommandSource, ConfigChangeOrigin,
     ConfigChanged, ConfigErrorCode, ConfigLayer, ConfigLayerSource, ConfigScope, ConfigState,
     ConfigStatus, ConfigStore, ConfigWrite, ConfigWriteTarget, ConfigWriteTargetState,
-    DesignCanvas, DesignCanvasEvent, DesignEntry, DesignTransition, DesktopAgent, DesktopAgentStep,
-    DesktopAgentUsage, DesktopErrorCode, DesktopErrorInfo, DesktopEvent, DesktopJob, DesktopMethod,
-    DesktopRecord, DesktopRequest, DesktopResponse, DesktopRpcError, DesktopSession, DevBinary,
-    DevBinaryState, Handoff, JobExitCode, JobOutput, ListSessionsQuery, MAX_REQUEST_BYTES,
-    MAX_SESSION_ID_UNITS, MAX_SESSIONS_LIMIT, ModelConfigPresence, NotificationsData,
-    OrchestratorStatus, PROMPT_COMMAND, PackageKind, PackageScope, PackageUpdate,
-    PackageUpdateState, PendingQuestionKind, PermissionMode, PermissionModeChanged,
-    PermissionModeState, PersonaMode, PiUpdate, PinSource, PolicyFile, ProfileApplied,
-    ProfileApplyErrorCode, ProfileApplyMode, ProfileBinding, ProfileBindingChanged,
-    ProfileBindingKind, ProfileBindingOrigin, ProfileConfirmation, ProfileFallbacksData,
-    ProfileNote, ProfileNoteLevel, ProfilesData, ProviderAuth, ProviderUsage, RateLimitEvent,
-    RateLimitSource, ReviewConfirmation, ReviewEffective, ReviewMode, ReviewScope, ReviewScopes,
-    ReviewSetting, ReviewSource, RoutingState, SCHEMA, SessionActivity, SessionChangedFile,
-    SessionChanges, SessionChangesSummary, SessionCommand, SessionEntry, SessionJobs, SessionList,
-    SessionPermission, SessionProject, SessionSection, SessionTodo, SessionTodoItem,
-    SessionTodoProgress, SessionWorktree, SessionsScope, SetBackgroundSubagentsOutcome,
-    SetConfigResult, SetPermissionModeResult, SetReviewModeOutcome, ShellChannel, ShellUpdate,
-    Snapshot, StatsRange, StatsScope, StatusSeverity, SubagentThread, SwitchSessionResult,
-    ThreadItem, UpdateState, UsageLimit, UsageLimitScope, UsageRefresh, UsageResetAt,
-    UsageStatsDay, UsageStatsModel, UsageStatsProvider, UsageStatsTotals, UsageStatsTruncated,
-    UsageStatus, UsageWindow, WIDGET_KEY, decode_payload, decode_widget,
+    CustomModelsData, DesignCanvas, DesignCanvasEvent, DesignEntry, DesignTransition, DesktopAgent,
+    DesktopAgentStep, DesktopAgentUsage, DesktopErrorCode, DesktopErrorInfo, DesktopEvent,
+    DesktopJob, DesktopMethod, DesktopRecord, DesktopRequest, DesktopResponse, DesktopRpcError,
+    DesktopSession, DevBinary, DevBinaryState, Handoff, JobExitCode, JobOutput, ListSessionsQuery,
+    MAX_REQUEST_BYTES, MAX_SESSION_ID_UNITS, MAX_SESSIONS_LIMIT, McpDocumentData, McpLayer,
+    ModelConfigPresence, ModelDefaultsData, NotificationsData, OrchestratorStatus, PROMPT_COMMAND,
+    PackageKind, PackageScope, PackageUpdate, PackageUpdateState, PendingQuestionKind,
+    PermissionMode, PermissionModeChanged, PermissionModeState, PersonaMode, PiUpdate, PinSource,
+    PolicyFile, ProfileApplied, ProfileApplyErrorCode, ProfileApplyMode, ProfileBinding,
+    ProfileBindingChanged, ProfileBindingKind, ProfileBindingOrigin, ProfileConfirmation,
+    ProfileFallbacksData, ProfileNote, ProfileNoteLevel, ProfilesData, ProviderAuth, ProviderUsage,
+    RateLimitEvent, RateLimitSource, ReviewConfirmation, ReviewEffective, ReviewMode, ReviewScope,
+    ReviewScopes, ReviewSetting, ReviewSource, RoutingState, SCHEMA, SessionActivity,
+    SessionChangedFile, SessionChanges, SessionChangesSummary, SessionCommand, SessionEntry,
+    SessionJobs, SessionList, SessionPermission, SessionProject, SessionSection, SessionTodo,
+    SessionTodoItem, SessionTodoProgress, SessionWorktree, SessionsScope,
+    SetBackgroundSubagentsOutcome, SetConfigResult, SetPermissionModeResult, SetReviewModeOutcome,
+    ShellChannel, ShellUpdate, Snapshot, StatsRange, StatsScope, StatusSeverity, SubagentThread,
+    SwitchSessionResult, ThreadItem, UpdateState, UsageLimit, UsageLimitScope, UsageRefresh,
+    UsageResetAt, UsageStatsDay, UsageStatsModel, UsageStatsProvider, UsageStatsTotals,
+    UsageStatsTruncated, UsageStatus, UsageWindow, WIDGET_KEY, decode_payload, decode_widget,
 };
 use pi_rpc::{Response, UiMethod, UiRequest};
 use serde_json::{Value, json};
@@ -3273,6 +3273,24 @@ fn config_stores_are_a_closed_vocabulary_with_their_documented_shape() {
             ConfigScope::Global,
             false,
         ),
+        (
+            ConfigStore::ModelDefaults,
+            "model_defaults",
+            ConfigScope::Global,
+            false,
+        ),
+        (
+            ConfigStore::CustomModels,
+            "custom_models",
+            ConfigScope::Global,
+            false,
+        ),
+        (
+            ConfigStore::McpServers,
+            "mcp_servers",
+            ConfigScope::GlobalProject,
+            false,
+        ),
     ];
     assert_eq!(ConfigStore::ALL.len(), expected.len());
     for (store, (want, name, scope, read_only)) in ConfigStore::ALL.into_iter().zip(expected) {
@@ -3328,12 +3346,16 @@ fn config_stores_are_a_closed_vocabulary_with_their_documented_shape() {
     ));
     assert_eq!(
         ConfigWriteTarget::ALL.map(ConfigWriteTarget::as_str),
-        ["global", "local", "repo"]
+        ["global", "project", "local", "repo"]
     );
     assert!(matches!(
-        "project".parse::<ConfigWriteTarget>(),
+        "workspace".parse::<ConfigWriteTarget>(),
         Err(DesktopRpcError::InvalidConfigWriteTarget(_))
     ));
+    assert_eq!(
+        ConfigStore::McpServers.write_targets(),
+        [ConfigWriteTarget::Global, ConfigWriteTarget::Project]
+    );
     assert_eq!(PinSource::Local.as_str(), "local");
     assert_eq!(PinSource::Repo.as_str(), "repo");
     assert_eq!(PinSource::Local.write_target(), ConfigWriteTarget::Local);
@@ -3708,6 +3730,61 @@ fn set_config_writes_the_settings_stores_through_their_global_target() {
         NotificationsData::new(json!([])),
         Err(DesktopRpcError::InvalidConfigData(_))
     ));
+    // Model defaults: the four keys, an absent one removed there.
+    let defaults = json!({ "defaultProvider": "anthropic", "defaultModel": "claude-opus-4-5",
+                           "defaultThinkingLevel": "high" });
+    let write = ConfigWrite::ModelDefaults(ModelDefaultsData::new(defaults.clone()).unwrap());
+    assert_eq!(write.store(), ConfigStore::ModelDefaults);
+    assert_eq!(write.write_target(), ConfigWriteTarget::Global);
+    assert_eq!(
+        DesktopRequest::set_config("desktop-6", write, "r4")
+            .unwrap()
+            .payload(),
+        request_payload(
+            "desktop-6",
+            "set_config",
+            json!({ "store": "model_defaults", "data": defaults, "expectedRevision": "r4" }),
+        )
+    );
+    assert!(matches!(
+        ModelDefaultsData::new(json!("gpt")),
+        Err(DesktopRpcError::InvalidConfigData(_))
+    ));
+    // Pi's models.json, whole; a secret marker goes back as read.
+    let models = json!({ "providers": { "local": { "baseUrl": "http://localhost:11434/v1",
+                         "apiKey": "•••", "models": [{ "id": "qwen3" }] } } });
+    let write = ConfigWrite::CustomModels(CustomModelsData::new(models.clone()).unwrap());
+    assert_eq!(write.store(), ConfigStore::CustomModels);
+    assert_eq!(
+        DesktopRequest::set_config("desktop-7", write, "r5")
+            .unwrap()
+            .payload(),
+        request_payload(
+            "desktop-7",
+            "set_config",
+            json!({ "store": "custom_models", "data": models, "expectedRevision": "r5" }),
+        )
+    );
+    // One mcp.json, named by its layer, guarded by that file's revision.
+    let mcp = json!({ "mcpServers": { "docs": { "url": "https://docs.example/mcp" } } });
+    let write = ConfigWrite::McpServers {
+        layer: McpLayer::Project,
+        document: McpDocumentData::new(mcp.clone()).unwrap(),
+    };
+    assert_eq!(write.store(), ConfigStore::McpServers);
+    assert_eq!(write.write_target(), ConfigWriteTarget::Project);
+    assert_eq!(
+        DesktopRequest::set_config("desktop-8", write, "r6")
+            .unwrap()
+            .payload(),
+        request_payload(
+            "desktop-8",
+            "set_config",
+            json!({ "store": "mcp_servers", "data": { "source": "project", "document": mcp },
+                    "expectedRevision": "r6" }),
+        )
+    );
+    assert!(McpDocumentData::new(json!(null)).is_err());
     assert_eq!(
         "gentleman".parse::<PersonaMode>().unwrap(),
         PersonaMode::Gentleman

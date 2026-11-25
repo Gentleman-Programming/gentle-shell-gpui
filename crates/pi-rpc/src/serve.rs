@@ -29,7 +29,7 @@ mod upgrade;
 
 pub use files::{
     Entry, EntryKind, FileChunk, GitOutput, Listing, READ_CHUNK, SearchHit, Stat, Uploaded,
-    WatchEvent, WatchStream, Written,
+    WRITE_LIMIT, WatchEvent, WatchStream, Written,
 };
 pub use local::{LocalHold, hold_local_page};
 pub use services::{ForwardedPage, Service};

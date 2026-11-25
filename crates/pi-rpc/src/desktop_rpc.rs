@@ -3002,10 +3002,14 @@ impl DesignCanvasEvent {
     }
 }
 
-/// The nine configuration stores the protocol names. A store is an
+/// The twelve configuration stores the protocol names. A store is an
 /// identifier, never a path; anything else is refused. Gentle Shell 4.9.0
 /// knows only the first six: it answers `unknown_store` for the settings
-/// stores (`persona`, `banner`, `notifications`).
+/// stores (`persona`, `banner`, `notifications`), and a Shell older than
+/// the last three answers it for those: `model_defaults` (Pi's default
+/// model, effort and scoped models in the agent home's `settings.json`),
+/// `custom_models` (Pi's `models.json`) and `mcp_servers` (Pi's
+/// `mcp.json`, global and project).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ConfigStore {
     Profiles,
@@ -3017,11 +3021,14 @@ pub enum ConfigStore {
     Persona,
     Banner,
     Notifications,
+    ModelDefaults,
+    CustomModels,
+    McpServers,
 }
 
 impl ConfigStore {
     /// Every store the protocol speaks, in wire order.
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 12] = [
         Self::Profiles,
         Self::Models,
         Self::ProfileFallbacks,
@@ -3031,6 +3038,9 @@ impl ConfigStore {
         Self::Persona,
         Self::Banner,
         Self::Notifications,
+        Self::ModelDefaults,
+        Self::CustomModels,
+        Self::McpServers,
     ];
 
     /// The wire name of the store.
@@ -3045,6 +3055,9 @@ impl ConfigStore {
             Self::Persona => "persona",
             Self::Banner => "banner",
             Self::Notifications => "notifications",
+            Self::ModelDefaults => "model_defaults",
+            Self::CustomModels => "custom_models",
+            Self::McpServers => "mcp_servers",
         }
     }
 
@@ -3055,8 +3068,12 @@ impl ConfigStore {
             | Self::ProfileFallbacks
             | Self::ManagedAssets
             | Self::Banner
-            | Self::Notifications => ConfigScope::Global,
-            Self::Models | Self::Subagents | Self::Persona => ConfigScope::GlobalProject,
+            | Self::Notifications
+            | Self::ModelDefaults
+            | Self::CustomModels => ConfigScope::Global,
+            Self::Models | Self::Subagents | Self::Persona | Self::McpServers => {
+                ConfigScope::GlobalProject
+            }
             Self::Pins => ConfigScope::LocalRepo,
         }
     }
@@ -3076,7 +3093,10 @@ impl ConfigStore {
             | Self::ProfileFallbacks
             | Self::Persona
             | Self::Banner
-            | Self::Notifications => &[ConfigWriteTarget::Global],
+            | Self::Notifications
+            | Self::ModelDefaults
+            | Self::CustomModels => &[ConfigWriteTarget::Global],
+            Self::McpServers => &[ConfigWriteTarget::Global, ConfigWriteTarget::Project],
             Self::Pins => &[ConfigWriteTarget::Local, ConfigWriteTarget::Repo],
             Self::Models | Self::Subagents | Self::ManagedAssets => &[],
         }
@@ -3223,18 +3243,20 @@ impl fmt::Display for ConfigLayerSource {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ConfigWriteTarget {
     Global,
+    Project,
     Local,
     Repo,
 }
 
 impl ConfigWriteTarget {
     /// Every write target the protocol speaks, in wire order.
-    pub const ALL: [Self; 3] = [Self::Global, Self::Local, Self::Repo];
+    pub const ALL: [Self; 4] = [Self::Global, Self::Project, Self::Local, Self::Repo];
 
     /// The wire name of the write target.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Global => "global",
+            Self::Project => "project",
             Self::Local => "local",
             Self::Repo => "repo",
         }
@@ -3386,6 +3408,88 @@ impl NotificationsData {
     }
 }
 
+/// The complete `model_defaults` store content: `defaultProvider`,
+/// `defaultModel`, `defaultThinkingLevel` and `enabledModels`, an absent
+/// key unset (written as removed; `{}` clears them all). Only the JSON
+/// object shape is checked here; the server's owner validates the rest
+/// (`invalid_data`) and keeps every other `settings.json` key.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModelDefaultsData(Value);
+
+impl ModelDefaultsData {
+    pub fn new(data: Value) -> Result<Self, DesktopRpcError> {
+        store_document(&data, "model_defaults")?;
+        Ok(Self(data))
+    }
+
+    pub fn as_value(&self) -> &Value {
+        &self.0
+    }
+}
+
+/// The complete `custom_models` store content: Pi's whole `models.json`
+/// (`providers` required), secrets as the `"•••"` marker where they were
+/// read (sent back in place, a marker keeps that secret). Only the JSON
+/// object shape is checked here; the server validates it with Pi's own
+/// schema (`invalid_data`, its message saying where).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CustomModelsData(Value);
+
+impl CustomModelsData {
+    pub fn new(data: Value) -> Result<Self, DesktopRpcError> {
+        store_document(&data, "custom_models")?;
+        Ok(Self(data))
+    }
+
+    pub fn as_value(&self) -> &Value {
+        &self.0
+    }
+}
+
+/// Which `mcp.json` an `mcp_servers` write replaces: the agent home's, or
+/// the session folder's `.pi/mcp.json` (read by Pi only in a trusted
+/// project).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum McpLayer {
+    Global,
+    Project,
+}
+
+impl McpLayer {
+    /// The wire name of the layer (`source`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Global => "global",
+            Self::Project => "project",
+        }
+    }
+
+    /// The write target whose revision guards a write of this layer.
+    pub fn write_target(self) -> ConfigWriteTarget {
+        match self {
+            Self::Global => ConfigWriteTarget::Global,
+            Self::Project => ConfigWriteTarget::Project,
+        }
+    }
+}
+
+/// One complete `mcp.json` document (`{ mcpServers, … }`), secrets as the
+/// `"•••"` marker where they were read. Only the JSON object shape is
+/// checked here; the server validates every server with Pi's own rules.
+#[derive(Debug, Clone, PartialEq)]
+pub struct McpDocumentData(Value);
+
+impl McpDocumentData {
+    pub fn new(data: Value) -> Result<Self, DesktopRpcError> {
+        store_document(&data, "mcp_servers")?;
+        Ok(Self(data))
+    }
+
+    pub fn as_value(&self) -> &Value {
+        &self.0
+    }
+}
+
 /// One `set_config` write. Only the writable stores exist here, so a
 /// read-only store cannot be targeted through the typed API.
 #[derive(Debug, Clone, PartialEq)]
@@ -3407,6 +3511,16 @@ pub enum ConfigWrite {
     Banner(BannerData),
     /// Replace the whole `notifications` store.
     Notifications(NotificationsData),
+    /// Replace the whole `model_defaults` store.
+    ModelDefaults(ModelDefaultsData),
+    /// Replace Pi's whole `models.json` (`custom_models`).
+    CustomModels(CustomModelsData),
+    /// Replace one whole `mcp.json` (`mcp_servers`), sent as
+    /// `{ source, document }`.
+    McpServers {
+        layer: McpLayer,
+        document: McpDocumentData,
+    },
 }
 
 impl ConfigWrite {
@@ -3435,6 +3549,9 @@ impl ConfigWrite {
             Self::Persona(_) => ConfigStore::Persona,
             Self::Banner(_) => ConfigStore::Banner,
             Self::Notifications(_) => ConfigStore::Notifications,
+            Self::ModelDefaults(_) => ConfigStore::ModelDefaults,
+            Self::CustomModels(_) => ConfigStore::CustomModels,
+            Self::McpServers { .. } => ConfigStore::McpServers,
         }
     }
 
@@ -3442,11 +3559,14 @@ impl ConfigWrite {
     pub fn write_target(&self) -> ConfigWriteTarget {
         match self {
             Self::Pin { source, .. } => source.write_target(),
+            Self::McpServers { layer, .. } => layer.write_target(),
             Self::Profiles(_)
             | Self::ProfileFallbacks(_)
             | Self::Persona(_)
             | Self::Banner(_)
-            | Self::Notifications(_) => ConfigWriteTarget::Global,
+            | Self::Notifications(_)
+            | Self::ModelDefaults(_)
+            | Self::CustomModels(_) => ConfigWriteTarget::Global,
         }
     }
 }
@@ -3478,6 +3598,11 @@ fn set_config_params(
         ConfigWrite::Persona(mode) => json!({ "mode": mode.as_str() }),
         ConfigWrite::Banner(data) => data.as_value().clone(),
         ConfigWrite::Notifications(data) => data.as_value().clone(),
+        ConfigWrite::ModelDefaults(data) => data.as_value().clone(),
+        ConfigWrite::CustomModels(data) => data.as_value().clone(),
+        ConfigWrite::McpServers { layer, document } => {
+            json!({ "source": layer.as_str(), "document": document.as_value() })
+        }
     };
     Ok(json!({
         "store": write.store().as_str(),

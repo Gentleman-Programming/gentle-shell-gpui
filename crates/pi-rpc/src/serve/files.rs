@@ -13,6 +13,10 @@ use super::{BODY_LIMIT, Body, Events, ServeClient, ServeError, malformed, query,
 /// The most one `GET /api/fs/read` answers.
 pub const READ_CHUNK: u64 = 8 * 1024 * 1024;
 
+/// The largest body `PUT /api/fs/write` takes: the server refuses more
+/// (`413 too_large`).
+pub const WRITE_LIMIT: u64 = 64 * 1024 * 1024;
+
 /// What an entry is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EntryKind {

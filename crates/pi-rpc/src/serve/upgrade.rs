@@ -2,7 +2,10 @@
 //! `upgrade`, scope `admin`): one job at a time runs `gentle-shell
 //! upgrade` there, its output streams as Server-Sent Events, and on success
 //! `serve` restarts itself on the new version (its session keepers and
-//! terminal host keep running; clients reconnect).
+//! terminal host keep running; clients reconnect). Running Gentle Shell's
+//! own setup for the server's home (`/api/setup`, capability `setup`, scope
+//! `admin`) is a job of the same runner: the same events (`finished`
+//! without a version), and nothing restarts.
 
 use std::sync::atomic::AtomicBool;
 
@@ -57,13 +60,13 @@ impl UpgradeStream {
     }
 }
 
-fn job_path(job: &str) -> Result<String, ServeError> {
+fn job_path(route: &str, job: &str) -> Result<String, ServeError> {
     if !job.is_empty()
         && job
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
     {
-        Ok(format!("/api/upgrade/{job}/stream"))
+        Ok(format!("/api/{route}/{job}/stream"))
     } else {
         Err(malformed())
     }
@@ -88,7 +91,26 @@ impl ServeClient {
 
     /// `GET /api/upgrade/:jobId/stream`: the job's output from its start.
     pub fn upgrade_stream(&self, job: &str) -> Result<UpgradeStream, ServeError> {
-        let (_, response) = self.send(&self.stream, "GET", &job_path(job)?, None, &[])?;
+        let (_, response) =
+            self.send(&self.stream, "GET", &job_path("upgrade", job)?, None, &[])?;
+        Ok(UpgradeStream(Events::new(response)))
+    }
+
+    /// `POST /api/setup {}` (needs `admin`): run `gentle-shell setup` for
+    /// the server's home. The job to follow; while another job runs the
+    /// server answers `409 setup_running` or `409 upgrade_running`.
+    pub fn setup(&self) -> Result<String, ServeError> {
+        let answer = self.json("POST", "/api/setup", Some(&json!({})))?;
+        answer["jobId"]
+            .as_str()
+            .filter(|job| !job.is_empty())
+            .map(str::to_string)
+            .ok_or_else(malformed)
+    }
+
+    /// `GET /api/setup/:jobId/stream`: the setup's output from its start.
+    pub fn setup_stream(&self, job: &str) -> Result<UpgradeStream, ServeError> {
+        let (_, response) = self.send(&self.stream, "GET", &job_path("setup", job)?, None, &[])?;
         Ok(UpgradeStream(Events::new(response)))
     }
 
@@ -141,8 +163,15 @@ mod tests {
 
     #[test]
     fn a_job_id_stays_one_path_segment() {
-        assert_eq!(job_path("up_1").unwrap(), "/api/upgrade/up_1/stream");
-        assert!(job_path("../server").is_err());
-        assert!(job_path("").is_err());
+        assert_eq!(
+            job_path("upgrade", "up_1").unwrap(),
+            "/api/upgrade/up_1/stream"
+        );
+        assert_eq!(
+            job_path("setup", "setup_0123456789abcdef").unwrap(),
+            "/api/setup/setup_0123456789abcdef/stream"
+        );
+        assert!(job_path("upgrade", "../server").is_err());
+        assert!(job_path("setup", "").is_err());
     }
 }
