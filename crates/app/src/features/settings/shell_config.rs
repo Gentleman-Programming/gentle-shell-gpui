@@ -3,7 +3,10 @@
 //! `config_changed`), when its Shell serves them. A Shell without the config
 //! methods, or one that answers `unknown_store` for a settings store (4.9.0
 //! and older), keeps the direct file read (and, for notifications, the file
-//! write) of before. Nothing here touches a file on the RPC path.
+//! write) of before. Nothing here touches a file on the RPC path. On a
+//! Gentle Shell server the `profiles` store is read too (no file of it is
+//! read there), and a store it does not serve is never read or written from
+//! this computer's files.
 
 use std::collections::HashMap;
 
@@ -23,6 +26,19 @@ pub(super) const SETTINGS_STORES: [ConfigStore; 3] = [
     ConfigStore::Banner,
     ConfigStore::Notifications,
 ];
+
+/// What a server's Configuration reads besides [`SETTINGS_STORES`]: the
+/// profile rows, which a local screen reads from `profiles.json`.
+const SERVER_STORES: [ConfigStore; 1] = [ConfigStore::Profiles];
+
+/// The stores Configuration asks for, on a server (`server`) or not.
+fn stores_read(server: bool) -> Vec<ConfigStore> {
+    let mut stores = SETTINGS_STORES.to_vec();
+    if server {
+        stores.extend(SERVER_STORES);
+    }
+    stores
+}
 
 /// Where one settings store comes from on this tab.
 #[derive(Debug, Clone, PartialEq)]
@@ -160,18 +176,33 @@ pub(super) fn persona_of(state: &ConfigState) -> Option<String> {
         .map(str::to_string)
 }
 
+/// The `profiles` store's active profile and profile names.
+pub(super) fn profiles_of(state: &ConfigState) -> (Option<String>, Vec<String>) {
+    let Some(value) = state.value.as_ref() else {
+        return (None, Vec::new());
+    };
+    let active = value["active"].as_str().map(str::to_string);
+    let names = value["profiles"]
+        .as_object()
+        .map(|profiles| profiles.keys().cloned().collect())
+        .unwrap_or_default();
+    (active, names)
+}
+
 /// The notification policy a `notifications` read describes.
 pub(super) fn policy_of(state: &ConfigState) -> Policy {
+    policy_at(state, crate::features::alerts::policy_file())
+}
+
+/// [`policy_of`] naming `file` as where it lives: a server's is no path of
+/// this computer's (and resolving this computer's home is not done for it).
+fn policy_at(state: &ConfigState, file: std::path::PathBuf) -> Policy {
     let store = match state.status {
         ConfigStatus::Ok => FileState::Valid,
         ConfigStatus::Missing => FileState::Missing,
         ConfigStatus::Invalid => FileState::Invalid,
     };
-    Policy::from_store(
-        crate::features::alerts::policy_file(),
-        store,
-        state.value.as_ref(),
-    )
+    Policy::from_store(file, store, state.value.as_ref())
 }
 
 impl SettingsView {
@@ -190,7 +221,7 @@ impl SettingsView {
             ConfigSupport::Legacy | ConfigSupport::Unavailable => return,
         }
         self.shell_config.awaiting = false;
-        let stores: Vec<ConfigStore> = SETTINGS_STORES
+        let stores: Vec<ConfigStore> = stores_read(self.server().is_some())
             .into_iter()
             .filter(|store| self.shell_config.stores.get(store) != Some(&StoreSource::Files))
             .collect();
@@ -260,9 +291,10 @@ impl SettingsView {
                 }
             }
         }
+        let read = stores_read(self.server().is_some());
         let changes: Vec<(ConfigStore, Option<String>)> = changes
             .into_iter()
-            .filter(|change| SETTINGS_STORES.contains(&change.store))
+            .filter(|change| read.contains(&change.store))
             .map(|change| (change.store, change.revision))
             .collect();
         for store in stale_stores(&self.shell_config, &changes) {
@@ -278,18 +310,38 @@ impl SettingsView {
         }
     }
 
+    /// The server's Gentle Shell won't report `store`: it said it doesn't
+    /// know it, or its session can't serve the config methods at all (none,
+    /// failed, or too old). While it is still being asked, `false`.
+    pub(super) fn server_lacks(&self, store: ConfigStore, cx: &App) -> bool {
+        if self.shell_config.stores.get(&store) == Some(&StoreSource::Files) {
+            return true;
+        }
+        match &self.session {
+            Some(session) => matches!(
+                session.read(cx).config_support(),
+                ConfigSupport::Legacy | ConfigSupport::Unavailable
+            ),
+            None => true,
+        }
+    }
+
     /// The notification policy the section shows: Gentle Shell's when it
-    /// serves the store, the file's otherwise.
-    pub(super) fn notification_policy(&self) -> Policy {
+    /// serves the store, the file's otherwise. `None` on a server whose
+    /// Gentle Shell does not serve it: there is no file of it here.
+    pub(super) fn notification_policy(&self) -> Option<Policy> {
         match self.shell_config.state(ConfigStore::Notifications) {
-            Some(state) => policy_of(state),
-            None => crate::features::alerts::policy(),
+            Some(state) if self.server().is_some() => Some(policy_at(state, Default::default())),
+            Some(state) => Some(policy_of(state)),
+            None if self.server().is_some() => None,
+            None => Some(crate::features::alerts::policy()),
         }
     }
 
     /// Write one notification change: through Gentle Shell's
     /// `notifications` store (guarded by the revision it reported) when the
-    /// active tab's Shell serves it, to notifications.json otherwise.
+    /// active tab's Shell serves it, to notifications.json otherwise (never
+    /// on a server: that file is this computer's).
     pub(super) fn set_notification(
         &mut self,
         change: notifications::Change,
@@ -298,6 +350,9 @@ impl SettingsView {
         let store = ConfigStore::Notifications;
         let (Some(session), Some(state)) = (self.session.clone(), self.shell_config.state(store))
         else {
+            if self.server().is_some() {
+                return;
+            }
             self.notifications.note = crate::features::alerts::apply(change)
                 .err()
                 .map(|e| format!("Could not write notifications.json: {e}"));
@@ -313,7 +368,7 @@ impl SettingsView {
             return;
         };
         let revision = revision.to_string();
-        let data = policy_of(state).store_data(change);
+        let data = policy_at(state, Default::default()).store_data(change);
         let sent = NotificationsData::new(data)
             .map_err(|error| error.to_string())
             .and_then(|data| {

@@ -377,7 +377,8 @@ impl SettingsView {
     /// the launcher the app resolves now which version it runs: that's the
     /// result shown.
     fn run_upgrade(&mut self, target: UpgradeTarget, cx: &mut Context<Self>) {
-        if self.shell_job_running() {
+        // A server's Gentle Shell is upgraded there, not by this computer's.
+        if self.shell_job_running() || self.server().is_some() {
             return;
         }
         let channel = target.channel();
@@ -439,6 +440,14 @@ impl SettingsView {
         offer: UpdateOffer,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
+        if let Some(server) = self.server() {
+            return update_card_body(
+                format!("Gentle Shell {} is available", offer.latest),
+                Some(&offer.current),
+                "Open agent tabs keep running on the server's current version until it restarts them.",
+            )
+            .child(super::remote::note(server.run(super::remote::commands::UPGRADE)));
+        }
         let target = offer.clone();
         let skipped = offer.latest.clone();
         let upgrading = self.shell_update.upgrading.is_some();
@@ -462,6 +471,16 @@ impl SettingsView {
     }
 
     pub(super) fn render_main_update(&self, commit: &str, cx: &mut Context<Self>) -> Div {
+        if let Some(server) = self.server() {
+            return update_card_body(
+                format!("Gentle Shell main has a newer commit {commit}"),
+                None,
+                "Open agent tabs keep running on the server's current build until it restarts them.",
+            )
+            .child(super::remote::note(
+                server.run(super::remote::commands::UPGRADE_MAIN),
+            ));
+        }
         let target = commit.to_string();
         let busy = self.upgrading_on(UpgradeChannel::Main);
         let running = busy.is_some();
@@ -483,7 +502,7 @@ impl SettingsView {
     }
 
     fn run_pi_update(&mut self, cx: &mut Context<Self>) {
-        if self.shell_job_running() {
+        if self.shell_job_running() || self.server().is_some() {
             return;
         }
         self.shell_update.pi_running = true;
@@ -519,6 +538,10 @@ impl SettingsView {
     }
 
     pub(super) fn render_pi_update(&self, available: bool, cx: &mut Context<Self>) -> Option<Div> {
+        if let Some(server) = self.server() {
+            return available
+                .then(|| super::remote::note(server.run(super::remote::commands::UPDATE_PI)));
+        }
         let running = self.shell_update.pi_running;
         let show_button = available || running;
         let output = self.shell_update.pi_result.as_ref();

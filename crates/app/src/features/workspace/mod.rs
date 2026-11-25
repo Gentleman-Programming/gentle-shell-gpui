@@ -278,6 +278,9 @@ impl Tab {
 struct Space {
     name: String,
     root: PathBuf,
+    /// The Gentle Shell server (its address) whose folder `root` is; `None`
+    /// for a folder on this computer.
+    server: Option<String>,
     last_active: u64,
     tabs: Vec<Tab>,
     active: usize,
@@ -292,6 +295,7 @@ impl Space {
         Self {
             name,
             root,
+            server: None,
             last_active: workspaces::now(),
             tabs: Vec::new(),
             active: 0,
@@ -500,10 +504,19 @@ impl Workspace {
             .workspaces
             .into_iter()
             .map(|w| {
+                // Before workspaces named their server, one whose agents
+                // followed a server's sessions was opened there.
+                let server = w.server.or_else(|| {
+                    w.tabs
+                        .iter()
+                        .flat_map(|tab| tab.layout.leaves())
+                        .find_map(|pane| pane.server.as_ref().map(|s| s.url.clone()))
+                });
                 restored.push((w.tabs, w.active_tab));
                 Space {
                     name: w.name,
                     root: w.root,
+                    server,
                     last_active: w.last_active,
                     tabs: Vec::new(),
                     active: 0,
@@ -637,7 +650,21 @@ impl Workspace {
                 Some(index) => index,
                 None => this.push_space(None, folder),
             },
-            None if this.spaces.is_empty() => this.push_space(None, crate::cli::default_cwd()),
+            // Agents on a Gentle Shell server: the first workspace is the
+            // server's home folder, not one on this computer.
+            None if this.spaces.is_empty() => match crate::features::backend::saved() {
+                gentle_core::backend::Backend::Server { url, .. } => {
+                    match crate::features::backend::server::known_home(&url) {
+                        Some(home) => {
+                            let index = this.push_space(None, home.into());
+                            this.spaces[index].server = Some(url);
+                            index
+                        }
+                        None => this.push_space(None, crate::cli::default_cwd()),
+                    }
+                }
+                _ => this.push_space(None, crate::cli::default_cwd()),
+            },
             None => this.current,
         };
         this.current = target;
@@ -649,7 +676,7 @@ impl Workspace {
             this.activate(active, window, cx);
         }
         if let Some(url) = url {
-            this.open_agent_page(url, None, false, window, cx);
+            this.open_agent_page(url, None, None, false, window, cx);
         }
         this.space_mut().last_active = workspaces::now();
         this.schedule_save(cx);
@@ -701,7 +728,7 @@ impl Workspace {
             self.open_tab(PaneKind::Agent, root, Some(prompt), None, window, cx);
         }
         if let Some(url) = url {
-            self.open_agent_page(url, None, false, window, cx);
+            self.open_agent_page(url, None, None, false, window, cx);
         }
         if let Some(args) = device {
             self.device_request(&args, cx);

@@ -113,6 +113,10 @@ pub fn save_bridge_plan(agent: &Path, plan: &str) -> std::io::Result<()> {
 
 impl SettingsView {
     fn set_plan(&mut self, plan: &'static str, cx: &mut Context<Self>) {
+        // A server's claude-bridge.json is not a file of this computer's.
+        if self.server().is_some() {
+            return;
+        }
         let agent = pi_rpc::resolve_homes().agent;
         forget_claude_auth();
         match save_bridge_plan(&agent, plan) {
@@ -128,8 +132,26 @@ impl SettingsView {
     }
 
     /// An existing bridge install: its package, Claude Code's sign-in and the
-    /// Pro/Max plan. `None` without the bridge: the app doesn't offer it.
+    /// Pro/Max plan. `None` without the bridge: the app doesn't offer it. On
+    /// a server (its packages as its update status lists them) the plan is
+    /// changed there: the bridge's file has no Desktop RPC store.
     pub(super) fn bridge_section(&self, s: &Snapshot, cx: &mut Context<Self>) -> Option<Div> {
+        if let Some(server) = self.server() {
+            let installed = self.shell_updates.status.as_ref().is_some_and(|status| {
+                crate::features::updates::status::package_status(
+                    "npm:pi-claude-bridge",
+                    &status.packages.items,
+                )
+                .is_some()
+            });
+            return installed.then(|| {
+                section(IconName::Bot, "Claude bridge")
+                    .child(row("Package", "pi-claude-bridge installed".to_string()))
+                    .child(super::remote::note(server.act(
+                        "set provider.plan (pro or max) in claude-bridge.json in its Gentle Shell agent folder",
+                    )))
+            });
+        }
         if !s.has_package("npm:pi-claude-bridge") {
             return None;
         }

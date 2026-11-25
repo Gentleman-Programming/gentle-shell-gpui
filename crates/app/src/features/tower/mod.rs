@@ -96,15 +96,22 @@ fn drain(pipe: impl std::io::Read + Send + 'static) {
 
 /// Starts the server for `cwd` and waits for its URL (blocking: run off the
 /// main thread): with `--json` unless a Shell refused it before, and again
-/// without it when this one refuses it.
-fn start(cwd: PathBuf) -> Result<(Server, String), String> {
+/// without it when this one refuses it. Where the folder's agents run on a
+/// Gentle Shell server, Tower runs there (`POST /api/tower`, started once
+/// for every device and left running when this tab closes) and the tab
+/// opens it through the forward the server returns: no server here.
+fn start(cwd: PathBuf) -> Result<(Option<Server>, String), String> {
+    let backend = crate::features::backend::for_tab(&cwd);
+    if backend.is_server() {
+        return crate::features::backend::server::tower(&backend).map(|url| (None, url));
+    }
     if !JSON_REFUSED.load(Ordering::Relaxed) {
         match serve(&cwd, true) {
             Err(why) if refused_json_flag(&why) => JSON_REFUSED.store(true, Ordering::Relaxed),
-            served => return served,
+            served => return served.map(|(server, url)| (Some(server), url)),
         }
     }
-    serve(&cwd, false)
+    serve(&cwd, false).map(|(server, url)| (Some(server), url))
 }
 
 /// Runs `gentle-shell tower --no-open` (with `--json` when `json`) until it
@@ -113,9 +120,6 @@ fn start(cwd: PathBuf) -> Result<(Server, String), String> {
 /// `wsl.exe` or `docker` wouldn't stop it); its page is reached through
 /// the backend's forwarded localhost.
 fn serve(cwd: &Path, json: bool) -> Result<(Server, String), String> {
-    if crate::features::backend::on_server(cwd) {
-        return Err(crate::features::backend::server::UNAVAILABLE.into());
-    }
     let args: &[&str] = if json {
         &["tower", "--no-open", "--json"]
     } else {
@@ -163,6 +167,8 @@ fn serve(cwd: &Path, json: bool) -> Result<(Server, String), String> {
 
 pub struct TowerView {
     cwd: PathBuf,
+    /// Tower runs on the Gentle Shell server the folder's agents run on.
+    on_server: bool,
     state: State,
     server: Option<Server>,
     /// Its tab is the one on screen.
@@ -187,6 +193,7 @@ impl TowerView {
             async {}
         });
         let mut this = Self {
+            on_server: crate::features::backend::on_server(&cwd),
             cwd,
             state: State::Starting,
             server: None,
@@ -213,7 +220,7 @@ impl TowerView {
             let _ = this.update(cx, |this, cx| {
                 match started {
                     Ok((server, url)) => {
-                        this.server = Some(server);
+                        this.server = server;
                         let (shown, covered) = (this.shown, this.covered);
                         let surface = cx.new(|cx| {
                             let mut surface = WebSurface::new(url, None);
@@ -331,8 +338,9 @@ impl Render for TowerView {
                         .child(line.clone()),
                 ),
             State::Failed(why) => {
-                // Gentle Shell 4.9.0 shipped without Tower's web app.
-                let missing_web = why.contains("web app is not built");
+                // Gentle Shell 4.9.0 shipped without Tower's web app; on a
+                // server it is built there, so the server's words say how.
+                let missing_web = !self.on_server && why.contains("web app is not built");
                 v_flex()
                     .gap_3()
                     .items_center()

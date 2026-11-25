@@ -65,12 +65,26 @@ pub(super) struct NotificationUiState {
 }
 
 impl SettingsView {
-    /// Gentle Shell's notification policy, shared with the terminal.
+    /// Gentle Shell's notification policy, shared with the terminal. On a
+    /// server whose Gentle Shell doesn't serve the store, where to change it.
     pub(super) fn notifications_section(&self, cx: &mut Context<Self>) -> Div {
-        let policy = self.notification_policy();
+        let Some(policy) = self.notification_policy() else {
+            let line = self.server().map(|server| {
+                if self.server_lacks(pi_rpc::desktop_rpc::ConfigStore::Notifications, cx) {
+                    server.run(super::remote::commands::CUSTOMIZE)
+                } else {
+                    format!("Asking {}'s Gentle Shell…", server.name)
+                }
+            });
+            return section(IconName::Bell, "Notifications")
+                .children(line.map(super::remote::note));
+        };
         let enabled = policy.enabled();
+        let on_server = self.server().is_some();
         let mut card = section(IconName::Bell, "Notifications")
-            .child(row("File", policy.file.display().to_string()))
+            .when(!on_server, |card| {
+                card.child(row("File", policy.file.display().to_string()))
+            })
             .child(row(
                 "Context threshold",
                 format!(

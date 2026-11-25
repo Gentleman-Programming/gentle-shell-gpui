@@ -2,12 +2,17 @@
 //! It shows what this machine has for Gentle Shell (`crate::features::setup` checks),
 //! installs what can be installed unattended with a live log, hands anything
 //! that needs a password or an interactive login to a terminal tab, and sends
-//! provider sign-in to the Providers screen.
+//! provider sign-in to the Providers screen. The other way in is connecting
+//! to a Gentle Shell server (`gentle-shell serve share`'s code): agents then
+//! run there, nothing is installed on this computer and only the server is
+//! checked.
 
 use std::collections::VecDeque;
 
+use gentle_core::backend::Backend;
 use gpui_kit::*;
 
+use crate::features::settings::{ConnectEvent, ServerConnect};
 use crate::features::setup::{self, Check, CheckId};
 
 mod checks;
@@ -70,6 +75,10 @@ pub enum OnboardingEvent {
     /// Open a terminal tab with this command typed (needs the user: a
     /// password, an interactive login).
     Terminal(String),
+    /// Where agents run changed here: a Gentle Shell server was paired
+    /// (nothing needs installing on this computer then), or this computer
+    /// was chosen again.
+    RunsOnChanged,
 }
 
 pub struct OnboardingView {
@@ -94,6 +103,9 @@ pub struct OnboardingView {
     /// The provider check as the active agent tab's Gentle Shell answered
     /// it (`get_auth_status`), applied over every look at the machine.
     registry_sign_in: Option<Result<String, String>>,
+    /// Connecting to a Gentle Shell server instead of setting up this
+    /// computer (the first-run paths; Configuration has its own).
+    connect: Option<(Entity<ServerConnect>, Subscription)>,
     _probe: Task<()>,
     _job: Task<()>,
 }
@@ -102,7 +114,23 @@ impl EventEmitter<OnboardingEvent> for OnboardingView {}
 
 impl OnboardingView {
     /// `probe` is a look already taken (the startup check); `None` looks now.
-    pub fn new(probe: Option<Probe>, cx: &mut Context<Self>) -> Self {
+    /// Offers connecting to a Gentle Shell server as the other way in.
+    pub fn new(probe: Option<Probe>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let mut this = Self::build(probe, cx);
+        let url = match crate::features::backend::saved() {
+            Backend::Server { url, .. } => url,
+            _ => String::new(),
+        };
+        let connect = cx.new(|cx| ServerConnect::new(url, window, cx));
+        let paired = cx.subscribe(&connect, |this, _, event: &ConnectEvent, cx| {
+            let ConnectEvent::Paired(choice, _) = event;
+            this.choose_runs_on(choice.clone(), cx);
+        });
+        this.connect = Some((connect, paired));
+        this
+    }
+
+    fn build(probe: Option<Probe>, cx: &mut Context<Self>) -> Self {
         let mut this = Self {
             mode: Mode::Screen,
             entrance: std::time::Duration::ZERO,
@@ -117,6 +145,7 @@ impl OnboardingView {
             failure: None,
             announce: false,
             registry_sign_in: None,
+            connect: None,
             _probe: Task::ready(()),
             _job: Task::ready(()),
         };
@@ -129,10 +158,32 @@ impl OnboardingView {
 
     /// The checklist for Configuration → Setup & requirements: looks at the
     /// machine now, installs and hands off actions like the screen does.
+    /// Where agents run is Configuration's own section there.
     pub fn embedded(cx: &mut Context<Self>) -> Self {
-        let mut this = Self::new(None, cx);
+        let mut this = Self::build(None, cx);
         this.mode = Mode::Embedded;
         this
+    }
+
+    /// Save where agents run (a server just paired, or this computer
+    /// again), then look again: on a server only the server is checked and
+    /// nothing is installed here.
+    fn choose_runs_on(&mut self, choice: Backend, cx: &mut Context<Self>) {
+        if let Err(err) = crate::features::backend::save(&choice) {
+            eprintln!("gentle-shell-gpui: could not save where agents run: {err}");
+        }
+        self.failure = None;
+        self.checks = None;
+        self.refresh(cx);
+        cx.emit(OnboardingEvent::RunsOnChanged);
+    }
+
+    /// The Gentle Shell server agents run on, as saved: its name.
+    fn server(&self) -> Option<String> {
+        match crate::features::backend::saved() {
+            Backend::Server { name, .. } => Some(name),
+            _ => None,
+        }
     }
 
     /// The install sequence for the welcome screen; its steps come in after
@@ -140,9 +191,10 @@ impl OnboardingView {
     pub fn sequence(
         probe: Option<Probe>,
         entrance: std::time::Duration,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let mut this = Self::new(probe, cx);
+        let mut this = Self::new(probe, window, cx);
         this.mode = Mode::Sequence;
         this.entrance = entrance;
         this

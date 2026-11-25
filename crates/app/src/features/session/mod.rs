@@ -92,6 +92,9 @@ pub enum SessionEvent {
     /// tools that the window runs: show a page, drive a browser card, or
     /// use the canvas this agent floats over.
     HostTool(HostToolRequest),
+    /// The tab's folder doesn't exist on its Gentle Shell server: the
+    /// window asks for one there (⌘K, typed as the server sees it).
+    OpenServerFolder,
 }
 
 /// What the window reads from a tab, to emit [`SessionEvent::ChromeChanged`]
@@ -247,6 +250,7 @@ impl SessionView {
         cx: &mut Context<Self>,
         start_now: bool,
     ) -> Self {
+        let on_server = crate::features::backend::on_server(&cwd);
         let composer = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .auto_grow(1, 10)
@@ -371,9 +375,13 @@ impl SessionView {
             activity: state::TurnActivity::default(),
             agents_panel: AgentsPanel::default(),
             mode: None,
-            default_mode: crate::shared::gentle_state::read_default_mode(
-                &pi_rpc::resolve_homes().config,
-            ),
+            // A server's tab reads no Gentle Shell home of this computer:
+            // its default mode comes from the server (`get_permission_mode`).
+            default_mode: (!on_server)
+                .then(|| {
+                    crate::shared::gentle_state::read_default_mode(&pi_rpc::resolve_homes().config)
+                })
+                .flatten(),
             _agents_ticker: Task::ready(()),
             job_output: agents::JobOutputView::default(),
             todo: state::TodoIsland::default(),
@@ -389,7 +397,11 @@ impl SessionView {
             title: None,
             active_shell: None,
             credentials_reload: None,
-            banner: crate::shared::banner::read_config(&pi_rpc::resolve_homes().config),
+            banner: if on_server {
+                crate::shared::banner::BannerConfig::default()
+            } else {
+                crate::shared::banner::read_config(&pi_rpc::resolve_homes().config)
+            },
             banner_reveal: 0.0,
             _banner_anim: Task::ready(()),
             list: view::TranscriptList::new(),
@@ -438,6 +450,25 @@ impl SessionView {
 
     pub fn cwd(&self) -> &PathBuf {
         &self.cwd
+    }
+
+    /// Where this tab's agent runs: the backend it started on, else where a
+    /// tab in its folder starts.
+    pub fn runs_on(&self) -> gentle_core::backend::Backend {
+        self.runs_on
+            .clone()
+            .unwrap_or_else(|| crate::features::backend::for_tab(&self.cwd))
+    }
+
+    /// The default permission mode for new sessions as this tab's Gentle
+    /// Shell reported it (`get_permission_mode`); `None` until it says.
+    pub(crate) fn reported_default_mode(
+        &self,
+    ) -> Option<gentle_core::gentle_state::PermissionMode> {
+        self.permission
+            .confirmed()
+            .default_mode
+            .map(from_desktop_mode)
     }
 
     /// Pairs this agent with a canvas; set before its backend starts.

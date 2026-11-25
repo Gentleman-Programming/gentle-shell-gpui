@@ -443,6 +443,13 @@ fn add_named_profile(name: &str, cx: &mut App) {
 
 pub struct BrowserPanel {
     url: String,
+    /// The page as a server session named it, on the server's own loopback,
+    /// when the card shows it through a forward ([`Self::url`] is the
+    /// forward's): one card per page, whichever forward link opened it.
+    source: Option<String>,
+    /// Why the page can't show (the server refused its forward), drawn in
+    /// its place; no native view runs meanwhile.
+    refused: Option<String>,
     /// What the header calls this page. `None` derives it from the URL (the
     /// host), so any web app can use the card, not only Gentle Design.
     label: Option<String>,
@@ -475,6 +482,8 @@ impl BrowserPanel {
         });
         Self {
             url,
+            source: None,
+            refused: None,
             label,
             name: None,
             driven: false,
@@ -493,6 +502,30 @@ impl BrowserPanel {
 
     pub fn url(&self) -> &str {
         &self.url
+    }
+
+    /// The page this card shows, as whoever opened it named it: the server's
+    /// loopback URL for a forwarded page, else [`Self::url`].
+    pub fn source(&self) -> &str {
+        self.source.as_deref().unwrap_or(&self.url)
+    }
+
+    pub fn set_source(&mut self, source: Option<String>) {
+        self.source = source;
+    }
+
+    /// The page can't show: `why` (the server's words) in its place, the
+    /// address it was asked for in the header, until the next
+    /// [`Self::navigate`].
+    pub fn refuse(&mut self, url: String, why: String, cx: &mut Context<Self>) {
+        self.surface.update(cx, |surface, cx| surface.hide(cx));
+        self.url = url;
+        self.refused = Some(why);
+        cx.notify();
+    }
+
+    pub fn refusal(&self) -> Option<&str> {
+        self.refused.as_deref()
     }
 
     pub fn mode(&self) -> Mode {
@@ -578,8 +611,13 @@ impl BrowserPanel {
     /// Show `url`, or reload when it is already showing (the canvas was
     /// refreshed).
     pub fn navigate(&mut self, url: String, label: Option<String>, cx: &mut Context<Self>) {
-        self.surface
-            .update(cx, |surface, cx| surface.navigate(url.clone(), cx));
+        let refused = self.refused.take().is_some();
+        self.surface.update(cx, |surface, cx| {
+            if refused {
+                surface.show(cx);
+            }
+            surface.navigate(url.clone(), cx)
+        });
         self.url = url;
         self.label = label;
         cx.notify();
@@ -867,9 +905,29 @@ impl BrowserPanel {
             .rounded(px(floating::BODY_RADIUS))
             .bg(ui::well())
             .overflow_hidden()
-            .map(|body| match &self.choosing {
-                Some(choosing) => body.child(self.chooser(choosing, cx)),
-                None => body.child(self.surface.clone()),
+            .map(|body| match (&self.choosing, &self.refused) {
+                (Some(choosing), _) => body.child(self.chooser(choosing, cx)),
+                (None, Some(why)) => body.child(
+                    v_flex()
+                        .size_full()
+                        .items_center()
+                        .justify_center()
+                        .gap_1()
+                        .p_4()
+                        .child(
+                            div()
+                                .text_size(rems(13. / 16.))
+                                .text_color(ui::fg())
+                                .child("This page didn't open"),
+                        )
+                        .child(
+                            div()
+                                .text_size(rems(12. / 16.))
+                                .text_color(ui::muted())
+                                .child(why.clone()),
+                        ),
+                ),
+                (None, None) => body.child(self.surface.clone()),
             })
     }
 

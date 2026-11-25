@@ -1,6 +1,8 @@
 //! Packages: `gentle-shell install|remove`, Pi's own package manager
 //! against the resolved home. Update badges come from the active agent
-//! tab's Desktop RPC when available.
+//! tab's Desktop RPC when available. On a Gentle Shell server the packages
+//! are those its update status lists, and installing or removing one is
+//! done there (no Desktop RPC method does it).
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -63,7 +65,10 @@ impl SettingsView {
         source: String,
         cx: &mut Context<Self>,
     ) {
-        if self.package.running.is_some() || self.shell_update.blocks_packages() {
+        if self.package.running.is_some()
+            || self.shell_update.blocks_packages()
+            || self.server().is_some()
+        {
             return;
         }
         self.package.running = Some(format!("{verb} {source}"));
@@ -104,6 +109,9 @@ impl SettingsView {
 
     /// Installed packages (remove each) and a field to install any source.
     pub(super) fn packages_section(&self, s: &Snapshot, cx: &mut Context<Self>) -> Div {
+        if let Some(server) = self.server() {
+            return self.server_packages_section(server);
+        }
         let updates = self.shell_updates.status.as_ref();
         let updating_shell = self.shell_update.blocks_packages();
         let available = updates.map_or(0, crate::features::updates::status::packages_with_updates);
@@ -263,5 +271,49 @@ impl SettingsView {
                     ),
                 )
             })
+    }
+
+    /// A server's packages, read-only: what its update status lists, and
+    /// how to update, install or remove one there.
+    fn server_packages_section(&self, server: &super::remote::ServerPlace) -> Div {
+        use super::remote::{commands, note};
+        let updates = self.shell_updates.status.as_ref();
+        let items = updates.map_or(&[][..], |status| status.packages.items.as_slice());
+        let available = updates.map_or(0, crate::features::updates::status::packages_with_updates);
+        section(IconName::Layers, "Packages")
+            .when(updates.is_none(), |d| {
+                d.child(row("Installed", format!("not reported by {}", server.name)))
+            })
+            .children(items.iter().map(|item| {
+                let update = item.state == pi_rpc::desktop_rpc::PackageUpdateState::UpdateAvailable;
+                h_flex()
+                    .gap_2()
+                    .px_2()
+                    .py_1()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(ui::code_rems(12.))
+                            .font_family(ui::mono())
+                            .text_color(ui::fg())
+                            .child(item.name.clone()),
+                    )
+                    .when_some(item.current.clone(), |d, v| {
+                        d.child(ui::chip(v, ui::info()).flex_shrink_0())
+                    })
+                    .children(
+                        crate::features::updates::status::package_chip(item).map(|text| {
+                            let color = if update { ui::accent() } else { ui::muted() };
+                            ui::chip(text, color).flex_shrink_0()
+                        }),
+                    )
+            }))
+            .when(available > 0, |d| {
+                d.child(note(server.run(commands::UPDATE_PACKAGES)))
+            })
+            .child(note(server.run(commands::INSTALL)))
+            .child(note(server.run(&commands::remove("<source>"))))
     }
 }

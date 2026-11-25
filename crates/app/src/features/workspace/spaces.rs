@@ -57,6 +57,45 @@ impl Workspace {
         self.switch_workspace(index, window, cx);
     }
 
+    /// A new workspace at `root`, a folder on the Gentle Shell server agents
+    /// run on, typed as the server sees it (this computer can't browse it):
+    /// its tabs start there.
+    pub(super) fn create_server_workspace(
+        &mut self,
+        name: Option<String>,
+        root: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let server = match crate::features::backend::saved() {
+            gentle_core::backend::Backend::Server { url, .. } => Some(url),
+            _ => None,
+        };
+        let index = self.push_space(name.filter(|n| !n.trim().is_empty()), root);
+        self.spaces[index].server = server;
+        self.switch_workspace(index, window, cx);
+    }
+
+    /// Ask for a folder on the Gentle Shell server agents run on: ⌘K on
+    /// Workspaces with the server's home folder typed, to go on from (Enter
+    /// opens a workspace there).
+    pub(super) fn open_server_folder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let home = match crate::features::backend::saved() {
+            gentle_core::backend::Backend::Server { url, .. } => {
+                crate::features::backend::server::known_home(&url)
+            }
+            _ => return,
+        };
+        if matches!(self.overlay, Some((Overlay::Palette(_), _))) {
+            self.close_overlay(window, cx);
+        }
+        self.open_palette(Category::Workspaces, window, cx);
+        if let Some((Overlay::Palette(view), _)) = &self.overlay {
+            let typed = format!("{}/", home.unwrap_or_default().trim_end_matches('/'));
+            view.update(cx, |view, cx| view.set_query(&typed, window, cx));
+        }
+    }
+
     /// Open a new tab in a specific workspace, using its root rather than
     /// the working directory of a previously focused agent.
     pub(super) fn open_workspace_tab(
@@ -70,7 +109,17 @@ impl Workspace {
             return;
         };
         space.sidebar_expanded = true;
-        let root = space.root.clone();
+        let mut root = space.root.clone();
+        // Agents on a Gentle Shell server: a workspace not opened there
+        // starts them in the server's home.
+        if kind == PaneKind::Agent
+            && let gentle_core::backend::Backend::Server { url, .. } =
+                crate::features::backend::saved()
+        {
+            let there = space.server.as_deref() == Some(url.as_str());
+            let home = crate::features::backend::server::known_home(&url);
+            root = gentle_core::serve::tab_folder(&root, there, home.as_deref());
+        }
         if index != self.current {
             self.switch_workspace(index, window, cx);
         }
@@ -85,6 +134,10 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // A Gentle Shell server's folders can't be browsed from here.
+        if crate::features::backend::saved().is_server() {
+            return self.open_server_folder(window, cx);
+        }
         let paths = cx.prompt_for_paths(PathPromptOptions {
             files: false,
             directories: true,

@@ -40,6 +40,10 @@ pub(super) struct Backend {
     /// The Gentle Shell server session a restored tab reattaches to when it
     /// starts (it kept running while the app was closed).
     pub(super) attach: Option<gentle_core::serve::ServerSession>,
+    /// The Gentle Shell server has no such folder (`invalid_cwd`): its
+    /// user's home folder there, which the failed tab offers to open
+    /// instead.
+    pub(super) server_home: Option<String>,
 }
 
 impl Backend {
@@ -53,6 +57,7 @@ impl Backend {
             pending_session: None,
             restart_pending: false,
             attach: None,
+            server_home: None,
         }
     }
 

@@ -79,6 +79,9 @@ pub enum PaletteAction {
     /// A new workspace at `root`, typed: a folder on a Gentle Shell server,
     /// which this computer can't browse.
     CreateWorkspaceAt(PathBuf),
+    /// Type a folder on the Gentle Shell server agents run on, from its
+    /// home folder.
+    OpenServerFolder,
     OpenFile(PathBuf),
     /// Asks for confirmation before running `git switch`.
     SwitchBranch(String),
@@ -276,6 +279,17 @@ impl PaletteView {
             state.set_placeholder(category.placeholder(), window, cx);
             state.focus(window, cx);
         });
+        self.refresh_rows(cx);
+        cx.notify();
+    }
+
+    /// Type `text` in the field (the cursor at its end), as if the user had.
+    pub fn set_query(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.query.update(cx, |state, cx| {
+            state.set_value(text.to_string(), window, cx);
+            state.focus(window, cx);
+        });
+        self.selected = 0;
         self.refresh_rows(cx);
         cx.notify();
     }

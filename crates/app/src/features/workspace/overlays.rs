@@ -147,14 +147,24 @@ impl Workspace {
                 name,
                 pick_folder: false,
             } => {
-                let root = self.active_cwd(cx);
-                self.create_workspace(Some(name), root, window, cx);
+                // On a Gentle Shell server: a folder there (the focused
+                // agent's, else the server's home), never this computer's.
+                if crate::features::backend::saved().is_server() {
+                    let root = self.new_agent_cwd(cx);
+                    self.create_server_workspace(Some(name), root, window, cx);
+                } else {
+                    let root = self.active_cwd(cx);
+                    self.create_workspace(Some(name), root, window, cx);
+                }
             }
             PaletteAction::CreateWorkspace {
                 name,
                 pick_folder: true,
             } => self.pick_workspace_folder(Some(name), window, cx),
-            PaletteAction::CreateWorkspaceAt(root) => self.create_workspace(None, root, window, cx),
+            PaletteAction::CreateWorkspaceAt(root) => {
+                self.create_server_workspace(None, root, window, cx)
+            }
+            PaletteAction::OpenServerFolder => self.open_server_folder(window, cx),
             PaletteAction::OpenFile(path) => self.open_file(path, window, cx),
             PaletteAction::SwitchBranch(branch) => self.confirm_switch_branch(branch, window, cx),
         }
@@ -492,11 +502,14 @@ impl Workspace {
                     this.on_setup_event(event, usable, window, cx);
                 }
                 SettingsEvent::ShellCommand(text) => {
+                    // The session Configuration reads from: the active tab,
+                    // or on a server, its control session there.
+                    let session = view.read(cx).control_session();
                     let view = view.downgrade();
                     let report = move |result: Result<(), String>, cx: &mut App| {
                         let _ = view.update(cx, |view, cx| view.shell_done(result, cx));
                     };
-                    match this.active_session() {
+                    match session {
                         Some(session) => session.update(cx, |session, cx| {
                             session.run_extension_command(text.clone(), cx, report)
                         }),
@@ -577,9 +590,12 @@ impl Workspace {
     pub(super) fn open_usage(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // The Subscription tab reads through the active agent's RPC slice, so
         // its backend must be started (probe included) before it is opened.
+        // On a Gentle Shell server without a tab there, the screen starts
+        // its own control session there (see `settings::remote`).
         self.start_active_session(window, cx);
         let session = self.active_session();
-        let view = cx.new(|cx| UsageView::new(window, cx, session));
+        let cwd = self.active_cwd(cx);
+        let view = cx.new(|cx| UsageView::new(&cwd, window, cx, session));
         let subscription = cx.subscribe_in(
             &view,
             window,
@@ -627,7 +643,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let view = cx.new(|cx| OnboardingView::new(probe, cx));
+        let view = cx.new(|cx| OnboardingView::new(probe, window, cx));
         let subscription = cx.subscribe_in(
             &view,
             window,
@@ -649,7 +665,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.resume_welcome = None;
-        let view = cx.new(|cx| WelcomeView::new(probe, cx));
+        let view = cx.new(|cx| WelcomeView::new(probe, window, cx));
         self.attach_welcome(view, window, cx);
     }
 
@@ -708,7 +724,35 @@ impl Workspace {
                 let home = dirs::home_dir().unwrap_or_else(|| self.active_cwd(cx));
                 self.open_setup_terminal(home, command.clone(), window, cx);
             }
+            OnboardingEvent::RunsOnChanged => self.runs_on_changed(window, cx),
         }
+    }
+
+    /// Onboarding changed where agents run. On a Gentle Shell server, the
+    /// shown workspace, when it isn't one of that server's folders, moves to
+    /// the server's home folder (a folder on this computer is none there)
+    /// and the agent tabs that never came up start again there; on this
+    /// computer, they start again where they are.
+    fn runs_on_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let gentle_core::backend::Backend::Server { url, .. } = crate::features::backend::saved()
+        else {
+            return self.retry_failed_sessions(window, cx);
+        };
+        let Some(home) = crate::features::backend::server::known_home(&url) else {
+            return self.retry_failed_sessions(window, cx);
+        };
+        if self.space().server.as_deref() != Some(url.as_str()) {
+            let space = self.space_mut();
+            space.root = PathBuf::from(&home);
+            space.server = Some(url);
+            cx.emit(WorkspaceEvent::RootChanged(PathBuf::from(&home)));
+            self.schedule_save(cx);
+        }
+        for tab in self.sessions() {
+            let home = PathBuf::from(&home);
+            tab.update(cx, |session, cx| session.retry_start_in(home, window, cx));
+        }
+        cx.notify();
     }
 
     /// A terminal tab in `cwd` (where its agents run) with `command` typed at

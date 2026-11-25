@@ -10,6 +10,28 @@ impl Workspace {
             .unwrap_or_else(|| self.space().root.clone())
     }
 
+    /// Where a new agent starts: [`Self::active_cwd`], except when agents
+    /// run on a Gentle Shell server and that folder isn't known to be one
+    /// there (the focused agent doesn't run on it and the workspace wasn't
+    /// opened on it): then the server's home folder
+    /// ([`gentle_core::serve::tab_folder`]), never a path on this computer.
+    pub(super) fn new_agent_cwd(&self, cx: &App) -> PathBuf {
+        let cwd = self.active_cwd(cx);
+        let gentle_core::backend::Backend::Server { url, .. } = crate::features::backend::saved()
+        else {
+            return cwd;
+        };
+        let focused_there = self
+            .focused_pane()
+            .and_then(|id| self.panes.get(&id))
+            .and_then(|pane| pane.session.as_ref())
+            .and_then(|session| session.read(cx).server_session())
+            .is_some_and(|session| session.url == url);
+        let opened_there = self.space().server.as_deref() == Some(url.as_str());
+        let home = crate::features::backend::server::known_home(&url);
+        gentle_core::serve::tab_folder(&cwd, focused_there || opened_there, home.as_deref())
+    }
+
     /// The agent the screens act on: the focused pane's, else the first agent
     /// in the tab, else any in the workspace.
     pub(super) fn active_session(&self) -> Option<Entity<SessionView>> {
@@ -99,6 +121,7 @@ impl Workspace {
                 SavedWorkspace {
                     name: space.name.clone(),
                     root: space.root.clone(),
+                    server: space.server.clone(),
                     tabs,
                     active_tab: space.active,
                     last_active: space.last_active,

@@ -119,16 +119,18 @@ impl ProfilesView {
                                     .label("Close")
                                     .on_click(cx.listener(|this, _, window, cx| this.leave(Leave::Close, window, cx))),
                             )
-                            .child(
-                                Button::new("use-session")
-                                    .small()
-                                    .primary()
-                                    .icon(Icon::new(IconName::CircleCheck))
-                                    .label("Use in this session")
-                                    .tooltip("Switch this session's orchestrator to the profile (saves edits first)")
-                                    .disabled(disabled)
-                                    .on_click(cx.listener(|this, _, _, cx| this.use_in_session(cx))),
-                            ),
+                            .when(!self.control_only(), |d| {
+                                d.child(
+                                    Button::new("use-session")
+                                        .small()
+                                        .primary()
+                                        .icon(Icon::new(IconName::CircleCheck))
+                                        .label("Use in this session")
+                                        .tooltip("Switch this session's orchestrator to the profile (saves edits first)")
+                                        .disabled(disabled)
+                                        .on_click(cx.listener(|this, _, _, cx| this.use_in_session(cx))),
+                                )
+                            }),
                     ),
             )
     }

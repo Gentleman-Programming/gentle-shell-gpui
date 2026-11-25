@@ -7,6 +7,7 @@ use gpui_kit::*;
 use super::super::{
     SettingsView,
     layout::{or_dash, row, section},
+    remote,
     snapshot::Snapshot,
 };
 use crate::shared::ui;
@@ -34,10 +35,27 @@ pub(super) fn render(
         )
         .child(
             section(IconName::SquareTerminal, "Terminal appearance")
-                .child(row("Theme (terminal)", or_dash(&snapshot.theme, "default")))
+                .child(row(
+                    "Theme (terminal)",
+                    match view.server() {
+                        // Pi's settings.json has no Desktop RPC store.
+                        Some(server) => server.run(remote::commands::SETTINGS),
+                        None => or_dash(&snapshot.theme, "default"),
+                    },
+                ))
                 .child(row(
                     "Banner",
-                    or_dash(&snapshot.banner, "pink · rose on · text on"),
+                    match view.server() {
+                        Some(server)
+                            if view
+                                .shell_config
+                                .state(pi_rpc::desktop_rpc::ConfigStore::Banner)
+                                .is_none() =>
+                        {
+                            format!("not reported by {}", server.name)
+                        }
+                        _ => or_dash(&snapshot.banner, "pink · rose on · text on"),
+                    },
                 ))
                 .child(
                     div().pt_2().text_xs().text_color(ui::faint()).child(

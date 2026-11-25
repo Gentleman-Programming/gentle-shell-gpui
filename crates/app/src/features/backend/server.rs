@@ -9,7 +9,7 @@
 use std::path::PathBuf;
 
 use gentle_core::backend::Backend;
-use gentle_core::serve::{ConnectionCode, Nearby};
+use gentle_core::serve::{ConnectionCode, Nearby, ServerPage, ServerSession};
 use pi_rpc::serve::{Paired, ServeClient, ServerInfo};
 use serde_json::{Map, Value, json};
 
@@ -140,10 +140,11 @@ fn paired_with(url: String, name: String, paired: Paired) -> Result<(Backend, Se
     let client = ServeClient::new(&url, Some(paired.token.clone()));
     let info = client.server().map_err(|e| e.message)?;
     let mut tokens = read_tokens();
-    tokens.insert(
-        url.clone(),
-        json!({"device": paired.device, "token": paired.token}),
-    );
+    let mut entry = json!({"device": paired.device, "token": paired.token});
+    if let Some(home) = &info.home {
+        entry["home"] = home.clone().into();
+    }
+    tokens.insert(url.clone(), entry);
     write_tokens(&tokens).map_err(|e| format!("Couldn't save the device token: {e}"))?;
     Ok((
         Backend::Server {
@@ -165,10 +166,78 @@ fn host_of(url: &str) -> String {
 }
 
 /// What `choice` (a server) says about itself, with this device's token.
-/// Blocking.
+/// Its home folder is kept beside the token for [`known_home`]. Blocking.
 pub fn info(choice: &Backend) -> Result<ServerInfo, String> {
-    client(choice)
+    let info = client(choice)
         .map_err(|e| e.to_string())?
         .server()
+        .map_err(|e| e.message)?;
+    if let (Backend::Server { url, .. }, Some(home)) = (choice, &info.home)
+        && known_home(url).as_ref() != Some(home)
+    {
+        let mut tokens = read_tokens();
+        if let Some(entry) = tokens.get_mut(url).and_then(Value::as_object_mut) {
+            entry.insert("home".into(), home.clone().into());
+            if let Err(err) = write_tokens(&tokens) {
+                eprintln!("gentle-shell-gpui: could not save the server's home folder: {err}");
+            }
+        }
+    }
+    Ok(info)
+}
+
+/// The home folder of the user `choice` (a server) runs as, a path there:
+/// where new workspaces and tabs on it start, and Configuration's control
+/// session runs. Kept from the last answer, else asked ([`info`]); `None`
+/// when this server doesn't say (an older `gentle-shell serve`) or doesn't
+/// answer. Blocking the first time.
+pub fn home(choice: &Backend) -> Option<String> {
+    let Backend::Server { url, .. } = choice else {
+        return None;
+    };
+    known_home(url).or_else(|| info(choice).ok().and_then(|info| info.home))
+}
+
+/// The home folder the server at `url` last said it has (kept beside its
+/// token), without asking it.
+pub fn known_home(url: &str) -> Option<String> {
+    read_tokens()
+        .get(url)
+        .and_then(|entry| entry["home"].as_str())
+        .filter(|home| !home.is_empty())
+        .map(str::to_string)
+}
+
+/// The address that opens `url`, a page a server session gave, on this
+/// device: as it is unless it is on the server's own loopback, where it
+/// goes through a forward of `session` (`POST /api/sessions/:id/forwards`;
+/// the server reuses this device's forward of the port and mints a new
+/// single-use link each time). An error in words when it can't. Blocking.
+pub fn page_url(session: &ServerSession, url: &str) -> Result<String, String> {
+    match gentle_core::serve::server_page(url) {
+        ServerPage::Elsewhere => Ok(url.to_string()),
+        ServerPage::Unreachable(why) => Err(why),
+        ServerPage::Loopback { port, path } => {
+            let token = token(&session.url).ok_or_else(|| {
+                format!(
+                    "This computer isn't paired with the Gentle Shell server at {} any more.",
+                    session.url
+                )
+            })?;
+            ServeClient::new(&session.url, Some(token))
+                .forward(&session.id, port, &path)
+                .map(|forward| forward.url)
+                .map_err(|e| e.message)
+        }
+    }
+}
+
+/// Gentle Tower running on `choice` (a server), through a forward: the
+/// address to open. Blocking.
+pub fn tower(choice: &Backend) -> Result<String, String> {
+    client(choice)
+        .map_err(|e| e.to_string())?
+        .tower()
+        .map(|forward| forward.url)
         .map_err(|e| e.message)
 }

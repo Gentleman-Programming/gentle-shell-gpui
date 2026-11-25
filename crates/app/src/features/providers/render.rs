@@ -67,27 +67,31 @@ impl Render for ProvidersView {
         let listing = self.flow.is_none() && !(self.error.is_some() && self.helper.is_none());
         let body: AnyElement = if let Some((cwd, label)) = &self.remote {
             let (cwd, label) = (cwd.clone(), label.clone());
-            // A Gentle Shell server has no terminals for this app yet.
-            let server = crate::features::backend::on_server(&cwd);
+            // A Gentle Shell server has no terminals for this app yet, and
+            // a sign-in there needs its own browser flow: say where to do it.
+            let server = crate::features::settings::remote::ServerPlace::of(
+                &crate::features::backend::for_tab(&cwd),
+            );
+            let on_server = server.is_some();
             v_flex()
                 .gap_3()
                 .child(notice(
                     IconName::SquareTerminal,
                     ui::accent(),
-                    if server {
-                        format!(
-                            "Agents here run on {label}, so they sign in there: run gentle-shell \
-                             on the server and /login. Credentials go to its auth.json."
-                        )
-                    } else {
-                        format!(
+                    match &server {
+                        Some(server) => format!(
+                            "Agents here run on {}, so they sign in there. {}. Credentials go to its auth.json.",
+                            server.name,
+                            server.run(crate::features::settings::remote::commands::LOGIN),
+                        ),
+                        None => format!(
                             "Agents here run on {label}, so they sign in there: open Gentle \
                              Shell in a terminal on {label} and run /login. Credentials go to \
                              its auth.json."
-                        )
+                        ),
                     },
                 ))
-                .when(!server, |d| {
+                .when(!on_server, |d| {
                     d.child(
                         h_flex().child(
                             Button::new("providers-remote-login")

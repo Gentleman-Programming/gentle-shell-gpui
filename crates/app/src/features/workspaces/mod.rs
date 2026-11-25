@@ -52,6 +52,10 @@ pub struct SavedTab {
 pub struct SavedWorkspace {
     pub name: String,
     pub root: PathBuf,
+    /// The Gentle Shell server (its address) whose folder `root` is;
+    /// absent for a folder on this computer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server: Option<String>,
     #[serde(default)]
     pub tabs: Vec<SavedTab>,
     #[serde(default)]

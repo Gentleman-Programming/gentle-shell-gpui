@@ -821,16 +821,46 @@ impl SessionView {
                         .child(body),
                 )
                 .when(restart, |this| {
+                    let home = self.backend.server_home.clone();
+                    let server = server.clone().unwrap_or_default();
                     this.child(
-                        h_flex().child(
-                            Button::new("backend-start-again")
-                                .small()
-                                .icon(Icon::new(IconName::RefreshCw))
-                                .label("Start again")
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.restart_backend(window, cx)
-                                })),
-                        ),
+                        h_flex()
+                            .gap_2()
+                            .flex_wrap()
+                            // The server has no such folder: its home, or
+                            // another folder typed as the server sees it.
+                            .when_some(home, |row, home| {
+                                row.child(
+                                    Button::new("backend-server-home")
+                                        .small()
+                                        .primary()
+                                        .icon(Icon::new(IconName::House))
+                                        .label(format!("Open in your home on {server}"))
+                                        .tooltip(home.clone())
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.change_cwd(home.clone().into(), window, cx)
+                                        })),
+                                )
+                                .child(
+                                    Button::new("backend-server-folder")
+                                        .small()
+                                        .ghost()
+                                        .icon(Icon::new(IconName::FolderOpen))
+                                        .label(format!("Open another folder on {server}…"))
+                                        .on_click(cx.listener(|_, _, _, cx| {
+                                            cx.emit(super::SessionEvent::OpenServerFolder)
+                                        })),
+                                )
+                            })
+                            .child(
+                                Button::new("backend-start-again")
+                                    .small()
+                                    .icon(Icon::new(IconName::RefreshCw))
+                                    .label("Start again")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.restart_backend(window, cx)
+                                    })),
+                            ),
                     )
                 })
                 .into_any_element(),

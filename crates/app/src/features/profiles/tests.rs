@@ -1652,7 +1652,7 @@ fn reported_agents_join_only_the_roots_gentle_shell_does_not_read() {
         "defaultOrchestrator": { "status": "set", "model": "openai/gpt-5", "thinking": "high" }
     }))
     .unwrap();
-    let names = reported_names(&definitions, &env);
+    let names = reported_names(&definitions, Some(&env));
     // The same names the file discovery finds, from the Shell where it reads.
     assert_eq!(names, assignment_names(&discover_agents(&env)));
     assert!(names.iter().any(|name| name == "project-covered"));
@@ -1704,7 +1704,7 @@ fn agents_that_say_where_they_came_from_are_the_whole_list() {
         entry("local", "project", Some("project")),
     ]));
     assert_eq!(
-        reported_names(&sourced, &env),
+        reported_names(&sourced, Some(&env)),
         assignment_names_of(["jd-judge-a", "explore", "local"])
     );
 
@@ -1717,8 +1717,15 @@ fn agents_that_say_where_they_came_from_are_the_whole_list() {
         ]));
         assert!(!mixed.lists_every_root(), "{odd:?}");
         assert_eq!(
-            reported_names(&mixed, &env),
+            reported_names(&mixed, Some(&env)),
             assignment_names_of(["also-on-disk", "explore", "on-disk", "worker"]),
+            "{odd:?}"
+        );
+        // On a Gentle Shell server those roots are folders there, never
+        // read here: the list is what its Gentle Shell reported.
+        assert_eq!(
+            reported_names(&mixed, None),
+            assignment_names_of(["explore", "worker"]),
             "{odd:?}"
         );
     }

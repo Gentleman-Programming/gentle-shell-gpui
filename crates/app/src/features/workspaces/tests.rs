@@ -39,6 +39,7 @@ fn sample() -> SavedState {
             SavedWorkspace {
                 name: "Default".into(),
                 root: PathBuf::from("/tmp"),
+                server: None,
                 tabs: vec![SavedTab {
                     layout: PaneTree::Leaf(agent.clone()),
                     pinned: true,
@@ -52,6 +53,7 @@ fn sample() -> SavedState {
             SavedWorkspace {
                 name: "project".into(),
                 root: PathBuf::from("/tmp/project"),
+                server: Some("http://pc:8787".into()),
                 tabs: vec![SavedTab {
                     pinned: false,
                     layout: PaneTree::Split {

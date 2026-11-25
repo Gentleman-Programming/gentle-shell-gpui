@@ -69,7 +69,44 @@ impl PaletteView {
                 current: w.current,
             })
             .collect();
+        // A Gentle Shell server's folders have no picker here: typed as the
+        // server sees them (a path), or from its home folder. Both show in
+        // All too.
+        let runs_on = crate::features::backend::saved();
+        let server = runs_on.is_server().then(|| runs_on.label());
+        let typed_folder = server
+            .as_ref()
+            .filter(|_| query.starts_with('/'))
+            .map(|name| Row {
+                icon: IconName::Server,
+                title: format!("Open \u{201c}{query}\u{201d} on {name}"),
+                meta: String::new(),
+                detail: "A workspace in that folder on the server".into(),
+                group: "Workspaces",
+                action: PaletteAction::CreateWorkspaceAt(query.into()),
+                workspace: None,
+                current: false,
+            });
+        let server_folder = server
+            .as_ref()
+            .filter(|_| !query.starts_with('/'))
+            .map(|name| format!("Open folder on {name}\u{2026}"))
+            .filter(|title| query.is_empty() || fuzzy_score(&self.needle.lower, title).is_some())
+            .map(|title| Row {
+                icon: IconName::Server,
+                title,
+                meta: String::new(),
+                detail: "A workspace in a folder there, typed from its home folder".into(),
+                group: "Workspaces",
+                action: PaletteAction::OpenServerFolder,
+                workspace: None,
+                current: false,
+            });
         if all {
+            if let Some(row) = typed_folder {
+                rows.insert(0, row);
+            }
+            rows.extend(server_folder);
             return rows;
         }
         let exists = self
@@ -94,24 +131,10 @@ impl PaletteView {
                 },
             );
         }
-        // A Gentle Shell server's folders have no picker here: typed as the
-        // server sees them.
-        let runs_on = crate::features::backend::saved();
-        if runs_on.is_server() && query.starts_with('/') {
-            rows.insert(
-                0,
-                Row {
-                    icon: IconName::Server,
-                    title: format!("Open \u{201c}{query}\u{201d} on {}", runs_on.label()),
-                    meta: String::new(),
-                    detail: "A workspace in that folder on the server".into(),
-                    group: "Workspaces",
-                    action: PaletteAction::CreateWorkspaceAt(query.into()),
-                    workspace: None,
-                    current: false,
-                },
-            );
+        if let Some(row) = typed_folder {
+            rows.insert(0, row);
         }
+        rows.extend(server_folder);
         rows.push(Row {
             icon: IconName::Folder,
             title: "Browse folders…".into(),

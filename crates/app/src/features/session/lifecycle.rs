@@ -137,14 +137,28 @@ impl SessionView {
     /// or broken, then fixed by onboarding). Running and unstarted tabs are
     /// left alone; a backend that exited before any conversation counts.
     pub fn retry_start(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.never_ran() {
+            self.start(window, cx);
+        }
+    }
+
+    /// [`Self::retry_start`] in `cwd`: agents now run on a Gentle Shell
+    /// server, where this computer's folder isn't one (`cwd` is the
+    /// server's home).
+    pub fn retry_start_in(&mut self, cwd: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        if self.never_ran() {
+            self.change_cwd(cwd, window, cx);
+        }
+    }
+
+    /// Started, but its backend never came up.
+    fn never_ran(&self) -> bool {
         let never_ran = match &self.backend.status {
             BackendStatus::Failed(_) => true,
             BackendStatus::Exited(_) => self.transcript.items.is_empty(),
             BackendStatus::Starting | BackendStatus::Ready(_) => false,
         };
-        if self.backend.started && never_ran {
-            self.start(window, cx);
-        }
+        self.backend.started && never_ran
     }
 
     /// Restart the backend in another folder; the conversation starts fresh.
@@ -413,6 +427,12 @@ impl SessionView {
         let runs_on = self.runs_on.clone();
         // A server session the restored tab reattaches to (it kept running).
         let attach = self.backend.attach.take();
+        self.backend.server_home = None;
+        // Where a server would be asked for its home folder, should it have
+        // no such folder as this tab's.
+        let choice = runs_on
+            .clone()
+            .unwrap_or_else(|| crate::features::backend::for_tab(&cwd));
         self._io = cx.spawn_in(window, async move |this, cx| {
             let spawned = cx
                 .background_executor()
@@ -423,7 +443,9 @@ impl SessionView {
                         // The server starts the session itself, in the folder
                         // as it sees it; a conversation resumes by its Pi id.
                         let client = crate::features::backend::server::client(&runs_on)?;
-                        let version = client.server().ok().and_then(|info| info.version);
+                        let version = crate::features::backend::server::info(&runs_on)
+                            .ok()
+                            .and_then(|info| info.version);
                         let attach = attach.filter(|s| s.url == *url).map(|s| s.id);
                         let pi_session = resume.as_deref().and_then(|path| {
                             gentle_core::serve::pi_session_id(&path.to_string_lossy())
@@ -485,10 +507,25 @@ impl SessionView {
                     rx
                 }
                 Err(error) => {
+                    // No such folder on the server: the tab offers the
+                    // server's home instead.
+                    let missing = error
+                        .downcast_ref::<pi_rpc::serve::ServeError>()
+                        .is_some_and(|e| e.error.as_deref() == Some("invalid_cwd"));
                     let _ = this.update(cx, |this, cx| {
                         this.backend.status = BackendStatus::Failed(format!("{error:#}"));
                         cx.notify();
                     });
+                    if missing {
+                        let home = cx
+                            .background_executor()
+                            .spawn(async move { crate::features::backend::server::home(&choice) })
+                            .await;
+                        let _ = this.update(cx, |this, cx| {
+                            this.backend.server_home = home;
+                            cx.notify();
+                        });
+                    }
                     return;
                 }
             };

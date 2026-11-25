@@ -1,6 +1,8 @@
 //! Configuration: everything the user's Gentle Shell is already set up with,
 //! read from the same homes the launcher uses, plus package management
-//! (`gentle-shell install|remove`) and the Claude bridge's plan.
+//! (`gentle-shell install|remove`) and the Claude bridge's plan. Where agents
+//! run on a Gentle Shell server it reads only what that server's Gentle Shell
+//! reports over Desktop RPC, through a control session ([`remote`]).
 
 use std::path::PathBuf;
 
@@ -30,7 +32,9 @@ mod notifications;
 mod packages;
 mod pages;
 mod reading_desk;
+pub(crate) mod remote;
 mod runs_on;
+pub(crate) use runs_on::{ConnectEvent, ServerConnect};
 mod services;
 mod shell_config;
 mod shell_status;
@@ -92,7 +96,10 @@ pub struct SettingsView {
     theme_share: theme::ThemeShare,
     /// Fonts: the open picker, its search and cursor.
     fonts: fonts::FontsUi,
-    /// Active agent tab, if available, for the new Desktop RPC update status.
+    /// The session Gentle Shell's own answers come from: the active agent
+    /// tab, or on a server, a dedicated one ([`remote::ControlSession`]).
+    control: remote::ControlSession,
+    /// [`Self::control`]'s session, if any.
     session: Option<Entity<crate::features::session::SessionView>>,
     _session_sub: Option<Subscription>,
     /// RPC status and its in-flight ticket; separate from upgrade UI state.
@@ -140,6 +147,8 @@ impl SettingsView {
             },
         );
         let setup = cx.new(crate::features::onboarding::OnboardingView::embedded);
+        let control = remote::ControlSession::open(session, &cwd, window, cx);
+        let session = control.session().cloned();
         let setup_sub = cx.subscribe(&setup, |_, _, event, cx| {
             cx.emit(SettingsEvent::Setup(event.clone()));
         });
@@ -174,6 +183,7 @@ impl SettingsView {
                 .as_ref()
                 .map(|session| cx.observe(session, |this, _, cx| this.session_changed(cx))),
             session,
+            control,
             shell_updates: upgrade::ShellUpdates::default(),
             shell_config: shell_config::ShellConfig::default(),
             shell_status: shell_status::ShellStatusRead::default(),
@@ -193,6 +203,13 @@ impl SettingsView {
     /// gentle-shell can start, as of the Setup & requirements checklist.
     pub fn setup_usable(&self, cx: &App) -> bool {
         self.setup.read(cx).usable()
+    }
+
+    /// The session Gentle Shell's answers come from (see
+    /// [`remote::ControlSession`]): where a setting the screen applies with
+    /// a Gentle Shell command runs.
+    pub fn control_session(&self) -> Option<Entity<crate::features::session::SessionView>> {
+        self.session.clone()
     }
 
     /// Open on the Updates page, where this app's update is installed.
@@ -222,6 +239,33 @@ impl SettingsView {
         self.shell_config_changed(cx);
         self.background_changed(cx);
         self.sign_ins_changed(cx);
+        self.permission_changed(cx);
+    }
+
+    /// The server agents run on, when they do: what Configuration can't do
+    /// from this computer says where to do it instead.
+    fn server(&self) -> Option<&remote::ServerPlace> {
+        self.control.server()
+    }
+
+    /// On a server, the permission default its Gentle Shell reported
+    /// (`get_permission_mode`); there is no file of it to read here.
+    fn permission_changed(&mut self, cx: &mut Context<Self>) {
+        if self.server().is_none() {
+            return;
+        }
+        let reported = self
+            .session
+            .as_ref()
+            .and_then(|session| session.read(cx).reported_default_mode())
+            .map(|mode| mode.id().to_string());
+        if let Some(snapshot) = self.snapshot.as_mut()
+            && reported.is_some()
+            && snapshot.permission_mode != reported
+        {
+            snapshot.permission_mode = reported;
+            cx.notify();
+        }
     }
 
     /// Show what the active tab's Gentle Shell reported over what the files
@@ -239,6 +283,12 @@ impl SettingsView {
                 .state(pi_rpc::desktop_rpc::ConfigStore::Banner)
             {
                 snapshot.banner = state.value.as_ref().map(snapshot::describe_banner);
+            }
+            if let Some(state) = self
+                .shell_config
+                .state(pi_rpc::desktop_rpc::ConfigStore::Profiles)
+            {
+                (snapshot.active_profile, snapshot.profiles) = shell_config::profiles_of(state);
             }
             if let Some(state) = &self.background.shell {
                 let project_file = snapshot.background_subagents.project_file.clone();
@@ -268,14 +318,18 @@ impl SettingsView {
         self.ask_sign_ins(cx);
         self.ask_background(cx);
         let cwd = self.cwd.clone();
+        let server = self.server().cloned();
         self._load = cx.spawn(async move |this, cx| {
             let snapshot = cx
                 .background_executor()
-                .spawn(async move { services::snapshot::load(&cwd, shell_updates) })
+                .spawn(
+                    async move { services::snapshot::load(&cwd, shell_updates, server.as_ref()) },
+                )
                 .await;
             let _ = this.update(cx, |this, cx| {
                 this.snapshot = Some(snapshot);
                 this.adopt_shell(cx);
+                this.permission_changed(cx);
             });
         });
     }

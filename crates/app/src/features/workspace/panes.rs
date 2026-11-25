@@ -200,6 +200,7 @@ impl Workspace {
                 }
             }
             SessionEvent::OpenProviders => self.open_providers(window, cx),
+            SessionEvent::OpenServerFolder => self.open_server_folder(window, cx),
             SessionEvent::OpenScreen(screen) => {
                 self.open_screen(*screen, Some(session.clone()), window, cx)
             }
@@ -213,7 +214,8 @@ impl Workspace {
                 }
             }
             SessionEvent::DesignCanvas(canvas) => {
-                self.show_design_canvas(canvas.clone(), id, window, cx)
+                let from = super::stages::PageFrom::Design(canvas.clone());
+                self.open_session_page(session, from, id, window, cx)
             }
             SessionEvent::Device(intent) => {
                 // A device an agent starts itself still shows in the app.
@@ -228,22 +230,34 @@ impl Workspace {
                 self.devices
                     .update(cx, |panel, cx| panel.activity(command, cx));
             }
-            SessionEvent::OpenWeb(url) => self.open_web(url.clone(), Some(id), true, window, cx),
+            // In a server tab, `localhost` is the server's: forwarded too.
+            SessionEvent::OpenWeb(url) => {
+                let from = super::stages::PageFrom::User { url: url.clone() };
+                self.open_session_page(session, from, id, window, cx)
+            }
             SessionEvent::OpenFile { path, line } => {
                 self.open_file_at(path.clone(), *line, window, cx)
             }
             SessionEvent::AgentWeb(url) => {
-                self.open_agent_page(url.clone(), Some(id), true, window, cx)
+                let from = super::stages::PageFrom::Agent {
+                    url: url.clone(),
+                    once: true,
+                };
+                self.open_session_page(session, from, id, window, cx)
             }
             // A server session's host tools: `gentle-open` and
             // `gentle-browser` as the app's own commands run them. The
             // canvas this agent floats over answers its canvas tools.
             SessionEvent::HostTool(request) => match request {
                 crate::features::session::HostToolRequest::OpenPage(url) => {
-                    self.open_agent_page(url.clone(), Some(id), false, window, cx)
+                    let from = super::stages::PageFrom::Agent {
+                        url: url.clone(),
+                        once: false,
+                    };
+                    self.open_session_page(session, from, id, window, cx)
                 }
                 crate::features::session::HostToolRequest::Browser { op, reply } => {
-                    self.browser_request(op.clone(), reply.clone(), window, cx)
+                    self.session_browser_request(session, op.clone(), reply.clone(), window, cx)
                 }
                 crate::features::session::HostToolRequest::Canvas { .. } => {}
                 crate::features::session::HostToolRequest::Device(args) => {
@@ -725,7 +739,10 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let cwd = self.active_cwd(cx);
+        let cwd = match kind {
+            PaneKind::Agent => self.new_agent_cwd(cx),
+            _ => self.active_cwd(cx),
+        };
         self.tile(Some((kind, cwd)), window, cx);
     }
 

@@ -7,11 +7,17 @@ use gpui_kit::component::{Sizable as _, h_flex};
 use gpui_kit::*;
 
 use super::layout::{or_dash, row, section};
+use super::remote::{commands, do_on, note, run_on};
 use super::snapshot::Snapshot;
 use super::{SettingsEvent, SettingsView};
 use crate::shared::ui;
 
 pub(super) fn models_section(s: &Snapshot) -> Div {
+    // Pi's settings.json has no Desktop RPC store: change it there.
+    if let Some(server) = &s.server {
+        return section(IconName::Cpu, "Model defaults")
+            .child(note(run_on(&server.name, commands::SETTINGS)));
+    }
     section(IconName::Cpu, "Model defaults")
         .child(row(
             "Default model",
@@ -32,12 +38,22 @@ pub(super) fn models_section(s: &Snapshot) -> Div {
 }
 
 pub(super) fn providers_section(s: &Snapshot, cx: &mut Context<SettingsView>) -> Div {
+    let server = s.server.as_ref().map(|server| server.name.as_str());
+    // On a server, nothing here is a file read: an empty list means its
+    // Gentle Shell didn't report one.
+    let unknown = |fallback: &'static str| match server {
+        Some(name) => format!("not reported by {name}"),
+        None => fallback.into(),
+    };
     section(IconName::Bot, "Profiles & providers")
-        .child(row("Active profile", or_dash(&s.active_profile, "none")))
+        .child(row(
+            "Active profile",
+            s.active_profile.clone().unwrap_or_else(|| unknown("none")),
+        ))
         .child(row(
             "Profiles",
             if s.profiles.is_empty() {
-                "—".into()
+                unknown("—")
             } else {
                 s.profiles.join(", ")
             },
@@ -45,7 +61,7 @@ pub(super) fn providers_section(s: &Snapshot, cx: &mut Context<SettingsView>) ->
         .child(row(
             "Sign-ins",
             if s.sign_ins.is_empty() {
-                "none".into()
+                unknown("none")
             } else {
                 s.sign_ins
                     .iter()
@@ -56,12 +72,14 @@ pub(super) fn providers_section(s: &Snapshot, cx: &mut Context<SettingsView>) ->
         ))
         .child(row(
             "Custom providers",
-            if s.custom_providers.is_empty() {
-                "—".into()
-            } else {
-                s.custom_providers.join(", ")
+            match server {
+                // Pi's models.json has no Desktop RPC store.
+                Some(name) => do_on(name, "edit models.json in its Gentle Shell agent folder"),
+                None if s.custom_providers.is_empty() => "—".into(),
+                None => s.custom_providers.join(", "),
             },
         ))
+        .children(server.map(|name| note(run_on(name, commands::LOGIN))))
         .child(
             div().pt_2().text_xs().text_color(ui::faint()).child(
                 "Model and sign-in details are read-only here. Use Profiles to edit agent routing and defaults.",

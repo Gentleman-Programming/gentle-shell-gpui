@@ -11,8 +11,9 @@ use pi_rpc::desktop_rpc::ShellStatus;
 use super::super::{
     SettingsView,
     layout::{row, section},
+    remote::note,
     shell_status::{status_rows, warns},
-    snapshot::Snapshot,
+    snapshot::{ServerFacts, Snapshot},
 };
 use crate::shared::ui;
 
@@ -33,8 +34,13 @@ pub(super) fn render(
 }
 
 /// The homes and launcher, then, when the active agent tab's Shell offers
-/// `get_status`, what `/gentle:status` reports and whether it warns.
+/// `get_status`, what `/gentle:status` reports and whether it warns. On a
+/// server, its home folder and version as it says them instead: none of
+/// this computer's homes or launcher is read for it.
 fn gentle_shell_section(snapshot: &Snapshot, status: Option<&ShellStatus>) -> Div {
+    if let Some(server) = &snapshot.server {
+        return server_section(server, status);
+    }
     section(IconName::SquareTerminal, "Gentle Shell")
         .child(row(
             "Home",
@@ -79,6 +85,26 @@ fn gentle_shell_section(snapshot: &Snapshot, status: Option<&ShellStatus>) -> Di
                         .on_click(move |_, _, cx| cx.open_url(&format!("file://{}", dir.display())))
                 }),
         )
+}
+
+/// General › Gentle Shell on a server: where it runs, its home folder and
+/// version (`GET /api/server`), then its `get_status`.
+fn server_section(server: &ServerFacts, status: Option<&ShellStatus>) -> Div {
+    section(IconName::SquareTerminal, "Gentle Shell")
+        .child(row("Runs on", server.name.clone()))
+        .child(row(
+            "Home",
+            server
+                .home
+                .clone()
+                .unwrap_or_else(|| format!("not reported by {}", server.name)),
+        ))
+        .child(row(
+            "Version",
+            server.version.clone().unwrap_or_else(|| "—".into()),
+        ))
+        .children(status.map(status_block))
+        .children(server.error.clone().map(note))
 }
 
 /// `/gentle:status`'s facts: a chip with its severity, then one row each.

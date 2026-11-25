@@ -127,8 +127,8 @@ fn open_page() -> HostTool {
         "Open page",
         format!(
             "Show a web page (a dev server, a preview, docs) to the user on {WHERE}: in the app's \
-             browser, or in their own browser when they chose that. The page loads there, so its \
-             URL must reach that computer."
+             browser, or in their own browser when they chose that. A page on your machine's \
+             localhost opens there through the server's authenticated forward of its port."
         ),
         json!({
             "type": "object",
@@ -140,7 +140,7 @@ fn open_page() -> HostTool {
         }),
         &[
             "To show the user a page, call open_page; never run open, xdg-open, start or a browser yourself: you run on a server and nothing you open there reaches the user.",
-            "A server on your machine's localhost (a dev server you started) only loads on the user's computer through an address that reaches your machine (its network address, or a forwarded port); say so when the page can't load.",
+            "Pass a dev server you started as its localhost URL (http://localhost:5173/...): the app forwards that port of your machine to the user's computer by itself. A page served over https on localhost can't be forwarded; serve it over plain http.",
         ],
     )
 }

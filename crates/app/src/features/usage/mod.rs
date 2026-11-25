@@ -6,6 +6,12 @@
 //! Parsing mirrors gentle-pi's `lib/shell-usage.ts` and `lib/stats-collector.ts`.
 //! Tokens and API keys only ever travel from `auth.json` into the HTTP request
 //! header; they are never stored in view state, logged, or rendered.
+//!
+//! Where agents run on a Gentle Shell server both tabs read only its Gentle
+//! Shell (through a control session there, see
+//! [`crate::features::settings::remote`]); this computer's `auth.json` and
+//! session files are never read for it, and a Shell without the methods
+//! says where to look instead.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -24,6 +30,7 @@ use pi_rpc::desktop_rpc::{
 use crate::features::session::{
     READ_DECIDE_WAIT, ReadOutcome, ReadRequest, ReadSupport, ReadTicket, SessionView,
 };
+use crate::features::settings::remote::{ControlSession, commands};
 
 mod credentials;
 mod fetch;
@@ -67,6 +74,8 @@ enum UsageState {
         /// reuses the legacy sign-in prompt.
         empty: UsageEmpty,
     },
+    /// On a server whose Gentle Shell doesn't report it: where to look.
+    Elsewhere(String),
 }
 
 /// What the Subscription tab shows when there are no provider cards.
@@ -97,6 +106,8 @@ enum StatsState {
         source: StatsSource,
         summary: StatsSummary,
     },
+    /// On a server whose Gentle Shell doesn't report them: where to look.
+    Elsewhere(String),
 }
 
 /// What a loaded Local stats tab was computed from.
@@ -274,8 +285,11 @@ pub struct UsageView {
     metric: Metric,
     /// The agent tab whose subscription RPC slice feeds the Subscription tab
     /// and whose Shell answers Local stats when it offers them; `None` when
-    /// the window has no agent (the legacy paths run instead).
+    /// the window has no agent (the legacy paths run instead). On a server,
+    /// possibly the screen's own control session there.
     session: Option<Entity<SessionView>>,
+    /// Where the session comes from, and the server agents run on.
+    control: ControlSession,
     /// How the Subscription tab currently reads its data.
     mode: UsageMode,
     /// Local stats from Gentle Shell, when that is their source.
@@ -297,10 +311,13 @@ pub fn now_ms() -> i64 {
 
 impl UsageView {
     pub fn new(
-        _window: &mut Window,
+        cwd: &std::path::Path,
+        window: &mut Window,
         cx: &mut Context<Self>,
         session: Option<Entity<SessionView>>,
     ) -> Self {
+        let control = ControlSession::open(session, cwd, window, cx);
+        let session = control.session().cloned();
         let mut this = Self {
             tab: Tab::Usage,
             usage: UsageState::Loading,
@@ -308,6 +325,7 @@ impl UsageView {
             range: StatsRange::All,
             metric: Metric::Tokens,
             session: session.clone(),
+            control,
             mode: UsageMode::Legacy,
             shell_stats: ShellStats {
                 mode: StatsMode::Files,
@@ -420,6 +438,12 @@ impl UsageView {
     /// runs only when there is no agent session, or its capabilities are known
     /// not to offer the subscription methods.
     fn refresh_usage_legacy(&mut self, cx: &mut Context<Self>) {
+        // A server's auth.json is not this computer's to read.
+        if let Some(server) = self.control.server() {
+            self.usage = UsageState::Elsewhere(server.run(commands::USAGE));
+            cx.notify();
+            return;
+        }
         self.usage = UsageState::Loading;
         cx.notify();
         let auth_path = pi_rpc::resolve_homes().agent.join("auth.json");
@@ -495,6 +519,12 @@ impl UsageView {
             StatsMode::Shell => self.ask_shell_stats(cx),
             StatsMode::Undecided => {
                 self.stats = StatsState::Loading;
+                // On a server there are no files to fall back on: wait for
+                // its session to say (it decides once it starts, or fails).
+                if self.control.server().is_some() {
+                    cx.notify();
+                    return;
+                }
                 self._stats_task = cx.spawn(async move |this, cx| {
                     cx.background_executor().timer(READ_DECIDE_WAIT).await;
                     let _ = this.update(cx, |this, cx| {
@@ -633,6 +663,12 @@ impl UsageView {
     }
 
     fn refresh_stats_files(&mut self, cx: &mut Context<Self>) {
+        // A server's session files are not this computer's to scan.
+        if let Some(server) = self.control.server() {
+            self.stats = StatsState::Elsewhere(server.run(commands::STATS));
+            cx.notify();
+            return;
+        }
         self.stats = StatsState::Loading;
         cx.notify();
         let root = pi_rpc::resolve_homes().agent.join("sessions");

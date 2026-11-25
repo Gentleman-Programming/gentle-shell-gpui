@@ -28,6 +28,12 @@
 //! switch. `list_agent_definitions` gives the agent list and Pi's default
 //! orchestrator, and `clear_profile_binding` clears the session binding,
 //! each only where advertised.
+//!
+//! Where agents run on a Gentle Shell server the screen reads and writes
+//! only through that server's Gentle Shell (a control session there, see
+//! [`crate::features::settings::remote`]): this computer's homes, agent
+//! folders and Pi settings are never resolved or touched, and a Shell that
+//! doesn't serve its config says where to edit profiles instead.
 
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -42,6 +48,7 @@ use gpui_kit::*;
 use pi_rpc::desktop_rpc::{ConfigStore, ConfigWrite, DesktopMethod, SetConfigResult};
 
 use crate::features::session::{ReadOutcome, ReadRequest, ReadSupport, ReadTicket, SessionView};
+use crate::features::settings::remote::{ControlSession, ServerPlace, commands};
 
 mod actions;
 mod apply;
@@ -183,7 +190,10 @@ const ALL_ROW: &str = "__all";
 pub struct ProfilesView {
     env: Option<Env>,
     cwd: PathBuf,
-    /// The tab whose Gentle Shell owns the config, when there is one.
+    /// Where the session below comes from, and the server agents run on.
+    control: ControlSession,
+    /// The tab whose Gentle Shell owns the config, when there is one (on a
+    /// server, possibly the screen's own control session).
     session: Option<Entity<SessionView>>,
     backend: Backend,
     /// The agent names and Pi's default were read (they are not config
@@ -293,6 +303,8 @@ impl ProfilesView {
                 },
             ),
         ];
+        let control = ControlSession::open(session, &cwd, window, cx);
+        let session = control.session().cloned();
         if let Some(session) = &session {
             subscriptions.push(cx.observe(session, |this, _, cx| this.session_changed(cx)));
         }
@@ -302,6 +314,7 @@ impl ProfilesView {
         let mut this = Self {
             env: None,
             cwd,
+            control,
             session,
             backend: Backend::Undecided,
             local_loaded: false,
@@ -390,6 +403,12 @@ impl ProfilesView {
             Some(session) => session.read(cx).config_support(),
             None => ConfigSupport::Legacy,
         };
+        if let Some(line) = self.unserved(support) {
+            self.loading = false;
+            self.error = Some(line);
+            cx.notify();
+            return;
+        }
         match support {
             ConfigSupport::Legacy => {
                 self.backend = Backend::Legacy;
@@ -538,7 +557,7 @@ impl ProfilesView {
             self.definitions = Some((ticket, full));
             return;
         }
-        self.read_agent_files(full, cx);
+        self.read_agents_elsewhere(full, cx);
     }
 
     fn read_agent_files(&mut self, full: bool, cx: &mut Context<Self>) {
@@ -569,11 +588,18 @@ impl ProfilesView {
         };
         self.definitions = None;
         let ReadOutcome::AgentDefinitions(definitions) = outcome else {
-            return self.read_agent_files(full, cx);
+            return self.read_agents_elsewhere(full, cx);
         };
         let pi_default = orchestrator_route(&definitions.default_orchestrator);
         if !full {
             self.pi_default = pi_default;
+            return;
+        }
+        if self.server().is_some() {
+            self.pi_default = pi_default;
+            self.names = reported_names(&definitions, None);
+            self.local_loaded = true;
+            self.adopt_rpc(true, cx);
             return;
         }
         let env = self.env.clone();
@@ -582,11 +608,23 @@ impl ProfilesView {
             cx,
             move || {
                 let env = env.unwrap_or_else(|| Env::resolve(cwd));
-                let names = reported_names(&definitions, &env);
+                let names = reported_names(&definitions, Some(&env));
                 (env, Some(names), pi_default)
             },
             |this, (env, names, pi_default), cx| this.agents_read(env, names, pi_default, cx),
         );
+    }
+
+    /// No `list_agent_definitions` answer: the agent files and Pi's
+    /// settings, or on a server nothing more (its agents and settings are
+    /// not files of this computer's).
+    fn read_agents_elsewhere(&mut self, full: bool, cx: &mut Context<Self>) {
+        if self.server().is_some() {
+            self.local_loaded = true;
+            self.adopt_rpc(full, cx);
+            return;
+        }
+        self.read_agent_files(full, cx);
     }
 
     fn agents_read(
@@ -736,8 +774,18 @@ impl ProfilesView {
         if let Backend::Rpc(remote) = &mut self.backend {
             remote.forget();
         }
-        self.backend = Backend::Legacy;
         self.seeding = false;
+        // A server's files are not this computer's to edit: say where to,
+        // and stay there ([`Self::reload_files`] says it again).
+        if let Some(server) = self.server() {
+            let line = server.run(commands::PROFILES);
+            self.backend = Backend::Legacy;
+            self.loading = false;
+            self.error = Some(format!("{} {line}", failure.message()));
+            cx.notify();
+            return;
+        }
+        self.backend = Backend::Legacy;
         self.say(
             format!(
                 "{} Profiles edits the files directly from here on; a change Gentle Shell had not confirmed was not saved, so check it and save again.",
@@ -746,6 +794,37 @@ impl ProfilesView {
             Tone::Info,
         );
         self.reload_files(cx);
+    }
+
+    /// The server agents run on, when they do.
+    fn server(&self) -> Option<&ServerPlace> {
+        self.control.server()
+    }
+
+    /// The session is the screen's own control session on a server, not a
+    /// tab of the user's: "Use in this session" has nothing to act on.
+    pub(super) fn control_only(&self) -> bool {
+        self.control.hidden()
+    }
+
+    /// On a server, what the screen says instead of opening when its Gentle
+    /// Shell doesn't serve the config stores (the files are not this
+    /// computer's to read); `None` when it does, or is still being asked,
+    /// or agents run here.
+    fn unserved(&self, support: ConfigSupport) -> Option<String> {
+        let server = self.server()?;
+        let why = match support {
+            ConfigSupport::Rpc | ConfigSupport::NotReady => return None,
+            ConfigSupport::Legacy => format!(
+                "{}'s Gentle Shell doesn't serve its profiles to Desktop, or its session didn't start.",
+                server.name
+            ),
+            ConfigSupport::Unavailable => format!(
+                "Gentle Desktop's channel to {} failed, so Profiles can't read its profiles.",
+                server.name
+            ),
+        };
+        Some(format!("{why} {}", server.run(commands::PROFILES)))
     }
 
     /// Show the stores last read over RPC once every read has landed.
@@ -821,6 +900,12 @@ impl ProfilesView {
 
     /// Re-read the store, agents and pins from the files.
     fn reload_files(&mut self, cx: &mut Context<Self>) {
+        // Never this computer's files for a server's profiles.
+        if let Some(line) = self.server().map(|server| server.run(commands::PROFILES)) {
+            self.loading = false;
+            self.error = Some(line);
+            return;
+        }
         let env = self.env.clone();
         let cwd = self.cwd.clone();
         self.run_io(

@@ -40,6 +40,23 @@ pub struct Snapshot {
     pub skipped_release: Option<String>,
     /// A newer Engram release than the one the app runs.
     pub engram_update: Option<crate::features::updates::UpdateOffer>,
+    /// Agents run on a Gentle Shell server: what it says about itself.
+    /// Nothing else here was read from this computer's Gentle Shell home;
+    /// the rest comes from the server's Desktop RPC answers.
+    pub server: Option<ServerFacts>,
+}
+
+/// A Gentle Shell server as `GET /api/server` describes it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ServerFacts {
+    /// The server's name, as the screens show it.
+    pub name: String,
+    /// The home folder of the user it runs as, a path there.
+    pub home: Option<String>,
+    /// Its Gentle Shell version.
+    pub version: Option<String>,
+    /// Why it did not answer.
+    pub error: Option<String>,
 }
 
 impl Snapshot {
@@ -180,6 +197,7 @@ pub fn read_snapshot(agent: &Path, config: &Path, cwd: &Path) -> Snapshot {
         managed: false,
         skipped_release: None,
         engram_update: None,
+        server: None,
     }
 }
 

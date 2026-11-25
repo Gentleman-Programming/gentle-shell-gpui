@@ -45,8 +45,8 @@ impl EventEmitter<WelcomeEvent> for WelcomeView {}
 
 impl WelcomeView {
     /// `probe` is a look at the machine already taken (the startup check).
-    pub fn new(probe: Option<Probe>, cx: &mut Context<Self>) -> Self {
-        let setup = cx.new(|cx| OnboardingView::sequence(probe, AFTER_INTRO, cx));
+    pub fn new(probe: Option<Probe>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let setup = cx.new(|cx| OnboardingView::sequence(probe, AFTER_INTRO, window, cx));
         let subscriptions = vec![
             cx.subscribe(&setup, |_, _, event: &OnboardingEvent, cx| {
                 cx.emit(WelcomeEvent::Setup(event.clone()));
@@ -63,7 +63,13 @@ impl WelcomeView {
         });
         Self {
             setup,
-            banner: banner::read_config(&pi_rpc::resolve_homes().config),
+            // Agents on a Gentle Shell server: this computer's Gentle Shell
+            // home isn't theirs (and may not exist), so the default banner.
+            banner: if crate::features::backend::saved().is_server() {
+                BannerConfig::default()
+            } else {
+                banner::read_config(&pi_rpc::resolve_homes().config)
+            },
             intro_done: false,
             focus: cx.focus_handle(),
             _subscriptions: subscriptions,
