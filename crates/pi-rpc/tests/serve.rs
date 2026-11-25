@@ -596,7 +596,10 @@ fn a_server_that_moved_is_found_by_its_id() {
         Some(fake.url.clone())
     );
     // Another server at a known address isn't this one.
-    assert_eq!(pi_rpc::serve::find("srv_other", &[fake.url.clone()]), None);
+    assert_eq!(
+        pi_rpc::serve::find("srv_other", std::slice::from_ref(&fake.url)),
+        None
+    );
     assert_eq!(pi_rpc::serve::find(SERVER_ID, &[]), None);
     assert_eq!(
         pi_rpc::serve::identify(&fake.url),
@@ -622,7 +625,7 @@ fn a_client_follows_its_server_to_a_new_address() {
     // The request that couldn't connect is sent again where it went.
     assert_eq!(client.server().unwrap().server_id, SERVER_ID);
     assert_eq!(copy.url(), fake.url, "every clone follows");
-    assert_eq!(*asked.lock().unwrap(), [gone.clone()]);
+    assert_eq!(*asked.lock().unwrap(), std::slice::from_ref(&gone));
     // Asked once: the next request goes there directly.
     copy.server().unwrap();
     assert_eq!(asked.lock().unwrap().len(), 1);
