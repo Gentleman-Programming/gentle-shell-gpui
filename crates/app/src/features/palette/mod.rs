@@ -77,9 +77,10 @@ pub enum PaletteAction {
         name: String,
         pick_folder: bool,
     },
-    /// A new workspace at `root`, typed: a folder on a Gentle Shell server,
-    /// as the server names it.
-    CreateWorkspaceAt(PathBuf),
+    /// The workspace at `root`, typed: a folder on the Gentle Shell server
+    /// agents run on, as the server names it. The one already open there is
+    /// shown, else one is created.
+    ShowServerFolder(PathBuf),
     /// Browse the folders of the Gentle Shell server agents run on, from
     /// its home folder.
     OpenServerFolder,

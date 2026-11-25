@@ -67,22 +67,22 @@ impl Workspace {
         }
     }
 
-    /// The workspace rooted at `folder`, created when there is none. A
-    /// folder of the Gentle Shell server at `server` is compared by its text
-    /// alone and marks the workspace as that server's; one on this computer
-    /// is compared canonically ([`workspaces::root_key`]).
+    /// The workspace rooted at `folder` on `server` (`None`: this
+    /// computer), created when there is none. A folder of a Gentle Shell
+    /// server is compared by its text alone and only with that server's
+    /// workspaces; one on this computer is compared canonically
+    /// ([`workspaces::root_key`]) with this computer's.
     pub(super) fn space_for(&mut self, folder: PathBuf, server: Option<String>) -> usize {
-        let on_server = server.is_some();
-        let folder = workspaces::root_key(folder, on_server);
-        let index =
-            match workspaces::find_root(self.spaces.iter().map(|s| &s.root), &folder, on_server) {
-                Some(index) => index,
-                None => self.push_space(None, folder),
-            };
-        if on_server {
-            self.spaces[index].server = server;
+        let folder = workspaces::root_key(folder, server.is_some());
+        let spaces = self.spaces.iter().map(|s| (&s.root, s.server.as_deref()));
+        match workspaces::find_root(spaces, &folder, server.as_deref()) {
+            Some(index) => index,
+            None => {
+                let index = self.push_space(None, folder);
+                self.spaces[index].server = server;
+                index
+            }
         }
-        index
     }
 
     /// A new workspace at `root`, a folder on the Gentle Shell server agents

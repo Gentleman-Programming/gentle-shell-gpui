@@ -162,8 +162,10 @@ impl Workspace {
                 name,
                 pick_folder: true,
             } => self.pick_workspace_folder(Some(name), window, cx),
-            PaletteAction::CreateWorkspaceAt(root) => {
-                self.create_server_workspace(None, root, window, cx)
+            PaletteAction::ShowServerFolder(root) => {
+                if let Some(url) = Self::agents_server() {
+                    self.show_server_folder(root, url, window, cx)
+                }
             }
             PaletteAction::OpenServerFolder => self.open_server_folder(window, cx),
             PaletteAction::OpenFile(path) => self.open_file(path, window, cx),

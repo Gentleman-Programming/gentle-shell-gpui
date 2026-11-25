@@ -82,7 +82,7 @@ impl PaletteView {
                 meta: String::new(),
                 detail: "A workspace in that folder on the server".into(),
                 group: "Workspaces",
-                action: PaletteAction::CreateWorkspaceAt(query.into()),
+                action: PaletteAction::ShowServerFolder(query.into()),
                 workspace: None,
                 current: false,
             });

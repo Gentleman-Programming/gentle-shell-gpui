@@ -345,17 +345,19 @@ pub fn root_key(path: PathBuf, on_server: bool) -> PathBuf {
     dunce::canonicalize(&path).unwrap_or(path)
 }
 
-/// The position of the root that is `folder` (already a [`root_key`]),
-/// comparing saved roots the same way (`on_server` as for `folder`): older
-/// saves and other entry points may hold a root reached another way.
+/// The position of the workspace that is `folder` (already a
+/// [`root_key`]) on `server` (the Gentle Shell server's address; `None` for
+/// this computer), among `(root, server)` pairs: only a workspace of the
+/// same server matches, and its root is compared the same way as `folder`,
+/// since older saves and other entry points may hold a root reached another
+/// way.
 pub fn find_root<'a>(
-    roots: impl Iterator<Item = &'a PathBuf>,
+    mut spaces: impl Iterator<Item = (&'a PathBuf, Option<&'a str>)>,
     folder: &std::path::Path,
-    on_server: bool,
+    server: Option<&str>,
 ) -> Option<usize> {
-    roots
-        .map(|root| root_key(root.clone(), on_server))
-        .position(|root| root == folder)
+    let on_server = server.is_some();
+    spaces.position(|(root, there)| there == server && root_key(root.clone(), on_server) == folder)
 }
 
 pub fn now() -> u64 {
