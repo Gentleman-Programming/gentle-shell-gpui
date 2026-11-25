@@ -13,6 +13,7 @@ use pi_rpc::desktop_rpc::{
 
 use super::discovery::{find_session, list_sessions};
 use super::{Pending, Scope, SessionsEvent, SessionsView, Source};
+use crate::features::backend;
 use crate::features::session::{
     READ_DECIDE_WAIT, ReadFailure, ReadOutcome, ReadRequest, ReadSupport, SessionView,
 };
@@ -37,6 +38,10 @@ impl Row<'_> {
         }
     }
 }
+
+/// Why a folder on a Gentle Shell server lists no sessions: only its agent
+/// tab's Gentle Shell can list them (its session files are on the server).
+const ON_SERVER: &str = "This folder is on a Gentle Shell server: open an agent tab here, with a Gentle Shell that can list sessions, to browse them.";
 
 /// A session to open, from either source.
 pub(super) enum Target {
@@ -206,6 +211,13 @@ impl SessionsView {
     }
 
     fn reload_files(&mut self, cx: &mut Context<Self>) {
+        if backend::on_server(&self.cwd) {
+            self.sessions.clear();
+            self.loading = false;
+            self.error = Some(ON_SERVER.into());
+            cx.notify();
+            return;
+        }
         self.loading = true;
         let agent = pi_rpc::resolve_homes().agent;
         let cwd = self.cwd.clone();
@@ -435,6 +447,11 @@ impl SessionsView {
     /// rooted at its folder (or, for this folder, Pi's `switch_session
     /// {sessionPath}`).
     fn open_from_file(&mut self, entry: SessionEntry, cx: &mut Context<Self>) {
+        if backend::on_server(&self.cwd) {
+            self.error = Some(ON_SERVER.into());
+            cx.notify();
+            return;
+        }
         let agent = pi_rpc::resolve_homes().agent;
         let id = entry.id;
         self._load = cx.spawn(async move |this, cx| {
