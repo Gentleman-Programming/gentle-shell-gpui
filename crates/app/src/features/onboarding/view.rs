@@ -481,6 +481,10 @@ impl Render for OnboardingView {
                 .w_full()
                 .gap_6()
                 .children(runs_on)
+                .children(
+                    self.render_server_setup(cx)
+                        .map(|setup| ui::card().w_full().p_4().child(setup)),
+                )
                 .child(self.render_sequence(cx))
                 .into_any_element();
         }
@@ -501,6 +505,10 @@ impl Render for OnboardingView {
             return v_flex()
                 .w_full()
                 .child(self.render_embedded_bar(cx))
+                .children(
+                    self.render_server_setup(cx)
+                        .map(|setup| div().pb_3().child(setup)),
+                )
                 .child(body)
                 .into_any_element();
         }
@@ -524,6 +532,12 @@ impl Render for OnboardingView {
                                 self.render_runs_on(cx)
                                     .map(|card| div().px_6().pb_4().child(card)),
                             )
+                            .children(self.render_server_setup(cx).map(|setup| {
+                                div()
+                                    .px_6()
+                                    .pb_4()
+                                    .child(ui::card().w_full().p_4().child(setup))
+                            }))
                             .child(body),
                     )
                     .child(self.render_footer(cx))

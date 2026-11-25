@@ -14,6 +14,7 @@ impl OnboardingView {
             let probe = cx.background_executor().spawn(async { Probe::run() }).await;
             let _ = this.update(cx, |this, cx| this.apply(probe, cx));
         });
+        self.ask_server_setup(cx);
         cx.notify();
     }
 

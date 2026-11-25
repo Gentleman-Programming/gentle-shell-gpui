@@ -2,7 +2,9 @@
 //! container): Node.js, Gentle Shell, its setup, a provider, git and the
 //! optional pieces are looked for there, never on this computer. Fixes are
 //! commands for a terminal, which opens in the backend too. A Gentle Shell
-//! server runs nothing of the app's: Setup only checks it answers.
+//! server runs nothing of the app's: Setup only checks it answers (an
+//! admin device may run Gentle Shell's own setup there, see
+//! `onboarding::server_setup`).
 
 use gentle_core::backend::Backend;
 use serde_json::Value;

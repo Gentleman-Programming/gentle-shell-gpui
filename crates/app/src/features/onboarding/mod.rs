@@ -4,8 +4,9 @@
 //! that needs a password or an interactive login to a terminal tab, and sends
 //! provider sign-in to the Providers screen. The other way in is connecting
 //! to a Gentle Shell server (`gentle-shell serve share`'s code): agents then
-//! run there, nothing is installed on this computer and only the server is
-//! checked.
+//! run there, nothing is installed on this computer, only the server is
+//! checked, and an admin device may run Gentle Shell's own setup there
+//! ([`server_setup`]).
 
 use std::collections::VecDeque;
 
@@ -18,6 +19,7 @@ use crate::features::setup::{self, Check, CheckId};
 mod checks;
 mod install;
 mod sequence;
+mod server_setup;
 mod view;
 
 use checks::{install_plan, required_ok, usable, with_registry};
@@ -106,6 +108,8 @@ pub struct OnboardingView {
     /// Connecting to a Gentle Shell server instead of setting up this
     /// computer (the first-run paths; Configuration has its own).
     connect: Option<(Entity<ServerConnect>, Subscription)>,
+    /// Gentle Shell's setup run on the server agents run on.
+    server_setup: server_setup::ServerSetup,
     _probe: Task<()>,
     _job: Task<()>,
 }
@@ -146,6 +150,7 @@ impl OnboardingView {
             announce: false,
             registry_sign_in: None,
             connect: None,
+            server_setup: server_setup::ServerSetup::default(),
             _probe: Task::ready(()),
             _job: Task::ready(()),
         };
@@ -205,9 +210,10 @@ impl OnboardingView {
         self.entrance = std::time::Duration::ZERO;
     }
 
-    /// An install is running: the screen must stay open until it ends.
+    /// An install (or setup on the server) is running: the screen must stay
+    /// open until it ends.
     pub fn busy(&self) -> bool {
-        self.installing.is_some()
+        self.installing.is_some() || self.server_setup.running()
     }
 
     /// gentle-shell can start, as of the last look.
