@@ -402,6 +402,25 @@ impl ServeClient {
         Forward::parse(&answer).ok_or_else(malformed)
     }
 
+    /// `POST /api/print { cwd, prompt }` (capability `print`): one
+    /// `gentle-shell --print --no-session --no-tools` run in `cwd` (a folder
+    /// there) on `prompt` with the server's default model, as this computer
+    /// runs one for a commit message. Its stdout as it printed it. The
+    /// server gives it 120 s.
+    pub fn print(&self, cwd: &str, prompt: &str) -> Result<String, ServeError> {
+        let body = json!({"cwd": cwd, "prompt": prompt});
+        let (status, mut response) = self.call(&self.long, "POST", "/api/print", Some(&body))?;
+        let answer = read_json(&mut response).map_err(|message| ServeError {
+            status: Some(status),
+            error: None,
+            message,
+        })?;
+        answer["text"]
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(malformed)
+    }
+
     /// `GET /api/sessions/:id`.
     pub fn session(&self, id: &str) -> Result<SessionInfo, ServeError> {
         let answer = self.json("GET", &session_path(id, "")?, None)?;

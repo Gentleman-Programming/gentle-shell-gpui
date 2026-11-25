@@ -234,6 +234,16 @@ impl Fake {
                     }),
                 )
             }
+            ("POST", "/api/print") if body["prompt"] == "fail" => reply(
+                &mut stream,
+                502,
+                &json!({"error": {"code": "print_failed", "message": "No API key for the default model"}, "exitCode": 1}),
+            ),
+            ("POST", "/api/print") => reply(
+                &mut stream,
+                200,
+                &json!({"text": "feat: add a thing\n\nBecause.\n"}),
+            ),
             ("POST", "/api/uploads") => reply(
                 &mut stream,
                 201,
@@ -512,6 +522,26 @@ fn git_runs_there_and_answers_whatever_its_exit() {
     let failed = client.git("/srv/p", &["fail".into()], &[], None).unwrap();
     assert!(!failed.success());
     assert_eq!(failed.code, Some(1));
+}
+
+#[test]
+fn a_one_shot_prompt_runs_there() {
+    let fake = Fake::start();
+    let client = fake.client();
+    let text = client.print("/srv/p", "Write a commit message").unwrap();
+    assert_eq!(text, "feat: add a thing\n\nBecause.\n");
+    let sent = fake.requests("/api/print")[0].json();
+    assert_eq!(
+        sent,
+        json!({"cwd": "/srv/p", "prompt": "Write a commit message"})
+    );
+
+    let failed = client.print("/srv/p", "fail").unwrap_err();
+    assert_eq!(failed.error.as_deref(), Some("print_failed"));
+    assert_eq!(
+        failed.message,
+        "gentle-shell failed on the server: No API key for the default model"
+    );
 }
 
 #[test]

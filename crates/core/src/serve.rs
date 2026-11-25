@@ -687,6 +687,22 @@ pub fn error_text(status: u16, code: Option<&str>, message: Option<&str>) -> Str
         (501, Some("not_supported")) => {
             "The server can't do that: its gentle-shell serve doesn't support it.".into()
         }
+        // `POST /api/print`: a one-shot `gentle-shell --print` there.
+        (502, Some("print_failed")) => match message {
+            Some(message) if !message.trim().is_empty() => {
+                format!("gentle-shell failed on the server: {}", message.trim())
+            }
+            _ => "gentle-shell failed on the server.".into(),
+        },
+        (502, Some("output_too_large")) => {
+            "gentle-shell on the server answered more than it allows (1 MiB).".into()
+        }
+        (504, Some("print_timeout")) => {
+            "gentle-shell on the server didn't answer within 2 minutes.".into()
+        }
+        (429, Some("too_many_prints")) => {
+            "The server is already writing 4 answers like this one. Try again in a moment.".into()
+        }
         (404, _) => "The server doesn't know this session any more (it was stopped, or the \
              server restarted)."
             .into(),
@@ -1272,6 +1288,11 @@ mod tests {
             "The server answered 500: Server error"
         );
         assert_eq!(error_text(502, None, None), "The server answered 502.");
+        assert!(
+            error_text(502, Some("print_failed"), Some("no API key\n"))
+                .ends_with("on the server: no API key")
+        );
+        assert!(error_text(504, Some("print_timeout"), None).contains("2 minutes"));
     }
 
     #[test]

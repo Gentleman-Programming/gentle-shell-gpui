@@ -1257,11 +1257,24 @@ fn commit_prompt(diff: &str) -> String {
 }
 
 /// Run the user's Gentle Shell once, in print mode without a session or
-/// tools, on the staged diff. Blocking; call off the UI thread.
+/// tools, on the staged diff: on a Gentle Shell server, the server's
+/// (`POST /api/print`). Blocking; call off the UI thread.
 fn generate_message(toplevel: &Path) -> Result<(String, String), String> {
     let diff = git::staged_diff(toplevel, DIFF_LIMIT)?;
     if diff.trim().is_empty() {
         return Err("Stage some changes first; the message is written from the staged diff".into());
+    }
+    if let Some(client) = crate::features::backend::server::at(toplevel) {
+        let choice = crate::features::backend::for_tab(toplevel);
+        if !crate::features::backend::server::offers(&choice, "print") {
+            return Err(crate::features::backend::server::UNAVAILABLE.into());
+        }
+        let reply = client
+            .map_err(|e| format!("{e:#}"))?
+            .print(&toplevel.to_string_lossy(), &commit_prompt(&diff))
+            .map_err(|e| e.message)?;
+        return parse_commit_message(&reply)
+            .ok_or_else(|| "gentle-shell returned no message".into());
     }
     let spec = crate::features::backend::shell_spec(toplevel).map_err(|e| format!("{e:#}"))?;
     // Launcher options (home selectors) come before Pi's own arguments;
