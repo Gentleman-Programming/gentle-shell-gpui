@@ -27,10 +27,10 @@ use pi_rpc::desktop_rpc::{
     SessionPermission, SessionProject, SessionSection, SessionTodo, SessionTodoItem,
     SessionTodoProgress, SessionWorktree, SessionsScope, SetBackgroundSubagentsOutcome,
     SetConfigResult, SetPermissionModeResult, SetReviewModeOutcome, ShellChannel, ShellUpdate,
-    StatsRange, StatsScope, StatusSeverity, SubagentThread, SwitchSessionResult, ThreadItem,
-    UpdateState, UsageLimit, UsageLimitScope, UsageRefresh, UsageResetAt, UsageStatsDay,
-    UsageStatsModel, UsageStatsProvider, UsageStatsTotals, UsageStatsTruncated, UsageStatus,
-    UsageWindow, WIDGET_KEY, decode_payload, decode_widget,
+    Snapshot, StatsRange, StatsScope, StatusSeverity, SubagentThread, SwitchSessionResult,
+    ThreadItem, UpdateState, UsageLimit, UsageLimitScope, UsageRefresh, UsageResetAt,
+    UsageStatsDay, UsageStatsModel, UsageStatsProvider, UsageStatsTotals, UsageStatsTruncated,
+    UsageStatus, UsageWindow, WIDGET_KEY, decode_payload, decode_widget,
 };
 use pi_rpc::{Response, UiMethod, UiRequest};
 use serde_json::{Value, json};
@@ -104,6 +104,38 @@ fn event_line(seq: u64, event: &str, data: Value) -> String {
         "data": data,
     })
     .to_string()
+}
+
+/// An event of a server that names its numbering with an `epoch`.
+fn epoch_event_line(epoch: &str, seq: u64) -> String {
+    json!({
+        "schema": SCHEMA,
+        "kind": "event",
+        "seq": seq,
+        "epoch": epoch,
+        "event": "jobs_update",
+        "data": { "jobs": [] },
+    })
+    .to_string()
+}
+
+/// A `get_snapshot` answer of `epoch` at `sequence`, accepted for the
+/// session's pending request and decoded.
+fn epoch_snapshot(session: &mut DesktopSession, epoch: &str, sequence: u64) -> Snapshot {
+    let request_id = session
+        .issue(DesktopMethod::GetSnapshot)
+        .unwrap()
+        .request_id()
+        .to_string();
+    let data = json!({ "schema": SCHEMA, "sequence": sequence, "epoch": epoch, "state": {} });
+    record_response(
+        session
+            .accept(&widget(&response_line(&request_id, data)))
+            .unwrap()
+            .unwrap(),
+    )
+    .snapshot()
+    .unwrap()
 }
 
 /// The `DesktopResponse` inside a decoded record.
@@ -807,6 +839,181 @@ fn a_snapshot_resyncs_the_event_sequence_after_a_gap() {
         })
     ));
     assert_eq!(session.last_sequence(), Some(4));
+}
+
+#[test]
+fn events_and_snapshots_decode_their_epoch() {
+    let event = record_event(
+        decode_widget(&widget(&epoch_event_line("e1", 3)))
+            .unwrap()
+            .unwrap(),
+    );
+    assert_eq!((event.seq, event.epoch.as_deref()), (3, Some("e1")));
+    // A server older than epochs sends none.
+    let older = record_event(
+        decode_widget(&widget(&event_line(3, "jobs_update", json!({}))))
+            .unwrap()
+            .unwrap(),
+    );
+    assert_eq!(older.epoch, None);
+
+    let snapshot = |data: Value| {
+        record_response(
+            decode_widget(&widget(&response_line("desktop-1", data)))
+                .unwrap()
+                .unwrap(),
+        )
+        .snapshot()
+    };
+    let named = snapshot(json!({ "schema": SCHEMA, "sequence": 2, "epoch": "e1", "state": {} }));
+    assert_eq!(named.unwrap().epoch.as_deref(), Some("e1"));
+    let unnamed = snapshot(json!({ "schema": SCHEMA, "sequence": 2, "state": {} }));
+    assert_eq!(unnamed.unwrap().epoch, None);
+
+    // An epoch is a non-empty string or nothing.
+    for epoch in [json!(""), json!(7), json!(null)] {
+        let line = json!({
+            "schema": SCHEMA, "kind": "event", "seq": 1, "epoch": epoch,
+            "event": "jobs_update", "data": {},
+        });
+        assert!(matches!(
+            decode_widget(&widget(&line.to_string())),
+            Err(DesktopRpcError::MalformedPayload(_))
+        ));
+        assert!(matches!(
+            snapshot(json!({ "schema": SCHEMA, "sequence": 2, "epoch": epoch, "state": {} })),
+            Err(DesktopRpcError::MalformedPayload(_))
+        ));
+    }
+}
+
+#[test]
+fn a_new_epoch_restarts_the_event_sequence_and_duplicates_within_one_stay_dropped() {
+    let mut session = DesktopSession::new();
+    for seq in 1..=5 {
+        session
+            .accept(&widget(&epoch_event_line("before-reload", seq)))
+            .unwrap()
+            .unwrap();
+    }
+    // Within an epoch a seen sequence is a replay.
+    assert!(matches!(
+        session.accept(&widget(&epoch_event_line("before-reload", 5))),
+        Err(DesktopRpcError::DuplicateSequence { last: 5, got: 5 })
+    ));
+
+    // The server reloaded: its channel numbers from 1 again under a new
+    // epoch, and those events are new, not replays.
+    session
+        .accept(&widget(&epoch_event_line("after-reload", 1)))
+        .unwrap()
+        .unwrap();
+    assert_eq!(session.last_sequence(), Some(1));
+    assert!(matches!(
+        session.accept(&widget(&epoch_event_line("after-reload", 1))),
+        Err(DesktopRpcError::DuplicateSequence { last: 1, got: 1 })
+    ));
+    session
+        .accept(&widget(&epoch_event_line("after-reload", 2)))
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        session.accept(&widget(&epoch_event_line("after-reload", 4))),
+        Err(DesktopRpcError::OutOfOrderSequence {
+            expected: 3,
+            got: 4
+        })
+    ));
+
+    // A new epoch whose first event is not 1 lost the ones before it: the
+    // gap resyncs from a snapshot of that epoch.
+    assert!(matches!(
+        session.accept(&widget(&epoch_event_line("after-switch", 3))),
+        Err(DesktopRpcError::OutOfOrderSequence {
+            expected: 1,
+            got: 3
+        })
+    ));
+    assert_eq!(session.last_sequence(), Some(0));
+    let snapshot = epoch_snapshot(&mut session, "after-switch", 3);
+    session.resync_from_snapshot(&snapshot).unwrap();
+    session
+        .accept(&widget(&epoch_event_line("after-switch", 4)))
+        .unwrap()
+        .unwrap();
+    assert_eq!(session.last_sequence(), Some(4));
+}
+
+#[test]
+fn a_snapshot_of_a_new_epoch_replaces_a_larger_baseline() {
+    let mut session = DesktopSession::new();
+    for seq in 1..=9 {
+        session
+            .accept(&widget(&epoch_event_line("before-reload", seq)))
+            .unwrap();
+    }
+    // Within an epoch a smaller snapshot is stale.
+    let stale = epoch_snapshot(&mut session, "before-reload", 3);
+    assert!(matches!(
+        session.resync_from_snapshot(&stale),
+        Err(DesktopRpcError::StaleSnapshot {
+            last: 9,
+            sequence: 3
+        })
+    ));
+    assert_eq!(session.last_sequence(), Some(9));
+
+    // After a reload it counts a new numbering and is the baseline.
+    let reloaded = epoch_snapshot(&mut session, "after-reload", 2);
+    session.resync_from_snapshot(&reloaded).unwrap();
+    assert_eq!(session.last_sequence(), Some(2));
+    assert!(matches!(
+        session.accept(&widget(&epoch_event_line("after-reload", 2))),
+        Err(DesktopRpcError::DuplicateSequence { last: 2, got: 2 })
+    ));
+    session
+        .accept(&widget(&epoch_event_line("after-reload", 3)))
+        .unwrap()
+        .unwrap();
+    assert_eq!(session.last_sequence(), Some(3));
+}
+
+#[test]
+fn without_an_epoch_a_restarted_sequence_still_reads_as_replays() {
+    // An older server names no epoch: the session keeps today's rules.
+    let mut session = DesktopSession::new();
+    for seq in 1..=3 {
+        session
+            .accept(&widget(&event_line(seq, "jobs_update", json!({}))))
+            .unwrap();
+    }
+    assert!(matches!(
+        session.accept(&widget(&event_line(1, "jobs_update", json!({})))),
+        Err(DesktopRpcError::DuplicateSequence { last: 3, got: 1 })
+    ));
+    let request_id = session
+        .issue(DesktopMethod::GetSnapshot)
+        .unwrap()
+        .request_id()
+        .to_string();
+    let older = record_response(
+        session
+            .accept(&widget(&response_line(
+                &request_id,
+                json!({ "schema": SCHEMA, "sequence": 1, "state": {} }),
+            )))
+            .unwrap()
+            .unwrap(),
+    )
+    .snapshot()
+    .unwrap();
+    assert!(matches!(
+        session.resync_from_snapshot(&older),
+        Err(DesktopRpcError::StaleSnapshot {
+            last: 3,
+            sequence: 1
+        })
+    ));
 }
 
 #[test]

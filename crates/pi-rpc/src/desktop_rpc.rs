@@ -18,7 +18,9 @@
 //! [`DesktopSession::abandon`] for a request that will never be answered (a
 //! transport timeout, or a disposition other than `handled`), and
 //! [`DesktopSession::reset`] / [`DesktopSession::resync_from_snapshot`] for a
-//! backend restart or a lost event sequence.
+//! backend restart or a lost event sequence. A server that names its event
+//! numbering with an `epoch` also says when that numbering restarted (a
+//! reload or a switch on its side), so the session follows it on its own.
 //!
 //! The server validates the domain: the client keeps only the rules the
 //! contract documents. It checks input before sending only where the server
@@ -1658,10 +1660,15 @@ impl DesktopResponse {
     }
 }
 
-/// One inner event. `seq` is session-scoped and advances by one.
+/// One inner event. `seq` is session-scoped and advances by one within its
+/// `epoch`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DesktopEvent {
     pub seq: u64,
+    /// The numbering `seq` belongs to: a new one each time the server's
+    /// channel starts again (a reload, a switch, a restart) and `seq` restarts
+    /// at 1. `None` from a server older than epochs.
+    pub epoch: Option<String>,
     pub event: String,
     pub data: Value,
 }
@@ -2093,6 +2100,8 @@ fn expect_event(event: &DesktopEvent, expected: &'static str) -> Result<(), Desk
 #[derive(Debug, Clone, PartialEq)]
 pub struct Snapshot {
     pub sequence: u64,
+    /// The numbering `sequence` counts in, as [`DesktopEvent::epoch`].
+    pub epoch: Option<String>,
     pub state: Value,
     pub session: Option<SessionSections>,
 }
@@ -2105,6 +2114,7 @@ impl Snapshot {
             .get("sequence")
             .and_then(Value::as_u64)
             .ok_or_else(|| DesktopRpcError::MalformedPayload("snapshot has no sequence".into()))?;
+        let epoch = epoch_field(data, "snapshot")?;
         let state = data
             .get("state")
             .filter(|state| state.is_object())
@@ -2118,9 +2128,22 @@ impl Snapshot {
             .transpose()?;
         Ok(Self {
             sequence,
+            epoch,
             state,
             session,
         })
+    }
+}
+
+/// The `epoch` an event or a snapshot names its numbering with: absent from
+/// a server older than epochs, otherwise a non-empty string.
+fn epoch_field(record: &Value, what: &str) -> Result<Option<String>, DesktopRpcError> {
+    match record.get("epoch") {
+        None => Ok(None),
+        Some(Value::String(epoch)) if !epoch.is_empty() => Ok(Some(epoch.clone())),
+        Some(_) => Err(DesktopRpcError::MalformedPayload(format!(
+            "{what} epoch must be a non-empty string"
+        ))),
     }
 }
 
@@ -4106,6 +4129,9 @@ pub struct DesktopSession {
     next_request_id: u64,
     pending: Option<Pending>,
     last_seq: Option<u64>,
+    /// The epoch `last_seq` counts in; `None` before a baseline or from a
+    /// server older than epochs.
+    epoch: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4127,6 +4153,7 @@ impl DesktopSession {
             next_request_id: 1,
             pending: None,
             last_seq: None,
+            epoch: None,
         }
     }
 
@@ -4501,22 +4528,32 @@ impl DesktopSession {
     /// backend can never match a new request.
     pub fn reset(&mut self) {
         self.pending = None;
-        self.last_seq = None;
+        self.forget_baseline();
     }
 
     /// Adopt a snapshot's sequence as the event baseline, the documented
-    /// recovery after an [`DesktopRpcError::OutOfOrderSequence`] gap. A
-    /// snapshot older than the last accepted event is refused, so a stale one
-    /// cannot rewind the session into replays.
+    /// recovery after an [`DesktopRpcError::OutOfOrderSequence`] gap. Within
+    /// one epoch a snapshot older than the last accepted event is refused, so
+    /// a stale one cannot rewind the session into replays; a snapshot of
+    /// another epoch counts a numbering that started again, so its sequence
+    /// is taken whatever it is.
     pub fn resync_from_snapshot(&mut self, snapshot: &Snapshot) -> Result<(), DesktopRpcError> {
-        if let Some(last) = self.last_seq.filter(|last| snapshot.sequence < *last) {
+        if snapshot.epoch == self.epoch
+            && let Some(last) = self.last_seq.filter(|last| snapshot.sequence < *last)
+        {
             return Err(DesktopRpcError::StaleSnapshot {
                 last,
                 sequence: snapshot.sequence,
             });
         }
         self.last_seq = Some(snapshot.sequence);
+        self.epoch = snapshot.epoch.clone();
         Ok(())
+    }
+
+    fn forget_baseline(&mut self) {
+        self.last_seq = None;
+        self.epoch = None;
     }
 
     /// Decode and correlate an `extension_ui_request`: `Ok(None)` when it is
@@ -4552,29 +4589,46 @@ impl DesktopSession {
                 }
                 if switching {
                     // The new session numbers its events from 1 again.
-                    self.last_seq = None;
+                    self.forget_baseline();
                 }
             }
-            DesktopRecord::Event(event) => match self.last_seq {
-                // During a switch either session may speak, and the new one
-                // restarts at 1: each event is a new baseline.
-                _ if switching => self.last_seq = Some(event.seq),
-                Some(last) if event.seq <= last => {
-                    return Err(DesktopRpcError::DuplicateSequence {
-                        last,
-                        got: event.seq,
-                    });
+            DesktopRecord::Event(event) => {
+                let last = if switching {
+                    // During a switch either session may speak, and the new
+                    // one restarts at 1: each event is a new baseline.
+                    None
+                } else if self.last_seq.is_some() && event.epoch != self.epoch {
+                    // Another epoch is a channel that started again (a
+                    // reload, a switch, a restart) numbering from 1: none of
+                    // its events is a replay, and a first one other than 1
+                    // means events were lost.
+                    self.last_seq = Some(0);
+                    self.epoch = event.epoch.clone();
+                    Some(0)
+                } else {
+                    self.last_seq
+                };
+                match last {
+                    Some(last) if event.seq <= last => {
+                        return Err(DesktopRpcError::DuplicateSequence {
+                            last,
+                            got: event.seq,
+                        });
+                    }
+                    Some(last) if event.seq != last + 1 => {
+                        return Err(DesktopRpcError::OutOfOrderSequence {
+                            expected: last + 1,
+                            got: event.seq,
+                        });
+                    }
+                    // The first event seen sets the baseline: the session
+                    // does not know how many events preceded its subscription.
+                    _ => {
+                        self.last_seq = Some(event.seq);
+                        self.epoch = event.epoch.clone();
+                    }
                 }
-                Some(last) if event.seq != last + 1 => {
-                    return Err(DesktopRpcError::OutOfOrderSequence {
-                        expected: last + 1,
-                        got: event.seq,
-                    });
-                }
-                // The first event seen sets the baseline: the session does not
-                // know how many events preceded its subscription.
-                _ => self.last_seq = Some(event.seq),
-            },
+            }
         }
         Ok(Some(record))
     }
@@ -4694,6 +4748,7 @@ fn decode_response(value: Value) -> Result<DesktopRecord, DesktopRpcError> {
 }
 
 fn decode_event(value: Value) -> Result<DesktopRecord, DesktopRpcError> {
+    let epoch = epoch_field(&value, "event")?;
     let raw: RawEvent = serde_json::from_value(value)
         .map_err(|error| DesktopRpcError::MalformedPayload(error.to_string()))?;
     let seq = raw
@@ -4706,7 +4761,12 @@ fn decode_event(value: Value) -> Result<DesktopRecord, DesktopRpcError> {
     let data = raw
         .data
         .ok_or_else(|| DesktopRpcError::MalformedPayload("event has no data".into()))?;
-    Ok(DesktopRecord::Event(DesktopEvent { seq, event, data }))
+    Ok(DesktopRecord::Event(DesktopEvent {
+        seq,
+        epoch,
+        event,
+        data,
+    }))
 }
 
 /// Everything that can go wrong before, while and after a request: request

@@ -101,6 +101,7 @@ mod tests {
     fn event(name: &str, data: serde_json::Value) -> DesktopEvent {
         DesktopEvent {
             seq: 1,
+            epoch: None,
             event: name.into(),
             data,
         }
