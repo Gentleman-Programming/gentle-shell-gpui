@@ -1992,3 +1992,77 @@ fn a_local_tab_keeps_sending_gentle_ui_events_to_the_extension(cx: &mut TestAppC
     // Not handled here: it went to the (missing) backend.
     assert!(matches!(ran.take(), Some(Err(_))));
 }
+
+#[gpui::test]
+fn a_dialog_another_device_answered_closes_with_a_note(cx: &mut TestAppContext) {
+    use gentle_core::transcript::Item;
+    let (view, cx) = tab(cx);
+    let dialog = |id: &str| UiRequest {
+        id: id.into(),
+        timeout: None,
+        method: UiMethod::Confirm {
+            title: "Deploy?".into(),
+            message: String::new(),
+        },
+    };
+    view.update_in(cx, |view, window, cx| {
+        view.handle_batch(
+            vec![
+                pi_rpc::Incoming::Ui(dialog("d1")),
+                pi_rpc::Incoming::Ui(dialog("d2")),
+            ],
+            window,
+            cx,
+        );
+    });
+    let notes = |view: &SessionView| {
+        view.transcript
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Notice { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    view.update_in(cx, |view, window, cx| {
+        // The front one, answered on another device: the next one shows.
+        view.handle_batch(
+            vec![pi_rpc::Incoming::DialogResolved {
+                id: "d1".into(),
+                refused: false,
+            }],
+            window,
+            cx,
+        );
+        assert_eq!(view.extension.dialogs.len(), 1);
+        assert_eq!(view.extension.dialogs[0].id, "d2");
+        assert_eq!(notes(view), ["Answered on another device."]);
+
+        // This tab's own answer comes back as resolved too: nothing to say.
+        view.handle_batch(
+            vec![pi_rpc::Incoming::DialogResolved {
+                id: "d0".into(),
+                refused: false,
+            }],
+            window,
+            cx,
+        );
+        assert_eq!(notes(view).len(), 1);
+
+        // Answered here after another device did: the server kept theirs.
+        view.extension.dialogs.clear();
+        view.handle_batch(
+            vec![pi_rpc::Incoming::DialogResolved {
+                id: "d2".into(),
+                refused: true,
+            }],
+            window,
+            cx,
+        );
+        assert_eq!(
+            notes(view).last().map(String::as_str),
+            Some("Another device answered this first; the answer here wasn't used.")
+        );
+    });
+}

@@ -858,6 +858,13 @@ fn post_command(
         Ok((_, body)) => {
             dispatch(crate::parse_record(&body), pending, tx);
         }
+        // Another client answered this dialog first: the server kept that
+        // answer, and this one's dialog closes with a note.
+        Err(error) if kind == "extension_ui_response" && error.status == Some(409) => {
+            if let Some(id) = id {
+                let _ = tx.send_blocking(Incoming::DialogResolved { id, refused: true });
+            }
+        }
         Err(error) => match id {
             Some(id) => {
                 let failed = json!({
@@ -984,6 +991,12 @@ impl Follow<'_> {
                     }
                     Step::Reconnect => return Ended::Resync,
                     Step::Exited(code) => return Ended::Exited(code),
+                    Step::DialogResolved(id) => {
+                        let resolved = Incoming::DialogResolved { id, refused: false };
+                        if self.tx.send_blocking(resolved).is_err() {
+                            return Ended::Closed;
+                        }
+                    }
                     Step::Note(note) => self.note(note),
                     Step::Ignore => {}
                 }

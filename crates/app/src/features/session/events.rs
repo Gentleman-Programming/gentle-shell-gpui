@@ -67,6 +67,9 @@ impl SessionView {
                 self.reset_desktop_channel();
                 self.refresh_state(cx);
             }
+            Incoming::DialogResolved { id, refused } => {
+                self.dialog_resolved(&id, refused, window, cx);
+            }
             Incoming::Exited(code) => {
                 self.backend.status = BackendStatus::Exited(code);
                 self.usage.compacting = false;
@@ -634,6 +637,35 @@ impl SessionView {
                 .notice(NoticeLevel::Error, format!("{error:#}"));
         }
         self.prepare_dialog(window, cx);
+        self.sync_chrome(cx);
+        cx.notify();
+    }
+
+    /// Another device following this server session answered the dialog
+    /// `id`: it closes here with a quiet note. `refused`: this tab's own
+    /// answer arrived second and the server kept the other one.
+    pub(super) fn dialog_resolved(
+        &mut self,
+        id: &str,
+        refused: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let front = self.extension.dialogs.front().is_some_and(|d| d.id == id);
+        let shown = self.extension.dialogs.len();
+        self.extension.dialogs.retain(|d| d.id != id);
+        let note = if self.extension.dialogs.len() < shown {
+            "Answered on another device."
+        } else if refused {
+            "Another device answered this first; the answer here wasn't used."
+        } else {
+            // This tab's own answer, or one it never showed.
+            return;
+        };
+        self.transcript.notice(NoticeLevel::Info, note.into());
+        if front {
+            self.prepare_dialog(window, cx);
+        }
         self.sync_chrome(cx);
         cx.notify();
     }

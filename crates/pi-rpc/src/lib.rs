@@ -55,6 +55,10 @@ pub enum Incoming {
     /// Gentle Shell server's replay window passed them while the stream was
     /// reconnecting): read the whole state again.
     Resync,
+    /// A Gentle Shell server session's dialog was answered by another of its
+    /// clients: close it here if it is still shown. `refused` when this
+    /// client's own answer came second and the server didn't take it.
+    DialogResolved { id: String, refused: bool },
     /// The child exited; `None` when it was killed by a signal.
     Exited(Option<i32>),
 }

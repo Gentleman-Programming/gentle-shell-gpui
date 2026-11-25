@@ -300,6 +300,12 @@ impl Fake {
             }
         };
         match kind.as_str() {
+            // Another device answered `taken` first.
+            "extension_ui_response" if command["id"] == "taken" => reply(
+                stream,
+                409,
+                &json!({"error": {"code": "dialog_answered", "message": "Another client already answered this dialog"}}),
+            ),
             "extension_ui_response" => reply(stream, 202, &json!({"accepted": true})),
             // Longer than the server waits: answered in the stream only.
             "bash" => {
@@ -545,6 +551,33 @@ fn host_tool_requests_go_to_the_desktop_endpoint_and_calls_arrive_in_the_stream(
         panic!("expected a desktop event")
     };
     assert_eq!(event.host_tool_call().unwrap().call_id, "c2");
+    process.detach();
+}
+
+#[test]
+fn a_dialog_another_device_answered_closes_here() {
+    let fake = Fake::start();
+    let (process, rx) = PiProcess::serve(fake.client(), "/srv/project", None, None).unwrap();
+    fake.wait_for("the stream", |s| !s.subscribers.is_empty());
+    let mut stderr = Vec::new();
+
+    // Another device answered a dialog this one shows.
+    fake.emit(json!({"type": "serve_dialog_resolved", "id": "d1"}));
+    let Incoming::DialogResolved { id, refused } = next(&rx, &mut stderr) else {
+        panic!("expected the dialog to close")
+    };
+    assert_eq!((id.as_str(), refused), ("d1", false));
+
+    // This device answered second: the server kept the other answer.
+    process
+        .respond_ui("taken", pi_rpc::UiAnswer::Confirmed(true))
+        .unwrap();
+    let Incoming::DialogResolved { id, refused } = next(&rx, &mut stderr) else {
+        panic!("expected the refused answer")
+    };
+    assert_eq!((id.as_str(), refused), ("taken", true));
+    // Not a failure to report.
+    assert!(stderr.is_empty(), "{stderr:?}");
     process.detach();
 }
 

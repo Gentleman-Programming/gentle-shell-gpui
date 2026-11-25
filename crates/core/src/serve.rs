@@ -808,6 +808,9 @@ pub enum Step {
     Exited(Option<i32>),
     /// Something to tell the user (a dropped record).
     Note(String),
+    /// A client answered the dialog with this id (`serve_dialog_resolved`):
+    /// close it if it is still shown.
+    DialogResolved(String),
     /// Nothing to do (`hello`, a record already seen, server bookkeeping).
     Ignore,
 }
@@ -881,7 +884,12 @@ impl Stream {
             Some("serve_session_exited") => {
                 Step::Exited(record["code"].as_i64().and_then(|c| i32::try_from(c).ok()))
             }
-            Some("serve_dialog_resolved") => Step::Ignore,
+            // Some client answered this dialog (another device, or this one):
+            // one still shown here closes.
+            Some("serve_dialog_resolved") => match record["id"].as_str() {
+                Some(id) => Step::DialogResolved(id.to_string()),
+                None => Step::Ignore,
+            },
             Some("serve_record_dropped") => Step::Note(format!(
                 "The server dropped a record over {} bytes.",
                 record["maxBytes"].as_u64().unwrap_or_default()
@@ -1421,7 +1429,7 @@ mod tests {
                 1,
                 json!({"type": "serve_dialog_resolved", "id": "d"})
             )),
-            Step::Ignore
+            Step::DialogResolved("d".into())
         );
         assert!(matches!(
             stream.step(&message(2, json!({"type": "serve_record_dropped", "maxBytes": 16}))),
