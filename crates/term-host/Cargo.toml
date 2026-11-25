@@ -1,0 +1,26 @@
+[package]
+name = "gentle-term-host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Terminals that outlive their clients, for a Gentle Shell server
+# (`gentle-shell serve`): see src/main.rs. Unix only for now; elsewhere the
+# binary only says so.
+[[bin]]
+name = "gentle-term-host"
+path = "src/main.rs"
+
+[target.'cfg(unix)'.dependencies]
+# PTYs, and the headless emulator a reattaching client's snapshot is drawn
+# from. The version the app already locks.
+alacritty_terminal = "0.26"
+# Terminal data on the protocol. The version the app already locks.
+base64 = "0.23"
+serde_json.workspace = true
+# Signals, umask and the passwd shell; and the PTY's I/O loop (what
+# alacritty_terminal's own loop polls with). The versions alacritty_terminal
+# already locks.
+libc = "0.2"
+polling = "3"
