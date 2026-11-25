@@ -10,6 +10,10 @@
 #[path = "serve/relay.rs"]
 mod relay;
 
+// Forwarded pages through a proxy on this computer.
+#[path = "serve/local_pages.rs"]
+mod local_pages;
+
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::sync::{Arc, Mutex};
@@ -909,6 +913,11 @@ struct TlsFront {
 
 impl TlsFront {
     fn start(fake: &Fake, cert: &str) -> Self {
+        Self::to(fake.url.trim_start_matches("http://"), cert)
+    }
+
+    /// TLS in front of the plain server at `backend` (`host:port`).
+    fn to(backend: &str, cert: &str) -> Self {
         use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
         let der = fixture(&format!("cert-{cert}.der"));
         let key = PrivatePkcs8KeyDer::from(fixture(&format!("key-{cert}.der")));
@@ -923,7 +932,7 @@ impl TlsFront {
         let config = Arc::new(config);
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
-        let backend = fake.url.trim_start_matches("http://").to_string();
+        let backend = backend.to_string();
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(stream) = stream else { return };

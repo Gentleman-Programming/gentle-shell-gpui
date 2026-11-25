@@ -7,14 +7,14 @@ use super::*;
 
 /// A relay (`gentle-shell relay`, its client side only) splicing every
 /// client to the server listening on `to`, or saying the server is offline.
-struct FakeRelay {
-    url: String,
+pub(super) struct FakeRelay {
+    pub(super) url: String,
     /// Every client's hello line.
-    hellos: Arc<Mutex<Vec<Value>>>,
+    pub(super) hellos: Arc<Mutex<Vec<Value>>>,
 }
 
 impl FakeRelay {
-    fn start(to: u16, offline: bool) -> Self {
+    pub(super) fn start(to: u16, offline: bool) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("gsr://{}", listener.local_addr().unwrap());
         let hellos = Arc::new(Mutex::new(Vec::new()));

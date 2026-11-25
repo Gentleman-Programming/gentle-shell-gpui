@@ -479,7 +479,9 @@ pub fn known_home(url: &str) -> Option<String> {
 /// device: as it is unless it is on the server's own loopback, where it
 /// goes through a forward of `session` (`POST /api/sessions/:id/forwards`;
 /// the server reuses this device's forward of the port and mints a new
-/// single-use link each time). An error in words when it can't. Blocking.
+/// single-use link each time), opened through this computer's proxy for
+/// it (`ServeClient::local_page`). An error in words when it can't.
+/// Blocking.
 pub fn page_url(session: &ServerSession, url: &str) -> Result<String, String> {
     match gentle_core::serve::server_page(url) {
         ServerPage::Elsewhere => Ok(url.to_string()),
@@ -491,22 +493,20 @@ pub fn page_url(session: &ServerSession, url: &str) -> Result<String, String> {
                     session.url
                 )
             })?;
-            client
+            let forward = client
                 .forward(&session.id, port, &path)
-                .map(|forward| forward.url)
-                .map_err(|e| e.message)
+                .map_err(|e| e.message)?;
+            client.local_page(&forward)
         }
     }
 }
 
-/// Gentle Tower running on `choice` (a server), through a forward: the
-/// address to open. Blocking.
+/// Gentle Tower running on `choice` (a server), through a forward and this
+/// computer's proxy for it: the address to open. Blocking.
 pub fn tower(choice: &Backend) -> Result<String, String> {
-    client(choice)
-        .map_err(|e| e.to_string())?
-        .tower()
-        .map(|forward| forward.url)
-        .map_err(|e| e.message)
+    let client = client(choice).map_err(|e| e.to_string())?;
+    let forward = client.tower().map_err(|e| e.message)?;
+    client.local_page(&forward)
 }
 
 #[cfg(test)]

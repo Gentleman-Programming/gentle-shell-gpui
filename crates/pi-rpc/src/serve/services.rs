@@ -142,7 +142,7 @@ impl ForwardedPage {
 }
 
 /// A forward's link as `scheme://host:port` and the rest (path and query).
-fn split_link(url: &str) -> Option<(String, &str)> {
+pub(super) fn split_link(url: &str) -> Option<(String, &str)> {
     let (scheme, rest) = url.split_once("://")?;
     if !matches!(scheme, "http" | "https") {
         return None;

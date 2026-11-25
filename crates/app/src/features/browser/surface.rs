@@ -48,6 +48,10 @@ fn shared_pump(cx: &App) -> Rc<Task<()>> {
 
 pub struct WebSurface {
     url: String,
+    /// Keeps open the proxy on this computer a forwarded page from a
+    /// Gentle Shell server goes through while this surface shows it
+    /// (`pi_rpc::serve::hold_local_page`); dropping the last closes it.
+    local: Option<pi_rpc::serve::LocalHold>,
     /// Runs before the page's own scripts, on every load.
     script: Option<String>,
     /// Set for a page the app serves itself, locked down (see [`Sandbox`]).
@@ -83,6 +87,7 @@ const PARKED: (f32, f32) = (1280., 800.);
 impl WebSurface {
     pub fn new(url: String, script: Option<String>) -> Self {
         Self {
+            local: pi_rpc::serve::hold_local_page(&url),
             url,
             script,
             sandbox: None,
@@ -221,6 +226,7 @@ impl WebSurface {
                 view.load_url(&url);
             }
         }
+        self.local = pi_rpc::serve::hold_local_page(&url);
         self.url = url;
         cx.notify();
     }
@@ -232,6 +238,7 @@ impl WebSurface {
         if let Some(view) = &self.view {
             view.load_url(&url);
         }
+        self.local = pi_rpc::serve::hold_local_page(&url);
         self.url = url;
         cx.notify();
     }

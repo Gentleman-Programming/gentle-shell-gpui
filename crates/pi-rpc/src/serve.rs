@@ -21,6 +21,7 @@
 //!   to reattach to ([`PiProcess::serve`] with its id).
 
 mod files;
+mod local;
 mod services;
 mod terminals;
 mod tls;
@@ -29,6 +30,7 @@ pub use files::{
     Entry, EntryKind, FileChunk, GitOutput, Listing, READ_CHUNK, SearchHit, Stat, Uploaded,
     WatchEvent, WatchStream, Written,
 };
+pub use local::{LocalHold, hold_local_page};
 pub use services::{ForwardedPage, Service};
 pub use terminals::{TermEvent, TermHost, TermStream, Terminal};
 

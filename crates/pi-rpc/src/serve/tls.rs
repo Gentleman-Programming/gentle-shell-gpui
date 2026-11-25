@@ -16,10 +16,15 @@
 //!   at the relay's address): one handshake line to the relay naming the
 //!   server by its fingerprint, then the same pinned TLS end to end, so the
 //!   relay sees only ciphertext.
+//! - **A byte stream** ([`Link::open`]): the same pinned TLS, through the
+//!   relay when there is one, for a forwarded page's proxy on this computer
+//!   (`super::local`), read and written from two threads ([`Tunnel`]).
 
 use std::io::{Read, Write};
+use std::net::{TcpStream, ToSocketAddrs as _};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::WebPkiSupportedAlgorithms;
@@ -116,6 +121,88 @@ impl Link {
             _ => None,
         }
     }
+
+    /// A pinned TLS connection to `dial` (`host:port`: a forward's
+    /// listener, or the relay that reaches it), its handshake done within
+    /// `timeout`; then no timeout (a page's stream stays open). Only a
+    /// paired server's certificate is accepted.
+    pub(crate) fn open(&self, dial: &str, timeout: Duration) -> std::io::Result<Tunnel> {
+        use std::io::{Error, ErrorKind};
+        let Some(id) = self.fingerprint() else {
+            return Err(Error::new(
+                ErrorKind::PermissionDenied,
+                "This device doesn't know the server's certificate: pair it again.",
+            ));
+        };
+        let mut tcp = connect(dial, timeout)?;
+        tcp.set_nodelay(true)?;
+        tcp.set_read_timeout(Some(timeout))?;
+        tcp.set_write_timeout(Some(timeout))?;
+        if let Some(relay) = self.relay.as_deref().filter(|relay| *relay == dial) {
+            relay_handshake(&mut tcp, relay, id, self.relay_port)?;
+        }
+        let host = dial
+            .rsplit_once(':')
+            .map_or(dial, |(host, _)| host)
+            .trim_start_matches('[')
+            .trim_end_matches(']');
+        let name = ServerName::try_from(host.to_string())
+            .or_else(|_| ServerName::try_from(NO_NAME.to_string()))
+            .map_err(|e| Error::new(ErrorKind::InvalidInput, e))?;
+        let mut conn = ClientConnection::new(self.config.clone(), name).map_err(Error::other)?;
+        while conn.is_handshaking() {
+            conn.complete_io(&mut tcp).map_err(|e| {
+                if self.changed() {
+                    Error::new(ErrorKind::PermissionDenied, protocol::CERTIFICATE_CHANGED)
+                } else {
+                    e
+                }
+            })?;
+        }
+        tcp.set_read_timeout(None)?;
+        tcp.set_write_timeout(None)?;
+        Ok(Tunnel { conn, tcp })
+    }
+}
+
+/// TCP to the first of `dial`'s addresses that answers within `timeout`.
+fn connect(dial: &str, timeout: Duration) -> std::io::Result<TcpStream> {
+    let mut last = None;
+    for addr in dial.to_socket_addrs()? {
+        match TcpStream::connect_timeout(&addr, timeout) {
+            Ok(tcp) => return Ok(tcp),
+            Err(e) => last = Some(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("{dial} has no address"),
+        )
+    }))
+}
+
+/// The relay's answer that the server has nothing on the port asked for:
+/// the forward there closed.
+#[derive(Debug)]
+pub(crate) struct NothingThere(String);
+
+impl std::fmt::Display for NothingThere {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for NothingThere {}
+
+/// Whether `error`, opening a [`Tunnel`], means nothing listens where a
+/// forward did: the relay said so, or (`relayed` false) the forward's
+/// listener refused the connection.
+pub(crate) fn nothing_there(error: &std::io::Error, relayed: bool) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|inner| inner.is::<NothingThere>())
+        || (!relayed && error.kind() == std::io::ErrorKind::ConnectionRefused)
 }
 
 /// The URL ureq is given for `base`: a relay's `gsr://host:port` is
@@ -318,7 +405,13 @@ pub(crate) fn relay_handshake(
             ErrorKind::ConnectionRefused,
             "the server isn't connected to it right now".to_string(),
         ),
-        "busy" | "timeout" | "refused" => (ErrorKind::ConnectionRefused, said.to_string()),
+        "busy" | "timeout" => (ErrorKind::ConnectionRefused, said.to_string()),
+        "refused" => {
+            return Err(Error::new(
+                ErrorKind::ConnectionRefused,
+                NothingThere(format!("The relay {relay} answered: {said}.")),
+            ));
+        }
         "unsupported_version" => (
             ErrorKind::Unsupported,
             format!("{said}: update Gentle Shell GPUI or the relay"),
@@ -369,6 +462,139 @@ impl Transport for PinnedTls {
 impl std::fmt::Debug for PinnedTls {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PinnedTls").finish_non_exhaustive()
+    }
+}
+
+/// A [`Link::open`] connection: TLS records go out in order under one lock
+/// while the socket is read without it, so a page's request body and its
+/// streamed answer (SSE, a WebSocket) flow at once.
+pub(crate) struct Tunnel {
+    conn: ClientConnection,
+    tcp: TcpStream,
+}
+
+/// What both halves of a [`Tunnel`] share.
+struct TunnelState {
+    conn: Mutex<ClientConnection>,
+    /// The socket's writing side: records are written in the order they
+    /// were made, without holding the connection while the network waits.
+    out: Mutex<TcpStream>,
+}
+
+impl TunnelState {
+    fn conn(&self) -> MutexGuard<'_, ClientConnection> {
+        self.conn.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Sends what rustls has to send: taken under the connection's lock,
+    /// written under the socket's.
+    fn send(&self, mut conn: MutexGuard<'_, ClientConnection>) -> std::io::Result<()> {
+        if !conn.wants_write() {
+            return Ok(());
+        }
+        let mut records = Vec::new();
+        while conn.wants_write() {
+            conn.write_tls(&mut records)?;
+        }
+        let mut out = self.out.lock().unwrap_or_else(|e| e.into_inner());
+        drop(conn);
+        out.write_all(&records)
+    }
+}
+
+impl Tunnel {
+    /// Its reading half, its writing half, and its socket (to end both).
+    pub(crate) fn split(self) -> std::io::Result<(TunnelReader, TunnelWriter, TcpStream)> {
+        let socket = self.tcp.try_clone()?;
+        let state = Arc::new(TunnelState {
+            conn: Mutex::new(self.conn),
+            out: Mutex::new(self.tcp.try_clone()?),
+        });
+        let reader = TunnelReader {
+            state: state.clone(),
+            tcp: self.tcp,
+            raw: vec![0; 18 * 1024],
+            start: 0,
+            end: 0,
+        };
+        Ok((reader, TunnelWriter { state }, socket))
+    }
+}
+
+/// The plaintext a [`Tunnel`] receives; `Ok(0)` once the server ended it.
+pub(crate) struct TunnelReader {
+    state: Arc<TunnelState>,
+    tcp: TcpStream,
+    /// Bytes read from the socket rustls hasn't taken yet.
+    raw: Vec<u8>,
+    start: usize,
+    end: usize,
+}
+
+impl Read for TunnelReader {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        use std::io::{Error, ErrorKind};
+        if out.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            let mut conn = self.state.conn();
+            while self.start < self.end {
+                match conn.read_tls(&mut &self.raw[self.start..self.end]) {
+                    // After the server's close_notify nothing more is read.
+                    Ok(0) => self.start = self.end,
+                    Ok(n) => {
+                        self.start += n;
+                        conn.process_new_packets()
+                            .map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
+                    }
+                    // Its plaintext buffer is full: hand that out first.
+                    Err(e) if e.kind() == ErrorKind::Other => break,
+                    Err(e) => return Err(e),
+                }
+            }
+            let read = match conn.reader().read(out) {
+                Ok(n) => Some(n),
+                Err(e) if e.kind() == ErrorKind::WouldBlock => None,
+                // The socket ended without a close_notify: the end all the same.
+                Err(e) if e.kind() == ErrorKind::UnexpectedEof => Some(0),
+                Err(e) => return Err(e),
+            };
+            // A key update or an alert to answer.
+            self.state.send(conn)?;
+            if let Some(n) = read {
+                return Ok(n);
+            }
+            if self.start < self.end {
+                return Err(Error::other("TLS stalled"));
+            }
+            let n = self.tcp.read(&mut self.raw)?;
+            (self.start, self.end) = (0, n);
+            if n == 0 {
+                let mut conn = self.state.conn();
+                conn.read_tls(&mut &[][..])?;
+                conn.process_new_packets()
+                    .map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
+            }
+        }
+    }
+}
+
+/// Plaintext for a [`Tunnel`]'s server, encrypted and sent at once.
+pub(crate) struct TunnelWriter {
+    state: Arc<TunnelState>,
+}
+
+impl Write for TunnelWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut conn = self.state.conn();
+        let n = conn.writer().write(buf)?;
+        self.state.send(conn)?;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 
