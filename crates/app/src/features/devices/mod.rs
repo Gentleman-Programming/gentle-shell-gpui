@@ -12,7 +12,7 @@
 //! are shut down when it quits.
 
 pub mod cli;
-mod hub;
+pub(crate) mod hub;
 mod instructions;
 mod panel;
 mod sdk;
@@ -24,7 +24,7 @@ use gentle_core::devices::{Device, State};
 use gpui_kit::*;
 
 use crate::features::setup::devices as setup;
-pub use instructions::agent_instructions;
+pub use instructions::{agent_instructions, theme_guide};
 pub use panel::{DevicePanel, DevicePanelEvent};
 pub(crate) use sdk::{android_sdk, android_tool_dirs, simctl_path, xcode_developer_dir};
 

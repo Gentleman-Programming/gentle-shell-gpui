@@ -80,7 +80,7 @@ pub fn run(args: Vec<String>) -> i32 {
 }
 
 /// The hub's port, once the app started it.
-fn wait_for_hub() -> Result<u16, String> {
+pub(crate) fn wait_for_hub() -> Result<u16, String> {
     let deadline = Instant::now() + Duration::from_secs(90);
     loop {
         if let Some(port) = hub::running_port() {
@@ -147,43 +147,50 @@ fn list(json: bool) -> i32 {
 }
 
 fn open(query: &str) -> i32 {
-    let port = match wait_for_hub() {
-        Ok(port) => port,
+    match wait_ready(query, |device| {
+        eprintln!("Starting {} in the app's device panel…", device.name)
+    }) {
+        Ok(device) => {
+            print!("{}", quick_start(&device, setup::AGENT.entry().is_some()));
+            0
+        }
         Err(error) => {
             eprintln!("gentle-device: {error}");
-            return 1;
+            1
         }
-    };
+    }
+}
+
+/// Wait for the device `query` names to be ready (the app was asked to
+/// boot it); `booting` is told once when it is still starting.
+pub(crate) fn wait_ready(query: &str, booting: impl FnOnce(&Device)) -> Result<Device, String> {
+    let port = wait_for_hub()?;
     let deadline = Instant::now() + Duration::from_secs(240);
-    let mut said_booting = false;
-    let device = loop {
+    let mut booting = Some(booting);
+    loop {
         let devices = hub::list(port).map(|(d, _)| d).unwrap_or_default();
         match find_device(&devices, query) {
-            Some(device) if device.state == State::Ready => break device.clone(),
-            Some(device) if !said_booting => {
-                eprintln!("Starting {} in the app's device panel…", device.name);
-                said_booting = true;
+            Some(device) if device.state == State::Ready => return Ok(device.clone()),
+            Some(device) => {
+                if let Some(booting) = booting.take() {
+                    booting(device);
+                }
             }
-            Some(_) => {}
             None if !devices.is_empty() => {
-                eprintln!(
-                    "gentle-device: no simulator or emulator named \"{query}\". Run `gentle-device list`."
-                );
-                return 1;
+                return Err(format!(
+                    "no simulator or emulator named \"{query}\". Run `gentle-device list`."
+                ));
             }
             None => {}
         }
         if Instant::now() > deadline {
-            eprintln!("gentle-device: \"{query}\" didn't finish starting in time.");
-            return 1;
+            return Err(format!("\"{query}\" didn't finish starting in time."));
         }
         std::thread::sleep(Duration::from_secs(1));
-    };
-    print!("{}", quick_start(&device, setup::AGENT.entry().is_some()));
-    0
+    }
 }
 
-fn platform_name(platform: Platform) -> &'static str {
+pub(crate) fn platform_name(platform: Platform) -> &'static str {
     match platform {
         Platform::Ios => "ios",
         Platform::Android => "android",

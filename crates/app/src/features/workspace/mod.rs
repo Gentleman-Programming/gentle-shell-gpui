@@ -710,7 +710,7 @@ impl Workspace {
     }
 
     /// `gentle-device`'s request: start the hub, open a device, close one.
-    fn device_request(&mut self, args: &[String], cx: &mut Context<Self>) {
+    pub(crate) fn device_request(&mut self, args: &[String], cx: &mut Context<Self>) {
         use crate::features::devices::cli::{Request, parse};
         let Ok(request) = parse(args) else { return };
         self.devices.update(cx, |panel, cx| match request {

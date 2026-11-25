@@ -114,16 +114,20 @@ pub fn agent_instructions(prefs: Prefs) -> Option<PathBuf> {
     if prefs.enabled && prefs.agents {
         text.push_str(DEVICES);
     }
-    if let Some(dir) = crate::shared::themes::app_themes_dir() {
-        let scenes: Vec<String> = crate::shared::backdrop::builtin_scene_names()
-            .map(|name| format!("`{name}`"))
-            .collect();
-        let guide = THEME_GUIDE.replace("BUILTIN_SCENES", &scenes.join(", "));
-        if write_if_changed(&dir.join("GUIDE.md"), &guide).is_some() {
-            write_examples(&dir);
-            text.push_str(&themes(&dir));
-        }
+    if let Some(dir) = crate::shared::themes::app_themes_dir()
+        && write_if_changed(&dir.join("GUIDE.md"), &theme_guide()).is_some()
+    {
+        write_examples(&dir);
+        text.push_str(&themes(&dir));
     }
     write_if_changed(&path, &text)?;
     Some(path)
+}
+
+/// The guide to making app themes, with the built-in scenes named.
+pub fn theme_guide() -> String {
+    let scenes: Vec<String> = crate::shared::backdrop::builtin_scene_names()
+        .map(|name| format!("`{name}`"))
+        .collect();
+    THEME_GUIDE.replace("BUILTIN_SCENES", &scenes.join(", "))
 }
