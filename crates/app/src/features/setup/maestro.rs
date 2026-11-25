@@ -5,6 +5,11 @@
 //! toolchain folder, no sudo, then registers `maestro mcp` with Pi through
 //! `gentle-shell mcp add`, so Pi writes its own `mcp.json`. Settings' UI
 //! testing section drives all of it.
+//!
+//! Agents on a Gentle Shell server get no MCP server: one would run Maestro
+//! there, away from the simulators. The CLI is installed on this computer
+//! instead, and the app runs it for them (the `maestro` host tool,
+//! `host_tools::maestro`).
 
 use std::path::{Path, PathBuf};
 
@@ -105,6 +110,40 @@ fn maestro() -> Option<PathBuf> {
         })
 }
 
+/// Whether the Maestro CLI is on this computer, wherever agents run.
+/// Blocking, but only file lookups.
+pub fn installed_here() -> bool {
+    maestro().is_some()
+}
+
+/// The Maestro CLI on this computer, set up to run as the app runs it for
+/// a server's agents: the Java 17+ home as `JAVA_HOME`, Xcode's developer
+/// folder and the Android SDK when found, the app's PATH, and no prompt
+/// about usage data. Blocking.
+pub fn command_here() -> Result<std::process::Command, String> {
+    let cli = maestro().ok_or(
+        "Maestro isn't installed on the user's computer: in the app, Configuration → Integrations → UI testing · Maestro → Install Maestro.",
+    )?;
+    let java = java_home().ok_or(
+        "Maestro needs Java 17 or newer on the user's computer: in the app, Configuration → Integrations → UI testing · Maestro → Install Maestro adds it.",
+    )?;
+    let mut command = pi_rpc::command(cli);
+    command
+        .env("JAVA_HOME", java)
+        .env("PATH", pi_rpc::child_path())
+        .env("MAESTRO_CLI_NO_ANALYTICS", "1")
+        .env("MAESTRO_CLI_ANALYSIS_NOTIFICATION_DISABLED", "true");
+    if let Some(developer) = crate::features::devices::xcode_developer_dir() {
+        command.env("DEVELOPER_DIR", developer);
+    }
+    if let Some(sdk) = crate::features::devices::android_sdk() {
+        command
+            .env("ANDROID_HOME", &sdk)
+            .env("ANDROID_SDK_ROOT", &sdk);
+    }
+    Ok(command)
+}
+
 /// The CLI the app installed, if any.
 fn app_cli() -> Option<PathBuf> {
     toolchain_dir()
@@ -135,24 +174,39 @@ pub struct MaestroStatus {
     pub java: Option<(PathBuf, u64)>,
     /// Pi's `mcp.json` has the `maestro` server.
     pub connected: bool,
+    /// Agents run on a Gentle Shell server: what is shown is this
+    /// computer's Maestro, which the app runs for them (no MCP server).
+    pub host_tool: bool,
 }
 
-/// Blocking: looks for the CLI, Java and the registration, where agents run.
+/// Blocking: looks for the CLI, Java and the registration, where agents run
+/// (on this computer, without a registration, for a server's agents).
 pub fn status() -> MaestroStatus {
-    if let Some(choice) = super::remote::backend() {
-        return remote_status(&choice).unwrap_or(MaestroStatus {
+    match super::remote::backend() {
+        Some(choice) if choice.is_server() => MaestroStatus {
+            host_tool: true,
+            ..status_here(false)
+        },
+        Some(choice) => remote_status(&choice).unwrap_or(MaestroStatus {
             cli: None,
             app_owned: false,
             java: None,
             connected: false,
-        });
+            host_tool: false,
+        }),
+        None => status_here(is_registered(&pi_rpc::resolve_homes().agent)),
     }
+}
+
+/// This computer's CLI and Java, with `connected` as given.
+fn status_here(connected: bool) -> MaestroStatus {
     let cli = maestro();
     MaestroStatus {
         app_owned: cli.is_some() && cli == app_cli(),
         cli,
         java: java_home().and_then(|home| java_major(&home).map(|major| (home, major))),
-        connected: is_registered(&pi_rpc::resolve_homes().agent),
+        connected,
+        host_tool: false,
     }
 }
 
@@ -197,14 +251,22 @@ pub fn disconnect(log: &Log) -> Result<(), String> {
 }
 
 /// Disconnect, then delete the CLI and the Java runtime the app installed.
-/// A Maestro or Java you installed yourself is left alone.
+/// A Maestro or Java you installed yourself is left alone. For a server's
+/// agents there is nothing to disconnect: the ones on this computer go.
 pub fn remove(log: &Log) -> Result<(), String> {
-    if let Some(choice) = super::remote::backend() {
-        return remote_remove(&choice, log);
+    match super::remote::backend() {
+        Some(choice) if choice.is_server() => return remove_here(log),
+        Some(choice) => return remote_remove(&choice, log),
+        None => {}
     }
     if is_registered(&pi_rpc::resolve_homes().agent) {
         disconnect(log)?;
     }
+    remove_here(log)
+}
+
+/// Delete the CLI and the Java runtime the app installed on this computer.
+fn remove_here(log: &Log) -> Result<(), String> {
     let toolchain = toolchain_dir().ok_or("This system has no app data folder.")?;
     for (dir, what) in [
         (toolchain.join("maestro"), "Maestro"),
@@ -220,34 +282,20 @@ pub fn remove(log: &Log) -> Result<(), String> {
     Ok(())
 }
 
-/// Java (when missing), the CLI (when missing), then the MCP server.
+/// Java (when missing), the CLI (when missing), then the MCP server. For a
+/// server's agents, Java and the CLI on this computer and no MCP server.
 pub fn install(log: &Log) -> Result<(), String> {
-    super::remote::refuse_server()?;
-    if let Some(choice) = super::remote::backend() {
-        return remote_install(&choice, log);
+    match super::remote::backend() {
+        Some(choice) if choice.is_server() => {
+            toolchain_here(log)?;
+            log("Done. Agents on the server get the app's maestro tool (with Devices on), which runs Maestro here.".into());
+            return Ok(());
+        }
+        Some(choice) => return remote_install(&choice, log),
+        None => {}
     }
     let spec = launcher()?;
-    let java = match java_home() {
-        Some(home) => {
-            log(format!("Using the Java in {}.", home.display()));
-            home
-        }
-        None => {
-            fetch::install_java_runtime(log)?;
-            java_home().ok_or("Java was installed, but it doesn't run.")?
-        }
-    };
-    let maestro = match maestro() {
-        Some(maestro) => {
-            log(format!("Using the Maestro CLI in {}.", maestro.display()));
-            maestro
-        }
-        None => {
-            fetch::install_maestro_release(log)?;
-            refresh_paths();
-            maestro().ok_or("Maestro was installed, but this app can't find it.")?
-        }
-    };
+    let (java, maestro) = toolchain_here(log)?;
     let java_env = format!("JAVA_HOME={}", java.display());
     let developer_env = crate::features::devices::xcode_developer_dir()
         .map(|dir| format!("DEVELOPER_DIR={}", dir.display()));
@@ -272,6 +320,33 @@ pub fn install(log: &Log) -> Result<(), String> {
     } else {
         Err("gentle-shell added Maestro, but it isn't in this home's mcp.json.".into())
     }
+}
+
+/// A Java 17+ home and the Maestro CLI on this computer, each installed
+/// first when missing.
+fn toolchain_here(log: &Log) -> Result<(PathBuf, PathBuf), String> {
+    let java = match java_home() {
+        Some(home) => {
+            log(format!("Using the Java in {}.", home.display()));
+            home
+        }
+        None => {
+            fetch::install_java_runtime(log)?;
+            java_home().ok_or("Java was installed, but it doesn't run.")?
+        }
+    };
+    let maestro = match maestro() {
+        Some(maestro) => {
+            log(format!("Using the Maestro CLI in {}.", maestro.display()));
+            maestro
+        }
+        None => {
+            fetch::install_maestro_release(log)?;
+            refresh_paths();
+            maestro().ok_or("Maestro was installed, but this app can't find it.")?
+        }
+    };
+    Ok((java, maestro))
 }
 
 // ── In a backend ───────────────────────────────────────────────────────────
@@ -306,6 +381,7 @@ fn remote_status(choice: &Backend) -> Option<MaestroStatus> {
         cli,
         java: java.filter(|(_, major)| *major >= MIN_JAVA),
         connected,
+        host_tool: false,
     })
 }
 

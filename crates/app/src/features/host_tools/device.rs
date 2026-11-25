@@ -325,20 +325,8 @@ fn drive(device: &Device, args: &[String], timeout: Duration) -> Result<String, 
     }
 }
 
-/// A temporary path of the app's own for `name`.
-fn scratch(name: &str) -> PathBuf {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or_default();
-    std::env::temp_dir().join(format!(
-        "gentle-device-{}-{nanos}-{name}",
-        std::process::id()
-    ))
-}
-
 fn shot(device: &Device) -> Result<Outcome, String> {
-    let path = scratch("shot.png");
+    let path = super::scratch("device", "shot.png");
     let path_text = path.to_string_lossy().into_owned();
     let result = drive(device, &["screenshot".into(), path_text], DRIVE_TIMEOUT)
         .and_then(|_| std::fs::read(&path).map_err(|error| format!("no picture: {error}")));
@@ -365,7 +353,7 @@ fn install(device: &Device, app: Source) -> Result<Outcome, String> {
             (path, None)
         }
         Source::Url(url) => {
-            let dir = scratch("install");
+            let dir = super::scratch("device", "install");
             let path = download(&url, &dir).inspect_err(|_| {
                 let _ = std::fs::remove_dir_all(&dir);
             })?;

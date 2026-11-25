@@ -13,12 +13,15 @@
 //! - `gentle_ui`: what the app's generative UI extension does
 //!   (`gentle_core::genui::host`), when the server takes host messages and
 //!   Agent UI isn't off.
+//! - `maestro`: Maestro flows, the view hierarchy and screenshots on the
+//!   device panel's open simulator, with this computer's Maestro (in place
+//!   of Maestro's MCP server, which would run on the server).
 //!
 //! This module is the pure part: the definitions sent, how a call's
 //! arguments become the operation the app's existing code runs, and how its
 //! answer becomes the result sent back. `session::host_tools` runs them.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use base64::Engine as _;
 use gentle_core::genui::host::{Mode, guide};
@@ -26,6 +29,7 @@ use pi_rpc::desktop_rpc::{HostTool, HostToolContent};
 use serde_json::{Value, json};
 
 pub mod device;
+pub mod maestro;
 pub mod themes;
 
 /// The provider name the app registers under. A server replaces it with
@@ -100,6 +104,9 @@ pub fn definitions(canvas: bool, genui: Option<Mode>) -> Vec<HostTool> {
     let mut tools = vec![open_page(), browser(), screen()];
     if device::offered() {
         tools.push(device::definition());
+    }
+    if maestro::offered() {
+        tools.push(maestro::definition());
     }
     tools.push(themes::definition());
     if canvas {
@@ -321,6 +328,8 @@ pub enum Call {
     Canvas(Value),
     /// A `gentle-device` operation (iOS/Android simulators).
     Device(device::Op),
+    /// A Maestro run on the device panel's open simulator.
+    Maestro(maestro::Op),
     /// An app theme operation.
     Theme(themes::Op),
     /// A `gentle_ui` call, as the generative UI extension takes it.
@@ -393,6 +402,7 @@ pub fn route(tool: &str, args: &Value, canvas: bool, genui: bool) -> Result<Call
             }
         })),
         "device" if device::offered() => device::route(args).map(Call::Device),
+        "maestro" if maestro::offered() => maestro::route(args).map(Call::Maestro),
         "app_theme" => themes::route(args).map(Call::Theme),
         "gentle_ui" if genui => Ok(Call::GenUi(args.clone())),
         other => Err(format!("The Gentle Shell app has no tool {other} here")),
@@ -437,6 +447,19 @@ pub fn png(bytes: &[u8]) -> HostToolContent {
         data: base64::engine::general_purpose::STANDARD.encode(bytes),
         mime_type: "image/png".into(),
     }
+}
+
+/// A path of the app's own in the temporary folder for `name`, one per
+/// call: `tool` and the time keep calls apart.
+fn scratch(tool: &str, name: &str) -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    std::env::temp_dir().join(format!(
+        "gentle-{tool}-{}-{nanos}-{name}",
+        std::process::id()
+    ))
 }
 
 /// A driver's `{ok}` / `{error}` answer (`gentle-browser`, `gentle-screen`)
@@ -531,6 +554,9 @@ mod tests {
             let mut expected = vec!["open_page", "browser", "screen"];
             if device::offered() {
                 expected.push("device");
+            }
+            if maestro::offered() {
+                expected.push("maestro");
             }
             expected.push("app_theme");
             if canvas {

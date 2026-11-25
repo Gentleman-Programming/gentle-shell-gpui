@@ -313,6 +313,7 @@ impl SessionView {
                 }
                 Box::new(move || tools::device::run(op))
             }
+            Call::Maestro(op) => Box::new(move || tools::maestro::run(op)),
             Call::Theme(op) => Box::new(move || tools::themes::run(op)),
             // Runs here, on the conversation's own surfaces.
             Call::GenUi(args) => {
