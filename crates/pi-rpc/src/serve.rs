@@ -25,6 +25,7 @@ mod local;
 mod services;
 mod terminals;
 mod tls;
+mod upgrade;
 
 pub use files::{
     Entry, EntryKind, FileChunk, GitOutput, Listing, READ_CHUNK, SearchHit, Stat, Uploaded,
@@ -33,6 +34,7 @@ pub use files::{
 pub use local::{LocalHold, hold_local_page};
 pub use services::{ForwardedPage, Service};
 pub use terminals::{TermEvent, TermHost, TermStream, Terminal};
+pub use upgrade::{UpgradeEvent, UpgradeStream};
 
 use std::io::Read as _;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
