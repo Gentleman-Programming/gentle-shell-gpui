@@ -16,6 +16,7 @@ use super::state::desktop::config::Applied as ConfigApplied;
 use super::state::desktop::design::Applied as DesignApplied;
 use super::state::desktop::output::Applied as OutputApplied;
 use super::state::desktop::permission::Applied as PermissionApplied;
+use super::state::desktop::reads::{ReadFailure, ReadOutcome, ReadRequest, ReadSupport};
 use super::state::desktop::review::Applied as ReviewApplied;
 use super::state::desktop::subscription::Applied as SubscriptionApplied;
 use super::state::desktop::supervision::Applied as SupervisionApplied;
@@ -140,6 +141,8 @@ impl SessionView {
             cx.notify();
         }
         self.send_desktop(applied.sends, cx);
+        // The probe may have said how to read the models owed.
+        self.sync_models(cx);
     }
 
     /// Act on a supervision decision: say what failed through the tab's report
@@ -655,6 +658,7 @@ impl SessionView {
             | DesktopMethod::SetBackgroundSubagents
             | DesktopMethod::GetAuthStatus
             | DesktopMethod::ReloadCredentials
+            | DesktopMethod::ListAvailableModels
             | DesktopMethod::LoginStart
             | DesktopMethod::LoginComplete
             | DesktopMethod::LoginCancel
@@ -745,6 +749,7 @@ impl SessionView {
             | DesktopMethod::SetBackgroundSubagents
             | DesktopMethod::GetAuthStatus
             | DesktopMethod::ReloadCredentials
+            | DesktopMethod::ListAvailableModels
             | DesktopMethod::LoginStart
             | DesktopMethod::LoginComplete
             | DesktopMethod::LoginCancel
@@ -803,8 +808,30 @@ impl SessionView {
         });
     }
 
-    /// Pi's models with usable credentials (`get_available_models`).
+    /// Pi's models with usable credentials: `list_available_models` over the
+    /// Desktop channel once the Shell is known to advertise it, else Pi
+    /// RPC's `get_available_models`. A backend without Pi RPC (a server's
+    /// session-less Desktop RPC) only has the Desktop read: until its probe
+    /// says, the models are owed ([`Self::sync_models`]).
     pub(super) fn refresh_models(&mut self, cx: &mut Context<Self>) {
+        let desktop_only = self.desktop_only();
+        match self.read_support(DesktopMethod::ListAvailableModels) {
+            ReadSupport::Rpc => {
+                self.models_owed = false;
+                match self.read(ReadRequest::AvailableModels, cx) {
+                    Ok(ticket) => self.models_read = Some(ticket),
+                    Err(_) if desktop_only => self.models_unavailable(),
+                    Err(_) => self.refresh_models_rpc(cx),
+                }
+            }
+            ReadSupport::NotReady if desktop_only => self.models_owed = true,
+            _ if desktop_only => self.models_unavailable(),
+            _ => self.refresh_models_rpc(cx),
+        }
+    }
+
+    /// Pi RPC's `get_available_models`.
+    fn refresh_models_rpc(&mut self, cx: &mut Context<Self>) {
         self.request(
             json!({"type": "get_available_models"}),
             cx,
@@ -823,8 +850,79 @@ impl SessionView {
         );
     }
 
+    /// Nothing to ask for models: the pickers stop waiting, empty.
+    fn models_unavailable(&mut self) {
+        self.models_owed = false;
+        self.models.loaded = true;
+        self.models.rev += 1;
+    }
+
+    /// The Desktop probe said: models owed until then are read now.
+    pub(super) fn sync_models(&mut self, cx: &mut Context<Self>) {
+        if self.models_owed
+            && self.read_support(DesktopMethod::ListAvailableModels) != ReadSupport::NotReady
+        {
+            self.models_owed = false;
+            self.refresh_models(cx);
+        }
+    }
+
+    /// The `list_available_models` answer, once it arrived. A backend
+    /// without Pi RPC also takes its current model and thinking levels from
+    /// it (no `get_state` to read them from); a failed read falls back to
+    /// Pi RPC where there is one.
+    pub(super) fn settle_models(&mut self, cx: &mut Context<Self>) {
+        let Some(ticket) = self.models_read else {
+            return;
+        };
+        let Some(outcome) = self.take_read(ticket) else {
+            return;
+        };
+        self.models_read = None;
+        let desktop_only = self.desktop_only();
+        match outcome {
+            ReadOutcome::AvailableModels(list) => {
+                self.models.loaded = true;
+                self.models.rev += 1;
+                self.models.available = list.models.iter().map(ModelInfo::from_available).collect();
+                if desktop_only {
+                    if !list.thinking_levels.is_empty() {
+                        self.models.thinking_levels = list.thinking_levels;
+                    }
+                    if let Some(current) = list.current {
+                        self.models.current = self
+                            .models
+                            .available
+                            .iter()
+                            .find(|m| m.provider == current.provider && m.id == current.id)
+                            .cloned();
+                        self.models.thinking = current.thinking_level;
+                    }
+                }
+            }
+            // Its backend was replaced: the new one reads its own.
+            ReadOutcome::Failed(ReadFailure::Dropped) => {}
+            _ if desktop_only => self.models_unavailable(),
+            _ => self.refresh_models_rpc(cx),
+        }
+    }
+
+    /// This backend is a server's session-less Desktop RPC: Desktop
+    /// requests only, no conversation and no Pi RPC.
+    pub(super) fn desktop_only(&self) -> bool {
+        self.process().is_some_and(|process| process.desktop_only())
+    }
+
     pub(super) fn refresh_state(&mut self, cx: &mut Context<Self>) {
         self.set_model_default(None, cx);
+        if self.desktop_only() {
+            // Nothing but Desktop RPC to read: the channel, the models and
+            // the default model through it.
+            self.refresh_models(cx);
+            self.refresh_commands(cx);
+            self.refresh_model_default(cx);
+            return;
+        }
         self.request(json!({"type": "get_state"}), cx, |this, result, _| {
             if let Some(state) = this.report(result) {
                 this.models.current = ModelInfo::parse(&state["model"]);

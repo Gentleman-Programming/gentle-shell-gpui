@@ -4,7 +4,10 @@
 //! elsewhere (another terminal's `/login`, the app's own sign-in) apply
 //! without restarting. Status only: no credential value ever crosses. A
 //! Shell that signs in itself (`login_start`) also says how each provider
-//! signs in (`loginKinds`).
+//! signs in (`loginKinds`). `list_available_models` reads the same registry
+//! for the models Pi can use now and the current model's thinking levels,
+//! as Pi RPC's `get_available_models` and `get_available_thinking_levels`
+//! do, for a client without a session's Pi RPC (a server's `/api/desktop`).
 
 use super::DesktopRpcError;
 use serde::{Deserialize, Deserializer};
@@ -119,5 +122,51 @@ impl ReloadCredentials {
             failed_providers: super::name_list(data, "failedProviders")?,
             status: AuthStatus::from_data(data)?,
         })
+    }
+}
+
+/// One model Pi can use now. Only `provider` and `id` always come; the rest
+/// only when Pi gives them that shape.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AvailableModel {
+    pub provider: String,
+    pub id: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub context_window: Option<u64>,
+    #[serde(default)]
+    pub reasoning: Option<bool>,
+    /// What it takes: `text`, `image`.
+    #[serde(default)]
+    pub input: Option<Vec<String>>,
+}
+
+/// The session's model and thinking level.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CurrentModel {
+    pub provider: String,
+    pub id: String,
+    pub thinking_level: String,
+}
+
+/// The decoded `list_available_models` data: the models in Pi's order (at
+/// most 1000), what the current model accepts, low to high, and that model
+/// when one is chosen.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AvailableModels {
+    pub models: Vec<AvailableModel>,
+    pub thinking_levels: Vec<String>,
+    #[serde(default)]
+    pub current: Option<CurrentModel>,
+    pub truncated: bool,
+}
+
+impl AvailableModels {
+    pub(super) fn from_data(data: &Value) -> Result<Self, DesktopRpcError> {
+        super::decode_data(data)
     }
 }

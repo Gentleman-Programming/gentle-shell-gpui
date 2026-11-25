@@ -51,6 +51,14 @@ impl SessionView {
         self.animate_banner(cx);
     }
 
+    /// Before it starts: on a server that offers it (capability
+    /// `desktop`), ask the server's session-less Desktop RPC instead of
+    /// starting a session there (Configuration's control session). An older
+    /// server gets a session of its own, as before.
+    pub fn use_server_desktop(&mut self) {
+        self.backend.server_desktop = true;
+    }
+
     /// Bloom the rose and write the wordmark in over
     /// [`crate::shared::banner::WRITE`]; the banner paces it.
     fn animate_banner(&mut self, cx: &mut Context<Self>) {
@@ -510,6 +518,7 @@ impl SessionView {
         // A server session the restored tab reattaches to (it kept running),
         // kept until the tab is up: a start that fails tries it again.
         let attach = self.backend.attach.clone();
+        let server_desktop = self.backend.server_desktop;
         self.backend.server_home = None;
         // Where a server would be asked for its home folder, should it have
         // no such folder as this tab's.
@@ -526,9 +535,17 @@ impl SessionView {
                         // The server starts the session itself, in the folder
                         // as it sees it; a conversation resumes by its Pi id.
                         let client = crate::features::backend::server::client(&runs_on)?;
-                        let version = crate::features::backend::server::info(&runs_on)
-                            .ok()
-                            .and_then(|info| info.version);
+                        let info = crate::features::backend::server::info(&runs_on).ok();
+                        let version = info.as_ref().and_then(|info| info.version.clone());
+                        // Configuration's control session: the server's own
+                        // Desktop RPC when it has it, no session started.
+                        if crate::features::settings::remote::uses_server_desktop(
+                            server_desktop,
+                            info.as_ref(),
+                        ) {
+                            let (process, rx) = PiProcess::serve_desktop(client)?;
+                            return anyhow::Ok((process, rx, version, runs_on, false));
+                        }
                         let attach = attach
                             .filter(|s| {
                                 s.url == *url

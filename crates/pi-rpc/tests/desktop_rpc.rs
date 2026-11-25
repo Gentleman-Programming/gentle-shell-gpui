@@ -5103,7 +5103,7 @@ fn capabilities_expose_the_profile_apply_method_and_event() {
 
 /// The `capabilities` methods of Gentle Shell 5.0.0, as the spec and a live
 /// backend list them.
-const MAIN_METHODS: [&str; 45] = [
+const MAIN_METHODS: [&str; 46] = [
     "capabilities",
     "get_snapshot",
     "get_config",
@@ -5136,6 +5136,7 @@ const MAIN_METHODS: [&str; 45] = [
     "clear_profile_binding",
     "get_auth_status",
     "reload_credentials",
+    "list_available_models",
     "set_host_tools",
     "host_tool_result",
     "host_tool_progress",
@@ -5188,7 +5189,7 @@ const RELEASE_4_8_EVENTS: [&str; 7] = [
     "profile_applied",
     "agents_update",
 ];
-const NEW_METHODS: [DesktopMethod; 31] = [
+const NEW_METHODS: [DesktopMethod; 32] = [
     DesktopMethod::GetJobOutput,
     DesktopMethod::GetSubagentThread,
     DesktopMethod::ListSessions,
@@ -5207,6 +5208,7 @@ const NEW_METHODS: [DesktopMethod; 31] = [
     DesktopMethod::ClearProfileBinding,
     DesktopMethod::GetAuthStatus,
     DesktopMethod::ReloadCredentials,
+    DesktopMethod::ListAvailableModels,
     DesktopMethod::SetHostTools,
     DesktopMethod::HostToolResult,
     DesktopMethod::HostToolProgress,
@@ -5307,6 +5309,37 @@ fn capabilities_gate_the_new_methods_and_events_per_backend() {
     // Without the feed seam the server omits `session_snapshot`.
     let without_feed = capabilities_of(&MAIN_METHODS, &MAIN_EVENTS[..9]);
     assert!(!without_feed.supports_session_sections());
+}
+
+#[test]
+fn available_models_decode_with_only_provider_and_id_required() {
+    let models = ok_response(json!({
+        "models": [
+            { "provider": "anthropic", "id": "claude-sol", "name": "Claude Sol", "contextWindow": 200000, "reasoning": true, "input": ["text", "image"] },
+            { "provider": "openrouter", "id": "openai/gpt-oss:free" }
+        ],
+        "thinkingLevels": ["off", "low", "high"],
+        "current": { "provider": "anthropic", "id": "claude-sol", "thinkingLevel": "high" },
+        "truncated": false,
+        "futureField": 1
+    }))
+    .available_models()
+    .unwrap();
+    assert_eq!(models.models.len(), 2);
+    assert_eq!(models.models[0].context_window, Some(200000));
+    assert_eq!(models.models[1].name, None);
+    assert_eq!(models.thinking_levels, ["off", "low", "high"]);
+    assert_eq!(models.current.unwrap().thinking_level, "high");
+    let fresh = ok_response(json!({"models": [], "thinkingLevels": ["off"], "truncated": false}))
+        .available_models()
+        .unwrap();
+    assert!(fresh.current.is_none());
+    assert!(
+        ok_response(json!({"models": [{"id": "x"}], "thinkingLevels": [], "truncated": false}))
+            .available_models()
+            .is_err(),
+        "a model without its provider is malformed"
+    );
 }
 
 #[test]

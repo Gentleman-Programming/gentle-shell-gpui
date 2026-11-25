@@ -5,8 +5,10 @@
 //! orchestrator and the model pickers' default model
 //! (`list_agent_definitions`), Gentle Shell's own status (`get_status`),
 //! background-subagents policy (`get_background_subagents`,
-//! `set_background_subagents`) and sign-ins (`get_auth_status`), and the
-//! tab's own credentials reload (`reload_credentials`). Each method is used
+//! `/gentle:background-subagents`) and sign-ins (`get_auth_status`), the
+//! models Pi can use (`list_available_models`, for a tab without Pi RPC:
+//! a server's session-less Desktop RPC), and the tab's own credentials
+//! reload (`reload_credentials`). Each method is used
 //! only when `capabilities` advertises it; otherwise the caller keeps its own
 //! path (session files, the stats file scan, the npm registry, the agent
 //! files and Pi's `settings.json`, no status, the policy files and
@@ -31,8 +33,8 @@ use std::collections::VecDeque;
 
 use pi_rpc::UiRequest;
 use pi_rpc::desktop_rpc::{
-    AgentDefinitions, AuthStatus, BackgroundPolicy, BackgroundSubagents, Capabilities,
-    DesktopErrorCode, DesktopMethod, DesktopRecord, DesktopResponse, DesktopRpcError,
+    AgentDefinitions, AuthStatus, AvailableModels, BackgroundPolicy, BackgroundSubagents,
+    Capabilities, DesktopErrorCode, DesktopMethod, DesktopRecord, DesktopResponse, DesktopRpcError,
     DesktopSession, InstalledPackage, ListSessionsQuery, ReloadCredentials, SessionList,
     SessionsScope, SetBackgroundSubagentsResult, ShellStatus, StatsRange, StatsScope,
     SwitchSessionResult, UpdateStatus, UsageStats,
@@ -98,6 +100,8 @@ pub(crate) enum ReadRequest {
     AuthStatus,
     /// Make this session pick up credentials added or removed elsewhere.
     ReloadCredentials,
+    /// The models Pi can use now, the current one and its thinking levels.
+    AvailableModels,
     /// Sign in to `provider` on the Shell's side; its steps arrive as
     /// [`crate::features::session::AccountEvent`]s.
     LoginStart {
@@ -142,6 +146,7 @@ impl ReadRequest {
             Self::SetBackgroundSubagents { .. } => DesktopMethod::SetBackgroundSubagents,
             Self::AuthStatus => DesktopMethod::GetAuthStatus,
             Self::ReloadCredentials => DesktopMethod::ReloadCredentials,
+            Self::AvailableModels => DesktopMethod::ListAvailableModels,
             Self::LoginStart { .. } => DesktopMethod::LoginStart,
             Self::LoginComplete { .. } => DesktopMethod::LoginComplete,
             Self::LoginCancel { .. } => DesktopMethod::LoginCancel,
@@ -180,6 +185,7 @@ impl ReadRequest {
             } => session.issue_set_background_subagents(*policy, confirmation_token.as_deref()),
             Self::AuthStatus => session.issue(DesktopMethod::GetAuthStatus),
             Self::ReloadCredentials => session.issue(DesktopMethod::ReloadCredentials),
+            Self::AvailableModels => session.issue(DesktopMethod::ListAvailableModels),
             Self::LoginStart { provider } => session.issue_login_start(gated()?, provider),
             Self::LoginComplete { login_id, value } => {
                 session.issue_login_complete(gated()?, login_id, &value.0)
@@ -269,6 +275,7 @@ pub(crate) enum ReadOutcome {
     BackgroundSubagentsSet(SetBackgroundSubagentsResult),
     AuthStatus(AuthStatus),
     CredentialsReloaded(ReloadCredentials),
+    AvailableModels(AvailableModels),
     LoginStarted(String),
     /// `login_complete` or `login_cancel` was taken.
     LoginAcknowledged,
@@ -503,6 +510,9 @@ impl Reads {
             ReadRequest::ReloadCredentials => response
                 .reload_credentials()
                 .map(ReadOutcome::CredentialsReloaded),
+            ReadRequest::AvailableModels => response
+                .available_models()
+                .map(ReadOutcome::AvailableModels),
             ReadRequest::LoginStart { .. } => response
                 .login_started()
                 .map(|started| ReadOutcome::LoginStarted(started.login_id)),
@@ -581,6 +591,7 @@ pub(in crate::features::session) fn is_read(method: DesktopMethod) -> bool {
             | DesktopMethod::SetBackgroundSubagents
             | DesktopMethod::GetAuthStatus
             | DesktopMethod::ReloadCredentials
+            | DesktopMethod::ListAvailableModels
             | DesktopMethod::LoginStart
             | DesktopMethod::LoginComplete
             | DesktopMethod::LoginCancel

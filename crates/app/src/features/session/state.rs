@@ -49,6 +49,11 @@ pub(super) struct Backend {
     /// command) new enough to (`backend::takes_host_tools`), started without
     /// the app's extensions and instructions.
     pub(super) host_tools: bool,
+    /// On a server that offers it (capability `desktop`), this view asks the
+    /// server's session-less Desktop RPC (`PiProcess::serve_desktop`)
+    /// instead of starting a session of its own: Configuration's control
+    /// session (`settings::remote::ControlSession`).
+    pub(super) server_desktop: bool,
 }
 
 impl Backend {
@@ -64,6 +69,7 @@ impl Backend {
             attach: None,
             server_home: None,
             host_tools: false,
+            server_desktop: false,
         }
     }
 
@@ -99,6 +105,22 @@ impl ModelInfo {
                 .as_array()
                 .is_none_or(|input| input.iter().any(|kind| kind == "image")),
         })
+    }
+
+    /// A model `list_available_models` listed, read as Pi's own
+    /// `get_available_models` entry would be.
+    pub(super) fn from_available(model: &pi_rpc::desktop_rpc::AvailableModel) -> Self {
+        Self {
+            provider: model.provider.clone(),
+            id: model.id.clone(),
+            name: model.name.clone().unwrap_or_else(|| model.id.clone()),
+            context_window: model.context_window.unwrap_or(0),
+            reasoning: model.reasoning.unwrap_or(false),
+            images: model
+                .input
+                .as_ref()
+                .is_none_or(|input| input.iter().any(|kind| kind == "image")),
+        }
     }
 }
 
@@ -616,6 +638,7 @@ pub(in crate::features::session) mod desktop {
                     | Some(DesktopMethod::ClearProfileBinding)
                     | Some(DesktopMethod::GetAuthStatus)
                     | Some(DesktopMethod::ReloadCredentials)
+                    | Some(DesktopMethod::ListAvailableModels)
                     | Some(DesktopMethod::LoginStart)
                     | Some(DesktopMethod::LoginComplete)
                     | Some(DesktopMethod::LoginCancel)

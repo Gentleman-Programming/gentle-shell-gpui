@@ -638,14 +638,19 @@ impl ServeClient {
         Ok((status, body))
     }
 
-    /// `POST /api/sessions/:id/desktop` with an inner Desktop request
-    /// document as the body (the server reads its `method` and `params`):
-    /// the answer the server correlated, as the record it is.
-    fn desktop(&self, id: &str, payload: &str) -> Result<Value, ServeError> {
+    /// `POST /api/sessions/:id/desktop` (or, for [`Target::Desktop`], the
+    /// server's session-less `POST /api/desktop`) with an inner Desktop
+    /// request document as the body (the server reads its `method` and
+    /// `params`): the answer the server correlated, as the record it is.
+    fn desktop(&self, target: &Target, payload: &str) -> Result<Value, ServeError> {
+        let path = match target {
+            Target::Session(id) => session_path(id, "/desktop")?,
+            Target::Desktop => "/api/desktop".to_string(),
+        };
         let (status, mut response) = self.send(
             &self.agent,
             "POST",
-            &session_path(id, "/desktop")?,
+            &path,
             Some(Body::Json(payload.as_bytes())),
             &[],
         )?;
@@ -656,13 +661,18 @@ impl ServeClient {
         })
     }
 
-    /// `GET /api/sessions/:id/events`, after `after` (live without it).
+    /// `GET /api/sessions/:id/events` (or, for [`Target::Desktop`], the
+    /// server's Desktop events, `GET /api/desktop/events`), after `after`
+    /// (live without it).
     fn events(
         &self,
-        id: &str,
+        target: &Target,
         after: Option<u64>,
     ) -> Result<ureq::BodyReader<'static>, ServeError> {
-        let mut path = session_path(id, "/events")?;
+        let mut path = match target {
+            Target::Session(id) => session_path(id, "/events")?,
+            Target::Desktop => "/api/desktop/events".to_string(),
+        };
         if let Some(after) = after {
             path.push_str(&format!("?after={after}"));
         }
@@ -1024,11 +1034,23 @@ fn read_json(response: &mut ureq::http::Response<ureq::Body>) -> Result<Value, S
     serde_json::from_slice(&body).map_err(|e| format!("The server's answer isn't JSON: {e}"))
 }
 
+/// What a [`Remote`] follows on its server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Target {
+    /// One agent session (`ses_…`): Pi RPC, its Desktop RPC and its records.
+    Session(String),
+    /// The server's session-less Desktop RPC (capability `desktop`):
+    /// `POST /api/desktop` and the Desktop events of
+    /// `GET /api/desktop/events`, answered by a control session the server
+    /// keeps itself. No Pi RPC, no conversation, no model turn.
+    Desktop,
+}
+
 /// The server side of a [`PiProcess`]: where commands queue, and how the
 /// session ends.
 pub(crate) struct Remote {
     client: ServeClient,
-    session: String,
+    target: Target,
     commands: mpsc::Sender<Value>,
     /// Set when this client stops following the session (closed or detached).
     stop: Arc<AtomicBool>,
@@ -1045,10 +1067,14 @@ impl Remote {
     }
 
     /// Stop the session there, in the background (the server waits for its
-    /// process to exit).
+    /// process to exit). The server's Desktop RPC is only let go of: its
+    /// control session stops by itself once nobody uses it.
     pub(crate) fn stop(&self) {
         self.stop.store(true, Ordering::Release);
-        let (client, session) = (self.client.clone(), self.session.clone());
+        let Target::Session(session) = &self.target else {
+            return;
+        };
+        let (client, session) = (self.client.clone(), session.clone());
         let _ = std::thread::Builder::new()
             .name("pi-rpc-serve-stop".into())
             .spawn(move || {
@@ -1087,6 +1113,31 @@ impl PiProcess {
             Some(id) => id,
             None => client.start(cwd, resume)?.id,
         };
+        Self::follow(client, Target::Session(session))
+    }
+
+    /// The server's session-less Desktop RPC (capability `desktop`) as a
+    /// backend, for screens that read and change the server's configuration,
+    /// sign-ins and packages without an agent session of their own: each
+    /// `/gentle:desktop` prompt goes to `POST /api/desktop` and its answer
+    /// comes back as the Desktop widget record a session would print; the
+    /// Desktop events come from `GET /api/desktop/events`. `get_commands`
+    /// lists only the Desktop command (the capability is the extension's
+    /// presence); any other Pi RPC command fails, since there is no
+    /// conversation. Closing it only stops following: the server stops its
+    /// control session once nobody uses it. Starts nothing on the server by
+    /// itself.
+    pub fn serve_desktop(
+        client: ServeClient,
+    ) -> Result<(Arc<Self>, async_channel::Receiver<Incoming>)> {
+        Self::follow(client, Target::Desktop)
+    }
+
+    /// The threads that post commands to `target` and follow its stream.
+    fn follow(
+        client: ServeClient,
+        target: Target,
+    ) -> Result<(Arc<Self>, async_channel::Receiver<Incoming>)> {
         let (tx, rx) = async_channel::unbounded();
         let pending: Pending = Arc::default();
         let traffic = Arc::new(Traffic::default());
@@ -1094,21 +1145,21 @@ impl PiProcess {
         let stop = Arc::new(AtomicBool::new(false));
         let (commands, queue) = mpsc::channel();
         {
-            let (client, session) = (client.clone(), session.clone());
+            let (client, target) = (client.clone(), target.clone());
             let (pending, ids, tx) = (pending.clone(), ids.clone(), tx.clone());
             std::thread::Builder::new()
                 .name("pi-rpc-serve-commands".into())
-                .spawn(move || write_commands(&client, &session, queue, &pending, &ids, &tx))?;
+                .spawn(move || write_commands(&client, &target, queue, &pending, &ids, &tx))?;
         }
         {
-            let (client, session) = (client.clone(), session.clone());
+            let (client, target) = (client.clone(), target.clone());
             let (pending, traffic, stop) = (pending.clone(), traffic.clone(), stop.clone());
             std::thread::Builder::new()
                 .name("pi-rpc-serve-events".into())
                 .spawn(move || {
                     let follow = Follow {
                         client: &client,
-                        session: &session,
+                        target: &target,
                         pending: &pending,
                         ids: &ids,
                         traffic: &traffic,
@@ -1124,7 +1175,7 @@ impl PiProcess {
         let process = Arc::new(Self {
             io: Io::Server(Box::new(Remote {
                 client,
-                session,
+                target,
                 commands,
                 stop,
             })),
@@ -1137,12 +1188,21 @@ impl PiProcess {
     }
 
     /// The server session this backend follows (`ses_…`); `None` for a
-    /// child process.
+    /// child process or the server's session-less Desktop RPC.
     pub fn server_session(&self) -> Option<&str> {
         match &self.io {
-            Io::Server(remote) => Some(&remote.session),
+            Io::Server(remote) => match &remote.target {
+                Target::Session(session) => Some(session),
+                Target::Desktop => None,
+            },
             Io::Child { .. } => None,
         }
+    }
+
+    /// Whether this backend is a server's session-less Desktop RPC
+    /// ([`Self::serve_desktop`]): Desktop requests only, no Pi RPC.
+    pub fn desktop_only(&self) -> bool {
+        matches!(&self.io, Io::Server(remote) if remote.target == Target::Desktop)
     }
 
     /// Send a Desktop request outside the app's Desktop channel and wait
@@ -1161,7 +1221,7 @@ impl PiProcess {
             Io::Server(remote) => remote,
             Io::Child { desktop, .. } => return self.desktop_stdin(desktop, request),
         };
-        let answer = remote.client.desktop(&remote.session, request.payload())?;
+        let answer = remote.client.desktop(&remote.target, request.payload())?;
         match crate::desktop_rpc::decode_value(answer)? {
             crate::desktop_rpc::DesktopRecord::Response(response) => Ok(response),
             crate::desktop_rpc::DesktopRecord::Event(_) => {
@@ -1175,7 +1235,7 @@ impl PiProcess {
 /// [`OVERTAKE`] lets the next go.
 fn write_commands(
     client: &ServeClient,
-    session: &str,
+    target: &Target,
     queue: mpsc::Receiver<Value>,
     pending: &Pending,
     ids: &Arc<Mutex<RpcIds>>,
@@ -1183,18 +1243,96 @@ fn write_commands(
 ) {
     for command in queue {
         let (done, answered) = mpsc::channel::<()>();
-        let (client, session) = (client.clone(), session.to_string());
+        let (client, target) = (client.clone(), target.clone());
         let (pending, ids, tx) = (pending.clone(), ids.clone(), tx.clone());
         let posted = std::thread::Builder::new()
             .name("pi-rpc-serve-command".into())
             .spawn(move || {
-                post_command(&client, &session, command, &pending, &ids, &tx);
+                match &target {
+                    Target::Session(session) => {
+                        post_command(&client, session, command, &pending, &ids, &tx);
+                    }
+                    Target::Desktop => post_desktop(&client, command, &pending, &tx),
+                }
                 let _ = done.send(());
             });
         if posted.is_ok() {
             let _ = answered.recv_timeout(OVERTAKE);
         }
     }
+}
+
+/// One command to the server's session-less Desktop RPC, answered as a
+/// session's stdout would answer it: a `/gentle:desktop` prompt is handled
+/// and its answer (from `POST /api/desktop`, under the prompt's own
+/// `requestId`; a refusal of the server as an `ok: false` answer) follows as
+/// the Desktop widget record; `get_commands` lists the Desktop command; any
+/// other command fails, since there is no conversation.
+fn post_desktop(
+    client: &ServeClient,
+    command: Value,
+    pending: &Pending,
+    tx: &async_channel::Sender<Incoming>,
+) {
+    let id = command["id"].clone();
+    let kind = command["type"].as_str().unwrap_or("command").to_string();
+    let respond = |data: Result<Value, String>| {
+        let mut response = json!({"type": "response", "id": id, "command": kind});
+        match data {
+            Ok(data) => {
+                response["success"] = true.into();
+                response["data"] = data;
+            }
+            Err(error) => {
+                response["success"] = false.into();
+                response["error"] = error.into();
+            }
+        }
+        dispatch(record_from(response), pending, tx);
+    };
+    let prompt = command["message"]
+        .as_str()
+        .and_then(|message| message.strip_prefix(crate::desktop_rpc::PROMPT_COMMAND))
+        .and_then(|rest| rest.strip_prefix(' '))
+        .filter(|_| kind == "prompt");
+    if kind == "get_commands" {
+        let desktop = crate::desktop_rpc::PROMPT_COMMAND.trim_start_matches('/');
+        return respond(Ok(json!({"commands": [{
+            "name": desktop,
+            "description": "Gentle Desktop RPC",
+            "source": "extension",
+        }]})));
+    }
+    let Some(payload) = prompt else {
+        return respond(Err(format!(
+            "{kind} needs an agent session: this server's Desktop RPC has none"
+        )));
+    };
+    let request: Value = serde_json::from_str(payload).unwrap_or_default();
+    let request_id = request["requestId"].clone();
+    let mut answer = match client.desktop(&Target::Desktop, payload) {
+        Ok(answer) => answer,
+        Err(error) => json!({
+            "schema": crate::desktop_rpc::SCHEMA,
+            "kind": "response",
+            "ok": false,
+            "error": {
+                "code": error.error.as_deref().unwrap_or("server_unavailable"),
+                "message": error.message,
+            },
+        }),
+    };
+    // The server answers under its own id; the app waits for its own.
+    answer["requestId"] = request_id.clone();
+    respond(Ok(json!({"disposition": "handled"})));
+    let widget = json!({
+        "type": "extension_ui_request",
+        "id": format!("desktop-{}", request_id.as_str().unwrap_or_default()),
+        "method": "setWidget",
+        "widgetKey": crate::desktop_rpc::WIDGET_KEY,
+        "widgetLines": [answer.to_string()],
+    });
+    dispatch(record_from(widget), pending, tx);
 }
 
 /// One command: its answer reaches the caller as if read from stdout; a
@@ -1252,7 +1390,7 @@ fn post_command(
 /// The event stream's reader.
 struct Follow<'a> {
     client: &'a ServeClient,
-    session: &'a str,
+    target: &'a Target,
     pending: &'a Pending,
     ids: &'a Mutex<RpcIds>,
     traffic: &'a Traffic,
@@ -1282,7 +1420,7 @@ impl Follow<'_> {
             if self.stop.load(Ordering::Acquire) {
                 return None;
             }
-            match self.client.events(self.session, stream.after()) {
+            match self.client.events(self.target, stream.after()) {
                 Ok(body) => {
                     failures = 0;
                     match self.read(body, &mut stream) {
@@ -1296,13 +1434,17 @@ impl Follow<'_> {
                     }
                     // An exited session's stream ends after its replay; one
                     // whose exit record was already evicted ends this way.
-                    match self.client.session(self.session) {
-                        Ok(info) if !info.running => return info.exit_code,
-                        Err(error) if matches!(error.status, Some(401 | 403 | 404)) => {
-                            self.note(error.message);
-                            return None;
+                    // The server's Desktop RPC has no end: the next
+                    // connection starts its control session again.
+                    if let Target::Session(session) = self.target {
+                        match self.client.session(session) {
+                            Ok(info) if !info.running => return info.exit_code,
+                            Err(error) if matches!(error.status, Some(401 | 403 | 404)) => {
+                                self.note(error.message);
+                                return None;
+                            }
+                            _ => {}
                         }
-                        _ => {}
                     }
                 }
                 // Gone, or this device's token no longer works: nothing to

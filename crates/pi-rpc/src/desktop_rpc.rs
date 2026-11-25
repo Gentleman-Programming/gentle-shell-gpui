@@ -119,7 +119,10 @@ mod stats;
 mod status;
 mod updates;
 
-pub use auth::{AuthSource, AuthStatus, AuthType, LoginKind, ProviderAuth, ReloadCredentials};
+pub use auth::{
+    AuthSource, AuthStatus, AuthType, AvailableModel, AvailableModels, CurrentModel, LoginKind,
+    ProviderAuth, ReloadCredentials,
+};
 pub use background::{
     BackgroundCapability, BackgroundConfirmation, BackgroundPolicy, BackgroundSource,
     BackgroundSubagents, PolicyFile, SetBackgroundSubagentsOutcome, SetBackgroundSubagentsResult,
@@ -231,6 +234,7 @@ pub enum DesktopMethod {
     ClearProfileBinding,
     GetAuthStatus,
     ReloadCredentials,
+    ListAvailableModels,
     SetHostTools,
     HostToolResult,
     HostToolProgress,
@@ -250,7 +254,7 @@ impl DesktopMethod {
     /// Every method this client knows, in the order `capabilities` lists
     /// them on Gentle Shell 5.0.0. Which ones a peer offers is only what its
     /// `capabilities` say: Gentle Shell 4.8.0 offers fourteen of them.
-    pub const ALL: [Self; 45] = [
+    pub const ALL: [Self; 46] = [
         Self::Capabilities,
         Self::GetSnapshot,
         Self::GetConfig,
@@ -283,6 +287,7 @@ impl DesktopMethod {
         Self::ClearProfileBinding,
         Self::GetAuthStatus,
         Self::ReloadCredentials,
+        Self::ListAvailableModels,
         Self::SetHostTools,
         Self::HostToolResult,
         Self::HostToolProgress,
@@ -333,6 +338,7 @@ impl DesktopMethod {
             Self::ClearProfileBinding => "clear_profile_binding",
             Self::GetAuthStatus => "get_auth_status",
             Self::ReloadCredentials => "reload_credentials",
+            Self::ListAvailableModels => "list_available_models",
             Self::SetHostTools => "set_host_tools",
             Self::HostToolResult => "host_tool_result",
             Self::HostToolProgress => "host_tool_progress",
@@ -430,6 +436,7 @@ impl DesktopMethod {
             "clear_profile_binding" => Ok(Self::ClearProfileBinding),
             "get_auth_status" => Ok(Self::GetAuthStatus),
             "reload_credentials" => Ok(Self::ReloadCredentials),
+            "list_available_models" => Ok(Self::ListAvailableModels),
             "set_host_tools" => Ok(Self::SetHostTools),
             "host_tool_result" => Ok(Self::HostToolResult),
             "host_tool_progress" => Ok(Self::HostToolProgress),
@@ -1589,6 +1596,11 @@ impl DesktopResponse {
     /// The response to `reload_credentials`.
     pub fn reload_credentials(&self) -> Result<ReloadCredentials, DesktopRpcError> {
         ReloadCredentials::from_data(self.data()?)
+    }
+
+    /// The response to `list_available_models`.
+    pub fn available_models(&self) -> Result<AvailableModels, DesktopRpcError> {
+        AvailableModels::from_data(self.data()?)
     }
 
     /// The response to `set_host_tools`.

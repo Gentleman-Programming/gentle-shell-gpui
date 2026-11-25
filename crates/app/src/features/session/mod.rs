@@ -122,6 +122,12 @@ pub struct SessionView {
     /// A `reload_credentials` sent after a sign-in, until it answers: a
     /// failure falls back to restarting the tab.
     credentials_reload: Option<ReadTicket>,
+    /// A `list_available_models` read in flight: how a tab without Pi RPC
+    /// (a server's session-less Desktop RPC), or one whose Shell advertises
+    /// it, learns the models it can offer.
+    models_read: Option<ReadTicket>,
+    /// The models are owed until the Desktop probe says how to read them.
+    models_owed: bool,
     transcript: Transcript,
     /// Rendered Markdown per (item, block): the state, the byte length of
     /// the shown text already pushed and how many Mermaid diagrams it showed
@@ -401,6 +407,8 @@ impl SessionView {
             title: None,
             active_shell: None,
             credentials_reload: None,
+            models_read: None,
+            models_owed: false,
             banner: if on_server {
                 crate::shared::banner::BannerConfig::default()
             } else {

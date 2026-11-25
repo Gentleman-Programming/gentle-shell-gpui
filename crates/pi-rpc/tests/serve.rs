@@ -325,6 +325,19 @@ impl Fake {
                 }),
             ),
             ("GET", "/api/sessions/ses_1/events") => self.subscribe(stream, query),
+            ("POST", "/api/desktop") => {
+                self.state.lock().unwrap().desktop.push(body.clone());
+                if body["method"] == "set_api_key" {
+                    return reply(
+                        &mut stream,
+                        403,
+                        &json!({"error": {"code": "forbidden", "message": "This device may only read"}}),
+                    );
+                }
+                let answer = json!({"schema": "gentle-shell.desktop-rpc/v1", "kind": "response", "requestId": "serve-desktop-9", "ok": true, "data": {"method": body["method"], "params": body["params"]}});
+                reply(&mut stream, 200, &answer);
+            }
+            ("GET", "/api/desktop/events") => self.subscribe(stream, query),
             _ => reply(&mut stream, 404, &json!({"error": {"code": "not_found"}})),
         }
     }
@@ -527,6 +540,88 @@ fn the_app_quitting_leaves_the_session_for_the_next_launch() {
         2
     );
     process.detach();
+}
+
+#[test]
+fn the_servers_desktop_rpc_answers_like_a_session_without_one() {
+    let fake = Fake::start();
+    let (process, rx) = PiProcess::serve_desktop(fake.client()).unwrap();
+    assert!(process.desktop_only());
+    assert_eq!(process.server_session(), None);
+    fake.wait_for("the stream", |s| !s.subscribers.is_empty());
+    assert!(fake.log().contains(&"GET /api/desktop/events".to_string()));
+    let mut stderr = Vec::new();
+
+    // The Desktop command is there: the capability is the extension.
+    let commands = pollster::block_on(process.request(json!({"type": "get_commands"}))).unwrap();
+    assert_eq!(commands.data["commands"][0]["name"], "gentle:desktop");
+    // No conversation: Pi RPC fails, nothing is sent.
+    let state = pollster::block_on(process.request(json!({"type": "get_state"})));
+    assert!(
+        state
+            .unwrap_err()
+            .to_string()
+            .contains("needs an agent session"),
+        "a clear refusal"
+    );
+
+    // A Desktop prompt is answered as a session would: handled, then the
+    // widget record under the app's own requestId.
+    let ask = |request_id: &str, method: &str| {
+        let inner = json!({"schema": "gentle-shell.desktop-rpc/v1", "requestId": request_id, "method": method, "params": {"store": "model_defaults"}});
+        pollster::block_on(
+            process
+                .request(json!({"type": "prompt", "message": format!("/gentle:desktop {inner}")})),
+        )
+        .unwrap()
+    };
+    let widget_answer = |incoming: Incoming| -> Value {
+        let Incoming::Ui(request) = incoming else {
+            panic!("expected the Desktop widget")
+        };
+        let pi_rpc::UiMethod::SetWidget { key, lines, .. } = request.method else {
+            panic!("expected setWidget")
+        };
+        assert_eq!(key, "gentle-desktop-rpc");
+        serde_json::from_str(&lines.unwrap()[0]).unwrap()
+    };
+    assert_eq!(ask("app-1", "get_config").data["disposition"], "handled");
+    let answer = widget_answer(next(&rx, &mut stderr));
+    assert_eq!(answer["requestId"], "app-1");
+    assert_eq!(answer["ok"], true);
+    assert_eq!(answer["data"]["method"], "get_config");
+    assert_eq!(
+        fake.state.lock().unwrap().desktop.last().unwrap()["params"]["store"],
+        "model_defaults"
+    );
+    // A refusal of the server is the answer's error, in its words.
+    ask("app-2", "set_api_key");
+    let refused = widget_answer(next(&rx, &mut stderr));
+    assert_eq!(refused["requestId"], "app-2");
+    assert_eq!(refused["ok"], false);
+    assert_eq!(refused["error"]["code"], "forbidden");
+
+    // Desktop events arrive from the server's stream.
+    let event = json!({"schema": "gentle-shell.desktop-rpc/v1", "kind": "event", "seq": 1, "epoch": "e", "event": "login_prompt", "data": {}});
+    fake.emit(json!({"type": "extension_ui_request", "id": "w-1", "method": "setWidget", "widgetKey": "gentle-desktop-rpc", "widgetLines": [event.to_string()]}));
+    assert_eq!(
+        widget_answer(next(&rx, &mut stderr))["event"],
+        "login_prompt"
+    );
+
+    // Closing only lets go (the stream ends by the next heartbeat): no
+    // session was started, none is stopped.
+    process.shutdown(Duration::from_secs(1));
+    assert!(pollster::block_on(process.request(json!({"type": "get_commands"}))).is_err());
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(
+        !fake
+            .log()
+            .iter()
+            .any(|l| l.starts_with("DELETE") || l.starts_with("POST /api/sessions")),
+        "{:?}",
+        fake.log()
+    );
 }
 
 #[test]

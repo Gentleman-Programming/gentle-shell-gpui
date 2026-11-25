@@ -12,26 +12,34 @@
 //! # The control session
 //!
 //! The Desktop RPC methods these screens use (`get_config`/`set_config`,
-//! `get_status`, `get_auth_status`, `get_update_status`, …) are asked of an
-//! agent session, so a screen needs one on the server:
+//! `get_status`, `get_auth_status`, `get_update_status`,
+//! `list_available_models`, …) are asked of an agent session or, on a
+//! server, of the server itself:
 //!
 //! - The active agent tab's, when it runs on that same server: reused as is,
 //!   and left running when the screen closes (it is the user's tab).
 //! - Otherwise a dedicated one ([`ControlSession::open`]): a [`SessionView`]
-//!   entity the screen owns and never shows, started in the server's home
-//!   folder ([`server::home`]; the screen's folder when an older server
-//!   doesn't say). Reusing `SessionView` keeps one Desktop RPC client (its
-//!   capability probe, request queue, timeouts and `config_changed`
-//!   handling) instead of a second copy of that plumbing.
-//!
-//! A dedicated session lives exactly as long as its screen. When the screen
-//! is released (closed, or replaced by another screen), the session's
-//! backend is shut down the way closing a tab does (`shutdown_backend` →
-//! `PiProcess::shutdown` → `DELETE /api/sessions/:id`), and quitting the app
-//! does the same, where a tab's server session is instead left running for
-//! the next launch to reattach to. A session still being started when the
-//! screen goes is dropped with its entity: `PiProcess`'s own `Drop` stops it
-//! on the server once the start returns, so none is left behind.
+//!   entity the screen owns and never shows. Reusing `SessionView` keeps one
+//!   Desktop RPC client (its capability probe, request queue, timeouts and
+//!   `config_changed` handling) instead of a second copy of that plumbing.
+//!   - On a server that offers it (capability `desktop`), the view asks the
+//!     server's session-less Desktop RPC (`POST /api/desktop`, its events
+//!     on `GET /api/desktop/events`; `PiProcess::serve_desktop`): no session
+//!     is started for the screen. The server answers from a control session
+//!     of its own, which it keeps hidden and stops once nobody uses it;
+//!     closing the screen only stops following it. The models come from
+//!     `list_available_models`, since there is no Pi RPC.
+//!   - On an older server, a hidden session started in the server's home
+//!     folder ([`server::home`]; the screen's folder when an older server
+//!     doesn't say). It lives exactly as long as its screen: when the screen
+//!     is released (closed, or replaced by another screen), the session's
+//!     backend is shut down the way closing a tab does (`shutdown_backend`
+//!     → `PiProcess::shutdown` → `DELETE /api/sessions/:id`), and quitting
+//!     the app does the same, where a tab's server session is instead left
+//!     running for the next launch to reattach to. A session still being
+//!     started when the screen goes is dropped with its entity:
+//!     `PiProcess`'s own `Drop` stops it on the server once the start
+//!     returns, so none is left behind.
 
 use std::path::{Path, PathBuf};
 
@@ -157,6 +165,17 @@ pub(crate) fn control_for(screen: &Backend, tab: Option<&Backend>) -> Control {
     }
 }
 
+/// Whether a view that asked for it (`requested`, Configuration's control
+/// session) takes the server's session-less Desktop RPC: only when the
+/// server says it offers it (`info`, capability `desktop`). An older
+/// server, or one that didn't answer, gets a hidden session as before.
+pub(crate) fn uses_server_desktop(
+    requested: bool,
+    info: Option<&pi_rpc::serve::ServerInfo>,
+) -> bool {
+    requested && info.is_some_and(|info| info.has("desktop"))
+}
+
 /// The session a screen reads Gentle Shell's configuration through, and the
 /// server it is on (see the module docs).
 pub(crate) struct ControlSession {
@@ -206,7 +225,16 @@ impl ControlSession {
         };
         let start_now = known.is_some();
         let folder = known.map_or_else(|| cwd.to_path_buf(), PathBuf::from);
-        let session = cx.new(|cx| SessionView::new(folder, None, window, cx, start_now));
+        // The server's own Desktop RPC when it has it (`use_server_desktop`);
+        // a hidden session on an older server.
+        let session = cx.new(|cx| {
+            let mut view = SessionView::new(folder, None, window, cx, false);
+            view.use_server_desktop();
+            if start_now {
+                view.ensure_started(window, cx);
+            }
+            view
+        });
         let start = if start_now {
             Task::ready(())
         } else {
@@ -273,7 +301,38 @@ impl ControlSession {
 mod tests {
     use gentle_core::backend::Backend;
 
-    use super::{Control, ServerPlace, commands, control_for, do_on, run_on};
+    use super::{Control, ServerPlace, commands, control_for, do_on, run_on, uses_server_desktop};
+
+    fn info(capabilities: &[&str]) -> pi_rpc::serve::ServerInfo {
+        pi_rpc::serve::ServerInfo {
+            server_id: "srv_1".into(),
+            version: None,
+            home: None,
+            capabilities: capabilities.iter().map(|c| c.to_string()).collect(),
+            platform: None,
+            arch: None,
+            path_separator: None,
+        }
+    }
+
+    #[test]
+    fn the_control_session_uses_the_servers_desktop_rpc_only_when_advertised() {
+        let new = info(&["sessions", "desktop-rpc", "desktop"]);
+        let old = info(&["sessions", "desktop-rpc"]);
+        assert!(uses_server_desktop(true, Some(&new)));
+        assert!(
+            !uses_server_desktop(true, Some(&old)),
+            "an older server keeps the hidden session"
+        );
+        assert!(
+            !uses_server_desktop(true, None),
+            "a server that didn't say keeps it too"
+        );
+        assert!(
+            !uses_server_desktop(false, Some(&new)),
+            "a tab never does: it is a session"
+        );
+    }
 
     fn server(url: &str, name: &str) -> Backend {
         Backend::Server {

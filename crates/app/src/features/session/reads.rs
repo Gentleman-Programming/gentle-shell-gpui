@@ -84,6 +84,7 @@ impl SessionView {
             .detach();
         }
         self.settle_credentials(cx);
+        self.settle_models(cx);
         cx.notify();
     }
 }
