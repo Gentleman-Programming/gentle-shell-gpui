@@ -6,6 +6,10 @@
 //! network (a stand-in UDP responder on 127.0.0.1), then pairing there; and
 //! the same over pinned TLS with the pairing proof (a TLS front).
 
+// Through a relay (`gentle-shell relay`).
+#[path = "serve/relay.rs"]
+mod relay;
+
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::sync::{Arc, Mutex};
