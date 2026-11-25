@@ -38,8 +38,23 @@ pub(super) struct DocumentEditor {
 #[derive(Default)]
 pub(super) struct ServerDocuments {
     open: Option<DocumentEditor>,
-    /// A save that landed, in words.
-    saved: Option<String>,
+    /// A save that landed: the document, and the save in words.
+    saved: Option<(AgentDocument, String)>,
+}
+
+impl ServerDocuments {
+    /// What the last save said, for the card editing `documents`: only
+    /// while no editor is open, and only on the card of the document saved
+    /// (a models.json save says nothing under MCP servers).
+    fn saved_for(&self, documents: &[AgentDocument]) -> Option<&str> {
+        if self.open.is_some() {
+            return None;
+        }
+        self.saved
+            .as_ref()
+            .filter(|(document, _)| documents.contains(document))
+            .map(|(_, text)| text.as_str())
+    }
 }
 
 /// The store a document lives in.
@@ -175,7 +190,7 @@ impl SettingsView {
         let server = self
             .server()
             .map_or_else(String::new, |server| server.name.clone());
-        self.server_documents.saved = Some(match document {
+        let saved = match document {
             AgentDocument::CustomModels => format!(
                 "Saved models.json on {server}. Its agents pick the models up on their own."
             ),
@@ -184,7 +199,8 @@ impl SettingsView {
                  Configuration reads reloads once idle, other agents with /reload.",
                 document.file_name()
             ),
-        });
+        };
+        self.server_documents.saved = Some((document, saved));
         cx.notify();
     }
 
@@ -285,11 +301,7 @@ impl SettingsView {
                 .child(text.to_string())
         };
         let Some(open) = open else {
-            let saved = self
-                .server_documents
-                .saved
-                .as_deref()
-                .filter(|_| self.server_documents.open.is_none());
+            let saved = self.server_documents.saved_for(documents);
             return v_flex()
                 .pt_2()
                 .gap_1()
@@ -396,7 +408,7 @@ mod tests {
     };
     use serde_json::json;
 
-    use super::{document_in, write_of};
+    use super::{ServerDocuments, document_in, write_of};
 
     fn mcp_state() -> ConfigState {
         ConfigState {
@@ -457,5 +469,29 @@ mod tests {
         );
         let write = write_of(AgentDocument::CustomModels, "{ \"providers\": {} }").unwrap();
         assert_eq!(write.store(), ConfigStore::CustomModels);
+    }
+
+    #[test]
+    fn a_save_is_reported_only_on_its_own_card() {
+        let documents = ServerDocuments {
+            open: None,
+            saved: Some((AgentDocument::CustomModels, "Saved models.json".into())),
+        };
+        assert_eq!(
+            documents.saved_for(&[AgentDocument::CustomModels]),
+            Some("Saved models.json")
+        );
+        assert_eq!(
+            documents.saved_for(&[AgentDocument::McpGlobal, AgentDocument::McpProject]),
+            None
+        );
+        let documents = ServerDocuments {
+            open: None,
+            saved: Some((AgentDocument::McpProject, "Saved .pi/mcp.json".into())),
+        };
+        assert_eq!(
+            documents.saved_for(&[AgentDocument::McpGlobal, AgentDocument::McpProject]),
+            Some("Saved .pi/mcp.json")
+        );
     }
 }
