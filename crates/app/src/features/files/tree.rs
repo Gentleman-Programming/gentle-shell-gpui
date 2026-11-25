@@ -4,6 +4,7 @@
 //! shows the same, through its API: what the server doesn't offer says so,
 //! and its changes stream in ([`ServerWatch`]).
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::rc::Rc;
@@ -11,8 +12,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use gentle_core::transfer::{
+    Conflict, Report, files as count_files, name_list, percent, progress_label,
+};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
+use gpui_kit::component::dialog::DialogFooter;
 use gpui_kit::component::input::{Escape, Input, InputEvent, InputState};
 use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::notification::Notification;
@@ -21,12 +26,13 @@ use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Icon, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use pi_rpc::serve::WatchEvent;
+use pi_rpc::serve::{WRITE_LIMIT, WatchEvent};
 
 use super::changes::{ChangesEvent, ChangesView};
 use super::listing::{Entry, list_dir};
 use super::ops::{self, ClipMode};
 use super::refs::{RefsEvent, RefsView};
+use super::transfer::{self, Update};
 use super::{file_icon, status_color};
 use crate::features::backend::{self, server};
 use crate::features::git::GitSnapshot;
@@ -80,6 +86,40 @@ impl Drop for ServerWatch {
     }
 }
 
+/// An upload or download between this computer and the server folder, shown
+/// in the strip under the tree; one at a time. Dropping it cancels it
+/// (between files).
+struct Transfer {
+    upload: bool,
+    /// The single entry's name, for the strip.
+    name: String,
+    /// `None` while it's being prepared.
+    progress: Option<transfer::Progress>,
+    cancel: Arc<AtomicBool>,
+}
+
+impl Transfer {
+    /// The strip's words: `Uploading 3 of 12 · 45%`.
+    fn label(&self) -> String {
+        let verb = if self.upload {
+            "Uploading"
+        } else {
+            "Downloading"
+        };
+        match self.progress {
+            None if self.upload => "Preparing the upload…".into(),
+            None => "Preparing the download…".into(),
+            Some(p) => progress_label(verb, &self.name, p.index, p.count, p.done, p.total),
+        }
+    }
+}
+
+impl Drop for Transfer {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Release);
+    }
+}
+
 /// The platform's name for showing a file in its folder.
 pub const REVEAL: &str = if cfg!(target_os = "macos") {
     "Reveal in Finder"
@@ -108,6 +148,7 @@ actions!(
         CopyEntry,
         PasteEntry,
         MoveToTrash,
+        DownloadEntry,
         SelectPrev,
         SelectNext,
         CollapseSelected,
@@ -258,6 +299,8 @@ pub struct FileTreeView {
     offered: Offered,
     /// A server folder's change stream, while the Files tab shows.
     watch: Option<ServerWatch>,
+    /// The upload or download under way (server folders only).
+    transfer: Option<Transfer>,
     _poll: Task<()>,
     _subscriptions: Vec<Subscription>,
 }
@@ -322,6 +365,7 @@ impl FileTreeView {
                 git: true,
             },
             watch: None,
+            transfer: None,
             _poll: Task::ready(()),
             _subscriptions: subscriptions,
         };
@@ -1093,6 +1137,415 @@ impl FileTreeView {
         }
     }
 
+    // ── Transfers ─────────────────────────────────────────────────────────
+
+    /// Whether a transfer may start: one already under way says so.
+    fn transfer_free(&self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.transfer.is_some() {
+            window.push_notification(
+                Notification::warning("Wait for the current transfer to finish, or cancel it."),
+                cx,
+            );
+        }
+        self.transfer.is_none()
+    }
+
+    /// A transfer is under way: the strip shows. Its cancel flag.
+    fn begin_transfer(
+        &mut self,
+        upload: bool,
+        name: String,
+        cx: &mut Context<Self>,
+    ) -> Arc<AtomicBool> {
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.transfer = Some(Transfer {
+            upload,
+            name,
+            progress: None,
+            cancel: cancel.clone(),
+        });
+        cx.notify();
+        cancel
+    }
+
+    fn cancel_transfer(&mut self, cx: &mut Context<Self>) {
+        self.transfer = None;
+        cx.notify();
+    }
+
+    /// Files dropped from this computer onto `dest`, a server folder: walked
+    /// and checked against what's there off the UI thread, then sent (names
+    /// already there asked about first).
+    fn drop_upload(
+        &mut self,
+        paths: Vec<PathBuf>,
+        dest: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.server || paths.is_empty() || !self.transfer_free(window, cx) {
+            return;
+        }
+        let name = paths.first().map(|p| file_name(p)).unwrap_or_default();
+        let cancel = self.begin_transfer(true, name, cx);
+        cx.spawn_in(window, async move |this, cx| {
+            let prepared = cx
+                .background_executor()
+                .spawn(async move { transfer::prepare_upload(&paths, &dest) })
+                .await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                // Cancelled while it was being prepared.
+                if cancel.load(Ordering::Acquire) {
+                    return;
+                }
+                match prepared {
+                    Err(message) => {
+                        this.cancel_transfer(cx);
+                        window.push_notification(Notification::warning(message), cx);
+                    }
+                    Ok(upload) if upload.conflicts.is_empty() => {
+                        this.start_upload(upload, cancel, window, cx)
+                    }
+                    Ok(upload) => {
+                        // Free while the dialog is up: nothing runs.
+                        this.cancel_transfer(cx);
+                        this.ask_conflicts(upload, window, cx);
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// One question for every dropped name already in the folder: replace
+    /// them, keep both, or skip them (Cancel uploads nothing).
+    fn ask_conflicts(
+        &mut self,
+        upload: transfer::Upload,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let title = match upload.conflicts.as_slice() {
+            [one] => format!("\u{201c}{one}\u{201d} already exists here"),
+            many => format!("{} items already exist here", many.len()),
+        };
+        let mut description = format!(
+            "{} {} already in \u{201c}{}\u{201d}.",
+            name_list(&upload.conflicts, 3),
+            if upload.conflicts.len() == 1 {
+                "is"
+            } else {
+                "are"
+            },
+            file_name(&upload.dest),
+        );
+        if upload.conflicts.iter().any(|n| upload.plan.makes_dir(n)) {
+            description.push_str(
+                " Replacing a folder merges them: files with the same name are \
+                 overwritten, the others are kept.",
+            );
+        }
+        let pending = Rc::new(RefCell::new(Some(upload)));
+        let this = cx.entity().downgrade();
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let choose = |id: &'static str, label: &'static str, choice: Option<Conflict>| {
+                let (this, pending) = (this.clone(), pending.clone());
+                Button::new(id).label(label).on_click(move |_, window, cx| {
+                    let upload = pending.borrow_mut().take();
+                    window.close_dialog(cx);
+                    if let (Some(upload), Some(choice)) = (upload, choice) {
+                        let _ = this.update(cx, |this, cx| {
+                            this.resume_upload(upload, choice, window, cx)
+                        });
+                    }
+                })
+            };
+            alert
+                .title(title.clone())
+                .description(description.clone())
+                .footer(
+                    DialogFooter::new()
+                        .child(choose("file-tree-upload-cancel", "Cancel", None))
+                        .child(choose(
+                            "file-tree-upload-skip",
+                            "Skip",
+                            Some(Conflict::Skip),
+                        ))
+                        .child(
+                            choose(
+                                "file-tree-upload-keep",
+                                "Keep Both",
+                                Some(Conflict::KeepBoth),
+                            )
+                            .primary(),
+                        )
+                        .child(
+                            choose(
+                                "file-tree-upload-replace",
+                                "Replace",
+                                Some(Conflict::Replace),
+                            )
+                            .danger(),
+                        ),
+                )
+        });
+    }
+
+    /// The conflicts settled by `choice`: send what's left.
+    fn resume_upload(
+        &mut self,
+        mut upload: transfer::Upload,
+        choice: Conflict,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.transfer_free(window, cx) {
+            return;
+        }
+        let plan = std::mem::take(&mut upload.plan);
+        upload.plan =
+            gentle_core::transfer::resolve(plan, &upload.conflicts, choice, &upload.taken);
+        if upload.plan.steps.is_empty() {
+            window.push_notification(Notification::info("Nothing was uploaded."), cx);
+            return;
+        }
+        let name = upload
+            .plan
+            .top_names()
+            .into_iter()
+            .next()
+            .unwrap_or_default();
+        let cancel = self.begin_transfer(true, name, cx);
+        self.start_upload(upload, cancel, window, cx);
+    }
+
+    /// Send `upload` on a thread of its own; the strip follows it, and the
+    /// destination is listed again at the end.
+    fn start_upload(
+        &mut self,
+        upload: transfer::Upload,
+        cancel: Arc<AtomicBool>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let dest = upload.dest.clone();
+        let (sender, updates) = async_channel::unbounded();
+        std::thread::spawn(move || {
+            let report = transfer::upload(&upload, &cancel, &sender);
+            let _ = sender.send_blocking(Update::Done(Ok(report)));
+        });
+        self.follow_transfer(
+            updates,
+            move |this, result, window, cx| {
+                match result {
+                    Ok(report) => {
+                        let done = format!(
+                            "Uploaded {} to \u{201c}{}\u{201d}.",
+                            count_files(report.sent),
+                            file_name(&dest)
+                        );
+                        window.push_notification(finished(done, &report, "upload"), cx);
+                    }
+                    Err(message) => window.push_notification(Notification::warning(message), cx),
+                }
+                // What came shows: the folder opens, and it and what's open
+                // under it are listed again.
+                if dest != this.root && this.expanded.insert(dest.clone()) {
+                    this.rebuild_rows();
+                }
+                let mut dirs: Vec<PathBuf> = this
+                    .expanded
+                    .iter()
+                    .filter(|p| p.starts_with(&dest))
+                    .cloned()
+                    .collect();
+                dirs.push(dest);
+                this.reload_dirs(dirs, cx);
+                this.refresh_git(cx);
+                cx.notify();
+            },
+            window,
+            cx,
+        );
+    }
+
+    fn download(&mut self, _: &DownloadEntry, window: &mut Window, cx: &mut Context<Self>) {
+        let (path, is_dir) = self.target();
+        self.download_entry(path, is_dir, window, cx);
+    }
+
+    /// Ask where on this computer the server's `path` goes (Downloads
+    /// suggested), then copy it there.
+    fn download_entry(
+        &mut self,
+        path: PathBuf,
+        is_dir: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.server || !self.transfer_free(window, cx) {
+            return;
+        }
+        let directory = dirs::download_dir()
+            .or_else(dirs::home_dir)
+            .unwrap_or_else(std::env::temp_dir);
+        let chosen = cx.prompt_for_new_path(&directory, Some(&file_name(&path)));
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(Ok(Some(to))) = chosen.await else {
+                return;
+            };
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.start_download(path, is_dir, to, window, cx)
+            });
+        })
+        .detach();
+    }
+
+    /// Copy the server's `from` to `to` here on a thread of its own; the
+    /// strip follows it, and the result shows in the file manager.
+    fn start_download(
+        &mut self,
+        from: PathBuf,
+        is_dir: bool,
+        to: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.transfer_free(window, cx) {
+            return;
+        }
+        let name = file_name(&from);
+        let cancel = self.begin_transfer(false, name.clone(), cx);
+        let (sender, updates) = async_channel::unbounded();
+        let (job_from, job_to) = (from, to.clone());
+        std::thread::spawn(move || {
+            let report = transfer::client(&job_from).and_then(|client| {
+                transfer::download(&client, &job_from, is_dir, &job_to, &cancel, &sender)
+            });
+            let _ = sender.send_blocking(Update::Done(report));
+        });
+        self.follow_transfer(
+            updates,
+            move |_, result, window, cx| match result {
+                Ok(report) if report.cancelled && !is_dir => window.push_notification(
+                    Notification::info(format!("Download of \u{201c}{name}\u{201d} cancelled.")),
+                    cx,
+                ),
+                Ok(report) => {
+                    let done = if report.clean() {
+                        format!("Downloaded \u{201c}{name}\u{201d} to {}", to.display())
+                    } else {
+                        format!(
+                            "Downloaded {} of \u{201c}{name}\u{201d} to {}.",
+                            count_files(report.sent),
+                            to.display()
+                        )
+                    };
+                    if report.sent > 0 || report.clean() {
+                        cx.reveal_path(&to);
+                    }
+                    window.push_notification(finished(done, &report, "download"), cx);
+                }
+                Err(message) => window.push_notification(Notification::warning(message), cx),
+            },
+            window,
+            cx,
+        );
+    }
+
+    /// Show a transfer's progress as its thread tells it, then end it and
+    /// hand its result to `done`.
+    fn follow_transfer(
+        &mut self,
+        updates: async_channel::Receiver<Update>,
+        done: impl FnOnce(&mut Self, Result<Report, String>, &mut Window, &mut Context<Self>) + 'static,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn_in(window, async move |this, cx| {
+            let mut done = Some(done);
+            while let Ok(update) = updates.recv().await {
+                let ended = this.update_in(cx, |this, window, cx| match update {
+                    Update::Progress(progress) => {
+                        if let Some(transfer) = &mut this.transfer {
+                            transfer.progress = Some(progress);
+                            cx.notify();
+                        }
+                        false
+                    }
+                    Update::Done(result) => {
+                        this.cancel_transfer(cx);
+                        if let Some(done) = done.take() {
+                            done(this, result, window, cx);
+                        }
+                        true
+                    }
+                });
+                if !matches!(ended, Ok(false)) {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// The strip under the tree while a transfer runs: what it's doing, how
+    /// far along (a bar along its bottom) and Cancel.
+    fn render_transfer(&self, cx: &mut Context<Self>) -> Option<Div> {
+        let transfer = self.transfer.as_ref()?;
+        let fraction = transfer
+            .progress
+            .map_or(0., |p| f32::from(percent(p.done, p.total)) / 100.);
+        Some(
+            h_flex()
+                .relative()
+                .flex_none()
+                .h(rems(30. / 16.))
+                .mx_2()
+                .mb_1p5()
+                .pl_2()
+                .pr_1()
+                .gap_2()
+                .rounded_lg()
+                .overflow_hidden()
+                .bg(ui::surface())
+                .child(
+                    Icon::new(if transfer.upload {
+                        IconName::Upload
+                    } else {
+                        IconName::Download
+                    })
+                    .xsmall()
+                    .text_color(ui::petal()),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(rems(12. / 16.))
+                        .text_color(ui::muted())
+                        .child(transfer.label()),
+                )
+                .child(
+                    Button::new("file-tree-transfer-cancel")
+                        .ghost()
+                        .xsmall()
+                        .label("Cancel")
+                        .on_click(cx.listener(|this, _, _, cx| this.cancel_transfer(cx))),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .left_0()
+                        .bottom_0()
+                        .h(px(2.))
+                        .w(relative(fraction))
+                        .bg(ui::petal()),
+                ),
+        )
+    }
+
     // ── Inline name field ─────────────────────────────────────────────────
 
     /// A name field for a new file or folder, in the selected folder (or the
@@ -1332,6 +1785,11 @@ impl FileTreeView {
         let click = entry.clone();
         let menu_target = entry.path.clone();
         let full_name = entry.name.clone();
+        let drop_dir = if entry.is_dir {
+            entry.path.clone()
+        } else {
+            parent_of(&entry.path)
+        };
         shell
             .tooltip(move |window, cx| Tooltip::new(full_name.clone()).build(window, cx))
             .child(
@@ -1374,6 +1832,18 @@ impl FileTreeView {
             .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                 this.click_entry(&click, event.click_count(), window, cx)
             }))
+            // Files from this computer dropped on a folder go into it; on a
+            // file, beside it.
+            .when(self.server, |d| {
+                d.when(entry.is_dir, |d| {
+                    d.drag_over::<ExternalPaths>(|style, _, _, _| style.bg(ui::raised()))
+                })
+                .on_drop(cx.listener(
+                    move |this, paths: &ExternalPaths, window, cx| {
+                        this.drop_upload(paths.paths().to_vec(), drop_dir.clone(), window, cx);
+                    },
+                ))
+            })
     }
 
     /// The inline name field of the edit in progress.
@@ -1442,6 +1912,7 @@ impl FileTreeView {
             .on_action(cx.listener(Self::copy))
             .on_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::move_to_trash))
+            .on_action(cx.listener(Self::download))
             .on_action(cx.listener(Self::select_prev))
             .on_action(cx.listener(Self::select_next))
             .on_action(cx.listener(Self::collapse_selected))
@@ -1461,6 +1932,14 @@ impl FileTreeView {
                 MouseButton::Left,
                 cx.listener(|this, _, window, cx| this.focus.focus(window, cx)),
             )
+            // Files from this computer dropped off the rows go to the root.
+            .when(self.server, |d| {
+                d.drag_over::<ExternalPaths>(|style, _, _, _| style.bg(ui::surface_hover()))
+                    .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
+                        let root = this.root.clone();
+                        this.drop_upload(paths.paths().to_vec(), root, window, cx);
+                    }))
+            })
             .child(body)
             .vertical_scrollbar(&self.scroll)
             .context_menu(move |menu, window, cx| match tree.upgrade() {
@@ -1530,7 +2009,12 @@ impl FileTreeView {
             ))
             .separator();
         let menu = if self.server {
-            menu
+            menu.item(item(
+                "Download…",
+                IconName::Download,
+                Box::new(DownloadEntry),
+            ))
+            .separator()
         } else {
             menu.item(item(
                 REVEAL,
@@ -1587,7 +2071,19 @@ impl FileTreeView {
                     .on_click(act(Self::collapse_all)),
             );
         let menu = if self.server {
-            menu
+            let tree = tree.clone();
+            menu.item(
+                PopupMenuItem::new("Download Folder…")
+                    .icon(Icon::new(IconName::Download))
+                    .on_click({
+                        let root = root.clone();
+                        move |_, window, cx| {
+                            let _ = tree.update(cx, |this, cx| {
+                                this.download_entry(root.clone(), true, window, cx)
+                            });
+                        }
+                    }),
+            )
         } else {
             menu.item(
                 PopupMenuItem::new(REVEAL)
@@ -1852,6 +2348,8 @@ impl Render for FileTreeView {
                             }),
                     )
             });
+        // A transfer's strip, at the bottom of the Files tab.
+        let strip = files.then(|| self.render_transfer(cx)).flatten();
         // The workspace's right sidebar slot paints the rounded glass; a fill here
         // would show square corners past it (GPUI clips to rectangles).
         v_flex()
@@ -1880,6 +2378,7 @@ impl Render for FileTreeView {
                     .child(self.refs.clone())
                     .into_any_element(),
             })
+            .children(strip)
             .children(footer)
     }
 }
@@ -1917,6 +2416,15 @@ fn empty_state(icon: IconName, text: &'static str) -> Div {
 /// Untracked files read as `U`, like editors show them.
 fn status_letter(status: char) -> char {
     if status == '?' { 'U' } else { status }
+}
+
+/// A transfer's closing toast: `done`, then what didn't go.
+fn finished(done: String, report: &Report, verb: &str) -> Notification {
+    if report.clean() {
+        Notification::success(done)
+    } else {
+        Notification::warning(format!("{done} {}", report.problems(verb, WRITE_LIMIT)))
+    }
 }
 
 fn file_name(path: &Path) -> String {

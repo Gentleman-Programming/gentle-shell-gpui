@@ -1131,23 +1131,104 @@ impl SessionView {
 
     /// `/export [path]`: RPC `export_html` to `path`, or where the save
     /// dialog says (`~/Downloads/<session>.html` suggested), then reveal it.
+    /// On a Gentle Shell server the file is written there and downloaded.
     pub(super) fn export_html(&mut self, path: Option<String>, cx: &mut Context<Self>) {
-        if let Some(path) = path {
-            self.export_to(expand_home(&path), cx);
+        let server = self.runs_on().is_server();
+        if let (Some(path), false) = (&path, server) {
+            self.export_to(expand_home(path), cx);
             return;
         }
         let directory = dirs::download_dir()
             .or_else(dirs::home_dir)
             .unwrap_or_else(|| self.cwd.clone());
         let name = format!("{}.html", export_file_stem(&self.title()));
+        if let Some(path) = path {
+            // A path there: the copy here goes to Downloads, beside
+            // whatever is already in it.
+            let local = free_local_file(&directory, &name);
+            self.export_on_server(Some(path), local, cx);
+            return;
+        }
         let chosen = cx.prompt_for_new_path(&directory, Some(&name));
         cx.spawn(async move |this, cx| {
             let Ok(Ok(Some(path))) = chosen.await else {
                 return;
             };
-            let _ = this.update(cx, |this, cx| this.export_to(path, cx));
+            let _ = this.update(cx, |this, cx| {
+                if server {
+                    this.export_on_server(None, path, cx);
+                } else {
+                    this.export_to(path, cx);
+                }
+            });
         })
         .detach();
+    }
+
+    /// `/export` on a Gentle Shell server: Gentle Shell writes the HTML
+    /// there (at `there`, a path on the server, or a scratch file in the
+    /// session's folder removed once copied), and the app downloads the
+    /// file its answer names to `local`.
+    fn export_on_server(&mut self, there: Option<String>, local: PathBuf, cx: &mut Context<Self>) {
+        let cwd = self.cwd.to_string_lossy().into_owned();
+        let scratch = there.is_none();
+        let output = there.unwrap_or_else(|| {
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_millis());
+            gentle_core::transfer::server_file(
+                &format!(".gentle-shell-export-{stamp}.html"),
+                &cwd,
+                None,
+            )
+        });
+        let command = json!({"type": "export_html", "outputPath": output});
+        self.request(command, cx, move |this, result, cx| {
+            let Some(data) = this.report(result) else {
+                return;
+            };
+            let home = crate::features::backend::server::known_home_of(&this.cwd);
+            let printed = data["path"].as_str().unwrap_or(&output);
+            let written = gentle_core::transfer::server_file(printed, &cwd, home.as_deref());
+            let server = this.runs_on().label();
+            cx.spawn(async move |this, cx| {
+                let copy = written.clone();
+                let fetched = cx
+                    .background_executor()
+                    .spawn(async move {
+                        let there = PathBuf::from(&copy);
+                        let bytes = crate::features::backend::fs::read(&there)?;
+                        std::fs::write(&local, bytes)?;
+                        if scratch {
+                            // Best effort: the copy here is what was asked.
+                            let _ = crate::features::backend::fs::remove_all(&there);
+                        }
+                        Ok::<_, std::io::Error>(local)
+                    })
+                    .await;
+                let _ = this.update(cx, |this, cx| match fetched {
+                    Ok(local) => {
+                        cx.reveal_path(&local);
+                        let text = if scratch {
+                            format!("Exported the conversation to {}", local.display())
+                        } else {
+                            format!(
+                                "Exported the conversation to {written} on {server}, and downloaded it to {}",
+                                local.display()
+                            )
+                        };
+                        this.note(text, cx);
+                    }
+                    Err(error) => this.toast(
+                        Notification::warning(format!(
+                            "Exported to {written} on {server}, but couldn't download it: {error}"
+                        )),
+                        cx,
+                    ),
+                });
+            })
+            .detach();
+        });
     }
 
     fn export_to(&mut self, path: PathBuf, cx: &mut Context<Self>) {
@@ -1305,6 +1386,17 @@ fn expand_home(path: &str) -> PathBuf {
         (Some(rest), Some(home)) => home.join(rest),
         _ => PathBuf::from(path),
     }
+}
+
+/// `name` in `dir`, or `name 2.html`, `name 3.html`, … when it's taken.
+fn free_local_file(dir: &std::path::Path, name: &str) -> PathBuf {
+    let path = dir.join(name);
+    if !path.exists() {
+        return path;
+    }
+    dir.join(gentle_core::transfer::free_name(name, false, |candidate| {
+        dir.join(candidate).exists()
+    }))
 }
 
 /// A session title as a file name: path separators and other characters

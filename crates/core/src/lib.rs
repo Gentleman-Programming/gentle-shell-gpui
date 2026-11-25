@@ -43,6 +43,7 @@ pub mod text;
 pub mod tools;
 pub mod tower;
 pub mod transcript;
+pub mod transfer;
 pub mod typing_kisses;
 pub mod usage;
 pub mod version;
