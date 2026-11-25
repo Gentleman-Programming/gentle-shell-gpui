@@ -35,6 +35,8 @@ struct State {
     paired: bool,
     /// Every `/desktop` body, in order.
     desktop: Vec<Value>,
+    /// The server predates `POST /api/tower`.
+    no_tower: bool,
 }
 
 #[derive(Clone)]
@@ -227,6 +229,54 @@ impl Fake {
                     _ => reply(&mut stream, 200, &answer(true, json!({"accepted": true}))),
                 }
             }
+            ("GET", "/api/server") => reply(
+                &mut stream,
+                200,
+                &json!({"serverId": SERVER_ID, "version": "0.0.0", "home": "/home/ana"}),
+            ),
+            ("POST", "/api/sessions/ses_1/forwards") => {
+                match (body["port"].as_u64(), body["path"].as_str()) {
+                    (Some(8787), _) => reply(
+                        &mut stream,
+                        400,
+                        &json!({"error": {"code": "invalid_port", "message": "That port is the server's own"}}),
+                    ),
+                    (Some(port), Some(path)) => reply(
+                        &mut stream,
+                        201,
+                        &json!({
+                            "id": "fwd_1",
+                            "port": port,
+                            "listenPort": 40001,
+                            "sessionId": "ses_1",
+                            "url": format!("http://127.0.0.1:40001{path}?gs_ticket=t1"),
+                            "expiresAt": "2026-01-01T00:01:00.000Z"
+                        }),
+                    ),
+                    _ => reply(
+                        &mut stream,
+                        400,
+                        &json!({"error": {"code": "invalid_port"}}),
+                    ),
+                }
+            }
+            ("POST", "/api/tower") if self.state.lock().unwrap().no_tower => reply(
+                &mut stream,
+                404,
+                &json!({"error": {"code": "not_found", "message": "Not found"}}),
+            ),
+            ("POST", "/api/tower") => reply(
+                &mut stream,
+                201,
+                &json!({
+                    "id": "fwd_2",
+                    "port": 47321,
+                    "listenPort": 40002,
+                    "sessionId": null,
+                    "url": "http://127.0.0.1:40002/tok/?gs_ticket=t2",
+                    "started": true
+                }),
+            ),
             ("GET", "/api/sessions/ses_1/events") => self.subscribe(stream, query),
             _ => reply(&mut stream, 404, &json!({"error": {"code": "not_found"}})),
         }
@@ -650,4 +700,57 @@ fn nothing_answering_finds_nothing() {
     let found = pi_rpc::serve::nearby(&[silent.local_addr().unwrap()]).unwrap();
     assert!(found.is_empty());
     assert!(started.elapsed() < Duration::from_secs(4));
+}
+
+#[test]
+fn a_page_on_the_servers_loopback_opens_through_a_forward() {
+    let fake = Fake::start();
+    let client = fake.client();
+    let forward = client.forward("ses_1", 5173, "/app?x=1").unwrap();
+    assert_eq!(forward.id, "fwd_1");
+    assert_eq!(forward.port, 5173);
+    assert!(forward.url.starts_with("http://127.0.0.1:40001/app?x=1"));
+    let refused = client.forward("ses_1", 8787, "/").unwrap_err();
+    assert_eq!(refused.status, Some(400));
+    assert_eq!(refused.error.as_deref(), Some("invalid_port"));
+    assert!(
+        refused.message.contains("server's own"),
+        "{}",
+        refused.message
+    );
+    let gone = client.forward("ses_gone", 5173, "/").unwrap_err();
+    assert_eq!(gone.status, Some(404));
+    assert!(client.forward("../x", 1, "/").is_err());
+
+    let tower = client.tower().unwrap();
+    assert_eq!(tower.url, "http://127.0.0.1:40002/tok/?gs_ticket=t2");
+    assert_eq!(client.server().unwrap().home.as_deref(), Some("/home/ana"));
+    assert!(
+        fake.log()
+            .iter()
+            .any(|line| line == "POST /api/sessions/ses_1/forwards")
+    );
+    assert!(fake.log().iter().any(|line| line == "POST /api/tower"));
+}
+
+#[test]
+fn a_server_without_tower_says_to_upgrade_it() {
+    let fake = Fake::start();
+    let client = ServeClient::new(&fake.url, Some("gss_revoked".into()));
+    // Unpaired: the token error, not an upgrade hint.
+    assert!(
+        client
+            .tower()
+            .unwrap_err()
+            .message
+            .contains("Pair it again")
+    );
+    let old = Fake::start();
+    old.state.lock().unwrap().no_tower = true;
+    let error = old.client().tower().unwrap_err();
+    assert!(
+        error.message.contains("upgrade Gentle Shell"),
+        "{}",
+        error.message
+    );
 }

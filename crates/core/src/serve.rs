@@ -671,6 +671,22 @@ pub fn error_text(status: u16, code: Option<&str>, message: Option<&str>) -> Str
         (400, Some("invalid_cwd")) => "The server has no such folder. A server tab's folder is \
              a path on the server, not on this computer."
             .into(),
+        (429, Some("too_many_forwards")) => "The server already forwards as many pages as it \
+             allows (32). Forwards close after 12 hours unused, or when their session ends."
+            .into(),
+        (409, Some("session_exited")) => "The session that opened this page has ended.".into(),
+        (503, Some("tower_unavailable")) => match message {
+            Some(message) if !message.trim().is_empty() => {
+                format!(
+                    "Gentle Tower couldn't start on the server: {}",
+                    message.trim()
+                )
+            }
+            _ => "Gentle Tower couldn't start on the server.".into(),
+        },
+        (501, Some("not_supported")) => {
+            "The server can't do that: its gentle-shell serve doesn't support it.".into()
+        }
         (404, _) => "The server doesn't know this session any more (it was stopped, or the \
              server restarted)."
             .into(),
@@ -958,6 +974,114 @@ pub fn backoff_secs(failures: u32) -> u64 {
     1u64.checked_shl(failures.min(5)).unwrap_or(32).min(30)
 }
 
+/// The longest path a forward takes (`POST /api/sessions/:id/forwards`).
+const FORWARD_PATH: usize = 2048;
+
+/// Where a URL a server session gave (the design canvas, `open_page`, a
+/// dev server in a tool's output) is, seen from a device of that server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServerPage {
+    /// Not on the server's loopback: it opens as it is.
+    Elsewhere,
+    /// On the server's own loopback (`localhost`, `127.0.0.0/8`, `[::1]`, or
+    /// the unspecified `0.0.0.0`/`[::]` a dev server prints): only a forward
+    /// reaches it, with `port` and `path` (query and fragment included) as
+    /// `POST /api/sessions/:id/forwards` takes them.
+    Loopback { port: u16, path: String },
+    /// On the server's loopback, but no forward can carry it: what's wrong,
+    /// in words.
+    Unreachable(String),
+}
+
+/// Where `url`, which a server session gave, is ([`ServerPage`]). A page
+/// on the server's loopback never opens as it is on this device: there
+/// it is this device's own loopback, another page or none.
+pub fn server_page(url: &str) -> ServerPage {
+    let url = url.trim();
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return ServerPage::Elsewhere;
+    };
+    let scheme = scheme.to_ascii_lowercase();
+    if !matches!(scheme.as_str(), "http" | "https" | "ws" | "wss") {
+        return ServerPage::Elsewhere;
+    }
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(end);
+    let host_port = authority.rsplit('@').next().unwrap_or(authority);
+    let (host, port) = if let Some(bracketed) = host_port.strip_prefix('[') {
+        let Some((host, after)) = bracketed.split_once(']') else {
+            return ServerPage::Elsewhere;
+        };
+        (host, after.strip_prefix(':'))
+    } else {
+        match host_port.split_once(':') {
+            Some((host, port)) => (host, Some(port)),
+            None => (host_port, None),
+        }
+    };
+    if !is_loopback_host(host) {
+        return ServerPage::Elsewhere;
+    }
+    if matches!(scheme.as_str(), "https" | "wss") {
+        return ServerPage::Unreachable(format!(
+            "{url} is served over HTTPS on the server's own loopback; the server forwards \
+             plain HTTP pages only."
+        ));
+    }
+    let port = match port {
+        None | Some("") => 80,
+        Some(port) => match port.parse::<u16>() {
+            Ok(port) if port > 0 => port,
+            _ => return ServerPage::Unreachable(format!("{url} has no valid port.")),
+        },
+    };
+    let mut path = String::with_capacity(tail.len() + 1);
+    if !tail.starts_with('/') {
+        path.push('/');
+    }
+    for byte in tail.bytes() {
+        if (0x21..=0x7e).contains(&byte) {
+            path.push(byte as char);
+        } else {
+            path.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    // The server refuses a path starting `//` (a scheme-relative URL).
+    while path.starts_with("//") {
+        path.remove(0);
+    }
+    if path.len() > FORWARD_PATH {
+        return ServerPage::Unreachable(format!(
+            "That page's address is too long to forward (over {FORWARD_PATH} characters)."
+        ));
+    }
+    ServerPage::Loopback { port, path }
+}
+
+/// The folder a new agent tab starts in while agents run on a Gentle Shell
+/// server: `cwd` when it is known to be a folder there (`there`: the
+/// focused agent runs there, or the workspace was opened there), else the
+/// server user's `home`: a folder on this computer is no folder on the
+/// server. Without a home to go to (an older server doesn't say), `cwd`.
+pub fn tab_folder(cwd: &std::path::Path, there: bool, home: Option<&str>) -> std::path::PathBuf {
+    match home {
+        Some(home) if !there => home.into(),
+        _ => cwd.to_path_buf(),
+    }
+}
+
+/// Whether `host` (no brackets) names the machine it is read on.
+fn is_loopback_host(host: &str) -> bool {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    if host == "localhost" || host.ends_with(".localhost") {
+        return true;
+    }
+    match host.parse::<IpAddr>() {
+        Ok(ip) => ip.is_loopback() || ip.is_unspecified(),
+        Err(_) => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -995,6 +1119,69 @@ mod tests {
                 .unwrap_err()
                 .contains("plain HTTP")
         );
+    }
+
+    #[test]
+    fn pages_on_the_servers_loopback_go_through_a_forward() {
+        let loopback = |port: u16, path: &str| ServerPage::Loopback {
+            port,
+            path: path.into(),
+        };
+        for (url, page) in [
+            ("http://localhost:5173", loopback(5173, "/")),
+            (
+                "http://127.0.0.1:8080/a/b?x=1#top",
+                loopback(8080, "/a/b?x=1#top"),
+            ),
+            ("http://[::1]:3000/", loopback(3000, "/")),
+            ("HTTP://LocalHost:4321/x", loopback(4321, "/x")),
+            ("http://0.0.0.0:8000", loopback(8000, "/")),
+            ("http://127.0.1.1:9/x", loopback(9, "/x")),
+            ("http://app.localhost:5000?q", loopback(5000, "/?q")),
+            ("http://localhost", loopback(80, "/")),
+            ("ws://localhost:24678/hmr", loopback(24678, "/hmr")),
+            ("  http://localhost:1/a b  ", loopback(1, "/a%20b")),
+            ("http://localhost:1/ñ", loopback(1, "/%C3%B1")),
+            ("http://localhost:1//evil.com/x", loopback(1, "/evil.com/x")),
+        ] {
+            assert_eq!(server_page(url), page, "{url}");
+        }
+        for url in [
+            "https://example.com",
+            "http://192.168.1.20:5173",
+            "http://localhost.example.com:80",
+            "file:///tmp/x.html",
+            "about:blank",
+            "localhost:5173",
+            "http://[fe80::1]:80/",
+        ] {
+            assert_eq!(server_page(url), ServerPage::Elsewhere, "{url}");
+        }
+        for url in [
+            "https://localhost:8443/",
+            "http://localhost:0/",
+            "http://localhost:99999/",
+        ] {
+            assert!(
+                matches!(server_page(url), ServerPage::Unreachable(_)),
+                "{url}"
+            );
+        }
+        let long = format!("http://localhost:1/{}", "a".repeat(FORWARD_PATH));
+        assert!(matches!(server_page(&long), ServerPage::Unreachable(_)));
+    }
+
+    #[test]
+    fn new_tabs_on_a_server_never_start_in_a_folder_of_this_computer() {
+        use std::path::{Path, PathBuf};
+        let mac = Path::new("/Users/ana/project");
+        assert_eq!(
+            tab_folder(mac, false, Some("/home/ana")),
+            PathBuf::from("/home/ana")
+        );
+        let there = Path::new("/home/ana/api");
+        assert_eq!(tab_folder(there, true, Some("/home/ana")), there);
+        assert_eq!(tab_folder(mac, false, None), mac);
     }
 
     #[test]

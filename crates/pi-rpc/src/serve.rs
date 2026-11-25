@@ -92,6 +92,36 @@ pub struct ServerInfo {
     pub server_id: String,
     /// The server's Gentle Shell version.
     pub version: Option<String>,
+    /// The home folder of the user the server runs as, a path there (only
+    /// to devices that may operate sessions; older servers don't say).
+    pub home: Option<String>,
+}
+
+/// A page on the server's own loopback, reachable from this device through
+/// one of the server's forwards (`POST /api/sessions/:id/forwards`,
+/// `POST /api/tower`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Forward {
+    /// `fwd_…`.
+    pub id: String,
+    /// The page's port on the server's loopback.
+    pub port: u16,
+    /// The address to open, as the server built it: the forward's own
+    /// port on the host this client reached the server at, the page's path
+    /// and a single-use ticket (`gs_ticket`, 60 s) the first visit trades
+    /// for a cookie. Every call mints a new one, so a page opened again
+    /// asks again (the forward itself is reused).
+    pub url: String,
+}
+
+impl Forward {
+    fn parse(value: &Value) -> Option<Self> {
+        Some(Self {
+            id: value["id"].as_str()?.to_string(),
+            port: u16::try_from(value["port"].as_u64()?).ok()?,
+            url: value["url"].as_str()?.to_string(),
+        })
+    }
 }
 
 /// One of the server's sessions.
@@ -266,7 +296,45 @@ impl ServeClient {
         Ok(ServerInfo {
             server_id: answer["serverId"].as_str().unwrap_or_default().to_string(),
             version: answer["version"].as_str().map(str::to_string),
+            home: answer["home"]
+                .as_str()
+                .filter(|home| !home.is_empty())
+                .map(str::to_string),
         })
+    }
+
+    /// `POST /api/sessions/:id/forwards { port, path }`: the page at `path`
+    /// on `port` of the server's loopback, opened by the session `session`.
+    /// The server reuses this device's forward of the same port, with a
+    /// fresh ticket.
+    pub fn forward(&self, session: &str, port: u16, path: &str) -> Result<Forward, ServeError> {
+        let answer = self.json(
+            "POST",
+            &session_path(session, "/forwards")?,
+            Some(&json!({"port": port, "path": path})),
+        )?;
+        Forward::parse(&answer).ok_or_else(malformed)
+    }
+
+    /// `POST /api/tower`: Gentle Tower running on the server (started when
+    /// it isn't), through a forward. A server without the route says so.
+    pub fn tower(&self) -> Result<Forward, ServeError> {
+        // An empty object rather than no body: a POST always says its length.
+        let answer = self
+            .json("POST", "/api/tower", Some(&json!({})))
+            .map_err(|e| {
+                if e.status == Some(404) || e.status == Some(405) {
+                    ServeError {
+                        message: "This server's gentle-shell serve can't run Gentle Tower for its \
+                              devices: upgrade Gentle Shell there."
+                            .into(),
+                        ..e
+                    }
+                } else {
+                    e
+                }
+            })?;
+        Forward::parse(&answer).ok_or_else(malformed)
     }
 
     /// `GET /api/sessions/:id`.
