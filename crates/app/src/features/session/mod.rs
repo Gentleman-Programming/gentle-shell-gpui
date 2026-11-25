@@ -18,6 +18,7 @@ mod agents;
 mod attachments;
 mod builtins;
 mod events;
+mod host_genui;
 mod host_tools;
 pub mod input_style;
 mod lifecycle;
@@ -225,6 +226,12 @@ pub struct SessionView {
     plan_seed_asked: std::cell::Cell<Option<std::time::Instant>>,
     /// The app's tools offered to a server session, and its calls running.
     host: host_tools::HostCalls,
+    /// `gentle_ui` run by the app for a server session (`host_genui`):
+    /// the conversation's surfaces, rebuilt from it.
+    host_genui: gentle_core::genui::host::Engine,
+    /// The host messages sent, for the tests (a test tab has no server).
+    #[cfg(test)]
+    host_messages: Vec<pi_rpc::desktop_rpc::HostMessage>,
 }
 
 impl EventEmitter<SessionEvent> for SessionView {}
@@ -400,6 +407,11 @@ impl SessionView {
             local_offset: std::cell::OnceCell::new(),
             plan_seed_asked: std::cell::Cell::new(None),
             host: host_tools::HostCalls::default(),
+            host_genui: gentle_core::genui::host::Engine::new(crate::features::genui::mode::mode(
+                cx,
+            )),
+            #[cfg(test)]
+            host_messages: Vec::new(),
         };
         if start_now {
             this.ensure_started(window, cx);

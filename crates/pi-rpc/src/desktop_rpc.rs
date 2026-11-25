@@ -37,7 +37,7 @@
 
 use crate::record::{Response as PiResponse, UiMethod, UiRequest};
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use std::fmt;
 
 /// A closed wire vocabulary: the enum, its wire names, parsing (an unknown
@@ -130,11 +130,12 @@ pub use definitions::{
     AgentDefinitions, DefaultOrchestrator, OrchestratorStatus, SubagentDefaults,
 };
 pub use host_tools::{
-    HOST_TOOL_CALL, HOST_TOOL_CANCEL, HostTool, HostToolCall, HostToolCancel, HostToolContent,
-    HostToolResultAck, MAX_DESCRIPTION_CHARS, MAX_GUIDELINE_CHARS, MAX_GUIDELINES,
-    MAX_HOST_TOOL_RESULT_BYTES, MAX_HOST_TOOLS, MAX_LABEL_CHARS, MAX_PARAMETERS_BYTES,
-    MAX_PROVIDER_CHARS, MAX_RESULT_CONTENT_BYTES, MAX_SET_HOST_TOOLS_BYTES, RejectedHostTool,
-    SetHostToolsResult, valid_tool_name,
+    HOST_TOOL_CALL, HOST_TOOL_CANCEL, HostDelivery, HostMessage, HostMessageAck, HostTool,
+    HostToolCall, HostToolCancel, HostToolContent, HostToolResultAck, MAX_DESCRIPTION_CHARS,
+    MAX_DETAILS_BYTES, MAX_GUIDELINE_CHARS, MAX_GUIDELINES, MAX_HOST_MESSAGE_BYTES,
+    MAX_HOST_TOOL_RESULT_BYTES, MAX_HOST_TOOLS, MAX_LABEL_CHARS, MAX_MESSAGE_CONTENT_BYTES,
+    MAX_PARAMETERS_BYTES, MAX_PROVIDER_CHARS, MAX_RESULT_CONTENT_BYTES, MAX_SET_HOST_TOOLS_BYTES,
+    RejectedHostTool, SetHostContextAck, SetHostToolsResult, valid_custom_type, valid_tool_name,
 };
 pub use output::{JobOutput, SubagentThread, ThreadItem};
 pub use review::{
@@ -219,13 +220,15 @@ pub enum DesktopMethod {
     ReloadCredentials,
     SetHostTools,
     HostToolResult,
+    HostMessage,
+    SetHostContext,
 }
 
 impl DesktopMethod {
     /// Every method this client knows, in the order `capabilities` lists
     /// them on Gentle Shell 5.0.0. Which ones a peer offers is only what its
     /// `capabilities` say: Gentle Shell 4.8.0 offers fourteen of them.
-    pub const ALL: [Self; 34] = [
+    pub const ALL: [Self; 36] = [
         Self::Capabilities,
         Self::GetSnapshot,
         Self::GetConfig,
@@ -260,6 +263,8 @@ impl DesktopMethod {
         Self::ReloadCredentials,
         Self::SetHostTools,
         Self::HostToolResult,
+        Self::HostMessage,
+        Self::SetHostContext,
     ];
 
     /// The wire name of the method.
@@ -299,15 +304,19 @@ impl DesktopMethod {
             Self::ReloadCredentials => "reload_credentials",
             Self::SetHostTools => "set_host_tools",
             Self::HostToolResult => "host_tool_result",
+            Self::HostMessage => "host_message",
+            Self::SetHostContext => "set_host_context",
         }
     }
 
     /// The largest inner request of this method, in bytes: host tool
-    /// results carry screenshots and registrations carry schemas.
+    /// results carry screenshots, registrations schemas, and host messages
+    /// and contexts `details`.
     pub fn max_request_bytes(self) -> usize {
         match self {
             Self::HostToolResult => MAX_HOST_TOOL_RESULT_BYTES,
             Self::SetHostTools => MAX_SET_HOST_TOOLS_BYTES,
+            Self::HostMessage | Self::SetHostContext => MAX_HOST_MESSAGE_BYTES,
             _ => MAX_REQUEST_BYTES,
         }
     }
@@ -332,6 +341,8 @@ impl DesktopMethod {
                 | Self::SetBackgroundSubagents
                 | Self::SetHostTools
                 | Self::HostToolResult
+                | Self::HostMessage
+                | Self::SetHostContext
         )
     }
 
@@ -372,6 +383,8 @@ impl DesktopMethod {
             "reload_credentials" => Ok(Self::ReloadCredentials),
             "set_host_tools" => Ok(Self::SetHostTools),
             "host_tool_result" => Ok(Self::HostToolResult),
+            "host_message" => Ok(Self::HostMessage),
+            "set_host_context" => Ok(Self::SetHostContext),
             other => Err(DesktopRpcError::UnsupportedMethod(other.to_string())),
         }
     }
@@ -970,17 +983,49 @@ impl DesktopRequest {
     }
 
     /// The `host_tool_result` request answering `call_id`; `is_error` is sent
-    /// only when true. Content over [`MAX_RESULT_CONTENT_BYTES`] is refused.
+    /// only when true, `details` (the Pi tool result's) only when given.
+    /// Content over [`MAX_RESULT_CONTENT_BYTES`] or details over
+    /// [`MAX_DETAILS_BYTES`] are refused.
     pub fn host_tool_result(
         request_id: impl Into<String>,
         call_id: &str,
         content: &[HostToolContent],
         is_error: bool,
+        details: Option<&Map<String, Value>>,
     ) -> Result<Self, DesktopRpcError> {
         Self::build(
             request_id,
             DesktopMethod::HostToolResult,
-            host_tools::host_tool_result_params(call_id, content, is_error)?,
+            host_tools::host_tool_result_params(call_id, content, is_error, details)?,
+        )
+    }
+
+    /// The `host_message` request: a custom message in the conversation.
+    /// Through a server, it goes to `/desktop`.
+    pub fn host_message(
+        request_id: impl Into<String>,
+        message: &HostMessage,
+    ) -> Result<Self, DesktopRpcError> {
+        Self::build(
+            request_id,
+            DesktopMethod::HostMessage,
+            host_tools::host_message_params(message)?,
+        )
+    }
+
+    /// The `set_host_context` request: `provider`'s hidden context before
+    /// each agent run (an empty `content` clears it). A Gentle Shell server
+    /// overwrites `provider` with the calling device's id.
+    pub fn set_host_context(
+        request_id: impl Into<String>,
+        provider: &str,
+        content: &str,
+        details: Option<&Map<String, Value>>,
+    ) -> Result<Self, DesktopRpcError> {
+        Self::build(
+            request_id,
+            DesktopMethod::SetHostContext,
+            host_tools::set_host_context_params(provider, content, details)?,
         )
     }
 
@@ -1339,6 +1384,16 @@ impl DesktopResponse {
     /// The response to `host_tool_result`.
     pub fn host_tool_result(&self) -> Result<HostToolResultAck, DesktopRpcError> {
         HostToolResultAck::from_data(self.data()?)
+    }
+
+    /// The response to `host_message`.
+    pub fn host_message(&self) -> Result<HostMessageAck, DesktopRpcError> {
+        HostMessageAck::from_data(self.data()?)
+    }
+
+    /// The response to `set_host_context`.
+    pub fn set_host_context(&self) -> Result<SetHostContextAck, DesktopRpcError> {
+        SetHostContextAck::from_data(self.data()?)
     }
 
     fn data(&self) -> Result<&Value, DesktopRpcError> {

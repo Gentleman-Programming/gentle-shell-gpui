@@ -119,6 +119,8 @@ impl SessionView {
                 }
                 self.refresh_stats(cx);
             }
+            // The context html pages shared went with this run.
+            Some("agent_start") => self.host_genui_turn_started(cx),
             Some("session_info_changed") => {
                 self.session_name = event["name"].as_str().map(str::to_string);
             }

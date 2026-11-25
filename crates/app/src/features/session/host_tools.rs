@@ -23,6 +23,7 @@ use pi_rpc::desktop_rpc::{
 
 use super::{SessionEvent, SessionView};
 use crate::features::host_tools::{self as tools, Call, Outcome};
+use gentle_core::genui::host::Mode;
 
 /// How long the open canvas has to answer, as its `.agent` requests do.
 const CANVAS_ANSWER: Duration = Duration::from_secs(10);
@@ -45,6 +46,8 @@ pub enum HostToolRequest {
         request: serde_json::Value,
         reply: mpsc::Sender<CanvasAnswer>,
     },
+    /// `gentle-device` arguments for the window's device panel.
+    Device(Vec<String>),
 }
 
 /// The open canvas' answer: its JSON, and the picture a shot asked for.
@@ -52,6 +55,9 @@ pub struct CanvasAnswer {
     pub json: serde_json::Value,
     pub shot: Option<gentle_core::canvas::agent::Shot>,
 }
+
+/// A Pi tool result's `details`.
+pub(super) type Details = serde_json::Map<String, serde_json::Value>;
 
 /// The host tool state of one tab.
 #[derive(Default)]
@@ -63,9 +69,13 @@ pub(super) struct HostCalls {
     /// Calls taken, newest last.
     seen: VecDeque<String>,
     next_request: u64,
-    /// What the tab answered, for the tests (a test tab has no server).
+    /// The host context last sent (`set_host_context`), `None` when none
+    /// is held: sent again only when it changes.
+    pub(super) context: Option<String>,
+    /// What the tab answered, with its details, for the tests (a test tab
+    /// has no server).
     #[cfg(test)]
-    pub(super) sent: Vec<(String, Outcome)>,
+    pub(super) sent: Vec<(String, Outcome, Option<Details>)>,
 }
 
 impl HostCalls {
@@ -80,9 +90,10 @@ impl HostCalls {
         self.registered = false;
         self.active.clear();
         self.seen.clear();
+        self.context = None;
     }
 
-    fn request_id(&mut self) -> String {
+    pub(super) fn request_id(&mut self) -> String {
         self.next_request += 1;
         format!("host-{}", self.next_request)
     }
@@ -135,8 +146,11 @@ impl SessionView {
         let request = DesktopRequest::set_host_tools(
             self.host.request_id(),
             tools::PROVIDER,
-            &tools::definitions(self.canvas.is_some()),
+            &tools::definitions(self.canvas.is_some(), self.host_genui_mode()),
         );
+        // The server holds the context per session; offer it with the tools.
+        self.host.context = None;
+        self.send_host_context(cx);
         let request = match request {
             Ok(request) => request,
             Err(error) => {
@@ -195,6 +209,9 @@ impl SessionView {
         if event.event == HOST_TOOL_CANCEL {
             if let Ok(cancel) = event.host_tool_cancel() {
                 self.host.cancel(&cancel.call_id);
+                // A review waiting for decisions: the call is over (the
+                // server already ended it), the review stays open.
+                let _ = self.host_genui.stop_waiting(&cancel.call_id, "");
             }
             return;
         }
@@ -225,7 +242,8 @@ impl SessionView {
             args,
             ..
         } = call;
-        let call = match tools::route(&tool, &args, self.canvas.is_some()) {
+        let genui = self.host_genui_mode().is_some_and(|mode| mode != Mode::Off);
+        let call = match tools::route(&tool, &args, self.canvas.is_some(), genui) {
             Ok(call) => call,
             Err(message) => {
                 self.answer_host_call(call_id, tool, Outcome::error(message), cx);
@@ -289,6 +307,18 @@ impl SessionView {
                     ),
                 })
             }
+            Call::Device(op) => {
+                if let Some(args) = tools::device::panel_args(&op) {
+                    cx.emit(SessionEvent::HostTool(HostToolRequest::Device(args)));
+                }
+                Box::new(move || tools::device::run(op))
+            }
+            Call::Theme(op) => Box::new(move || tools::themes::run(op)),
+            // Runs here, on the conversation's own surfaces.
+            Call::GenUi(args) => {
+                self.run_genui_call(call_id, args, cx);
+                return;
+            }
         };
         cx.spawn(async move |this, cx| {
             let outcome = cx.background_executor().spawn(async move { work() }).await;
@@ -308,26 +338,46 @@ impl SessionView {
         outcome: Outcome,
         cx: &mut Context<Self>,
     ) {
+        self.answer_host_call_with(call_id, tool, outcome, None, cx);
+    }
+
+    /// [`Self::answer_host_call`] with the Pi tool result's `details`.
+    pub(super) fn answer_host_call_with(
+        &mut self,
+        call_id: String,
+        tool: String,
+        outcome: Outcome,
+        details: Option<Details>,
+        cx: &mut Context<Self>,
+    ) {
         if !self.host.finish(&call_id) {
             return;
         }
         #[cfg(test)]
-        self.host.sent.push((call_id.clone(), outcome.clone()));
+        self.host
+            .sent
+            .push((call_id.clone(), outcome.clone(), details.clone()));
         let Some(process) = self.process() else {
             return;
         };
         let id = self.host.request_id();
-        let request =
-            DesktopRequest::host_tool_result(&id, &call_id, &outcome.content, outcome.is_error)
-                .or_else(|error| {
-                    let text = format!("{tool} answered more than the app can send: {error}");
-                    DesktopRequest::host_tool_result(
-                        &id,
-                        &call_id,
-                        &[HostToolContent::text(text)],
-                        true,
-                    )
-                });
+        let request = DesktopRequest::host_tool_result(
+            &id,
+            &call_id,
+            &outcome.content,
+            outcome.is_error,
+            details.as_ref(),
+        )
+        .or_else(|error| {
+            let text = format!("{tool} answered more than the app can send: {error}");
+            DesktopRequest::host_tool_result(
+                &id,
+                &call_id,
+                &[HostToolContent::text(text)],
+                true,
+                None,
+            )
+        });
         let Ok(request) = request else {
             return;
         };

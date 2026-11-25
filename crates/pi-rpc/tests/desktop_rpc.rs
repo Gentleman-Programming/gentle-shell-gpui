@@ -4819,7 +4819,7 @@ fn capabilities_expose_the_profile_apply_method_and_event() {
 
 /// The `capabilities` methods of Gentle Shell 5.0.0, as the spec and a live
 /// backend list them.
-const MAIN_METHODS: [&str; 34] = [
+const MAIN_METHODS: [&str; 36] = [
     "capabilities",
     "get_snapshot",
     "get_config",
@@ -4854,6 +4854,8 @@ const MAIN_METHODS: [&str; 34] = [
     "reload_credentials",
     "set_host_tools",
     "host_tool_result",
+    "host_message",
+    "set_host_context",
 ];
 const MAIN_EVENTS: [&str; 10] = [
     "config_changed",
@@ -4893,7 +4895,7 @@ const RELEASE_4_8_EVENTS: [&str; 7] = [
     "profile_applied",
     "agents_update",
 ];
-const NEW_METHODS: [DesktopMethod; 20] = [
+const NEW_METHODS: [DesktopMethod; 22] = [
     DesktopMethod::GetJobOutput,
     DesktopMethod::GetSubagentThread,
     DesktopMethod::ListSessions,
@@ -4914,6 +4916,8 @@ const NEW_METHODS: [DesktopMethod; 20] = [
     DesktopMethod::ReloadCredentials,
     DesktopMethod::SetHostTools,
     DesktopMethod::HostToolResult,
+    DesktopMethod::HostMessage,
+    DesktopMethod::SetHostContext,
 ];
 
 fn capabilities_of(methods: &[&str], events: &[&str]) -> Capabilities {
@@ -7131,7 +7135,8 @@ fn host_tool_result_carries_text_and_images_up_to_the_content_cap() {
             mime_type: "image/png".into(),
         },
     ];
-    let request = DesktopRequest::host_tool_result("host-3", "call-1", &content, false).unwrap();
+    let request =
+        DesktopRequest::host_tool_result("host-3", "call-1", &content, false, None).unwrap();
     assert_eq!(
         request.payload(),
         payload(
@@ -7140,26 +7145,138 @@ fn host_tool_result_carries_text_and_images_up_to_the_content_cap() {
             r#"{"callId":"call-1","content":[{"type":"text","text":"Screenshot"},{"type":"image","data":"iVBORw0=","mimeType":"image/png"}]}"#
         )
     );
-    let failed =
-        DesktopRequest::host_tool_result("host-4", "call-1", &[HostToolContent::text("no")], true)
-            .unwrap();
+    let failed = DesktopRequest::host_tool_result(
+        "host-4",
+        "call-1",
+        &[HostToolContent::text("no")],
+        true,
+        None,
+    )
+    .unwrap();
     assert!(failed.payload().contains(r#""isError":true"#));
-    assert!(DesktopRequest::host_tool_result("host-5", "", &[], false).is_err());
+    assert!(DesktopRequest::host_tool_result("host-5", "", &[], false, None).is_err());
     // A result far over the 64 KiB of other requests still goes…
     let big = HostToolContent::Image {
         data: "A".repeat(MAX_RESULT_CONTENT_BYTES - 10),
         mime_type: "image/png".into(),
     };
     assert!(
-        DesktopRequest::host_tool_result("host-6", "call-1", std::slice::from_ref(&big), false)
-            .is_ok()
+        DesktopRequest::host_tool_result(
+            "host-6",
+            "call-1",
+            std::slice::from_ref(&big),
+            false,
+            None
+        )
+        .is_ok()
     );
     // …but not over the content cap.
     let over = [big, HostToolContent::text("x".repeat(11))];
     assert!(matches!(
-        DesktopRequest::host_tool_result("host-7", "call-1", &over, false),
+        DesktopRequest::host_tool_result("host-7", "call-1", &over, false, None),
         Err(DesktopRpcError::RequestTooLarge { .. })
     ));
+}
+
+#[test]
+fn host_tool_result_details_and_host_messages_encode_within_their_caps() {
+    use pi_rpc::desktop_rpc::{
+        HostDelivery, HostMessage, HostToolContent, MAX_DETAILS_BYTES, MAX_MESSAGE_CONTENT_BYTES,
+    };
+    let details = json!({"id": "ui-1", "version": 2})
+        .as_object()
+        .cloned()
+        .unwrap();
+    let result = DesktopRequest::host_tool_result(
+        "host-8",
+        "call-1",
+        &[HostToolContent::text("ok")],
+        false,
+        Some(&details),
+    )
+    .unwrap();
+    assert!(
+        result
+            .payload()
+            .ends_with(r#""details":{"id":"ui-1","version":2}}}"#)
+    );
+    let huge = json!({"x": "y".repeat(MAX_DETAILS_BYTES)})
+        .as_object()
+        .cloned()
+        .unwrap();
+    assert!(matches!(
+        DesktopRequest::host_tool_result("host-9", "call-1", &[], false, Some(&huge)),
+        Err(DesktopRpcError::RequestTooLarge { .. })
+    ));
+
+    let message = HostMessage {
+        custom_type: "host.gentle-ui.event".into(),
+        content: "The user edited it".into(),
+        display: true,
+        details: Some(details.clone()),
+        deliver: HostDelivery::Auto,
+        trigger_turn: Some(false),
+    };
+    let request = DesktopRequest::host_message("host-10", &message).unwrap();
+    assert_eq!(request.method(), DesktopMethod::HostMessage);
+    assert_eq!(
+        request.payload(),
+        payload(
+            "host-10",
+            "host_message",
+            r#"{"customType":"host.gentle-ui.event","content":"The user edited it","display":true,"deliver":"auto","details":{"id":"ui-1","version":2},"triggerTurn":false}"#
+        )
+    );
+    for bad in ["gentle-ui.event", "host.", "host.Upper", "host._x"] {
+        let message = HostMessage {
+            custom_type: bad.into(),
+            ..message.clone()
+        };
+        assert!(
+            DesktopRequest::host_message("host-11", &message).is_err(),
+            "{bad}"
+        );
+    }
+    let long = HostMessage {
+        content: "x".repeat(MAX_MESSAGE_CONTENT_BYTES + 1),
+        ..message.clone()
+    };
+    assert!(DesktopRequest::host_message("host-12", &long).is_err());
+
+    let context = DesktopRequest::set_host_context("host-13", "desktop", "shared", None).unwrap();
+    assert_eq!(
+        context.payload(),
+        payload(
+            "host-13",
+            "set_host_context",
+            r#"{"provider":"desktop","content":"shared"}"#
+        )
+    );
+    assert!(DesktopRequest::set_host_context("host-14", "", "", None).is_err());
+    assert!(DesktopRequest::new("x", DesktopMethod::HostMessage, json!({})).is_err());
+
+    assert!(
+        ok_response(json!({"delivered": true}))
+            .host_message()
+            .unwrap()
+            .delivered
+    );
+    assert!(
+        ok_response(json!({"set": true}))
+            .set_host_context()
+            .unwrap()
+            .set
+    );
+}
+
+#[test]
+fn capabilities_with_a_method_this_client_doesnt_know_still_decode() {
+    let mut methods = MAIN_METHODS.to_vec();
+    methods.push("set_host_activity");
+    let capabilities = capabilities_of(&methods, &MAIN_EVENTS);
+    assert!(capabilities.supports(DesktopMethod::HostMessage));
+    assert!(capabilities.supports(DesktopMethod::SetHostContext));
+    assert!(DesktopMethod::parse("set_host_activity").is_err());
 }
 
 #[test]

@@ -1812,7 +1812,7 @@ fn host_tool_calls_reach_their_handler_once_and_answer_unless_cancelled(cx: &mut
     assert_eq!(asked.borrow()[0], json!({"action": "read"}));
     view.update(cx, |view, _| {
         let sent = &view.host.sent;
-        let ids: Vec<&str> = sent.iter().map(|(id, _)| id.as_str()).collect();
+        let ids: Vec<&str> = sent.iter().map(|(id, ..)| id.as_str()).collect();
         // c2 answers at once; c1 once the canvas did; c3 was cancelled.
         assert_eq!(ids, ["c2", "c1"]);
         assert!(sent[0].1.is_error);
@@ -1822,4 +1822,173 @@ fn host_tool_calls_reach_their_handler_once_and_answer_unless_cancelled(cx: &mut
         assert!(!sent[1].1.is_error);
         assert!(text.contains("shapes"), "{text}");
     });
+}
+
+/// A server tab whose Desktop channel takes host messages and contexts.
+fn genui_server_tab(cx: &mut TestAppContext) -> (Entity<SessionView>, &mut VisualTestContext) {
+    let (view, cx) = tab(cx);
+    view.update(cx, |view, _| {
+        view.runs_on = Some(gentle_core::backend::Backend::Server {
+            url: "http://127.0.0.1:8787".into(),
+            device: "dev_1".into(),
+            name: "pc".into(),
+        });
+        let probe = view.desktop.ready(true).sends.remove(0);
+        view.desktop.ui(&response(
+            probe.request.request_id(),
+            json!({
+                "schema": SCHEMA, "command": PROMPT_COMMAND, "widget": WIDGET_KEY,
+                "methods": ["capabilities", "get_snapshot", "set_host_tools", "host_tool_result",
+                            "host_message", "set_host_context", "set_host_activity"],
+                "events": ["host_tool_call", "host_tool_cancel"],
+            }),
+        ));
+    });
+    (view, cx)
+}
+
+#[gpui::test]
+fn a_server_tab_runs_gentle_ui_itself_and_sends_edits_as_host_messages(cx: &mut TestAppContext) {
+    use gentle_core::genui::host::{HOST_EVENT_MESSAGE, Mode};
+    use gentle_core::transcript::Item;
+
+    let (view, cx) = genui_server_tab(cx);
+    view.read_with(cx, |view, _| {
+        assert_eq!(view.host_genui_mode(), Some(Mode::Proactive));
+    });
+    let args = json!({"action": "show", "id": "plan", "kind": "checklist",
+                      "spec": {"items": [{"id": "a", "label": "Back up"}]}});
+    view.update_in(cx, |view, window, cx| {
+        view.handle_batch(
+            vec![host_event(
+                1,
+                "host_tool_call",
+                json!({"callId": "g1", "provider": "dev_1", "tool": "gentle_ui", "args": args}),
+            )],
+            window,
+            cx,
+        );
+    });
+    cx.run_until_parked();
+    let details = view.read_with(cx, |view, _| {
+        let (id, outcome, details) = &view.host.sent[0];
+        assert_eq!(id, "g1");
+        assert!(!outcome.is_error);
+        let pi_rpc::desktop_rpc::HostToolContent::Text { text } = &outcome.content[0] else {
+            panic!("expected text")
+        };
+        assert!(
+            text.starts_with(
+                "Checklist \"Checklist\" (plan, v1) is shown to the user (0 of 1 done)."
+            ),
+            "{text}"
+        );
+        Value::Object(details.clone().expect("details"))
+    });
+    assert_eq!(details["kind"], "checklist");
+    assert_eq!(details["spec"]["items"][0]["done"], false);
+
+    // The server's Pi records the call with those details: the surface
+    // draws from them, as from the extension's result.
+    view.update_in(cx, |view, window, cx| {
+        view.handle_batch(
+            vec![
+                pi_rpc::Incoming::Event(json!({
+                    "type": "tool_execution_start", "toolCallId": "t1", "toolName": "gentle_ui", "args": args,
+                })),
+                pi_rpc::Incoming::Event(json!({
+                    "type": "tool_execution_end", "toolCallId": "t1", "toolName": "gentle_ui",
+                    "result": {"content": [{"type": "text", "text": "shown"}], "details": details},
+                })),
+            ],
+            window,
+            cx,
+        );
+    });
+    // The user checks the item: the edit goes as a host message.
+    let mut spec = details["spec"].clone();
+    spec["items"][0]["done"] = json!(true);
+    let command = gentle_core::genui::event_command_json(
+        "plan",
+        1,
+        &[json!({"op": "check", "item": "a", "done": true})],
+        &["checked Back up".to_string()],
+        &spec,
+        None,
+    );
+    let ran = std::rc::Rc::new(std::cell::Cell::new(None));
+    let seen = ran.clone();
+    view.update(cx, |view, cx| {
+        view.run_extension_command(command, cx, move |result, _| seen.set(Some(result)));
+    });
+    cx.run_until_parked();
+    assert_eq!(ran.take(), Some(Ok(())));
+    let message = view.read_with(cx, |view, _| view.host_messages[0].clone());
+    assert_eq!(message.custom_type, HOST_EVENT_MESSAGE);
+    assert_eq!(message.trigger_turn, Some(true));
+    assert!(message.content.starts_with(
+        "The user edited the checklist \"Checklist\" (plan, now v2) in the app:\n- checked Back up"
+    ));
+    let event_details = Value::Object(message.details.clone().unwrap());
+    assert_eq!(event_details["version"], 2);
+
+    // The message comes back in the conversation: drawn as the extension's
+    // event, and the next call builds on version 2.
+    view.update_in(cx, |view, window, cx| {
+        view.handle_batch(
+            vec![pi_rpc::Incoming::Event(json!({
+                "type": "message_end",
+                "message": {"role": "custom", "customType": HOST_EVENT_MESSAGE, "content": message.content,
+                            "display": true, "details": event_details},
+            }))],
+            window,
+            cx,
+        );
+        assert!(view.transcript.items.iter().any(|item| matches!(
+            item,
+            Item::Custom { kind, .. } if kind == gentle_core::genui::EVENT_MESSAGE
+        )));
+        view.handle_batch(
+            vec![host_event(
+                2,
+                "host_tool_call",
+                json!({"callId": "g2", "provider": "dev_1", "tool": "gentle_ui",
+                       "args": {"action": "update", "id": "plan", "patch": {"items": [{"id": "b", "label": "Migrate"}]}}}),
+            )],
+            window,
+            cx,
+        );
+    });
+    cx.run_until_parked();
+    view.read_with(cx, |view, _| {
+        let (_, outcome, details) = &view.host.sent[1];
+        assert!(!outcome.is_error);
+        assert_eq!(details.as_ref().unwrap()["version"], 3);
+    });
+
+    // Agent UI off: the tool's offer is withdrawn and the Off rule becomes
+    // the host context.
+    view.update(cx, |view, cx| {
+        view.run_extension_command(Mode::Off.command(), cx, |_, _| {});
+        assert_eq!(view.host_genui_mode(), Some(Mode::Off));
+        assert_eq!(
+            view.host.context.as_deref(),
+            Some(gentle_core::genui::host::guide::OFF_RULE)
+        );
+    });
+}
+
+#[gpui::test]
+fn a_local_tab_keeps_sending_gentle_ui_events_to_the_extension(cx: &mut TestAppContext) {
+    let (view, cx) = tab(cx);
+    let ran = std::rc::Rc::new(std::cell::Cell::new(None));
+    let seen = ran.clone();
+    view.update(cx, |view, cx| {
+        assert_eq!(view.host_genui_mode(), None);
+        let command = gentle_core::genui::host::Mode::Off.command();
+        view.run_extension_command(command, cx, move |result, _| seen.set(Some(result)));
+        assert!(view.host_messages.is_empty());
+    });
+    // Not handled here: it went to the (missing) backend.
+    assert!(matches!(ran.take(), Some(Err(_))));
 }

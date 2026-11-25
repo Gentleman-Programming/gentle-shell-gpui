@@ -246,6 +246,9 @@ impl Workspace {
                     self.browser_request(op.clone(), reply.clone(), window, cx)
                 }
                 crate::features::session::HostToolRequest::Canvas { .. } => {}
+                crate::features::session::HostToolRequest::Device(args) => {
+                    self.device_request(&args.clone(), cx)
+                }
             },
             SessionEvent::Notice { level, message } => {
                 let source = self.pane_title(id);

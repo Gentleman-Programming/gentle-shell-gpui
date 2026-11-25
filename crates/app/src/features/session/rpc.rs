@@ -603,7 +603,9 @@ impl SessionView {
             | DesktopMethod::GetChanges
             | DesktopMethod::GetChangeDiff
             | DesktopMethod::SetHostTools
-            | DesktopMethod::HostToolResult => {
+            | DesktopMethod::HostToolResult
+            | DesktopMethod::HostMessage
+            | DesktopMethod::SetHostContext => {
                 let sends = self.desktop.expire(generation);
                 self.send_desktop(sends, cx);
             }
@@ -680,7 +682,9 @@ impl SessionView {
             | DesktopMethod::GetChanges
             | DesktopMethod::GetChangeDiff
             | DesktopMethod::SetHostTools
-            | DesktopMethod::HostToolResult => {
+            | DesktopMethod::HostToolResult
+            | DesktopMethod::HostMessage
+            | DesktopMethod::SetHostContext => {
                 let applied = self.desktop.outer(generation, handled);
                 self.apply_desktop(applied, cx);
             }
@@ -1228,12 +1232,17 @@ impl SessionView {
     /// adding a turn: Pi runs extension commands at once, even mid-stream.
     /// `done` gets `Ok` only when Pi reports the command as `handled`, so a
     /// missing or renamed command surfaces instead of being sent as a prompt.
+    /// A server tab that runs `gentle_ui` itself answers the generative UI's
+    /// commands here (`host_genui`).
     pub fn run_extension_command(
         &mut self,
         text: String,
         cx: &mut Context<Self>,
         done: impl FnOnce(Result<(), String>, &mut App) + 'static,
     ) {
+        let Some((text, done)) = self.host_genui_command(text, Box::new(done), cx) else {
+            return;
+        };
         if self.process().is_none() {
             done(
                 Err("Gentle Shell is still starting in this tab; try again in a moment.".into()),

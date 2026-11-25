@@ -234,6 +234,7 @@ impl SessionView {
             self.genui.set_root(&self.cwd, cx);
             self.genui
                 .sync(&self.transcript.items, from, dirty.reset, cx);
+            self.sync_host_genui(from, dirty.reset, cx);
             let session = self.session_file();
             self.genui.restore_pins(session.as_deref(), cx);
         }

@@ -452,8 +452,14 @@ fn host_tool_requests_go_to_the_desktop_endpoint_and_calls_arrive_in_the_stream(
     assert!(!fake.log().iter().any(|l| l.ends_with("/rpc")));
 
     let result = |call: &str| {
-        DesktopRequest::host_tool_result("host-2", call, &[HostToolContent::text("ok")], false)
-            .unwrap()
+        DesktopRequest::host_tool_result(
+            "host-2",
+            call,
+            &[HostToolContent::text("ok")],
+            false,
+            None,
+        )
+        .unwrap()
     };
     assert!(
         process

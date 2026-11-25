@@ -607,7 +607,9 @@ pub(in crate::features::session) mod desktop {
                     | Some(DesktopMethod::ReloadCredentials)
                     // Sent to a server's `/desktop`, never through this slot.
                     | Some(DesktopMethod::SetHostTools)
-                    | Some(DesktopMethod::HostToolResult) => Applied::default(),
+                    | Some(DesktopMethod::HostToolResult)
+                    | Some(DesktopMethod::HostMessage)
+                    | Some(DesktopMethod::SetHostContext) => Applied::default(),
                     None => Applied::default(),
                 },
                 Ok(Some(DesktopRecord::Event(event))) => {

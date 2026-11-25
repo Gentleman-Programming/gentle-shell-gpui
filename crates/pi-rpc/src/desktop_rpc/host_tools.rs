@@ -2,17 +2,21 @@
 //! agent runs wherever Gentle Shell runs. `set_host_tools` registers a
 //! provider's whole set (an empty list unregisters it); the agent calling
 //! one arrives as a `host_tool_call` event, a stopped turn or call as
-//! `host_tool_cancel`, and the client answers with `host_tool_result`.
+//! `host_tool_cancel`, and the client answers with `host_tool_result`
+//! (optionally with the Pi tool result's `details`). The same client talks
+//! to the agent without a call too: `host_message` is a custom message in
+//! the conversation, `set_host_context` a hidden one added before every
+//! agent run while it is set.
 //!
 //! The limits are the contract's, checked before anything is sent: a tool
 //! the server would refuse never leaves the app. Through a Gentle Shell
-//! server both requests go to `POST /api/sessions/:id/desktop` (the server
+//! server these requests go to `POST /api/sessions/:id/desktop` (the server
 //! sets `provider` to the calling device), never as a `/gentle:desktop`
 //! prompt.
 
 use super::{DesktopRpcError, decode_data};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 /// The event the agent calling a host tool arrives as.
 pub const HOST_TOOL_CALL: &str = "host_tool_call";
@@ -37,8 +41,18 @@ pub const MAX_GUIDELINE_CHARS: usize = 512;
 pub const MAX_RESULT_CONTENT_BYTES: usize = 8 * 1024 * 1024;
 /// Largest `set_host_tools` inner request, in bytes.
 pub const MAX_SET_HOST_TOOLS_BYTES: usize = 1024 * 1024;
-/// Largest `host_tool_result` inner request, in bytes.
-pub const MAX_HOST_TOOL_RESULT_BYTES: usize = 9 * 1024 * 1024;
+/// Largest `host_tool_result` inner request, in bytes: the content cap,
+/// its `details`, and room for the encoding.
+pub const MAX_HOST_TOOL_RESULT_BYTES: usize = 10 * 1024 * 1024;
+/// Largest `details` object (a result's, message's or context's), in bytes
+/// of its JSON encoding.
+pub const MAX_DETAILS_BYTES: usize = 1024 * 1024;
+/// Largest `host_message` or `set_host_context` content, in UTF-8 bytes.
+pub const MAX_MESSAGE_CONTENT_BYTES: usize = 64 * 1024;
+/// Largest `host_message` or `set_host_context` inner request, in bytes.
+pub const MAX_HOST_MESSAGE_BYTES: usize = 2 * 1024 * 1024;
+/// Longest `host_message` custom type, in characters (`host.` included).
+const MAX_CUSTOM_TYPE_CHARS: usize = 69;
 
 /// One tool a client provides.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -176,12 +190,14 @@ impl HostToolContent {
     }
 }
 
-/// The wire `params` of `host_tool_result`: `{ callId, content }` and
-/// `isError` only when true, content within [`MAX_RESULT_CONTENT_BYTES`].
+/// The wire `params` of `host_tool_result`: `{ callId, content }`, and
+/// `isError` only when true, `details` only when given; content within
+/// [`MAX_RESULT_CONTENT_BYTES`], details within [`MAX_DETAILS_BYTES`].
 pub(super) fn host_tool_result_params(
     call_id: &str,
     content: &[HostToolContent],
     is_error: bool,
+    details: Option<&Map<String, Value>>,
 ) -> Result<Value, DesktopRpcError> {
     if call_id.is_empty() {
         return Err(DesktopRpcError::InvalidValue {
@@ -199,6 +215,131 @@ pub(super) fn host_tool_result_params(
     let mut params = json!({ "callId": call_id, "content": content });
     if is_error {
         params["isError"] = Value::Bool(true);
+    }
+    if let Some(details) = details {
+        params["details"] = checked_details(details)?;
+    }
+    Ok(params)
+}
+
+/// `details` as sent, refused over [`MAX_DETAILS_BYTES`].
+fn checked_details(details: &Map<String, Value>) -> Result<Value, DesktopRpcError> {
+    let value = Value::Object(details.clone());
+    let bytes = serde_json::to_string(&value)
+        .map_err(|error| DesktopRpcError::MalformedPayload(error.to_string()))?
+        .len();
+    if bytes > MAX_DETAILS_BYTES {
+        return Err(DesktopRpcError::RequestTooLarge {
+            bytes,
+            limit: MAX_DETAILS_BYTES,
+        });
+    }
+    Ok(value)
+}
+
+/// `content` refused over [`MAX_MESSAGE_CONTENT_BYTES`].
+fn checked_content(content: &str) -> Result<(), DesktopRpcError> {
+    if content.len() > MAX_MESSAGE_CONTENT_BYTES {
+        return Err(DesktopRpcError::RequestTooLarge {
+            bytes: content.len(),
+            limit: MAX_MESSAGE_CONTENT_BYTES,
+        });
+    }
+    Ok(())
+}
+
+/// Whether `custom_type` is a host message's:
+/// `^host\.[a-z0-9][a-z0-9_.-]{0,63}$`.
+pub fn valid_custom_type(custom_type: &str) -> bool {
+    let Some(name) = custom_type.strip_prefix("host.") else {
+        return false;
+    };
+    let mut chars = name.chars();
+    custom_type.len() <= MAX_CUSTOM_TYPE_CHARS
+        && chars
+            .next()
+            .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        && chars
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '_' | '.' | '-'))
+}
+
+/// How a host message reaches the agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostDelivery {
+    /// Start a run when the agent is idle (unless `trigger_turn` is
+    /// false), steer the running one otherwise.
+    Auto,
+    Steer,
+    FollowUp,
+    NextTurn,
+}
+
+impl HostDelivery {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Steer => "steer",
+            Self::FollowUp => "followUp",
+            Self::NextTurn => "nextTurn",
+        }
+    }
+}
+
+/// A custom message for the conversation (`host_message`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct HostMessage {
+    /// `host.<name>`.
+    pub custom_type: String,
+    pub content: String,
+    /// Shown in the conversation (or only read by the agent).
+    pub display: bool,
+    pub details: Option<Map<String, Value>>,
+    pub deliver: HostDelivery,
+    /// Sent only when given.
+    pub trigger_turn: Option<bool>,
+}
+
+/// The wire `params` of `host_message`.
+pub(super) fn host_message_params(message: &HostMessage) -> Result<Value, DesktopRpcError> {
+    if !valid_custom_type(&message.custom_type) {
+        return Err(DesktopRpcError::InvalidValue {
+            field: "customType",
+            value: message.custom_type.clone(),
+        });
+    }
+    checked_content(&message.content)?;
+    let mut params = json!({
+        "customType": message.custom_type,
+        "content": message.content,
+        "display": message.display,
+        "deliver": message.deliver.as_str(),
+    });
+    if let Some(details) = &message.details {
+        params["details"] = checked_details(details)?;
+    }
+    if let Some(trigger) = message.trigger_turn {
+        params["triggerTurn"] = Value::Bool(trigger);
+    }
+    Ok(params)
+}
+
+/// The wire `params` of `set_host_context`.
+pub(super) fn set_host_context_params(
+    provider: &str,
+    content: &str,
+    details: Option<&Map<String, Value>>,
+) -> Result<Value, DesktopRpcError> {
+    let chars = provider.chars().count();
+    if chars == 0 || chars > MAX_PROVIDER_CHARS {
+        return Err(DesktopRpcError::InvalidValue {
+            field: "provider",
+            value: provider.to_string(),
+        });
+    }
+    checked_content(content)?;
+    let mut params = json!({ "provider": provider, "content": content });
+    if let Some(details) = details {
+        params["details"] = checked_details(details)?;
     }
     Ok(params)
 }
@@ -230,6 +371,30 @@ pub struct HostToolResultAck {
 }
 
 impl HostToolResultAck {
+    pub(super) fn from_data(data: &Value) -> Result<Self, DesktopRpcError> {
+        decode_data(data)
+    }
+}
+
+/// The decoded `host_message` data: `{ delivered: true }`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct HostMessageAck {
+    pub delivered: bool,
+}
+
+impl HostMessageAck {
+    pub(super) fn from_data(data: &Value) -> Result<Self, DesktopRpcError> {
+        decode_data(data)
+    }
+}
+
+/// The decoded `set_host_context` data: `{ set: true }`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct SetHostContextAck {
+    pub set: bool,
+}
+
+impl SetHostContextAck {
     pub(super) fn from_data(data: &Value) -> Result<Self, DesktopRpcError> {
         decode_data(data)
     }

@@ -10,6 +10,9 @@
 //! - `screen`: what `gentle-screen` does, on this computer.
 //! - `canvas_read`, `canvas_edit`, `canvas_shot`: for an agent opened beside
 //!   a canvas, on that open canvas.
+//! - `gentle_ui`: what the app's generative UI extension does
+//!   (`gentle_core::genui::host`), when the server takes host messages and
+//!   Agent UI isn't off.
 //!
 //! This module is the pure part: the definitions sent, how a call's
 //! arguments become the operation the app's existing code runs, and how its
@@ -18,8 +21,12 @@
 use std::path::Path;
 
 use base64::Engine as _;
+use gentle_core::genui::host::{Mode, guide};
 use pi_rpc::desktop_rpc::{HostTool, HostToolContent};
 use serde_json::{Value, json};
+
+pub mod device;
+pub mod themes;
 
 /// The provider name the app registers under. A server replaces it with
 /// this device's id, which the call events then carry.
@@ -87,13 +94,31 @@ fn tool(
 }
 
 /// The tools the app offers a server session; the canvas tools only to an
-/// agent opened beside a canvas.
-pub fn definitions(canvas: bool) -> Vec<HostTool> {
+/// agent opened beside a canvas, `gentle_ui` with the rules of the Agent UI
+/// mode given (none: not offered).
+pub fn definitions(canvas: bool, genui: Option<Mode>) -> Vec<HostTool> {
     let mut tools = vec![open_page(), browser(), screen()];
+    if device::offered() {
+        tools.push(device::definition());
+    }
+    tools.push(themes::definition());
     if canvas {
         tools.extend(canvas_tools());
     }
+    if let Some(mode) = genui.filter(|mode| *mode != Mode::Off) {
+        tools.push(gentle_ui(mode));
+    }
     tools
+}
+
+fn gentle_ui(mode: Mode) -> HostTool {
+    HostTool {
+        name: gentle_core::genui::TOOL.into(),
+        label: guide::LABEL.into(),
+        description: guide::DESCRIPTION.into(),
+        parameters: guide::parameters(),
+        guidelines: guide::guidelines(mode),
+    }
 }
 
 fn open_page() -> HostTool {
@@ -294,11 +319,18 @@ pub enum Call {
     Screen(gentle_core::screen::Op),
     /// A request for the open canvas (`gentle_core::canvas::agent`).
     Canvas(Value),
+    /// A `gentle-device` operation (iOS/Android simulators).
+    Device(device::Op),
+    /// An app theme operation.
+    Theme(themes::Op),
+    /// A `gentle_ui` call, as the generative UI extension takes it.
+    GenUi(Value),
 }
 
 /// The operation `tool` called with `args` asks for, or what is wrong with
-/// the call, in words for the agent. `canvas`: this agent is beside one.
-pub fn route(tool: &str, args: &Value, canvas: bool) -> Result<Call, String> {
+/// the call, in words for the agent. `canvas`: this agent is beside one;
+/// `genui`: `gentle_ui` is offered.
+pub fn route(tool: &str, args: &Value, canvas: bool, genui: bool) -> Result<Call, String> {
     let text = |key: &str| args.get(key).and_then(Value::as_str);
     match tool {
         "open_page" => {
@@ -360,6 +392,9 @@ pub fn route(tool: &str, args: &Value, canvas: bool) -> Result<Call, String> {
                 json!({ "action": "shot", "area": args.get("area").cloned().unwrap_or("view".into()) })
             }
         })),
+        "device" if device::offered() => device::route(args).map(Call::Device),
+        "app_theme" => themes::route(args).map(Call::Theme),
+        "gentle_ui" if genui => Ok(Call::GenUi(args.clone())),
         other => Err(format!("The Gentle Shell app has no tool {other} here")),
     }
 }
@@ -481,12 +516,29 @@ mod tests {
 
     #[test]
     fn the_registration_fits_the_contract() {
-        for canvas in [false, true] {
-            let tools = definitions(canvas);
+        let modes = [
+            None,
+            Some(Mode::Proactive),
+            Some(Mode::WhenAsked),
+            Some(Mode::Off),
+        ];
+        for (canvas, genui) in [false, true]
+            .into_iter()
+            .flat_map(|c| modes.map(|m| (c, m)))
+        {
+            let tools = definitions(canvas, genui);
             let names: Vec<&str> = tools.iter().map(|tool| tool.name.as_str()).collect();
             let mut expected = vec!["open_page", "browser", "screen"];
+            if device::offered() {
+                expected.push("device");
+            }
+            expected.push("app_theme");
             if canvas {
                 expected.extend(["canvas_read", "canvas_edit", "canvas_shot"]);
+            }
+            // Agent UI off: not offered.
+            if genui.is_some_and(|mode| mode != Mode::Off) {
+                expected.push("gentle_ui");
             }
             assert_eq!(names, expected);
             for tool in &tools {
@@ -495,11 +547,18 @@ mod tests {
             // The whole request the server receives stays within its cap.
             DesktopRequest::set_host_tools("host-1", PROVIDER, &tools).unwrap();
         }
+        // Each mode's policy leads the rules.
+        let rules = |mode| definitions(false, Some(mode)).pop().unwrap().guidelines;
+        assert!(rules(Mode::Proactive)[0].starts_with("Use gentle_ui on your own initiative"));
+        assert!(
+            rules(Mode::WhenAsked)[0]
+                .starts_with("The user wants gentle_ui surfaces only on request")
+        );
     }
 
     #[test]
     fn no_tool_tells_the_agent_to_run_the_local_commands() {
-        for tool in definitions(true) {
+        for tool in definitions(true, Some(Mode::Proactive)) {
             let text = format!("{} {}", tool.description, tool.guidelines.join(" "));
             for command in [
                 "gentle-open",
@@ -515,14 +574,28 @@ mod tests {
     #[test]
     fn calls_become_the_drivers_operations() {
         assert_eq!(
-            route("open_page", &json!({"url": " https://x.dev "}), false),
+            route(
+                "open_page",
+                &json!({"url": " https://x.dev "}),
+                false,
+                false
+            ),
             Ok(Call::OpenPage("https://x.dev".into()))
         );
-        assert!(route("open_page", &json!({"url": "file:///etc/passwd"}), false).is_err());
+        assert!(
+            route(
+                "open_page",
+                &json!({"url": "file:///etc/passwd"}),
+                false,
+                false
+            )
+            .is_err()
+        );
 
         let Ok(Call::Browser { op, screenshot }) = route(
             "browser",
             &json!({"op": "fill", "tab": "app", "target": "e5", "text": "hi"}),
+            false,
             false,
         ) else {
             panic!("expected a browser op")
@@ -535,43 +608,87 @@ mod tests {
             "browser",
             &json!({"op": "open", "url": "https://x.dev", "hidden": true}),
             false,
+            false,
         ) else {
             panic!("expected open")
         };
         assert_eq!(op["show"], false);
         assert!(matches!(
-            route("browser", &json!({"op": "screenshot", "tab": "app"}), false),
+            route(
+                "browser",
+                &json!({"op": "screenshot", "tab": "app"}),
+                false,
+                false
+            ),
             Ok(Call::Browser {
                 screenshot: true,
                 ..
             })
         ));
-        assert!(route("browser", &json!({"op": "bogus", "tab": "app"}), false).is_err());
-        assert!(route("browser", &json!({"op": "goto", "tab": "app"}), false).is_err());
+        assert!(
+            route(
+                "browser",
+                &json!({"op": "bogus", "tab": "app"}),
+                false,
+                false
+            )
+            .is_err()
+        );
+        assert!(
+            route(
+                "browser",
+                &json!({"op": "goto", "tab": "app"}),
+                false,
+                false
+            )
+            .is_err()
+        );
 
         assert!(matches!(
             route(
                 "screen",
                 &json!({"op": "key", "window": 4, "keys": "cmd+s"}),
+                false,
                 false
             ),
             Ok(Call::Screen(gentle_core::screen::Op::Key { window: 4, .. }))
         ));
-        assert!(route("screen", &json!({"op": "launch", "command": []}), false).is_err());
+        assert!(
+            route(
+                "screen",
+                &json!({"op": "launch", "command": []}),
+                false,
+                false
+            )
+            .is_err()
+        );
 
         // Canvas tools only beside a canvas; string ops are read as JSON.
-        assert!(route("canvas_read", &json!({}), false).is_err());
+        assert!(route("canvas_read", &json!({}), false, false).is_err());
         assert_eq!(
-            route("canvas_edit", &json!({"ops": "[{\"op\":\"clear\"}]"}), true),
+            route(
+                "canvas_edit",
+                &json!({"ops": "[{\"op\":\"clear\"}]"}),
+                true,
+                false
+            ),
             Ok(Call::Canvas(
                 json!({"action": "edit", "ops": [{"op": "clear"}]})
             ))
         );
         assert_eq!(
-            route("canvas_shot", &json!({}), true),
+            route("canvas_shot", &json!({}), true, false),
             Ok(Call::Canvas(json!({"action": "shot", "area": "view"})))
         );
-        assert!(route("bash", &json!({}), true).is_err());
+        assert!(route("bash", &json!({}), true, false).is_err());
+
+        // gentle_ui only when offered; its arguments go as they came.
+        let args = json!({"action": "show", "spec": "{}"});
+        assert!(route("gentle_ui", &args, false, false).is_err());
+        assert_eq!(
+            route("gentle_ui", &args, false, true),
+            Ok(Call::GenUi(args))
+        );
     }
 
     #[test]
@@ -641,7 +758,7 @@ mod tests {
         };
         assert!(capabilities.supports(DesktopMethod::SetHostTools));
         assert!(capabilities.supports(DesktopMethod::HostToolResult));
-        let tools = definitions(true);
+        let tools = definitions(true, Some(Mode::Proactive));
         let request = DesktopRequest::set_host_tools("live-2", PROVIDER, &tools).unwrap();
         let result = process.desktop(&request).unwrap().set_host_tools().unwrap();
         assert!(result.rejected.is_empty(), "{:?}", result.rejected);
@@ -650,11 +767,16 @@ mod tests {
         let mut names: Vec<String> = tools.iter().map(|tool| tool.name.clone()).collect();
         names.sort();
         assert_eq!(registered, names);
+        let details = json!({"id": "ui-1", "version": 1})
+            .as_object()
+            .cloned()
+            .unwrap();
         let stray = DesktopRequest::host_tool_result(
             "live-3",
             "htc_000000000000000000000000",
             &[HostToolContent::text("nobody asked")],
             false,
+            Some(&details),
         )
         .unwrap();
         match process.desktop(&stray) {
@@ -663,6 +785,38 @@ mod tests {
                 Some("unknown_call")
             ),
             Err(error) => panic!("{error:#}"),
+        }
+        // gentle_ui's messages and context (no turn: the agent is idle and
+        // the message doesn't start one).
+        assert!(capabilities.supports(DesktopMethod::HostMessage));
+        assert!(capabilities.supports(DesktopMethod::SetHostContext));
+        let message = pi_rpc::desktop_rpc::HostMessage {
+            custom_type: gentle_core::genui::host::HOST_EVENT_MESSAGE.into(),
+            content: "The user inserted a template (live check).".into(),
+            display: true,
+            details: Some(details.clone()),
+            deliver: pi_rpc::desktop_rpc::HostDelivery::Auto,
+            trigger_turn: Some(false),
+        };
+        let sent = DesktopRequest::host_message("live-5", &message).unwrap();
+        assert!(
+            process
+                .desktop(&sent)
+                .unwrap()
+                .host_message()
+                .unwrap()
+                .delivered
+        );
+        for (id, content) in [("live-6", "Shared context (live check)."), ("live-7", "")] {
+            let context = DesktopRequest::set_host_context(id, PROVIDER, content, None).unwrap();
+            assert!(
+                process
+                    .desktop(&context)
+                    .unwrap()
+                    .set_host_context()
+                    .unwrap()
+                    .set
+            );
         }
         // Unregister, then stop the session there.
         let empty = DesktopRequest::set_host_tools("live-4", PROVIDER, &[]).unwrap();
