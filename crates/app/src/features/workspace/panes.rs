@@ -665,10 +665,13 @@ impl Workspace {
         }
     }
 
-    /// Focus the active tab's focused pane.
+    /// Focus the shown workspace's focused pane; with none (a workspace
+    /// with no tabs), the workspace itself takes the keyboard, so a focus
+    /// left on a hidden pane or a closed overlay can't swallow its keys.
     pub(super) fn focus_active(&self, window: &mut Window, cx: &mut App) {
-        if let Some(pane) = self.focused_pane().and_then(|id| self.panes.get(&id)) {
-            pane.item.focus.focus(window, cx);
+        match self.focused_pane().and_then(|id| self.panes.get(&id)) {
+            Some(pane) => pane.item.focus.focus(window, cx),
+            None => self.focus.focus(window, cx),
         }
     }
 

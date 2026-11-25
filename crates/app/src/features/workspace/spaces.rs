@@ -35,7 +35,11 @@ impl Workspace {
         self.finish_workspace_rename(true, window, cx);
         let changed = index != self.current;
         self.current = index;
-        if !self.space().tabs.is_empty() {
+        if self.space().tabs.is_empty() {
+            // Nothing here to focus: the previous workspace's pane must not
+            // keep the keyboard.
+            self.focus_active(window, cx);
+        } else {
             let active = self.space().active;
             self.activate(active, window, cx);
         }
