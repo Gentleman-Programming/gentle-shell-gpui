@@ -567,9 +567,9 @@ impl SettingsView {
                              code it shows (from outside its network, paste the long code: it \
                              goes through the server's relay). The connection is encrypted and \
                              pinned to that server's certificate. It runs the agents and keeps \
-                             them running while this app is closed. Project folders are paths \
-                             on the server; files, git, terminals and Setup aren't available \
-                             there yet."
+                             them running while this app is closed. Project folders, files, \
+                             git and terminals are the server's; Setup only checks that it \
+                             answers."
                         }
                         _ => {
                             "Agents, terminals, git and Setup run here; open agent tabs stay \

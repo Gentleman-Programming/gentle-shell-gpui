@@ -123,7 +123,7 @@ impl ServerUpgrade {
     }
 }
 
-/// Whether this device may upgrade the server, as asked once per screen.
+/// Whether this device may upgrade the server, as asked on the last reload.
 #[derive(Default)]
 pub(super) struct ServerUpgradeUi {
     /// The server offers `upgrade` and this device has `admin`.
@@ -236,12 +236,18 @@ fn follow(
 }
 
 impl SettingsView {
-    /// Ask whether this device may upgrade the server (once per screen).
+    /// Ask whether this device may upgrade the server, on every reload: a new
+    /// pairing (another device, other scopes) may answer differently.
     pub(super) fn ask_server_upgrade(&mut self, cx: &mut Context<Self>) {
         let Some(place) = self.server().cloned() else {
             return;
         };
-        if self.server_upgrade.allowed.is_some() || self.server_upgrade._ask.is_some() {
+        if self
+            .server_upgrade
+            .upgrade
+            .as_ref()
+            .is_some_and(ServerUpgrade::running)
+        {
             return;
         }
         let choice = place.backend.clone();
