@@ -1,15 +1,15 @@
 //! Gentle Shell servers (`gentle-shell serve`) as where agents run: pairing
-//! this device with one (at a typed address, or wherever on the network a
-//! connection code's server answers), and the device token pairing returns.
-//! The token is a secret, so it stays out of `settings.json` (which names
-//! only the server, the device id and the server's name): it lives in
-//! `server-tokens.json` in the app's folder, owner-only (`0600`), keyed by
-//! server address.
+//! this device with one (at a typed address, found on the local network for
+//! a short pairing code, or wherever on the network a connection code's
+//! server answers), and the device token pairing returns. The token is a
+//! secret, so it stays out of `settings.json` (which names only the server,
+//! the device id and the server's name): it lives in `server-tokens.json` in
+//! the app's folder, owner-only (`0600`), keyed by server address.
 
 use std::path::PathBuf;
 
 use gentle_core::backend::Backend;
-use gentle_core::serve::ConnectionCode;
+use gentle_core::serve::{ConnectionCode, Nearby};
 use pi_rpc::serve::{Paired, ServeClient, ServerInfo};
 use serde_json::{Map, Value, json};
 
@@ -106,6 +106,24 @@ pub fn pair(url: &str, code: &str) -> Result<(Backend, ServerInfo), String> {
 pub fn pair_code(code: &ConnectionCode, url: &str) -> Result<(Backend, ServerInfo), String> {
     let paired = pi_rpc::serve::pair_code(code, url, &device_name())?;
     paired_with(url.to_string(), code.name.clone(), paired)
+}
+
+/// The Gentle Shell servers on the local network, each checked: the
+/// discovery query goes to 255.255.255.255 and to every network's directed
+/// broadcast address on this computer. Blocking (about 1.5 s).
+pub fn nearby() -> Result<Vec<Nearby>, String> {
+    let networks: Vec<(std::net::IpAddr, u8)> = sysinfo::Networks::new_with_refreshed_list()
+        .values()
+        .flat_map(|data| data.ip_networks().iter().map(|n| (n.addr, n.prefix)))
+        .collect();
+    pi_rpc::serve::nearby(&gentle_core::serve::discovery_targets(&networks))
+}
+
+/// Pair this device with `server` (found by [`nearby`]) using the short
+/// pairing `code`, named as it names itself. Blocking.
+pub fn pair_nearby(server: &Nearby, code: &str) -> Result<(Backend, ServerInfo), String> {
+    let paired = pi_rpc::serve::pair_nearby(server, code, &device_name())?;
+    paired_with(server.url(), server.name.clone(), paired)
 }
 
 /// How this device names itself to a server.

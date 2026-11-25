@@ -1,14 +1,17 @@
 //! Gentle Shell servers (`gentle-shell serve`, protocol
 //! `gentle-shell.serve/v1`): the rules a client of one follows, without the
 //! network. The server address a user types ([`normalize_url`]), the
-//! connection code `gentle-shell serve share` prints and how the server it
-//! names is found ([`decode_connection_code`], [`search`]), what its errors
-//! mean to them ([`error_text`]), its Server-Sent Events framing
-//! ([`SseParser`]), the stream's cursor and what each event asks of the
-//! client ([`Stream`]), and the Pi responses the stream repeats under the
-//! server's own ids ([`RpcIds`]).
+//! codes `gentle-shell serve share` prints ([`read_code`]: the short pairing
+//! code, or the connection code and how the server it names is found,
+//! [`decode_connection_code`], [`search`]), finding servers on the local
+//! network by UDP broadcast ([`discovery_targets`], [`read_announce`],
+//! [`pick`]), what its errors mean to them ([`error_text`]), its
+//! Server-Sent Events framing ([`SseParser`]), the stream's cursor and what
+//! each event asks of the client ([`Stream`]), and the Pi responses the
+//! stream repeats under the server's own ids ([`RpcIds`]).
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -181,8 +184,9 @@ impl std::fmt::Display for CodeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             CodeError::NotACode => f.write_str(
-                "That isn't a connection code (they start with gsc1.). On the other computer, \
-                 run gentle-shell serve share and copy the whole code.",
+                "That isn't a code Gentle Shell GPUI reads. On the other computer, run \
+                 gentle-shell serve share and enter the 8-character code it shows (like \
+                 ABCD-EFGH), or paste the long code that starts with gsc1.",
             ),
             CodeError::Damaged => f.write_str(
                 "This connection code is damaged or cut short. Copy the whole code again.",
@@ -218,6 +222,28 @@ impl std::error::Error for CodeError {}
 /// Whether `input` looks like a connection code (it may still be damaged).
 pub fn is_connection_code(input: &str) -> bool {
     input.trim_start().starts_with(CODE_PREFIX)
+}
+
+/// What the one Code field holds: the short pairing code `gentle-shell
+/// serve share` shows (its server is looked for on the network), or the
+/// long connection code it prints as a fallback.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Entered {
+    /// `XXXX-XXXX`, read as the server reads it.
+    Short(String),
+    Connection(ConnectionCode),
+}
+
+/// The Code field's text, read: a short pairing code ([`short_code`]), or
+/// a connection code ([`decode_connection_code`]); anything else (empty
+/// too) is [`CodeError::NotACode`].
+pub fn read_code(input: &str) -> Result<Entered, CodeError> {
+    if is_connection_code(input) {
+        return decode_connection_code(input).map(Entered::Connection);
+    }
+    short_code(input)
+        .map(Entered::Short)
+        .ok_or(CodeError::NotACode)
 }
 
 /// A pasted connection code, checked. White space is ignored (a terminal
@@ -260,7 +286,7 @@ pub fn decode_connection_code(input: &str) -> Result<ConnectionCode, CodeError> 
         .ok_or(CodeError::BadPort)?;
     let pairing_code = value["c"]
         .as_str()
-        .and_then(pairing_code)
+        .and_then(short_code)
         .ok_or(CodeError::BadPairingCode)?;
     let mut urls: Vec<String> = Vec::new();
     for address in value["a"].as_array().into_iter().flatten() {
@@ -315,8 +341,9 @@ fn url_host(url: &str) -> &str {
 }
 
 /// A pairing code read as the server reads it (case, dashes and white
-/// space ignored, O as 0, I and L as 1), as `XXXX-XXXX`.
-fn pairing_code(code: &str) -> Option<String> {
+/// space ignored, O as 0, I and L as 1, the server's alphabet), as
+/// `XXXX-XXXX`; `None` when it can't be one.
+pub fn short_code(code: &str) -> Option<String> {
     let code: String = code
         .chars()
         .filter(|c| !c.is_whitespace() && *c != '-')
@@ -415,6 +442,193 @@ pub fn search(server_id: &str, arrived: &[(usize, Probe)], finished: bool) -> Se
     } else {
         Search::NotFound
     }
+}
+
+/// What a client broadcasts to find servers on the local network.
+pub const DISCOVER_TYPE: &str = "gentle-shell/discover";
+
+/// What a server answers a [`DISCOVER_TYPE`] query with.
+pub const HERE_TYPE: &str = "gentle-shell/here";
+
+/// The ports servers are looked for at: a server answers discovery on
+/// its HTTP port (8787 by default; the next free ones when that's taken).
+pub const DISCOVERY_PORTS: std::ops::RangeInclusive<u16> = 8787..=8796;
+
+/// The largest discovery datagram either side reads or sends.
+pub const DATAGRAM_MAX: usize = 512;
+
+/// The query a client broadcasts: `{"t":"gentle-shell/discover","v":1}`.
+pub fn discover_query() -> Vec<u8> {
+    serde_json::json!({"t": DISCOVER_TYPE, "v": 1})
+        .to_string()
+        .into_bytes()
+}
+
+/// A server's answer to the query: who it is and its HTTP port. Not yet
+/// trusted: anything on the network can send one, so it is checked at
+/// [`IDENTITY_PATH`] before a pairing code goes there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Announce {
+    pub server_id: String,
+    /// The server's host name, cleaned for showing (may be empty).
+    pub name: String,
+    pub port: u16,
+}
+
+/// A datagram read as a server's answer
+/// (`{"t":"gentle-shell/here","v":1,"id","n","p"}`); `None` for anything
+/// else: too long, not JSON, another type or version, no valid id or port.
+pub fn read_announce(datagram: &[u8]) -> Option<Announce> {
+    if datagram.len() > DATAGRAM_MAX {
+        return None;
+    }
+    let value: Value = serde_json::from_slice(datagram).ok()?;
+    if value["t"] != HERE_TYPE || value["v"] != 1 {
+        return None;
+    }
+    let server_id = value["id"].as_str().filter(|id| is_server_id(id))?;
+    let port = value["p"]
+        .as_u64()
+        .and_then(|p| u16::try_from(p).ok())
+        .filter(|p| *p > 0)?;
+    let name: String = value["n"]
+        .as_str()
+        .unwrap_or_default()
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .take(64)
+        .collect();
+    Some(Announce {
+        server_id: server_id.to_string(),
+        name: name.trim().to_string(),
+        port,
+    })
+}
+
+/// Whether `id` can be a server id (`srv_…`).
+fn is_server_id(id: &str) -> bool {
+    (1..=128).contains(&id.len())
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// The directed broadcast address of the IPv4 network `addr/prefix`
+/// (192.168.1.20/24 → 192.168.1.255); `None` for loopback, link-local and
+/// networks without one (/0, /31, /32).
+pub fn directed_broadcast(addr: Ipv4Addr, prefix: u8) -> Option<Ipv4Addr> {
+    if addr.is_loopback() || addr.is_link_local() || addr.is_unspecified() {
+        return None;
+    }
+    if !(1..=30).contains(&prefix) {
+        return None;
+    }
+    let host_bits = u32::MAX >> prefix;
+    Some(Ipv4Addr::from(u32::from(addr) | host_bits))
+}
+
+/// Where the discovery query goes, given this computer's interface
+/// networks (`address`, prefix length): 255.255.255.255 and each IPv4
+/// network's directed broadcast address, each at every port in
+/// [`DISCOVERY_PORTS`], without repeats.
+pub fn discovery_targets(networks: &[(IpAddr, u8)]) -> Vec<SocketAddr> {
+    let mut hosts = vec![Ipv4Addr::BROADCAST];
+    for (addr, prefix) in networks {
+        if let IpAddr::V4(addr) = addr
+            && let Some(broadcast) = directed_broadcast(*addr, *prefix)
+            && !hosts.contains(&broadcast)
+        {
+            hosts.push(broadcast);
+        }
+    }
+    hosts
+        .into_iter()
+        .flat_map(|host| DISCOVERY_PORTS.map(move |port| SocketAddr::from((host, port))))
+        .collect()
+}
+
+/// A server found on the network: it answered the query from `ip` and
+/// says the same id at [`IDENTITY_PATH`] there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Nearby {
+    pub server_id: String,
+    /// Its host name, or its address when it gave none.
+    pub name: String,
+    pub ip: IpAddr,
+    pub port: u16,
+}
+
+impl Nearby {
+    /// The server answering at `ip` as `announce` says.
+    pub fn new(announce: &Announce, ip: IpAddr) -> Self {
+        Self {
+            server_id: announce.server_id.clone(),
+            name: if announce.name.is_empty() {
+                ip.to_string()
+            } else {
+                announce.name.clone()
+            },
+            ip,
+            port: announce.port,
+        }
+    }
+
+    /// Its base URL, `http://ip:port`.
+    pub fn url(&self) -> String {
+        match self.ip {
+            IpAddr::V4(ip) => format!("http://{ip}:{}", self.port),
+            IpAddr::V6(ip) => format!("http://[{ip}]:{}", self.port),
+        }
+    }
+}
+
+/// What the search for servers on the network found, for a short code.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Pick {
+    /// No server: the code can't go anywhere.
+    None,
+    /// One server: the code goes there.
+    One(Nearby),
+    /// Several: the user picks one (by name, then address).
+    Many(Vec<Nearby>),
+}
+
+/// What to do with the servers found (each checked): a server reached at
+/// several addresses (one per interface) counts once, at the first.
+pub fn pick(found: Vec<Nearby>) -> Pick {
+    let mut servers: Vec<Nearby> = Vec::new();
+    for server in found {
+        if !servers.iter().any(|s| s.server_id == server.server_id) {
+            servers.push(server);
+        }
+    }
+    match servers.len() {
+        0 => Pick::None,
+        1 => Pick::One(servers.remove(0)),
+        _ => {
+            servers.sort_by(|a, b| {
+                a.name
+                    .to_lowercase()
+                    .cmp(&b.name.to_lowercase())
+                    .then(a.ip.cmp(&b.ip))
+            });
+            Pick::Many(servers)
+        }
+    }
+}
+
+/// No server answered on the network.
+pub const NONE_NEARBY: &str = "Couldn't find a computer running gentle-shell serve on your \
+     network. Make sure both are on the same Wi-Fi and its firewall allows port 8787 (on \
+     Omarchy: sudo ufw allow 8787). Or paste the long code (gsc1.…) gentle-shell serve share \
+     shows instead.";
+
+/// The server `name` refused the short code: unknown, used or expired.
+pub fn short_code_refused(name: &str) -> String {
+    format!(
+        "{name} doesn't know that code, or it expired or was already used. On {name}, run \
+         gentle-shell serve share again and enter the new code."
+    )
 }
 
 /// The `{ "error": { "code", "message" } }` every server error carries.
@@ -1184,5 +1398,178 @@ mod tests {
         assert!(missing.contains("port 8787"));
         assert!(code.other_server().contains("restarted"));
         assert!(code.expired().contains("expired or was already used"));
+    }
+
+    #[test]
+    fn the_code_field_reads_a_short_or_a_long_code() {
+        assert_eq!(
+            read_code(" abcd efgh "),
+            Ok(Entered::Short("ABCD-EFGH".into()))
+        );
+        assert_eq!(
+            read_code("o1il-2345"),
+            Ok(Entered::Short("0111-2345".into()))
+        );
+        assert_eq!(
+            read_code("ABCDEFGH"),
+            Ok(Entered::Short("ABCD-EFGH".into()))
+        );
+        assert_eq!(
+            read_code("AB-CD-EF-GH"),
+            Ok(Entered::Short("ABCD-EFGH".into()))
+        );
+        let long = read_code(&encode(&shared())).unwrap();
+        assert!(matches!(long, Entered::Connection(code) if code.server_id == "srv_abc123"));
+        assert_eq!(read_code("gsc1.!!!"), Err(CodeError::Damaged));
+        for bad in [
+            "",
+            "  ",
+            "ABCD-EFG",
+            "ABCD-EFGHJ",
+            "ABCD-EFGU",
+            "ABCD_EFGH",
+            "http://pc",
+        ] {
+            assert_eq!(read_code(bad), Err(CodeError::NotACode), "{bad:?}");
+        }
+        assert!(CodeError::NotACode.to_string().contains("8-character code"));
+    }
+
+    #[test]
+    fn the_discovery_query_and_answer_follow_the_contract() {
+        assert_eq!(
+            String::from_utf8(discover_query()).unwrap(),
+            r#"{"t":"gentle-shell/discover","v":1}"#
+        );
+        let here = |value: Value| read_announce(value.to_string().as_bytes());
+        assert_eq!(
+            here(json!({"t": HERE_TYPE, "v": 1, "id": "srv_1", "n": "omarchy", "p": 8788})),
+            Some(Announce {
+                server_id: "srv_1".into(),
+                name: "omarchy".into(),
+                port: 8788
+            })
+        );
+        // A name is cleaned for showing; none is allowed.
+        assert_eq!(
+            here(json!({"t": HERE_TYPE, "v": 1, "id": "srv_1", "n": " pc\u{7}\n", "p": 1}))
+                .unwrap()
+                .name,
+            "pc"
+        );
+        assert_eq!(
+            here(json!({"t": HERE_TYPE, "v": 1, "id": "srv_1", "p": 1}))
+                .unwrap()
+                .name,
+            ""
+        );
+        let long = "x".repeat(200);
+        assert_eq!(
+            here(json!({"t": HERE_TYPE, "v": 1, "id": "srv_1", "n": long, "p": 1}))
+                .unwrap()
+                .name
+                .len(),
+            64
+        );
+        for bad in [
+            json!({"t": DISCOVER_TYPE, "v": 1, "id": "srv_1", "p": 8787}),
+            json!({"t": HERE_TYPE, "v": 2, "id": "srv_1", "p": 8787}),
+            json!({"t": HERE_TYPE, "v": 1, "id": "", "p": 8787}),
+            json!({"t": HERE_TYPE, "v": 1, "id": "srv/x", "p": 8787}),
+            json!({"t": HERE_TYPE, "v": 1, "id": "srv_1", "p": 0}),
+            json!({"t": HERE_TYPE, "v": 1, "id": "srv_1", "p": 70000}),
+            json!({"t": HERE_TYPE, "v": 1, "id": "srv_1", "p": "8787"}),
+            json!([HERE_TYPE]),
+        ] {
+            assert_eq!(here(bad.clone()), None, "{bad}");
+        }
+        assert_eq!(read_announce(b"not json"), None);
+        let padded = format!(
+            r#"{{"t":"{HERE_TYPE}","v":1,"id":"srv_1","p":8787}}{}"#,
+            " ".repeat(DATAGRAM_MAX)
+        );
+        assert_eq!(read_announce(padded.as_bytes()), None);
+    }
+
+    #[test]
+    fn broadcasts_go_to_every_network_and_port() {
+        let v4 = Ipv4Addr::new;
+        assert_eq!(
+            directed_broadcast(v4(192, 168, 1, 20), 24),
+            Some(v4(192, 168, 1, 255))
+        );
+        assert_eq!(
+            directed_broadcast(v4(10, 1, 2, 3), 8),
+            Some(v4(10, 255, 255, 255))
+        );
+        assert_eq!(
+            directed_broadcast(v4(172, 16, 5, 9), 20),
+            Some(v4(172, 16, 15, 255))
+        );
+        assert_eq!(directed_broadcast(v4(127, 0, 0, 1), 8), None);
+        assert_eq!(directed_broadcast(v4(169, 254, 3, 4), 16), None);
+        assert_eq!(directed_broadcast(v4(192, 168, 1, 20), 32), None);
+        assert_eq!(directed_broadcast(v4(192, 168, 1, 20), 31), None);
+        assert_eq!(directed_broadcast(v4(192, 168, 1, 20), 0), None);
+
+        let targets = discovery_targets(&[
+            (IpAddr::V4(v4(192, 168, 1, 20)), 24),
+            (IpAddr::V4(v4(192, 168, 1, 21)), 24),
+            (IpAddr::V4(v4(127, 0, 0, 1)), 8),
+            ("fe80::1".parse().unwrap(), 64),
+            (IpAddr::V4(v4(10, 0, 0, 5)), 16),
+        ]);
+        let ports = DISCOVERY_PORTS.count();
+        assert_eq!(targets.len(), 3 * ports);
+        assert_eq!(targets[0], SocketAddr::from((Ipv4Addr::BROADCAST, 8787)));
+        assert_eq!(
+            targets[ports - 1],
+            SocketAddr::from((Ipv4Addr::BROADCAST, 8796))
+        );
+        assert_eq!(
+            targets[ports],
+            SocketAddr::from((v4(192, 168, 1, 255), 8787))
+        );
+        assert_eq!(
+            targets[2 * ports],
+            SocketAddr::from((v4(10, 0, 255, 255), 8787))
+        );
+        assert_eq!(discovery_targets(&[]).len(), ports);
+    }
+
+    #[test]
+    fn one_server_found_is_used_several_are_picked_from() {
+        let found = |id: &str, name: &str, ip: &str| {
+            Nearby::new(
+                &Announce {
+                    server_id: id.into(),
+                    name: name.into(),
+                    port: 8787,
+                },
+                ip.parse().unwrap(),
+            )
+        };
+        assert_eq!(pick(vec![]), Pick::None);
+        let pc = found("srv_1", "omarchy", "192.168.1.20");
+        // The same server over two interfaces is one.
+        assert_eq!(
+            pick(vec![pc.clone(), found("srv_1", "omarchy", "10.0.0.5")]),
+            Pick::One(pc.clone())
+        );
+        assert_eq!(pc.url(), "http://192.168.1.20:8787");
+        let nameless = found("srv_2", "", "192.168.1.30");
+        assert_eq!(nameless.name, "192.168.1.30");
+        let Pick::Many(servers) = pick(vec![
+            pc.clone(),
+            found("srv_3", "Mac-mini", "192.168.1.40"),
+            nameless,
+        ]) else {
+            panic!("several servers are picked from");
+        };
+        let names: Vec<&str> = servers.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["192.168.1.30", "Mac-mini", "omarchy"]);
+        assert!(NONE_NEARBY.contains("sudo ufw allow 8787"));
+        assert!(NONE_NEARBY.contains("gsc1."));
+        assert!(short_code_refused("omarchy").contains("On omarchy, run gentle-shell serve share"));
     }
 }

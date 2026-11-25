@@ -47,9 +47,11 @@ resvg = { version = "0.46", default-features = false, features = ["text", "raste
 # A theme image's size without decoding it, for the camera over it.
 imagesize = "0.15"
 # Resource diagnostics (GENTLE_SHELL_GPUI_DIAGNOSTICS): CPU and memory of
-# the app and every process under it. The version another dependency
-# already locks; only process data, read on one thread.
-sysinfo = { version = "0.31", default-features = false, features = ["system"] }
+# the app and every process under it; and this computer's networks, whose
+# broadcast addresses finding a Gentle Shell server on the network asks
+# (`features::backend::server::nearby`). The version another dependency
+# already locks.
+sysinfo = { version = "0.31", default-features = false, features = ["system", "network"] }
 
 # UI tests drive real views in headless windows (GPUI's `TestAppContext`):
 # the generative UI diagram's and panels' pointer and keyboard. Only GPUI's

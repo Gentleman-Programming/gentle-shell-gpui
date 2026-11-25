@@ -2,10 +2,11 @@
 //! against a small stand-in for `gentle-shell serve`: plain HTTP/1.1 and a
 //! Server-Sent Events stream, with the server's own ids on the stream's
 //! copies of responses, `202 pending`, reconnects and `snapshot-required`;
-//! and finding the server a connection code names, then pairing there.
+//! and finding the server a connection code names, or the servers on the
+//! network (a stand-in UDP responder on 127.0.0.1), then pairing there.
 
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
-use std::net::{TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -458,4 +459,92 @@ fn a_server_nowhere_on_the_network_says_what_to_check() {
         "{error}"
     );
     assert!(fake.log().is_empty());
+}
+
+/// A stand-in for a server's discovery responder on 127.0.0.1: every
+/// datagram it gets is kept, and answered with each of `answers`.
+fn responder(answers: Vec<Vec<u8>>) -> (SocketAddr, Arc<Mutex<Vec<Vec<u8>>>>) {
+    let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let addr = socket.local_addr().unwrap();
+    let got = Arc::new(Mutex::new(Vec::new()));
+    let kept = got.clone();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 2048];
+        while let Ok((len, from)) = socket.recv_from(&mut buf) {
+            kept.lock().unwrap().push(buf[..len].to_vec());
+            for answer in &answers {
+                let _ = socket.send_to(answer, from);
+            }
+        }
+    });
+    (addr, got)
+}
+
+fn here(server_id: &str, port: u16) -> Vec<u8> {
+    json!({"t": "gentle-shell/here", "v": 1, "id": server_id, "n": "omarchy", "p": port})
+        .to_string()
+        .into_bytes()
+}
+
+fn port_of(fake: &Fake) -> u16 {
+    fake.url.rsplit_once(':').unwrap().1.parse().unwrap()
+}
+
+#[test]
+fn a_server_on_the_network_is_found_checked_and_paired_with_a_short_code() {
+    let fake = Fake::start();
+    let port = port_of(&fake);
+    // The same answer twice is one server.
+    let (addr, got) = responder(vec![here(SERVER_ID, port), here(SERVER_ID, port)]);
+    let found = pi_rpc::serve::nearby(&[addr]).unwrap();
+    assert_eq!(
+        got.lock().unwrap().as_slice(),
+        [br#"{"t":"gentle-shell/discover","v":1}"#.to_vec()]
+    );
+    assert_eq!(found.len(), 1);
+    let server = &found[0];
+    assert_eq!(server.server_id, SERVER_ID);
+    assert_eq!(server.name, "omarchy");
+    assert_eq!(server.url(), fake.url);
+    let paired =
+        pi_rpc::serve::pair_nearby(server, PAIRING_CODE, "Gentle Shell GPUI on test").unwrap();
+    assert_eq!(paired.token, TOKEN);
+    let again =
+        pi_rpc::serve::pair_nearby(server, PAIRING_CODE, "Gentle Shell GPUI on test").unwrap_err();
+    assert!(
+        again.contains("On omarchy, run gentle-shell serve share"),
+        "{again}"
+    );
+}
+
+#[test]
+fn an_answer_the_server_there_doesnt_confirm_is_dropped() {
+    let fake = Fake::start();
+    let port = port_of(&fake);
+    // Claims an id the HTTP server there doesn't have, or a port nothing
+    // listens on; junk and too-long datagrams are ignored.
+    let closed = TcpListener::bind("127.0.0.1:0").unwrap();
+    let closed_port = closed.local_addr().unwrap().port();
+    drop(closed);
+    let mut long = here(SERVER_ID, port);
+    long.extend(std::iter::repeat_n(b' ', 600));
+    let (addr, _) = responder(vec![
+        here("srv_impostor", port),
+        here(SERVER_ID, closed_port),
+        b"hello".to_vec(),
+        long,
+    ]);
+    let found = pi_rpc::serve::nearby(&[addr]).unwrap();
+    assert!(found.is_empty(), "{found:?}");
+    // Only asked who it is: no pairing code went anywhere.
+    assert_eq!(fake.log(), vec!["GET /.well-known/gentle-shell"]);
+}
+
+#[test]
+fn nothing_answering_finds_nothing() {
+    let silent = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let started = Instant::now();
+    let found = pi_rpc::serve::nearby(&[silent.local_addr().unwrap()]).unwrap();
+    assert!(found.is_empty());
+    assert!(started.elapsed() < Duration::from_secs(4));
 }

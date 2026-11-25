@@ -5,6 +5,7 @@
 //! stay where they started.
 
 use gentle_core::backend::{Backend, Distro};
+use gentle_core::serve::{Entered, Nearby, Pick};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
@@ -73,10 +74,14 @@ pub(super) struct RunsOn {
     check: Task<()>,
     /// Pointing Configuration at the new backend's Gentle Shell home.
     homes: Task<()>,
-    /// The connection code `gentle-shell serve share` printed on the
-    /// server: pasting one connects.
-    server_link: Entity<InputState>,
-    _server_link: Subscription,
+    /// The Code field: the short pairing code `gentle-shell serve share`
+    /// shows (its server is found on the network), or the long connection
+    /// code it prints as a fallback (pasting one connects).
+    code_field: Entity<InputState>,
+    _code_field: Subscription,
+    /// Several servers on the network answered: the user picks the one
+    /// the short code (the first) is for.
+    choices: Option<(String, Vec<Nearby>)>,
     /// Whether the address and pairing code fields show (Enter address
     /// manually).
     manual: bool,
@@ -89,7 +94,8 @@ pub(super) struct RunsOn {
     /// couldn't be asked).
     server: Option<Result<ServerInfo, String>>,
     pairing: bool,
-    /// Where connecting with a code is ("Looking for pc on your network…").
+    /// Where connecting with a code is ("Looking for computers on your
+    /// network…").
     progress: Option<String>,
     pair_error: Option<String>,
     pair: Task<()>,
@@ -131,17 +137,18 @@ impl RunsOn {
                 this.pair_server(cx);
             }
         });
-        let server_link = cx.new(|cx| InputState::new(window, cx).placeholder("gsc1.…"));
-        let link_subscription =
-            cx.subscribe(&server_link, |this, input, event: &InputEvent, cx| {
+        let code_field = cx.new(|cx| InputState::new(window, cx).placeholder("XXXX-XXXX"));
+        let field_subscription =
+            cx.subscribe(&code_field, |this, input, event: &InputEvent, cx| {
                 let text = input.read(cx).value().to_string();
                 match event {
-                    // A pasted code connects at once.
+                    // A pasted connection code connects at once.
                     InputEvent::Change if gentle_core::serve::is_connection_code(&text) => {
                         this.connect_code(&text, cx);
                     }
                     InputEvent::Change if text.trim().is_empty() && !this.runs_on.pairing => {
                         this.runs_on.pair_error = None;
+                        this.runs_on.choices = None;
                         cx.notify();
                     }
                     InputEvent::PressEnter { .. } => this.connect_code(&text, cx),
@@ -159,8 +166,9 @@ impl RunsOn {
             task: Task::ready(()),
             check: Task::ready(()),
             homes: Task::ready(()),
-            server_link,
-            _server_link: link_subscription,
+            code_field,
+            _code_field: field_subscription,
+            choices: None,
             manual: false,
             server_url,
             server_code,
@@ -295,14 +303,18 @@ impl SettingsView {
         cx.notify();
     }
 
-    /// Connect with a connection code (`gentle-shell serve share`): look
-    /// for its server at every address in it, then pair where it answered.
+    /// Connect with what the Code field holds: a short pairing code (find
+    /// the servers on the network, then pair with the one that answered,
+    /// or let the user pick when several did), or a connection code (look
+    /// for its server at every address in it, then pair where it answered).
     fn connect_code(&mut self, text: &str, cx: &mut Context<Self>) {
         if self.runs_on.pairing {
             return;
         }
-        let code = match gentle_core::serve::decode_connection_code(text) {
-            Ok(code) => code,
+        self.runs_on.choices = None;
+        let code = match gentle_core::serve::read_code(text) {
+            Ok(Entered::Connection(code)) => code,
+            Ok(Entered::Short(code)) => return self.find_nearby(code, cx),
             Err(error) => {
                 self.runs_on.pair_error = Some(error.to_string());
                 cx.notify();
@@ -334,6 +346,71 @@ impl SettingsView {
             let paired = cx
                 .background_executor()
                 .spawn(async move { backend::server::pair_code(&code, &url) })
+                .await;
+            let _ = this.update(cx, |this, cx| this.paired(paired, cx));
+        });
+        cx.notify();
+    }
+
+    /// Find the servers on the network for the short pairing `code`: one
+    /// that answered is paired with at once; several are listed to pick
+    /// from.
+    fn find_nearby(&mut self, code: String, cx: &mut Context<Self>) {
+        self.runs_on.pairing = true;
+        self.runs_on.pair_error = None;
+        self.runs_on.progress = Some("Looking for computers on your network…".into());
+        self.runs_on.pair = cx.spawn(async move |this, cx| {
+            let found = cx
+                .background_executor()
+                .spawn(async move { backend::server::nearby() })
+                .await;
+            let server = match found.map(gentle_core::serve::pick) {
+                Ok(Pick::One(server)) => server,
+                Ok(Pick::Many(servers)) => {
+                    let _ = this.update(cx, |this, cx| {
+                        this.runs_on.pairing = false;
+                        this.runs_on.progress = None;
+                        this.runs_on.choices = Some((code, servers));
+                        cx.notify();
+                    });
+                    return;
+                }
+                Ok(Pick::None) => {
+                    let error = gentle_core::serve::NONE_NEARBY.to_string();
+                    let _ = this.update(cx, |this, cx| this.paired(Err(error), cx));
+                    return;
+                }
+                Err(error) => {
+                    let _ = this.update(cx, |this, cx| this.paired(Err(error), cx));
+                    return;
+                }
+            };
+            let _ = this.update(cx, |this, cx| {
+                this.runs_on.progress = Some(format!("Pairing with {}…", server.name));
+                cx.notify();
+            });
+            let paired = cx
+                .background_executor()
+                .spawn(async move { backend::server::pair_nearby(&server, &code) })
+                .await;
+            let _ = this.update(cx, |this, cx| this.paired(paired, cx));
+        });
+        cx.notify();
+    }
+
+    /// Pair with `server` (found on the network) using the short `code`.
+    fn pair_nearby(&mut self, server: Nearby, code: String, cx: &mut Context<Self>) {
+        if self.runs_on.pairing {
+            return;
+        }
+        self.runs_on.choices = None;
+        self.runs_on.pairing = true;
+        self.runs_on.pair_error = None;
+        self.runs_on.progress = Some(format!("Pairing with {}…", server.name));
+        self.runs_on.pair = cx.spawn(async move |this, cx| {
+            let paired = cx
+                .background_executor()
+                .spawn(async move { backend::server::pair_nearby(&server, &code) })
                 .await;
             let _ = this.update(cx, |this, cx| this.paired(paired, cx));
         });
@@ -447,11 +524,11 @@ impl SettingsView {
                              docker exec -i dev). Press Enter to use it."
                         }
                         Kind::Server => {
-                            "On the other computer, run gentle-shell serve share and paste the \
-                             code here. Use it on a network you trust: the server speaks plain \
-                             HTTP. It runs the agents and keeps them running while this app is \
-                             closed. Project folders are paths on the server; files, git, \
-                             terminals and Setup aren't available there yet."
+                            "On the other computer, run gentle-shell serve share and enter the \
+                             code it shows. Use it on a network you trust: the server speaks \
+                             plain HTTP. It runs the agents and keeps them running while this \
+                             app is closed. Project folders are paths on the server; files, \
+                             git, terminals and Setup aren't available there yet."
                         }
                         _ => {
                             "Agents, terminals, git and Setup run here; open agent tabs stay \
@@ -463,8 +540,9 @@ impl SettingsView {
     }
 
     /// The paired server (its name, address and id, and Unpair), or the
-    /// connection code to connect with one (and, under Enter address
-    /// manually, the address and pairing code).
+    /// Code field to connect with one (the servers that answered on the
+    /// network when several did, and, under Enter address manually, the
+    /// address and pairing code).
     fn render_server(&self, cx: &mut Context<Self>) -> Div {
         if let Backend::Server { url, device, name } = &self.runs_on.choice {
             let server_id = match &self.runs_on.server {
@@ -559,7 +637,7 @@ impl SettingsView {
             ));
         v_flex()
             .child(control(
-                "Connection code",
+                "Code",
                 false,
                 h_flex()
                     .flex_1()
@@ -570,9 +648,13 @@ impl SettingsView {
                             .flex_1()
                             .min_w_0()
                             .h(rems(30. / 16.))
-                            .child(Icon::new(IconName::Link).small().text_color(ui::faint()))
                             .child(
-                                Input::new(&self.runs_on.server_link)
+                                Icon::new(IconName::KeyRound)
+                                    .small()
+                                    .text_color(ui::faint()),
+                            )
+                            .child(
+                                Input::new(&self.runs_on.code_field)
                                     .appearance(false)
                                     .small(),
                             ),
@@ -589,7 +671,7 @@ impl SettingsView {
                             })
                             .disabled(pairing)
                             .on_click(cx.listener(|this, _, _, cx| {
-                                let text = this.runs_on.server_link.read(cx).value().to_string();
+                                let text = this.runs_on.code_field.read(cx).value().to_string();
                                 this.connect_code(&text, cx);
                             })),
                     ),
@@ -612,6 +694,7 @@ impl SettingsView {
                     .child(Icon::new(IconName::CircleAlert).xsmall())
                     .child(div().min_w_0().child(error))
             }))
+            .children(self.render_nearby(cx))
             .child(
                 h_flex()
                     .id("runs-on-manual")
@@ -637,6 +720,55 @@ impl SettingsView {
                     })),
             )
             .when(manual, |d| d.child(manual_fields))
+    }
+
+    /// The servers that answered on the network, when several did: one
+    /// row each (its name and address) to pair the short code with.
+    fn render_nearby(&self, cx: &mut Context<Self>) -> Option<Div> {
+        let (code, servers) = self.runs_on.choices.as_ref()?;
+        let rows = servers.iter().enumerate().map(|(ix, server)| {
+            let (server, code) = (server.clone(), code.clone());
+            h_flex()
+                .id(("runs-on-nearby", ix))
+                .h(rems(26. / 16.))
+                .px_2()
+                .gap_2()
+                .rounded_md()
+                .cursor_pointer()
+                .hover(|s| s.bg(ui::surface_hover()))
+                .child(Icon::new(IconName::Server).xsmall().text_color(ui::faint()))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_xs()
+                        .text_color(ui::fg())
+                        .child(server.name.clone()),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .text_xs()
+                        .text_color(ui::faint())
+                        .child(server.ip.to_string()),
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.pair_nearby(server.clone(), code.clone(), cx)
+                }))
+        });
+        Some(
+            v_flex()
+                .pt_2()
+                .gap_1()
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(ui::muted())
+                        .child("Several computers answered. Which one showed this code?"),
+                )
+                .child(v_flex().gap_px().children(rows)),
+        )
     }
 
     fn render_distros(&self, cx: &mut Context<Self>) -> Div {

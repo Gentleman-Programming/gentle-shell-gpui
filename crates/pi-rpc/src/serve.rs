@@ -19,13 +19,15 @@
 //!   to reattach to ([`PiProcess::serve`] with its id).
 
 use std::io::Read as _;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
 use gentle_core::serve::{
-    self as protocol, ConnectionCode, Probe, RpcIds, Search, SseParser, Step, Stream,
+    self as protocol, Announce, ConnectionCode, Nearby, Probe, RpcIds, Search, SseParser, Step,
+    Stream,
 };
 use serde_json::{Value, json};
 
@@ -49,6 +51,10 @@ const BODY_LIMIT: u64 = 64 * 1024 * 1024;
 const PROBE: Duration = Duration::from_millis(1500);
 /// How long looking for that server may take in all.
 const SEARCH: Duration = Duration::from_secs(4);
+/// How long servers on the network have to answer the discovery query.
+const LISTEN: Duration = Duration::from_millis(1500);
+/// The most distinct discovery answers kept (each is then checked).
+const ANSWERS: usize = 32;
 
 /// What went wrong talking to a server, in words for the user.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -312,12 +318,7 @@ impl ServeClient {
 /// gets [`PROBE`], the whole search [`SEARCH`]. The pairing code is sent
 /// nowhere here. Blocking.
 pub fn locate(code: &ConnectionCode) -> Result<String, String> {
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .http_status_as_error(false)
-        .max_redirects(0)
-        .timeout_global(Some(PROBE))
-        .build()
-        .into();
+    let agent = probe_agent();
     let (tx, rx) = mpsc::channel();
     for (index, url) in code.urls.iter().enumerate() {
         let (agent, tx) = (agent.clone(), tx.clone());
@@ -359,6 +360,97 @@ fn probe(agent: &ureq::Agent, url: &str) -> Probe {
         return Probe::NotAServer;
     }
     read_json(&mut response).map_or(Probe::NotAServer, |body| protocol::identity(&body))
+}
+
+/// An agent for `GET /.well-known/gentle-shell`: [`PROBE`] in all.
+fn probe_agent() -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .max_redirects(0)
+        .timeout_global(Some(PROBE))
+        .build()
+        .into()
+}
+
+/// The Gentle Shell servers on the local network: the discovery query
+/// (`{"t":"gentle-shell/discover","v":1}`) goes from one UDP socket to every
+/// address in `targets` (broadcast addresses and ports,
+/// [`protocol::discovery_targets`]); answers are collected for [`LISTEN`],
+/// then each is checked at `/.well-known/gentle-shell` on the address it
+/// came from: only those saying the same server id are kept, in the order
+/// they answered. No secret is sent. Blocking.
+pub fn nearby(targets: &[SocketAddr]) -> Result<Vec<Nearby>, String> {
+    let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
+        .map_err(|e| format!("Couldn't look for servers on the network: {e}"))?;
+    // Without it, sending to a broadcast address is refused; a target that
+    // still can't be sent to (no route) is skipped.
+    let _ = socket.set_broadcast(true);
+    let query = protocol::discover_query();
+    for target in targets {
+        let _ = socket.send_to(&query, target);
+    }
+    let deadline = Instant::now() + LISTEN;
+    let mut heard: Vec<(Announce, IpAddr)> = Vec::new();
+    // One byte more than an answer may be, so a longer one reads as too long.
+    let mut buf = [0u8; protocol::DATAGRAM_MAX + 1];
+    while heard.len() < ANSWERS {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() || socket.set_read_timeout(Some(left)).is_err() {
+            break;
+        }
+        match socket.recv_from(&mut buf) {
+            Ok((len, from)) => {
+                if let Some(announce) = protocol::read_announce(&buf[..len]) {
+                    let answer = (announce, from.ip());
+                    if !heard.contains(&answer) {
+                        heard.push(answer);
+                    }
+                }
+            }
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                break;
+            }
+            // An ICMP error for one target (port unreachable): keep listening.
+            Err(_) => {}
+        }
+    }
+    let agent = probe_agent();
+    let (tx, rx) = mpsc::channel();
+    for (index, (announce, ip)) in heard.into_iter().enumerate() {
+        let (agent, tx) = (agent.clone(), tx.clone());
+        let _ = std::thread::Builder::new()
+            .name("serve-verify".into())
+            .spawn(move || {
+                let server = Nearby::new(&announce, ip);
+                let url = format!("{}{}", server.url(), protocol::IDENTITY_PATH);
+                let verified = probe(&agent, &url) == Probe::Server(server.server_id.clone());
+                let _ = tx.send((index, verified.then_some(server)));
+            });
+    }
+    drop(tx);
+    let mut checked: Vec<(usize, Nearby)> = rx
+        .iter()
+        .filter_map(|(index, server)| Some((index, server?)))
+        .collect();
+    checked.sort_by_key(|(index, _)| *index);
+    Ok(checked.into_iter().map(|(_, server)| server).collect())
+}
+
+/// Pair this device, named `name`, with `server` (found on the network by
+/// [`nearby`]) using the short pairing `code`. A code the server doesn't
+/// take reads as one to make again. Blocking.
+pub fn pair_nearby(server: &Nearby, code: &str, name: &str) -> Result<Paired, String> {
+    ServeClient::new(&server.url(), None)
+        .pair(code, name)
+        .map_err(|e| match (e.status, e.error.as_deref()) {
+            (Some(403), Some("invalid_code")) => protocol::short_code_refused(&server.name),
+            _ => e.message,
+        })
 }
 
 /// Pair this device, named `name`, with the server a connection code names
