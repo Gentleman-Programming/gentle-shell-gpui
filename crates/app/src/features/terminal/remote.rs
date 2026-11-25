@@ -88,7 +88,7 @@ pub(super) enum Problem {
     /// it fits the server.
     NoHost {
         host: TermHost,
-        bundled: Option<PathBuf>,
+        bundled: Option<Box<Binary>>,
     },
     /// This device may not open terminals there (paired without the
     /// `terminal` scope).
@@ -105,8 +105,42 @@ pub(super) struct Blocked {
     connect: Option<(Entity<ServerConnect>, Subscription)>,
     /// A terminal host is being installed.
     installing: bool,
+    /// The file being (or last) installed, once read: shown with its
+    /// SHA-256.
+    sent: Option<Binary>,
     install_error: Option<String>,
     install: Task<()>,
+}
+
+/// A terminal host binary on this computer, as it would be installed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct Binary {
+    path: PathBuf,
+    /// Its SHA-256, in hex: what the server checks the upload against.
+    sha256: String,
+}
+
+impl Binary {
+    /// `path`'s bytes and what they are. Blocking.
+    fn read(path: &Path) -> Result<(Self, Vec<u8>), String> {
+        use sha2::Digest as _;
+        let bytes =
+            std::fs::read(path).map_err(|e| format!("Couldn't read {}: {e}", path.display()))?;
+        let sha256 = sha2::Sha256::digest(&bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let binary = Self {
+            path: path.to_path_buf(),
+            sha256,
+        };
+        Ok((binary, bytes))
+    }
+
+    /// What is installed, in words: the file and its SHA-256.
+    fn describe(&self) -> String {
+        format!("{} (SHA-256 {})", self.path.display(), self.sha256)
+    }
 }
 
 /// Where a terminal's output resumes: the offset after the last byte drawn
@@ -163,10 +197,11 @@ fn same_build(platform: &str, arch: &str, os: &str, rust_arch: &str) -> bool {
     platform == os && arch == rust_arch
 }
 
-/// This app's own `gentle-term-host`, when it runs on `host`'s server:
-/// beside the app's executable (in the app bundle, or a cargo target folder
-/// in development, where the other profile's build counts too).
-fn bundled_for(host: &TermHost) -> Option<PathBuf> {
+/// This app's own `gentle-term-host`, with its SHA-256, when it runs on
+/// `host`'s server: the same platform and processor as this computer, and
+/// built beside the app ([`built_host`]). Nothing is downloaded: a server
+/// of another kind gets a file the user picks, or the build command.
+fn bundled_for(host: &TermHost) -> Option<Box<Binary>> {
     if !same_build(
         &host.platform,
         &host.arch,
@@ -175,21 +210,56 @@ fn bundled_for(host: &TermHost) -> Option<PathBuf> {
     ) {
         return None;
     }
-    let name = if cfg!(windows) {
-        "gentle-term-host.exe"
-    } else {
-        "gentle-term-host"
-    };
-    let exe = std::env::current_exe().ok()?;
+    let path = built_host(&std::env::current_exe().ok()?)?;
+    Binary::read(&path).ok().map(|(binary, _)| Box::new(binary))
+}
+
+/// The terminal host's file name on this system.
+const HOST_NAME: &str = if cfg!(windows) {
+    "gentle-term-host.exe"
+} else {
+    "gentle-term-host"
+};
+
+/// The `gentle-term-host` built with the app at `exe`: beside it (the app
+/// bundle's `Contents/MacOS`, an install's folder), else, for a development
+/// build run from a cargo target folder, the newest of `target/*/` and
+/// `target/<triple>/*/` (any profile).
+fn built_host(exe: &Path) -> Option<PathBuf> {
     let dir = exe.parent()?;
-    let mut places = vec![dir.to_path_buf()];
-    if let Some(target) = dir.parent() {
-        places.extend(["release", "debug"].map(|profile| target.join(profile)));
+    let beside = dir.join(HOST_NAME);
+    if beside.is_file() {
+        return Some(beside);
     }
-    places
+    let target = dir
+        .ancestors()
+        .skip(1)
+        .take(2)
+        .find(|folder| folder.file_name().is_some_and(|name| name == "target"))?;
+    let children = |folder: &Path| -> Vec<PathBuf> {
+        std::fs::read_dir(folder)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.is_dir())
+            .collect()
+    };
+    let profiles = children(target)
         .into_iter()
-        .map(|place| place.join(name))
-        .find(|path| path.is_file())
+        .flat_map(|child| std::iter::once(child.clone()).chain(children(&child)));
+    profiles
+        .map(|profile| profile.join(HOST_NAME))
+        .filter_map(|path| {
+            let modified = std::fs::metadata(&path)
+                .ok()
+                .filter(|meta| meta.is_file())?
+                .modified()
+                .ok()?;
+            Some((modified, path))
+        })
+        .max()
+        .map(|(_, path)| path)
 }
 
 /// What an error from the server's terminal endpoints means for the pane.
@@ -689,6 +759,7 @@ impl TerminalView {
                     server,
                     connect: None,
                     installing: false,
+                    sent: None,
                     install_error: None,
                     install: Task::ready(()),
                 };
@@ -748,18 +819,45 @@ impl TerminalView {
     }
 
     /// Install the terminal host at `binary` (a file on this computer) on
-    /// the server, then open the terminal.
+    /// the server, then open the terminal. The file and its SHA-256 show
+    /// while it goes.
     fn install_host(&mut self, binary: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         let Some(blocked) = &mut self.blocked else {
             return;
         };
         blocked.installing = true;
+        blocked.sent = None;
         blocked.install_error = None;
         let cwd = self.cwd.clone();
         blocked.install = cx.spawn_in(window, async move |this, cx| {
+            let read = cx
+                .background_executor()
+                .spawn(async move { Binary::read(&binary) })
+                .await;
+            let bytes = match read {
+                Ok((sent, bytes)) => {
+                    let _ = this.update(cx, |this, cx| {
+                        if let Some(blocked) = &mut this.blocked {
+                            blocked.sent = Some(sent);
+                        }
+                        cx.notify();
+                    });
+                    bytes
+                }
+                Err(why) => {
+                    let _ = this.update(cx, |this, cx| {
+                        if let Some(blocked) = &mut this.blocked {
+                            blocked.installing = false;
+                            blocked.install_error = Some(why);
+                        }
+                        cx.notify();
+                    });
+                    return;
+                }
+            };
             let installed = cx
                 .background_executor()
-                .spawn(async move { install(&cwd, &binary) })
+                .spawn(async move { install(&cwd, &bytes) })
                 .await;
             let _ = this.update_in(cx, |this, window, cx| match installed {
                 Ok(()) => this.start_remote(window, cx),
@@ -856,7 +954,7 @@ impl TerminalView {
                                 .label(here)
                                 .disabled(installing)
                                 .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.install_host(bundled.clone(), window, cx)
+                                    this.install_host(bundled.path.clone(), window, cx)
                                 })),
                         )
                     })
@@ -870,8 +968,26 @@ impl TerminalView {
                                 cx.listener(|this, _, window, cx| this.choose_host(window, cx)),
                             ),
                     );
+                // What goes, or would go, to the server: the file and its
+                // SHA-256 (the server checks the upload against it).
+                let what = match (&blocked.sent, bundled) {
+                    (Some(sent), _) if installing => {
+                        Some(format!("Installing {}", sent.describe()))
+                    }
+                    (Some(sent), _) => Some(format!("Sent {}", sent.describe())),
+                    (None, Some(bundled)) => {
+                        Some(format!("This computer's build: {}", bundled.describe()))
+                    }
+                    (None, None) => None,
+                };
+                let file = if host.platform == "win32" {
+                    "gentle-term-host.exe"
+                } else {
+                    "gentle-term-host"
+                };
                 let build = format!(
-                    "Or build it on {server} ({} {}) in a gentle-shell-gpui checkout:",
+                    "Or build it on {server} ({} {}) in a checkout of this app's branch of \
+                     gentle-shell-gpui (it has crates/term-host):",
                     host.platform, host.arch
                 );
                 (
@@ -883,15 +999,20 @@ impl TerminalView {
                              its terminals running while this app is closed."
                         )))
                         .child(buttons)
+                        .children(what.map(|what| {
+                            div()
+                                .text_size(rems(12. / 16.))
+                                .text_color(ui::muted())
+                                .child(what)
+                        }))
                         .child(paragraph(build))
                         .child(command("cargo build --release -p gentle-term-host"))
-                        .child(paragraph(
-                            "Then put target/release/gentle-term-host in the serve/bin folder \
-                             of the agent home there (~/.gentle-shell/agent/serve/bin by \
-                             default) or anywhere on its PATH, or point GENTLE_TERM_HOST at \
-                             it, and try again."
-                                .into(),
-                        ))
+                        .child(paragraph(format!(
+                            "Then put target/release/{file} in the serve/bin folder of the \
+                             agent home there (~/.gentle-shell/agent/serve/bin by default) or \
+                             anywhere on its PATH, or point GENTLE_TERM_HOST at it, and try \
+                             again."
+                        )))
                         .child(
                             h_flex().child(
                                 Button::new("terminal-retry")
@@ -965,14 +1086,12 @@ impl std::fmt::Display for Refused {
     }
 }
 
-/// Upload `binary` (a file on this computer) as the terminal host of the
+/// Upload `binary` (a file's bytes, read here) as the terminal host of the
 /// server `cwd` is on, and ask the server what it offers again. Blocking.
-fn install(cwd: &Path, binary: &Path) -> Result<(), Refused> {
+fn install(cwd: &Path, binary: &[u8]) -> Result<(), Refused> {
     let choice = backend::for_tab(cwd);
     let client = server::client(&choice).map_err(|e| Refused::Other(e.to_string()))?;
-    let bytes = std::fs::read(binary)
-        .map_err(|e| Refused::Other(format!("Couldn't read {}: {e}", binary.display())))?;
-    match client.install_term_host(&bytes) {
+    match client.install_term_host(binary) {
         Ok(_) => {
             server::forget_info(&choice);
             Ok(())
@@ -986,7 +1105,7 @@ fn install(cwd: &Path, binary: &Path) -> Result<(), Refused> {
 mod tests {
     use std::time::Duration;
 
-    use super::{Resume, backoff, same_build};
+    use super::{Binary, HOST_NAME, Resume, backoff, built_host, same_build};
 
     /// Output is drawn once: a chunk the resume point already passed is
     /// skipped, one that overlaps it is drawn from there, and an attachment
@@ -1034,5 +1153,73 @@ mod tests {
         assert!(!same_build("linux", "arm64", "macos", "aarch64"));
         assert!(!same_build("darwin", "x64", "macos", "aarch64"));
         assert!(!same_build("", "", "macos", "aarch64"));
+    }
+
+    /// The host the app offers is the one built with it: beside the app
+    /// (its bundle), else the newest build in the cargo target folder it
+    /// runs from; never a file elsewhere.
+    #[test]
+    fn the_offered_host_is_the_one_built_with_the_app() {
+        let root = std::env::temp_dir().join(format!("gsg-term-host-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let put = |path: std::path::PathBuf, age: u64| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"host").unwrap();
+            let file = std::fs::File::options().write(true).open(&path).unwrap();
+            file.set_modified(std::time::UNIX_EPOCH + Duration::from_secs(1_000_000 + age))
+                .unwrap();
+            path
+        };
+
+        // An app bundle: the one beside the executable.
+        let macos = root.join("Gentle Shell.app").join("Contents").join("MacOS");
+        let bundled = put(macos.join(HOST_NAME), 0);
+        assert_eq!(built_host(&macos.join("gentle-shell-gpui")), Some(bundled));
+
+        // A development build: the newest of any profile, triples too.
+        let target = root.join("checkout").join("target");
+        let exe = target.join("debug").join("gentle-shell-gpui");
+        assert_eq!(built_host(&exe), None);
+        put(target.join("release").join(HOST_NAME), 1);
+        let dist = put(target.join("dist").join(HOST_NAME), 2);
+        assert_eq!(built_host(&exe), Some(dist));
+        let triple = put(
+            target
+                .join("aarch64-apple-darwin")
+                .join("release")
+                .join(HOST_NAME),
+            3,
+        );
+        assert_eq!(built_host(&exe), Some(triple.clone()));
+        let cross = target
+            .join("aarch64-apple-darwin")
+            .join("debug")
+            .join("gentle-shell-gpui");
+        assert_eq!(built_host(&cross), Some(triple));
+
+        // Installed anywhere else: only beside the executable counts.
+        put(root.join("usr").join("lib").join(HOST_NAME), 4);
+        assert_eq!(
+            built_host(&root.join("usr").join("bin").join("gentle-shell-gpui")),
+            None
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// What the pane shows of a file to install: its path and SHA-256.
+    #[test]
+    fn a_binary_is_shown_with_its_sha256() {
+        let path = std::env::temp_dir().join(format!("gsg-term-host-sha-{}", std::process::id()));
+        std::fs::write(&path, b"abc").unwrap();
+        let (binary, bytes) = Binary::read(&path).unwrap();
+        assert_eq!(bytes, b"abc");
+        assert_eq!(
+            binary.sha256,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert!(binary.describe().contains(&binary.sha256));
+        assert!(binary.describe().starts_with(&path.display().to_string()));
+        std::fs::remove_file(&path).unwrap();
+        assert!(Binary::read(&path).is_err());
     }
 }
