@@ -8,11 +8,17 @@ publish.workspace = true
 [dependencies]
 anyhow.workspace = true
 async-channel.workspace = true
+# File contents, git output and terminal bytes on a Gentle Shell server's
+# API. The version the app already locks.
+base64 = "0.23"
 dunce = "1"
 # A Gentle Shell server's protocol rules (`gentle_core::serve`).
 gentle-core = { path = "../core" }
 serde.workspace = true
 serde_json.workspace = true
+# The terminal host binary's hash, as `PUT /api/term-host` checks it. The
+# version the app already locks.
+sha2 = "0.11"
 # A Gentle Shell server's session (`serve`): plain HTTP and its event stream.
 # The version the app already locks; TLS is the app's (servers speak HTTP).
 ureq = { version = "3", default-features = false }

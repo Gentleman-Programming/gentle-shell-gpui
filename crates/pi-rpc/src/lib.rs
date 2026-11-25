@@ -81,8 +81,9 @@ enum Io {
         child: Arc<Mutex<Child>>,
         pid: u32,
     },
-    /// A session of a Gentle Shell server.
-    Server(serve::Remote),
+    /// A session of a Gentle Shell server (its client is several HTTP
+    /// agents: boxed, so a child's `Io` stays small).
+    Server(Box<serve::Remote>),
 }
 
 /// What a backend has sent so far, for the app's diagnostics: two relaxed

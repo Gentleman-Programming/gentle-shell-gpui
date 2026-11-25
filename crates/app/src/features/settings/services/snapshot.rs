@@ -126,6 +126,7 @@ mod tests {
                 server_id: "srv_1".into(),
                 version: Some("5.1.0".into()),
                 home: Some("/home/ana".into()),
+                ..ServerInfo::default()
             })
         });
         let facts = s.server.as_ref().unwrap();

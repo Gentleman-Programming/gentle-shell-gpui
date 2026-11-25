@@ -18,6 +18,17 @@
 //!   quitting leaves it running ([`PiProcess::detach`]) for the next launch
 //!   to reattach to ([`PiProcess::serve`] with its id).
 
+mod files;
+mod services;
+mod terminals;
+
+pub use files::{
+    Entry, EntryKind, FileChunk, GitOutput, Listing, READ_CHUNK, SearchHit, Stat, Uploaded,
+    WatchEvent, WatchStream, Written,
+};
+pub use services::{ForwardedPage, Service};
+pub use terminals::{TermEvent, TermHost, TermStream, Terminal};
+
 use std::io::Read as _;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -39,6 +50,9 @@ const CONNECT: Duration = Duration::from_secs(10);
 const SILENCE: Duration = Duration::from_secs(45);
 /// How long an answer may take: the server waits 30 s for Pi's.
 const ANSWER: Duration = Duration::from_secs(45);
+/// How long work the server bounds itself may take: a network git command
+/// (600 s there), a 64 MiB upload or terminal host on a slow network.
+const LONG: Duration = Duration::from_secs(11 * 60);
 /// How long the next command waits for the one before it to be answered.
 /// Commands reach the server in order; one that runs long (`bash`,
 /// `compact`) must not hold up an `abort` behind it.
@@ -86,7 +100,7 @@ pub struct Paired {
 }
 
 /// `GET /api/server`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ServerInfo {
     /// `srv_…`, new on every server run.
     pub server_id: String,
@@ -95,6 +109,29 @@ pub struct ServerInfo {
     /// The home folder of the user the server runs as, a path there (only
     /// to devices that may operate sessions; older servers don't say).
     pub home: Option<String>,
+    /// What the server offers its devices (`files`, `git`, `uploads`,
+    /// `terminals`, `server-forwards`, `services`, …).
+    pub capabilities: Vec<String>,
+    /// Node's `process.platform` there (`darwin`, `linux`, `win32`).
+    pub platform: Option<String>,
+    /// Node's `os.arch()` there (`arm64`, `x64`).
+    pub arch: Option<String>,
+    /// Its path separator (`/` or `\`).
+    pub path_separator: Option<String>,
+}
+
+impl ServerInfo {
+    /// Whether the server offers `capability`.
+    pub fn has(&self, capability: &str) -> bool {
+        self.capabilities.iter().any(|c| c == capability)
+    }
+}
+
+/// A request body: JSON, or raw bytes (a file, an upload, a binary).
+#[derive(Clone, Copy)]
+enum Body<'a> {
+    Json(&'a [u8]),
+    Raw(&'a [u8]),
 }
 
 /// A page on the server's own loopback, reachable from this device through
@@ -152,6 +189,9 @@ pub struct ServeClient {
     agent: ureq::Agent,
     /// Event streams: open for good, dead after [`SILENCE`].
     stream: ureq::Agent,
+    /// Work the server bounds itself (a `git fetch`, an upload, a
+    /// binary): answers within [`LONG`].
+    long: ureq::Agent,
     url: String,
     token: Option<String>,
 }
@@ -176,9 +216,18 @@ impl ServeClient {
             .timeout_per_read(Some(SILENCE))
             .build()
             .into();
+        let long = ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .max_redirects(0)
+            .timeout_connect(Some(CONNECT))
+            .timeout_recv_response(Some(LONG))
+            .timeout_per_read(Some(LONG))
+            .build()
+            .into();
         Self {
             agent,
             stream,
+            long,
             url: url.trim_end_matches('/').to_string(),
             token,
         }
@@ -206,42 +255,47 @@ impl ServeClient {
         body: Option<&Value>,
     ) -> Result<(u16, ureq::http::Response<ureq::Body>), ServeError> {
         let body = body.map(|body| serde_json::to_vec(body).unwrap_or_default());
-        self.send(agent, method, path, body.as_deref())
+        self.send(agent, method, path, body.as_deref().map(Body::Json), &[])
     }
 
-    /// [`Self::call`] with a body already encoded as JSON.
+    /// `method` on `path` with an optional body and extra headers: the
+    /// answer's status and body for a 2xx, the server's error in words
+    /// otherwise.
     fn send(
         &self,
         agent: &ureq::Agent,
         method: &str,
         path: &str,
-        body: Option<&[u8]>,
+        body: Option<Body<'_>>,
+        headers: &[(&str, &str)],
     ) -> Result<(u16, ureq::http::Response<ureq::Body>), ServeError> {
         let url = format!("{}{path}", self.url);
         let mut request = ureq::http::Request::builder().method(method).uri(&url);
         if let Some(token) = &self.token {
             request = request.header("Authorization", format!("Bearer {token}"));
         }
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        let bad = |e: ureq::http::Error| ServeError {
+            status: None,
+            error: None,
+            message: format!("Bad request to {url}: {e}"),
+        };
         let response = match body {
-            Some(body) => {
-                let request = request
+            Some(Body::Json(body)) => agent.run(
+                request
                     .header("Content-Type", "application/json")
                     .body(body)
-                    .map_err(|e| ServeError {
-                        status: None,
-                        error: None,
-                        message: format!("Bad request to {url}: {e}"),
-                    })?;
-                agent.run(request)
-            }
-            None => {
-                let request = request.body(()).map_err(|e| ServeError {
-                    status: None,
-                    error: None,
-                    message: format!("Bad request to {url}: {e}"),
-                })?;
-                agent.run(request)
-            }
+                    .map_err(bad)?,
+            ),
+            Some(Body::Raw(body)) => agent.run(
+                request
+                    .header("Content-Type", "application/octet-stream")
+                    .body(body)
+                    .map_err(bad)?,
+            ),
+            None => agent.run(request.body(()).map_err(bad)?),
         }
         .map_err(|e| self.unreachable(e))?;
         let status = response.status().as_u16();
@@ -300,6 +354,17 @@ impl ServeClient {
                 .as_str()
                 .filter(|home| !home.is_empty())
                 .map(str::to_string),
+            capabilities: answer["capabilities"]
+                .as_array()
+                .map(|all| {
+                    all.iter()
+                        .filter_map(|c| c.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            platform: answer["platform"].as_str().map(str::to_string),
+            arch: answer["arch"].as_str().map(str::to_string),
+            path_separator: answer["pathSeparator"].as_str().map(str::to_string),
         })
     }
 
@@ -385,7 +450,8 @@ impl ServeClient {
             &self.agent,
             "POST",
             &session_path(id, "/desktop")?,
-            Some(payload.as_bytes()),
+            Some(Body::Json(payload.as_bytes())),
+            &[],
         )?;
         read_json(&mut response).map_err(|message| ServeError {
             status: Some(status),
@@ -693,12 +759,12 @@ impl PiProcess {
                 })?;
         }
         let process = Arc::new(Self {
-            io: Io::Server(Remote {
+            io: Io::Server(Box::new(Remote {
                 client,
                 session,
                 commands,
                 stop,
-            }),
+            })),
             pending,
             next_id: AtomicU64::new(1),
             stopping: AtomicBool::new(false),
@@ -927,5 +993,62 @@ impl Follow<'_> {
 
     fn note(&self, line: String) {
         let _ = self.tx.send_blocking(Incoming::Stderr(line));
+    }
+}
+
+/// `?key=value&…` with each value percent-encoded (paths, queries).
+fn query(pairs: &[(&str, &str)]) -> String {
+    let mut out = String::new();
+    for (n, (key, value)) in pairs.iter().enumerate() {
+        out.push(if n == 0 { '?' } else { '&' });
+        out.push_str(key);
+        out.push('=');
+        for byte in value.bytes() {
+            if byte.is_ascii_alphanumeric() || b"-_.~/".contains(&byte) {
+                out.push(byte as char);
+            } else {
+                out.push_str(&format!("%{byte:02X}"));
+            }
+        }
+    }
+    out
+}
+
+/// One of the server's own SSE streams (a folder's changes, a terminal):
+/// its events in order, ending when the connection does.
+struct Events {
+    body: ureq::BodyReader<'static>,
+    sse: SseParser,
+    queue: std::collections::VecDeque<gentle_core::serve::SseEvent>,
+    buf: Vec<u8>,
+}
+
+impl Events {
+    fn new(response: ureq::http::Response<ureq::Body>) -> Self {
+        Self {
+            body: response.into_body().into_with_config().reader(),
+            sse: SseParser::default(),
+            queue: std::collections::VecDeque::new(),
+            buf: vec![0; 64 * 1024],
+        }
+    }
+
+    /// The next event; `None` when the stream ended, went silent for
+    /// [`SILENCE`], or `stop` was set (checked whenever bytes arrive, a
+    /// heartbeat included, so within 20 s).
+    fn next(&mut self, stop: &AtomicBool) -> Option<gentle_core::serve::SseEvent> {
+        loop {
+            if stop.load(Ordering::Acquire) {
+                return None;
+            }
+            if let Some(event) = self.queue.pop_front() {
+                return Some(event);
+            }
+            let n = match self.body.read(&mut self.buf) {
+                Ok(0) | Err(_) => return None,
+                Ok(n) => n,
+            };
+            self.queue.extend(self.sse.push(&self.buf[..n]));
+        }
     }
 }
