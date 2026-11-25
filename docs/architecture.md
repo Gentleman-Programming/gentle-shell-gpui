@@ -35,7 +35,7 @@ flowchart TD
 
 `crates/pi-rpc` is a stable boundary: it knows nothing about GPUI, windows, tabs or visual components. `crates/app` depends on it, never the other way around.
 
-`crates/core` depends on nothing in the project (neither `app` nor `pi-rpc`) and not on GPUI; its only dependencies are `serde`, `serde_json` and `regex`. It compiles the same on macOS, Windows and Linux: it contains no platform-specific code except the syntax of the policy's `file:` paths, chosen with `cfg!(windows)` at compile time. When a module mixed pure logic and effects, the pure part lives in `core`, and the effectful part stays in `app` and calls it:
+`crates/core` depends on nothing in the project (neither `app` nor `pi-rpc`) and not on GPUI; its only dependencies are `serde`, `serde_json`, `regex`, `markdown` and `base64` (a server's connection code). It compiles the same on macOS, Windows and Linux: it contains no platform-specific code except the syntax of the policy's `file:` paths, chosen with `cfg!(windows)` at compile time. When a module mixed pure logic and effects, the pure part lives in `core`, and the effectful part stays in `app` and calls it:
 
 | `core` | Stays in `app` |
 | --- | --- |
@@ -69,6 +69,34 @@ flowchart TD
 | `canvas`: canvas tabs' whiteboard model after Tern's canvas blocks (shapes, Tern's 16-color palette, fill, pen types and sizes, which of them show on each kind of shape (`Kind::controls`, `Style::adopt`), the file format), perfect-freehand ink outlines (`freehand`), geometry, hit testing, lasso and box selection, the camera, copy and paste, the undo history, and what its agent reads, edits and sees of it (`agent`: the flat shape form, ops applied all or nothing, the SVG of an area) | `canvas/`: the view (`CanvasView`: tools, gestures, keys, saving the file), painting (shapes tessellated once in page units, only moved onto the screen each frame), the tool bar, zoom pill, style panel (only the controls the current tool and the selection show) and minimap, and the agent floating over it (`agent.rs`: a `SessionView` in a card, started with the `gentle-canvas.ts` extension it installs; answering its requests, rasterizing shots). The workspace handles that agent's events as an agent pane's (`on_session_event`) and saves its conversation with the canvas pane. |
 | `commands`: `/gentle:tower` routes to the Tower tab (`Screen::Tower`); `tower`: the URL from `gentle-shell tower`'s `--json` line or its older `Gentle Tower: <url>` text, and whether a Shell refused `--json` | `tower/`: Gentle Tower in a tab (`TowerView`): runs `gentle-shell tower --no-open --json` (again without `--json` on a Shell older than 5.0.0 that refuses it), shows its page in a `WebSurface`, shown or hidden by the workspace's `sync_web_views` like agents' web views. |
 | `commands`: `/gentle:changes` routes to the review screen (`Screen::Changes`) | `review/`: the review screen (`ReviewView`), a modal over the window (`Overlay::Review`, Esc closes it like the other screens): a `files::FileView` diff (Split · Unified) beside its own `files::ChangesView`, which polls while the review is open; the composer's `±` and `/gentle:changes` open it (`workspace/overlays.rs` `open_review`). |
+
+### The Gentle Shell server boundary
+
+When agents run on a Gentle Shell server (`gentle-shell serve`), the app is a thin client: the server owns sessions, folders, git and terminals. Three choke points in `app` decide, per folder, whether an effect runs here or there, so no view branches on the backend itself:
+
+| Choke point | Local / WSL / command | Gentle Shell server |
+| --- | --- | --- |
+| `features/backend/fs.rs` (`backend::fs::at(path)` → `Fs::Local` or `Fs::Server`) | `std::fs` | `pi_rpc::serve` `/api/fs/*` (list, read, write with `If-Match`, stat, mkdir, rename, remove, search, watch) |
+| `features/backend/mod.rs` (`backend::git`, `Git::output`) | `git` through the backend's argv | `POST /api/git { cwd, args, env }` |
+| `features/terminal/remote.rs` | a local PTY (alacritty) | a persistent terminal of the server's `gentle-term-host`, `/api/terminals/*` |
+
+`crates/pi-rpc/src/serve.rs` is the client of the server's API (`ServeClient`: pairing, discovery, `/api/server`, sessions, the event stream, Desktop requests, forwards, Tower), with `serve/files.rs`, `serve/services.rs` (Engram through a forward) and `serve/terminals.rs`. A server session is a `PiProcess` like a child's (`PiProcess::serve`), so the session view doesn't know which transport it has. The protocol's pure rules (codes, addresses, SSE framing, stream cursor, URL classification, folder keys) live in `gentle_core::serve`. `features/backend/server.rs` keeps the pairing, the device token (`server-tokens.json`, `0600`) and the server's advertised capabilities; host tools (`features/host_tools.rs`, `features/session/host_tools.rs`) answer the server's calls for the app's own tools.
+
+```mermaid
+flowchart TD
+    Views["Files, editor, Changes, Branches, Git pane, terminal panes"] --> Fs["backend::fs"]
+    Views --> Git["backend::git"]
+    Views --> Term["terminal/remote.rs"]
+    Session["SessionView → PiProcess"] --> Serve
+    Fs --> Serve["pi_rpc::serve (ServeClient)"]
+    Git --> Serve
+    Term --> Serve
+    Serve --> Core["gentle_core::serve (pure rules)"]
+    Serve -- "HTTP + SSE" --> Server["gentle-shell serve"]
+    Server --> Host["gentle-term-host (crates/term-host)"]
+```
+
+`crates/term-host` is built and shipped beside the app (`packaging/macos/bundle.sh` copies it into the bundle) only so the app can offer to install it on a server of the same platform; the app never runs it. Its protocol is tested end to end in `crates/term-host/tests/protocol.rs`.
 
 ## Layout
 
