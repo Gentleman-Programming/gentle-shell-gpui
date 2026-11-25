@@ -1,12 +1,14 @@
 //! Folder explorer in the style of oil.nvim: one directory at a time, driven
-//! from the keyboard, to pick where Gentle Shell opens. ↵ enters a folder,
-//! `-` (or ←, or ⌫ with nothing typed) goes to the parent, `~` goes home and
-//! typing filters. ⌘↵ / Ctrl+↵ opens an agent tab in the selected folder (or
-//! the one shown), ⌥↵ / Alt+↵ a terminal; both show the workspace rooted
-//! there, creating it, like `gsd <folder>`. Picking a folder for something
-//! else ([`Purpose::Choose`]), ⌘↵ hands it back. Where agents run on a
-//! Gentle Shell server, it browses the server's folders (through its API),
-//! home being the server's.
+//! from the keyboard, to pick where Gentle Shell opens. ↵ enters the
+//! highlighted folder, `-` (or ←, or ⌫ with nothing typed) goes to the
+//! parent, `~` goes home and typing filters (highlighting the best match).
+//! Nothing is highlighted until the arrows, a click or the filter pick an
+//! entry. ⌘↵ / Ctrl+↵ opens an agent tab in the highlighted folder, else the
+//! one shown (as a folder picker's Open does), ⌥↵ / Alt+↵ a terminal; both
+//! show the workspace rooted there, creating it, like `gsd <folder>`.
+//! Picking a folder for something else ([`Purpose::Choose`]), ⌘↵ hands it
+//! back. Where agents run on a Gentle Shell server, it browses the server's
+//! folders (through its API), home being the server's.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -18,7 +20,7 @@ use gpui_kit::component::{Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use gentle_core::explorer::{Entry, visible};
+use gentle_core::explorer::{self, Entry, visible};
 
 use crate::features::backend;
 use crate::shared::ui;
@@ -61,7 +63,9 @@ pub struct ExplorerView {
     repos: HashSet<String>,
     /// `entries` matching the filter, as shown.
     shown: Vec<Entry>,
-    selected: usize,
+    /// The highlighted entry of `shown`: none until the arrows, a click or
+    /// the filter pick one (or the folder just left, after going up).
+    selected: Option<usize>,
     filter: Entity<InputState>,
     /// Why `dir` couldn't be listed.
     error: Option<String>,
@@ -93,7 +97,7 @@ impl ExplorerView {
             entries: Vec::new(),
             repos: HashSet::new(),
             shown: Vec::new(),
-            selected: 0,
+            selected: None,
             filter,
             error: None,
             loading: false,
@@ -105,8 +109,9 @@ impl ExplorerView {
         this
     }
 
-    /// Show `dir`, read off the UI thread, selecting the entry named
-    /// `select` when it is there.
+    /// Show `dir`, read off the UI thread, highlighting the entry named
+    /// `select` when it is there. The folder being read is the one shown
+    /// (and the one ⌘↵ opens) from now on.
     fn load(
         &mut self,
         dir: PathBuf,
@@ -115,45 +120,50 @@ impl ExplorerView {
         cx: &mut Context<Self>,
     ) {
         self.loading = true;
+        self.dir = dir.clone();
+        self.entries.clear();
+        self.repos.clear();
+        self.shown.clear();
+        self.selected = None;
+        self.error = None;
+        self.filter
+            .update(cx, |state, cx| state.set_value("", window, cx));
         cx.notify();
         self._load = cx.spawn_in(window, async move |this, cx| {
-            let listed = dir.clone();
             let read = cx
                 .background_executor()
-                .spawn(async move { read_dir(&listed) })
+                .spawn(async move { read_dir(&dir) })
                 .await;
-            let _ = this.update_in(cx, |this, window, cx| {
-                let (entries, repos, error) = match read {
+            let _ = this.update(cx, |this, cx| {
+                (this.entries, this.repos, this.error) = match read {
                     Ok((entries, repos)) => (entries, repos, None),
                     Err(error) => (Vec::new(), HashSet::new(), Some(error.to_string())),
                 };
                 this.loading = false;
-                this.dir = dir;
-                this.entries = entries;
-                this.repos = repos;
-                this.error = error;
-                this.filter
-                    .update(cx, |state, cx| state.set_value("", window, cx));
                 this.refilter(select, cx);
             });
         });
     }
 
+    /// The entries matching the filter, highlighted as
+    /// [`explorer::highlight`] says (`select`: the entry named so).
     fn refilter(&mut self, select: Option<String>, cx: &mut Context<Self>) {
         let filter = self.filter.read(cx).value();
         self.shown = visible(&self.entries, &filter);
-        self.selected = select
-            .and_then(|name| self.shown.iter().position(|e| e.name == name))
-            .unwrap_or(0);
-        self.scroll.scroll_to_item(self.selected);
+        let select = select.and_then(|name| self.shown.iter().position(|e| e.name == name));
+        self.selected = explorer::highlight(select, !filter.trim().is_empty(), self.shown.len());
+        if let Some(selected) = self.selected {
+            self.scroll.scroll_to_item(selected);
+        }
         cx.notify();
     }
 
     fn selected_entry(&self) -> Option<&Entry> {
-        self.shown.get(self.selected)
+        self.shown.get(self.selected?)
     }
 
-    /// The folder an "open here" acts on: the selected folder, else the one shown.
+    /// The folder an "open here" acts on: the highlighted folder, else the
+    /// one shown.
     fn target(&self) -> PathBuf {
         match self.selected_entry() {
             Some(entry) if entry.is_dir => self.dir.join(&entry.name),
@@ -161,18 +171,19 @@ impl ExplorerView {
         }
     }
 
+    /// Move the highlight by `delta` rows ([`explorer::step`]).
     fn move_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
-        if self.shown.is_empty() {
+        let Some(next) = explorer::step(self.selected, delta, self.shown.len()) else {
             return;
-        }
-        let len = self.shown.len() as isize;
-        self.selected = (self.selected as isize + delta).rem_euclid(len) as usize;
-        self.scroll.scroll_to_item(self.selected);
+        };
+        self.selected = Some(next);
+        self.scroll.scroll_to_item(next);
         cx.notify();
     }
 
-    fn enter(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(entry) = self.shown.get(index).cloned() else {
+    /// Enter the folder (or open the file) at row `index`, if any.
+    fn enter(&mut self, index: Option<usize>, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(entry) = index.and_then(|index| self.shown.get(index)).cloned() else {
             return;
         };
         let path = self.dir.join(&entry.name);
@@ -305,7 +316,7 @@ impl ExplorerView {
     }
 
     fn render_row(&self, i: usize, entry: &Entry, cx: &mut Context<Self>) -> impl IntoElement {
-        let selected = i == self.selected;
+        let selected = Some(i) == self.selected;
         let repo = entry.is_dir && self.repos.contains(&entry.name);
         let icon = match (entry.is_dir, repo) {
             (true, true) => IconName::FolderGit,
@@ -323,9 +334,9 @@ impl ExplorerView {
             .when(selected, |d| d.bg(ui::raised()))
             .when(!selected, |d| d.hover(|s| s.bg(ui::surface_hover())))
             .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
-                this.selected = i;
+                this.selected = Some(i);
                 if event.click_count() > 1 {
-                    this.enter(i, window, cx);
+                    this.enter(Some(i), window, cx);
                 }
                 cx.notify();
             }))

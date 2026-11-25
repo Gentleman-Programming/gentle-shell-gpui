@@ -1,5 +1,6 @@
 //! Pure rules for the folder explorer (oil.nvim style): which entries of a
-//! directory show, in what order, for a filter.
+//! directory show, in what order, for a filter, and which one is
+//! highlighted.
 
 /// One directory entry as the explorer lists it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -29,9 +30,35 @@ pub fn visible(entries: &[Entry], filter: &str) -> Vec<Entry> {
     shown.into_iter().map(|(_, _, e)| e.clone()).collect()
 }
 
+/// The row highlighted once `shown` (`len` rows) is listed: `select` (the
+/// row of the folder just left, going up) when there, else the best match
+/// while the filter has text (`filtering`), else none, so opening acts on
+/// the folder shown, as a folder picker's Open does.
+pub fn highlight(select: Option<usize>, filtering: bool, len: usize) -> Option<usize> {
+    select
+        .filter(|row| *row < len)
+        .or_else(|| (filtering && len > 0).then_some(0))
+}
+
+/// The row highlighted after moving `delta` rows from `current` among
+/// `len`, wrapping; from none, down starts at the first row and up at the
+/// last.
+pub fn step(current: Option<usize>, delta: isize, len: usize) -> Option<usize> {
+    if len == 0 {
+        return None;
+    }
+    let len = len as isize;
+    let next = match current {
+        Some(row) => (row as isize + delta).rem_euclid(len),
+        None if delta > 0 => 0,
+        None => len - 1,
+    };
+    Some(next as usize)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Entry, visible};
+    use super::{Entry, highlight, step, visible};
 
     fn entry(name: &str, is_dir: bool) -> Entry {
         Entry {
@@ -74,5 +101,24 @@ mod tests {
             ["cargo-notes", "Cargo.lock"]
         );
         assert!(visible(&entries, "zzz").is_empty());
+    }
+
+    #[test]
+    fn nothing_is_highlighted_until_picked() {
+        assert_eq!(highlight(None, false, 3), None);
+        // Typing highlights the best match; going up the folder left.
+        assert_eq!(highlight(None, true, 3), Some(0));
+        assert_eq!(highlight(None, true, 0), None);
+        assert_eq!(highlight(Some(2), false, 3), Some(2));
+        assert_eq!(highlight(Some(3), false, 3), None);
+    }
+
+    #[test]
+    fn arrows_start_at_either_end_and_wrap() {
+        assert_eq!(step(None, 1, 3), Some(0));
+        assert_eq!(step(None, -1, 3), Some(2));
+        assert_eq!(step(Some(2), 1, 3), Some(0));
+        assert_eq!(step(Some(0), -1, 3), Some(2));
+        assert_eq!(step(None, 1, 0), None);
     }
 }
