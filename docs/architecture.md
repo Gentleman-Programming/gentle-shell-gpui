@@ -29,7 +29,8 @@ flowchart TD
 | --- | --- |
 | `crates/app` | Binary, composition, feature state, GPUI views, and the effects (files, processes, sound) of the logic that lives in `core`. |
 | `crates/core` (`gentle-core`) | Pure logic with no GPUI or IO: transcript and subagent activity models, tool summaries, permission mode, jobs and ODD phase, `/` command routing, `notifications.json` policy, usage and statistics models, and the profile and model routing model. |
-| `crates/pi-rpc` | Backend resolution and launch, JSONL transport (a child's stdio, or a Gentle Shell server's HTTP and event stream), authentication and protocol types. |
+| `crates/pi-rpc` | Backend resolution and launch, JSONL transport (a child's stdio, or a Gentle Shell server's HTTP and event stream), authentication and protocol types, and the client of a Gentle Shell server's API (files, git, uploads, forwards, services, terminals). |
+| `crates/term-host` (`gentle-term-host`) | A separate binary, not linked into the app: the terminal host a Gentle Shell server (`gentle-shell serve`) runs to keep its devices' terminals alive across clients (PTYs, a headless alacritty emulator for reattach snapshots, JSON Lines over a Unix socket). Unix only for now. |
 | `packaging` | Packaging and distribution integration per operating system. |
 
 `crates/pi-rpc` is a stable boundary: it knows nothing about GPUI, windows, tabs or visual components. `crates/app` depends on it, never the other way around.
@@ -86,7 +87,8 @@ crates/
 │       └── shared/              # pieces used by several features, with no logic of their own:
 │                                # ui, overlay (live indicators' layer), floating, themes, backdrop (theme scenes), assets, banner, surge, pane, gentle_state
 ├── core/                        # shared pure logic (gentle-core)
-└── pi-rpc/
+├── pi-rpc/
+└── term-host/                   # gentle-term-host: a Gentle Shell server's terminal host (its own binary)
 ```
 
 Paths follow the folder: `crate::features::session`, `crate::shared::ui`, `crate::platform::instance`. Each feature is a `features/<name>/` folder: `mod.rs` keeps its public types and API, and child modules add `impl` blocks and mark what they share as `pub(super)`. A new feature goes in `features/` as a folder even if it starts as a single file; something moves to `shared/` only when more than one feature uses it and it has no product logic.
