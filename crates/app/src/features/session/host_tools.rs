@@ -9,20 +9,28 @@
 //! the server's `/desktop`, or as a `/gentle:desktop` prompt on the child's
 //! stdin (`PiProcess::desktop`).
 //!
+//! A call can run long (a review waiting for the user, a browser wait, a
+//! Maestro flow, a device download): while it runs, and the Gentle Shell
+//! offers `host_tool_progress`, the tab says so every
+//! [`HOST_TOOL_PROGRESS_EVERY`] and the server restarts the call's
+//! 10-minute no-result deadline. It stops once the call is answered,
+//! cancelled or the backend is gone; an app that hangs or loses the server
+//! stops saying so, and the server fails the call as before.
+//!
 //! An older Gentle Shell keeps the extensions and instructions it launches
 //! with: it registers nothing.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gentle_core::transcript::NoticeLevel;
 use gpui_kit::*;
 use pi_rpc::PiProcess;
 use pi_rpc::desktop_rpc::{
     DesktopEvent, DesktopMethod, DesktopRequest, DesktopRpcError, HOST_TOOL_CALL, HOST_TOOL_CANCEL,
-    HostToolCall, HostToolContent,
+    HOST_TOOL_PROGRESS_EVERY, HostToolCall, HostToolContent,
 };
 
 use super::{SessionEvent, SessionView};
@@ -68,8 +76,11 @@ pub(super) type Details = serde_json::Map<String, serde_json::Value>;
 pub(super) struct HostCalls {
     /// The tools were offered on this connection (or the offer is in flight).
     registered: bool,
-    /// Calls running now; a cancel takes one out, and its answer is dropped.
-    active: HashSet<String>,
+    /// Calls running now, each with when its next `host_tool_progress` is
+    /// due; a cancel takes one out, and its answer is dropped.
+    active: HashMap<String, Instant>,
+    /// A heartbeat loop runs for [`Self::active`].
+    beating: bool,
     /// Calls taken, newest last.
     seen: VecDeque<String>,
     next_request: u64,
@@ -80,6 +91,9 @@ pub(super) struct HostCalls {
     /// has no server).
     #[cfg(test)]
     pub(super) sent: Vec<(String, Outcome, Option<Details>)>,
+    /// The calls a progress was due for, in order, for the tests.
+    #[cfg(test)]
+    pub(super) beats: Vec<String>,
 }
 
 impl HostCalls {
@@ -102,8 +116,8 @@ impl HostCalls {
         format!("host-{}", self.next_request)
     }
 
-    /// Take `call_id` once: false for a call already taken.
-    fn take(&mut self, call_id: &str) -> bool {
+    /// Take `call_id` once, at `now`: false for a call already taken.
+    fn take(&mut self, call_id: &str, now: Instant) -> bool {
         if self.seen.iter().any(|seen| seen == call_id) {
             return false;
         }
@@ -111,17 +125,39 @@ impl HostCalls {
             self.seen.pop_front();
         }
         self.seen.push_back(call_id.to_string());
-        self.active.insert(call_id.to_string());
+        self.active
+            .insert(call_id.to_string(), now + HOST_TOOL_PROGRESS_EVERY);
         true
     }
 
     /// Whether `call_id` still wants its answer; it no longer does after.
     fn finish(&mut self, call_id: &str) -> bool {
-        self.active.remove(call_id)
+        self.active.remove(call_id).is_some()
     }
 
     fn cancel(&mut self, call_id: &str) {
         self.active.remove(call_id);
+    }
+
+    /// When the next progress is due; `None` once no call runs.
+    fn next_beat(&self) -> Option<Instant> {
+        self.active.values().min().copied()
+    }
+
+    /// The calls whose progress is due at `now`, sorted; each is next due
+    /// [`HOST_TOOL_PROGRESS_EVERY`] after `now`.
+    fn due(&mut self, now: Instant) -> Vec<String> {
+        let mut due: Vec<String> = self
+            .active
+            .iter_mut()
+            .filter(|(_, at)| **at <= now)
+            .map(|(call_id, at)| {
+                *at = now + HOST_TOOL_PROGRESS_EVERY;
+                call_id.clone()
+            })
+            .collect();
+        due.sort();
+        due
     }
 }
 
@@ -216,10 +252,7 @@ impl SessionView {
         }
         if event.event == HOST_TOOL_CANCEL {
             if let Ok(cancel) = event.host_tool_cancel() {
-                self.host.cancel(&cancel.call_id);
-                // A review waiting for decisions: the call is over (the
-                // server already ended it), the review stays open.
-                let _ = self.host_genui.stop_waiting(&cancel.call_id, "");
+                self.end_host_call(&cancel.call_id);
             }
             return;
         }
@@ -228,10 +261,96 @@ impl SessionView {
         };
         // Other devices following this session provide their own tools: a
         // server names the provider by the device that registered it.
-        if !self.provides(&call.provider) || !self.host.take(&call.call_id) {
+        let now = cx.background_executor().now();
+        if !self.provides(&call.provider) || !self.host.take(&call.call_id, now) {
             return;
         }
         self.run_host_call(call, cx);
+        self.keep_host_calls_alive(cx);
+    }
+
+    /// The server ended `call_id` (cancelled, expired, answered): nothing
+    /// is owed for it. A review waiting for decisions stays open.
+    fn end_host_call(&mut self, call_id: &str) {
+        self.host.cancel(call_id);
+        let _ = self.host_genui.stop_waiting(call_id, "");
+    }
+
+    /// Whether this tab's Gentle Shell takes `host_tool_progress`: a call
+    /// then runs as long as the app works on it.
+    pub(super) fn host_progress(&self) -> bool {
+        self.desktop
+            .capabilities()
+            .is_some_and(|capabilities| capabilities.supports(DesktopMethod::HostToolProgress))
+    }
+
+    /// Run the heartbeat while calls run: wake when the next progress is
+    /// due, send it, and end once no call runs (a later call starts it
+    /// again).
+    fn keep_host_calls_alive(&mut self, cx: &mut Context<Self>) {
+        if self.host.beating || !self.host_progress() {
+            return;
+        }
+        self.host.beating = true;
+        cx.spawn(async move |this, cx| {
+            loop {
+                let next = this.update(cx, |this, _| {
+                    let next = this.host.next_beat();
+                    this.host.beating = next.is_some();
+                    next
+                });
+                let Ok(Some(at)) = next else {
+                    break;
+                };
+                let executor = cx.background_executor().clone();
+                executor
+                    .timer(at.saturating_duration_since(executor.now()))
+                    .await;
+                if this
+                    .update(cx, |this, cx| this.send_host_progress(cx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Send `host_tool_progress` for every call due now. A failed send is
+    /// left to the next beat; a call the server no longer holds ends.
+    fn send_host_progress(&mut self, cx: &mut Context<Self>) {
+        let due = self.host.due(cx.background_executor().now());
+        let Some(capabilities) = self.desktop.capabilities().cloned() else {
+            return;
+        };
+        for call_id in due {
+            #[cfg(test)]
+            self.host.beats.push(call_id.clone());
+            let Some(process) = self.process() else {
+                return;
+            };
+            let id = self.host.request_id();
+            let Ok(request) = DesktopRequest::host_tool_progress(id, &capabilities, &call_id)
+            else {
+                continue;
+            };
+            cx.spawn(async move |this, cx| {
+                let sent = cx
+                    .background_executor()
+                    .spawn(async move { process.desktop(&request) })
+                    .await;
+                let over = sent.is_ok_and(|answer| {
+                    answer.error().is_some_and(|error| {
+                        matches!(error.code.as_str(), "unknown_call" | "already_answered")
+                    })
+                });
+                if over {
+                    let _ = this.update(cx, |this, _| this.end_host_call(&call_id));
+                }
+            })
+            .detach();
+        }
     }
 
     /// Whether `provider` is this app: on a server it is this device's id
@@ -433,33 +552,76 @@ fn send_result(
 
 #[cfg(test)]
 mod tests {
-    use super::HostCalls;
+    use super::{HOST_TOOL_PROGRESS_EVERY, HostCalls};
+    use std::time::{Duration, Instant};
 
     #[test]
     fn a_call_runs_once_and_a_cancelled_one_is_not_answered() {
+        let now = Instant::now();
         let mut calls = HostCalls::default();
-        assert!(calls.take("c1"));
+        assert!(calls.take("c1", now));
         // Re-sent after a reconnect: not run again.
-        assert!(!calls.take("c1"));
+        assert!(!calls.take("c1", now));
         assert!(calls.finish("c1"));
         assert!(!calls.finish("c1"));
 
-        assert!(calls.take("c2"));
+        assert!(calls.take("c2", now));
         calls.cancel("c2");
         assert!(!calls.finish("c2"));
 
         // A reconnect re-offers the tools but keeps running calls.
-        assert!(calls.take("c3"));
+        assert!(calls.take("c3", now));
         calls.registered = true;
         calls.reconnected();
         assert!(!calls.registered);
         assert!(calls.finish("c3"));
 
         // A new backend owes nothing; ids keep advancing.
-        assert!(calls.take("c4"));
+        assert!(calls.take("c4", now));
         let before = calls.request_id();
         calls.reset();
         assert!(!calls.finish("c4"));
         assert_ne!(calls.request_id(), before);
+    }
+
+    #[test]
+    fn progress_is_due_every_minute_per_call_until_it_ends() {
+        let every = HOST_TOOL_PROGRESS_EVERY;
+        assert_eq!(every, Duration::from_secs(60));
+        let start = Instant::now();
+        let mut calls = HostCalls::default();
+        assert_eq!(calls.next_beat(), None);
+        calls.take("c1", start);
+        calls.take("c2", start + Duration::from_secs(20));
+        assert_eq!(calls.next_beat(), Some(start + every));
+
+        // Nothing is due before a minute has passed.
+        assert!(
+            calls
+                .due(start + every - Duration::from_millis(1))
+                .is_empty()
+        );
+        // c1's minute: only c1, next due a minute later.
+        assert_eq!(calls.due(start + every), ["c1"]);
+        assert_eq!(
+            calls.next_beat(),
+            Some(start + Duration::from_secs(20) + every)
+        );
+        assert_eq!(calls.due(start + Duration::from_secs(80)), ["c2"]);
+        // A late wake sends each once and counts the next minute from then.
+        let late = start + Duration::from_secs(300);
+        assert_eq!(calls.due(late), ["c1", "c2"]);
+        assert_eq!(calls.next_beat(), Some(late + every));
+        assert!(calls.due(late + Duration::from_secs(59)).is_empty());
+
+        // Answered, cancelled, or the backend gone: no more progress.
+        assert!(calls.finish("c1"));
+        assert_eq!(calls.due(late + every), ["c2"]);
+        calls.cancel("c2");
+        assert_eq!(calls.next_beat(), None);
+        assert!(calls.due(late + every * 10).is_empty());
+        calls.take("c3", late);
+        calls.reset();
+        assert_eq!(calls.next_beat(), None);
     }
 }

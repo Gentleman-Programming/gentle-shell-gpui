@@ -604,6 +604,7 @@ impl SessionView {
             | DesktopMethod::GetChangeDiff
             | DesktopMethod::SetHostTools
             | DesktopMethod::HostToolResult
+            | DesktopMethod::HostToolProgress
             | DesktopMethod::HostMessage
             | DesktopMethod::SetHostContext => {
                 let sends = self.desktop.expire(generation);
@@ -683,6 +684,7 @@ impl SessionView {
             | DesktopMethod::GetChangeDiff
             | DesktopMethod::SetHostTools
             | DesktopMethod::HostToolResult
+            | DesktopMethod::HostToolProgress
             | DesktopMethod::HostMessage
             | DesktopMethod::SetHostContext => {
                 let applied = self.desktop.outer(generation, handled);

@@ -4819,7 +4819,7 @@ fn capabilities_expose_the_profile_apply_method_and_event() {
 
 /// The `capabilities` methods of Gentle Shell 5.0.0, as the spec and a live
 /// backend list them.
-const MAIN_METHODS: [&str; 36] = [
+const MAIN_METHODS: [&str; 37] = [
     "capabilities",
     "get_snapshot",
     "get_config",
@@ -4854,6 +4854,7 @@ const MAIN_METHODS: [&str; 36] = [
     "reload_credentials",
     "set_host_tools",
     "host_tool_result",
+    "host_tool_progress",
     "host_message",
     "set_host_context",
 ];
@@ -4895,7 +4896,7 @@ const RELEASE_4_8_EVENTS: [&str; 7] = [
     "profile_applied",
     "agents_update",
 ];
-const NEW_METHODS: [DesktopMethod; 22] = [
+const NEW_METHODS: [DesktopMethod; 23] = [
     DesktopMethod::GetJobOutput,
     DesktopMethod::GetSubagentThread,
     DesktopMethod::ListSessions,
@@ -4916,6 +4917,7 @@ const NEW_METHODS: [DesktopMethod; 22] = [
     DesktopMethod::ReloadCredentials,
     DesktopMethod::SetHostTools,
     DesktopMethod::HostToolResult,
+    DesktopMethod::HostToolProgress,
     DesktopMethod::HostMessage,
     DesktopMethod::SetHostContext,
 ];
@@ -7277,6 +7279,57 @@ fn capabilities_with_a_method_this_client_doesnt_know_still_decode() {
     assert!(capabilities.supports(DesktopMethod::HostMessage));
     assert!(capabilities.supports(DesktopMethod::SetHostContext));
     assert!(DesktopMethod::parse("set_host_activity").is_err());
+}
+
+#[test]
+fn host_tool_progress_is_sent_only_to_a_server_that_takes_it() {
+    use pi_rpc::desktop_rpc::HostToolProgressAck;
+    let main = capabilities_of(&MAIN_METHODS, &MAIN_EVENTS);
+    let request = DesktopRequest::host_tool_progress("host-20", &main, "call-1").unwrap();
+    assert_eq!(request.method(), DesktopMethod::HostToolProgress);
+    assert_eq!(
+        request.payload(),
+        payload("host-20", "host_tool_progress", r#"{"callId":"call-1"}"#)
+    );
+    assert!(DesktopRequest::host_tool_progress("host-21", &main, "").is_err());
+    // Only through its typed constructor.
+    assert!(
+        DesktopRequest::new(
+            "host-22",
+            DesktopMethod::HostToolProgress,
+            json!({"callId": "call-1"})
+        )
+        .is_err()
+    );
+
+    // A server from before it: refused before anything is built.
+    let older: Vec<&str> = MAIN_METHODS
+        .iter()
+        .copied()
+        .filter(|method| *method != "host_tool_progress")
+        .collect();
+    let older = capabilities_of(&older, &MAIN_EVENTS);
+    assert_eq!(
+        DesktopRequest::host_tool_progress("host-23", &older, "call-1"),
+        Err(DesktopRpcError::NotAdvertised(
+            DesktopMethod::HostToolProgress
+        ))
+    );
+
+    assert_eq!(
+        ok_response(json!({"extended": true, "deadlineMs": 1_764_000_600_000_u64}))
+            .host_tool_progress()
+            .unwrap(),
+        HostToolProgressAck {
+            extended: true,
+            deadline_ms: 1_764_000_600_000,
+        }
+    );
+    assert!(
+        ok_response(json!({"extended": true}))
+            .host_tool_progress()
+            .is_err()
+    );
 }
 
 #[test]

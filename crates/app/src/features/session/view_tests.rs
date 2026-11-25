@@ -1842,7 +1842,26 @@ fn host_tools_tab(
     cx: &mut TestAppContext,
     runs_on: gentle_core::backend::Backend,
 ) -> (Entity<SessionView>, &mut VisualTestContext) {
+    host_tools_tab_offering(cx, runs_on, &[])
+}
+
+/// [`host_tools_tab`] whose Gentle Shell offers `more` methods too.
+fn host_tools_tab_offering<'a>(
+    cx: &'a mut TestAppContext,
+    runs_on: gentle_core::backend::Backend,
+    more: &[&str],
+) -> (Entity<SessionView>, &'a mut VisualTestContext) {
     let (view, cx) = tab(cx);
+    let mut methods = vec![
+        "capabilities",
+        "get_snapshot",
+        "set_host_tools",
+        "host_tool_result",
+        "host_message",
+        "set_host_context",
+        "set_host_activity",
+    ];
+    methods.extend_from_slice(more);
     view.update(cx, |view, _| {
         view.runs_on = Some(runs_on);
         view.backend.host_tools = true;
@@ -1851,13 +1870,95 @@ fn host_tools_tab(
             probe.request.request_id(),
             json!({
                 "schema": SCHEMA, "command": PROMPT_COMMAND, "widget": WIDGET_KEY,
-                "methods": ["capabilities", "get_snapshot", "set_host_tools", "host_tool_result",
-                            "host_message", "set_host_context", "set_host_activity"],
+                "methods": methods,
                 "events": ["host_tool_call", "host_tool_cancel"],
             }),
         ));
     });
     (view, cx)
+}
+
+/// A `gentle_ui` review that waits for decisions, on a server that takes
+/// `host_tool_progress` when `progress`; then `minutes` minute by minute.
+fn waiting_review(
+    cx: &mut TestAppContext,
+    progress: bool,
+    minutes: u64,
+) -> (Entity<SessionView>, &mut VisualTestContext) {
+    let server = gentle_core::backend::Backend::Server {
+        url: "http://127.0.0.1:8787".into(),
+        device: "dev_1".into(),
+        name: "pc".into(),
+    };
+    let more: &[&str] = if progress {
+        &["host_tool_progress"]
+    } else {
+        &[]
+    };
+    let (view, cx) = host_tools_tab_offering(cx, server, more);
+    let spec = json!({"files": [{"path": "src/a.rs", "hunks": [
+        {"id": "h1", "oldStart": 1, "newStart": 1, "lines": ["-a", "+b"]},
+    ]}]});
+    view.update_in(cx, |view, window, cx| {
+        view.handle_batch(
+            vec![host_event(
+                1,
+                "host_tool_call",
+                json!({"callId": "g1", "provider": "dev_1", "tool": "gentle_ui",
+                       "args": {"action": "show", "id": "r", "kind": "review", "spec": spec, "wait": true}}),
+            )],
+            window,
+            cx,
+        );
+    });
+    for _ in 0..minutes {
+        cx.executor()
+            .advance_clock(std::time::Duration::from_secs(60));
+        cx.run_until_parked();
+    }
+    (view, cx)
+}
+
+/// A server that takes `host_tool_progress` hears every minute that the
+/// app still waits for the review's decisions, with no cap, until the call
+/// ends.
+#[gpui::test]
+fn a_waiting_review_keeps_its_call_alive_while_the_server_takes_progress(cx: &mut TestAppContext) {
+    let (view, cx) = waiting_review(cx, true, 12);
+    view.read_with(cx, |view, _| {
+        assert!(view.host.sent.is_empty(), "still waiting past 9 minutes");
+        assert_eq!(view.host.beats, vec!["g1".to_string(); 12]);
+    });
+    view.update_in(cx, |view, window, cx| {
+        view.handle_batch(
+            vec![host_event(2, "host_tool_cancel", json!({"callId": "g1"}))],
+            window,
+            cx,
+        );
+    });
+    cx.executor()
+        .advance_clock(std::time::Duration::from_secs(180));
+    cx.run_until_parked();
+    view.read_with(cx, |view, _| {
+        assert_eq!(view.host.beats.len(), 12, "a cancelled call goes quiet");
+        assert!(view.host.sent.is_empty());
+    });
+}
+
+/// A server without `host_tool_progress` fails the call after 10 minutes:
+/// the review answers first, after 9, and nothing beats.
+#[gpui::test]
+fn a_waiting_review_gives_up_first_on_a_server_without_progress(cx: &mut TestAppContext) {
+    let (view, cx) = waiting_review(cx, false, 9);
+    view.read_with(cx, |view, _| {
+        assert!(view.host.beats.is_empty());
+        let (id, outcome, _) = &view.host.sent[0];
+        assert_eq!(id, "g1");
+        let pi_rpc::desktop_rpc::HostToolContent::Text { text } = &outcome.content[0] else {
+            panic!("expected text")
+        };
+        assert!(text.contains("No decisions after 9 minutes."), "{text}");
+    });
 }
 
 /// A Gentle Shell here with host tools: the app runs `gentle_ui` itself and

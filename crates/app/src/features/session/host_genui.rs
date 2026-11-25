@@ -109,7 +109,12 @@ impl SessionView {
                     self.answer_host_call_with(earlier, tool, answer, details, cx);
                 }
                 self.show_waiting(&args, &surface, cx);
-                // Give up before the server does; the review stays open.
+                // The heartbeat keeps the call alive while the review waits.
+                if self.host_progress() {
+                    return;
+                }
+                // An older server fails it after 10 minutes: give up first;
+                // the review stays open.
                 cx.spawn(async move |this, cx| {
                     cx.background_executor().timer(host::REVIEW_WAIT).await;
                     let _ = this.update(cx, |this, cx| {

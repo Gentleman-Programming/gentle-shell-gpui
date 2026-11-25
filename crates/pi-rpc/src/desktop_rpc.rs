@@ -130,12 +130,13 @@ pub use definitions::{
     AgentDefinitions, DefaultOrchestrator, OrchestratorStatus, SubagentDefaults,
 };
 pub use host_tools::{
-    HOST_TOOL_CALL, HOST_TOOL_CANCEL, HostDelivery, HostMessage, HostMessageAck, HostTool,
-    HostToolCall, HostToolCancel, HostToolContent, HostToolResultAck, MAX_DESCRIPTION_CHARS,
-    MAX_DETAILS_BYTES, MAX_GUIDELINE_CHARS, MAX_GUIDELINES, MAX_HOST_MESSAGE_BYTES,
-    MAX_HOST_TOOL_RESULT_BYTES, MAX_HOST_TOOLS, MAX_LABEL_CHARS, MAX_MESSAGE_CONTENT_BYTES,
-    MAX_PARAMETERS_BYTES, MAX_PROVIDER_CHARS, MAX_RESULT_CONTENT_BYTES, MAX_SET_HOST_TOOLS_BYTES,
-    RejectedHostTool, SetHostContextAck, SetHostToolsResult, valid_custom_type, valid_tool_name,
+    HOST_TOOL_CALL, HOST_TOOL_CANCEL, HOST_TOOL_PROGRESS_EVERY, HostDelivery, HostMessage,
+    HostMessageAck, HostTool, HostToolCall, HostToolCancel, HostToolContent, HostToolProgressAck,
+    HostToolResultAck, MAX_DESCRIPTION_CHARS, MAX_DETAILS_BYTES, MAX_GUIDELINE_CHARS,
+    MAX_GUIDELINES, MAX_HOST_MESSAGE_BYTES, MAX_HOST_TOOL_RESULT_BYTES, MAX_HOST_TOOLS,
+    MAX_LABEL_CHARS, MAX_MESSAGE_CONTENT_BYTES, MAX_PARAMETERS_BYTES, MAX_PROVIDER_CHARS,
+    MAX_RESULT_CONTENT_BYTES, MAX_SET_HOST_TOOLS_BYTES, RejectedHostTool, SetHostContextAck,
+    SetHostToolsResult, valid_custom_type, valid_tool_name,
 };
 pub use output::{JobOutput, SubagentThread, ThreadItem};
 pub use review::{
@@ -220,6 +221,7 @@ pub enum DesktopMethod {
     ReloadCredentials,
     SetHostTools,
     HostToolResult,
+    HostToolProgress,
     HostMessage,
     SetHostContext,
 }
@@ -228,7 +230,7 @@ impl DesktopMethod {
     /// Every method this client knows, in the order `capabilities` lists
     /// them on Gentle Shell 5.0.0. Which ones a peer offers is only what its
     /// `capabilities` say: Gentle Shell 4.8.0 offers fourteen of them.
-    pub const ALL: [Self; 36] = [
+    pub const ALL: [Self; 37] = [
         Self::Capabilities,
         Self::GetSnapshot,
         Self::GetConfig,
@@ -263,6 +265,7 @@ impl DesktopMethod {
         Self::ReloadCredentials,
         Self::SetHostTools,
         Self::HostToolResult,
+        Self::HostToolProgress,
         Self::HostMessage,
         Self::SetHostContext,
     ];
@@ -304,6 +307,7 @@ impl DesktopMethod {
             Self::ReloadCredentials => "reload_credentials",
             Self::SetHostTools => "set_host_tools",
             Self::HostToolResult => "host_tool_result",
+            Self::HostToolProgress => "host_tool_progress",
             Self::HostMessage => "host_message",
             Self::SetHostContext => "set_host_context",
         }
@@ -341,6 +345,7 @@ impl DesktopMethod {
                 | Self::SetBackgroundSubagents
                 | Self::SetHostTools
                 | Self::HostToolResult
+                | Self::HostToolProgress
                 | Self::HostMessage
                 | Self::SetHostContext
         )
@@ -383,6 +388,7 @@ impl DesktopMethod {
             "reload_credentials" => Ok(Self::ReloadCredentials),
             "set_host_tools" => Ok(Self::SetHostTools),
             "host_tool_result" => Ok(Self::HostToolResult),
+            "host_tool_progress" => Ok(Self::HostToolProgress),
             "host_message" => Ok(Self::HostMessage),
             "set_host_context" => Ok(Self::SetHostContext),
             other => Err(DesktopRpcError::UnsupportedMethod(other.to_string())),
@@ -1000,6 +1006,23 @@ impl DesktopRequest {
         )
     }
 
+    /// The `host_tool_progress` request for `call_id`: this client still
+    /// works on it, so the server restarts its no-result deadline. Refused
+    /// before anything is sent when the peer's `capabilities` don't list it
+    /// (an older server fails the call after its deadline whatever comes).
+    pub fn host_tool_progress(
+        request_id: impl Into<String>,
+        capabilities: &Capabilities,
+        call_id: &str,
+    ) -> Result<Self, DesktopRpcError> {
+        capabilities.require(DesktopMethod::HostToolProgress)?;
+        Self::build(
+            request_id,
+            DesktopMethod::HostToolProgress,
+            host_tools::host_tool_progress_params(call_id)?,
+        )
+    }
+
     /// The `host_message` request: a custom message in the conversation.
     /// Through a server, it goes to `/desktop`.
     pub fn host_message(
@@ -1384,6 +1407,11 @@ impl DesktopResponse {
     /// The response to `host_tool_result`.
     pub fn host_tool_result(&self) -> Result<HostToolResultAck, DesktopRpcError> {
         HostToolResultAck::from_data(self.data()?)
+    }
+
+    /// The response to `host_tool_progress`.
+    pub fn host_tool_progress(&self) -> Result<HostToolProgressAck, DesktopRpcError> {
+        HostToolProgressAck::from_data(self.data()?)
     }
 
     /// The response to `host_message`.

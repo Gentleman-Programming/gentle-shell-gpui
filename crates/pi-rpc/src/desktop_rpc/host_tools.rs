@@ -3,10 +3,12 @@
 //! provider's whole set (an empty list unregisters it); the agent calling
 //! one arrives as a `host_tool_call` event, a stopped turn or call as
 //! `host_tool_cancel`, and the client answers with `host_tool_result`
-//! (optionally with the Pi tool result's `details`). The same client talks
-//! to the agent without a call too: `host_message` is a custom message in
-//! the conversation, `set_host_context` a hidden one added before every
-//! agent run while it is set.
+//! (optionally with the Pi tool result's `details`). While it still works
+//! on a call, `host_tool_progress` restarts the call's no-result deadline
+//! (10 minutes on Gentle Shell). The same client talks to the agent without
+//! a call too: `host_message` is a custom message in the conversation,
+//! `set_host_context` a hidden one added before every agent run while it
+//! is set.
 //!
 //! The limits are the contract's, checked before anything is sent: a tool
 //! the server would refuse never leaves the app. Through a Gentle Shell
@@ -22,6 +24,9 @@ use serde_json::{Map, Value, json};
 pub const HOST_TOOL_CALL: &str = "host_tool_call";
 /// The event a stopped turn, cancelled or expired call arrives as.
 pub const HOST_TOOL_CANCEL: &str = "host_tool_cancel";
+/// How often a client still working on a call sends `host_tool_progress`:
+/// well inside the server's 10-minute no-result deadline.
+pub const HOST_TOOL_PROGRESS_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Longest provider name, in characters.
 pub const MAX_PROVIDER_CHARS: usize = 64;
@@ -222,6 +227,17 @@ pub(super) fn host_tool_result_params(
     Ok(params)
 }
 
+/// The wire `params` of `host_tool_progress`: `{ callId }`.
+pub(super) fn host_tool_progress_params(call_id: &str) -> Result<Value, DesktopRpcError> {
+    if call_id.is_empty() {
+        return Err(DesktopRpcError::InvalidValue {
+            field: "callId",
+            value: String::new(),
+        });
+    }
+    Ok(json!({ "callId": call_id }))
+}
+
 /// `details` as sent, refused over [`MAX_DETAILS_BYTES`].
 fn checked_details(details: &Map<String, Value>) -> Result<Value, DesktopRpcError> {
     let value = Value::Object(details.clone());
@@ -371,6 +387,21 @@ pub struct HostToolResultAck {
 }
 
 impl HostToolResultAck {
+    pub(super) fn from_data(data: &Value) -> Result<Self, DesktopRpcError> {
+        decode_data(data)
+    }
+}
+
+/// The decoded `host_tool_progress` data: `{ extended: true, deadlineMs }`,
+/// the call's new no-result deadline in epoch milliseconds.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostToolProgressAck {
+    pub extended: bool,
+    pub deadline_ms: u64,
+}
+
+impl HostToolProgressAck {
     pub(super) fn from_data(data: &Value) -> Result<Self, DesktopRpcError> {
         decode_data(data)
     }

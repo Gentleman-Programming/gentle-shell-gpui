@@ -619,6 +619,7 @@ pub(in crate::features::session) mod desktop {
                     // Sent to a server's `/desktop`, never through this slot.
                     | Some(DesktopMethod::SetHostTools)
                     | Some(DesktopMethod::HostToolResult)
+                    | Some(DesktopMethod::HostToolProgress)
                     | Some(DesktopMethod::HostMessage)
                     | Some(DesktopMethod::SetHostContext) => Applied::default(),
                     None => Applied::default(),

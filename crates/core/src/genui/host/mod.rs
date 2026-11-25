@@ -39,9 +39,11 @@ const MAX_ERRORS: usize = 10;
 /// Items a summary line lists at most.
 const MAX_LISTED: usize = 60;
 /// How long a `wait: true` review call waits for the user's decisions
-/// before answering that it stopped (the review stays open). The extension
-/// waits 30 minutes; a Gentle Shell server fails a host tool call nobody
-/// answered after 10, so the app answers first.
+/// before answering that it stopped (the review stays open), only on a
+/// Gentle Shell without `host_tool_progress`: that one fails a host tool
+/// call nobody answered after 10 minutes, so the app answers first. One
+/// that takes it keeps the call alive while the app sends progress, and the
+/// review waits without a cap.
 pub const REVIEW_WAIT: Duration = Duration::from_secs(9 * 60);
 
 /// The custom message type a call's surface or an event is drawn from.
