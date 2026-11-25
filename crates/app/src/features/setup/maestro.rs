@@ -180,7 +180,9 @@ pub struct MaestroStatus {
 }
 
 /// Blocking: looks for the CLI, Java and the registration, where agents run
-/// (on this computer, without a registration, for a server's agents).
+/// (on this computer, without a registration needed, for agents that take
+/// the app's host tools: a server's, or a Gentle Shell here new enough to).
+/// A registration left from before still shows, so it can be removed.
 pub fn status() -> MaestroStatus {
     match super::remote::backend() {
         Some(choice) if choice.is_server() => MaestroStatus {
@@ -194,8 +196,18 @@ pub fn status() -> MaestroStatus {
             connected: false,
             host_tool: false,
         }),
-        None => status_here(is_registered(&pi_rpc::resolve_homes().agent)),
+        None => MaestroStatus {
+            host_tool: host_tools_here(),
+            ..status_here(is_registered(&pi_rpc::resolve_homes().agent))
+        },
     }
+}
+
+/// Agents on this computer take the app's tools as host tools
+/// (`pi_rpc::takes_host_tools`): Maestro is the app's `maestro` tool for
+/// them, with no MCP server.
+fn host_tools_here() -> bool {
+    launcher().is_ok_and(|spec| pi_rpc::takes_host_tools(&spec))
 }
 
 /// This computer's CLI and Java, with `connected` as given.
@@ -282,8 +294,10 @@ fn remove_here(log: &Log) -> Result<(), String> {
     Ok(())
 }
 
-/// Java (when missing), the CLI (when missing), then the MCP server. For a
-/// server's agents, Java and the CLI on this computer and no MCP server.
+/// Java (when missing), the CLI (when missing), then the MCP server. For
+/// agents that take the app's host tools (a server's, or this computer's
+/// with a Gentle Shell new enough), Java and the CLI on this computer and no
+/// MCP server.
 pub fn install(log: &Log) -> Result<(), String> {
     match super::remote::backend() {
         Some(choice) if choice.is_server() => {
@@ -292,6 +306,11 @@ pub fn install(log: &Log) -> Result<(), String> {
             return Ok(());
         }
         Some(choice) => return remote_install(&choice, log),
+        None if host_tools_here() => {
+            toolchain_here(log)?;
+            log("Done. Agents get the app's maestro tool (with Devices on), which runs Maestro here.".into());
+            return Ok(());
+        }
         None => {}
     }
     let spec = launcher()?;

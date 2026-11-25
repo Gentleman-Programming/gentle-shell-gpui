@@ -13,7 +13,7 @@ use gentle_core::devices::{Device, Platform, State};
 use pi_rpc::desktop_rpc::{HostTool, HostToolContent};
 use serde_json::{Value, json};
 
-use super::{Outcome, WHERE, tool};
+use super::{Outcome, Place, tool};
 use crate::features::devices::{cli, find_device, hub};
 use crate::features::setup::devices as setup;
 
@@ -72,12 +72,21 @@ pub fn offered() -> bool {
     prefs.enabled && prefs.agents
 }
 
-pub fn definition() -> HostTool {
+pub fn definition(place: Place) -> HostTool {
+    let side = place.user_side();
+    let install = match place {
+        Place::Here => {
+            "install takes the absolute path of a build you made (a .app, a .zip holding one, an .ipa or an .apk) or an http(s) URL to one."
+        }
+        Place::Inside | Place::Server => {
+            "install runs on the user's computer: a path you built on your own machine doesn't exist there. Build with the project's usual tools, then make the build reachable (an http(s) URL, e.g. a file server or artifact link) and pass that URL, or ask the user for a path on their computer."
+        }
+    };
     tool(
         "device",
         "Device",
         format!(
-            "iOS simulators and Android emulators on {WHERE}, shown live in the app's device panel \
+            "iOS simulators and Android emulators on {side}, shown live in the app's device panel \
 where the user watches them. list; open a device (boots it without a separate window); then \
 launch an app, snapshot what's on screen (with @refs), press and fill those refs, screenshot, \
 install an app build; close it when done."
@@ -97,7 +106,7 @@ install an app build; close it when done."
         &[
             "Use device for every iOS simulator and Android emulator: list, then open \"<name>\"; drive it only with this tool's actions. Never boot or drive one with shell commands (no xcrun simctl, open -a Simulator, emulator -avd, adb shell input, idb, or scripts that wrap them).",
             "After launch or press/fill, read the snapshot it answers with; snapshot again only when the ref you need isn't there. Refs go stale after the screen changes.",
-            "install runs on the user's computer: a path you built on your own machine doesn't exist there. Build with the project's usual tools, then make the build reachable (an http(s) URL, e.g. a file server or artifact link) and pass that URL, or ask the user for a path on their computer.",
+            install,
             "close with shutdown: true turns a device off when you're done with it.",
         ],
     )

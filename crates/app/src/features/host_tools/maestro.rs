@@ -1,8 +1,8 @@
 //! `maestro`: Maestro flows, the view hierarchy and screenshots on the iOS
 //! simulator or Android emulator open in the app's device panel, run here
-//! with this computer's Maestro CLI (`setup::maestro`). An agent on a Gentle
-//! Shell server gets this tool instead of Maestro's MCP server, which would
-//! run Maestro on the server, where no simulator is.
+//! with this computer's Maestro CLI (`setup::maestro`). An agent that takes
+//! the app's host tools gets this tool instead of Maestro's MCP server
+//! (which on a server would run Maestro there, where no simulator is).
 
 use std::io::Read;
 use std::path::Path;
@@ -15,7 +15,7 @@ use gentle_core::devices::{Device, Platform, State};
 use pi_rpc::desktop_rpc::{HostTool, HostToolContent};
 use serde_json::{Value, json};
 
-use super::{Outcome, WHERE, tool};
+use super::{Outcome, Place, tool};
 use crate::features::devices::{android_sdk, find_device, hub, simctl_path};
 use crate::features::setup::maestro as setup;
 
@@ -69,12 +69,23 @@ fn gated(devices: bool, maestro: bool) -> bool {
     devices && maestro
 }
 
-pub fn definition() -> HostTool {
+pub fn definition(place: Place) -> HostTool {
+    let side = place.user_side();
+    let guidelines: [&str; 2] = match place {
+        Place::Here => [
+            "Use maestro for Maestro flows on simulators and emulators, not the maestro CLI or Maestro MCP tools: it drives the device open in the app's device panel, where the user watches it.",
+            "run_flow takes the whole flow in yaml: appId: <id>, a line with ---, then commands (launchApp, tapOn, inputText, assertVisible, scrollUntilVisible, takeScreenshot…). It runs from a temporary file: name files the flow uses (runFlow, addMedia, runScript) by absolute path, or inline those steps.",
+        ],
+        Place::Inside | Place::Server => [
+            "Use maestro for Maestro flows on simulators and emulators. Never run the maestro CLI or Maestro MCP tools on your own machine: it has no simulator.",
+            "run_flow takes the whole flow in yaml: appId: <id>, a line with ---, then commands (launchApp, tapOn, inputText, assertVisible, scrollUntilVisible, takeScreenshot…). It runs on the user's computer: files the flow names (runFlow, addMedia, runScript) aren't there, so inline those steps.",
+        ],
+    };
     tool(
         "maestro",
         "Maestro",
         format!(
-            "Maestro UI testing on {WHERE}, on the iOS simulator or Android emulator open in the \
+            "Maestro UI testing on {side}, on the iOS simulator or Android emulator open in the \
 app's device panel (open one with the device tool first). run_flow runs a Maestro flow and \
 answers with Maestro's output and whether it passed; hierarchy answers with the screen's view \
 hierarchy (JSON, trimmed); screenshot answers with a picture of the screen."
@@ -89,8 +100,8 @@ hierarchy (JSON, trimmed); screenshot answers with a picture of the screen."
             "required": ["action"]
         }),
         &[
-            "Use maestro for Maestro flows on simulators and emulators. Never run the maestro CLI or Maestro MCP tools on your own machine: it has no simulator.",
-            "run_flow takes the whole flow in yaml: appId: <id>, a line with ---, then commands (launchApp, tapOn, inputText, assertVisible, scrollUntilVisible, takeScreenshot…). It runs on the user's computer: files the flow names (runFlow, addMedia, runScript) aren't there, so inline those steps.",
+            guidelines[0],
+            guidelines[1],
             "A flow may run up to 5 minutes; keep each flow short and read its output: a failure names the step that failed.",
             "Use hierarchy to find the ids and texts to select on, and screenshot to see the screen.",
         ],
@@ -523,10 +534,12 @@ mod tests {
         assert!(!gated(true, false));
         assert!(!gated(false, true));
         assert!(!gated(false, false));
-        // Valid however this computer is set up.
-        definition()
-            .validate()
-            .unwrap_or_else(|error| panic!("{error}"));
+        // Valid however this computer is set up, wherever the agent runs.
+        for place in [Place::Here, Place::Inside, Place::Server] {
+            definition(place)
+                .validate()
+                .unwrap_or_else(|error| panic!("{error}"));
+        }
     }
 
     #[test]

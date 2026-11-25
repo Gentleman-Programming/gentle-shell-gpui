@@ -1826,13 +1826,26 @@ fn host_tool_calls_reach_their_handler_once_and_answer_unless_cancelled(cx: &mut
 
 /// A server tab whose Desktop channel takes host messages and contexts.
 fn genui_server_tab(cx: &mut TestAppContext) -> (Entity<SessionView>, &mut VisualTestContext) {
-    let (view, cx) = tab(cx);
-    view.update(cx, |view, _| {
-        view.runs_on = Some(gentle_core::backend::Backend::Server {
+    host_tools_tab(
+        cx,
+        gentle_core::backend::Backend::Server {
             url: "http://127.0.0.1:8787".into(),
             device: "dev_1".into(),
             name: "pc".into(),
-        });
+        },
+    )
+}
+
+/// A tab on `runs_on` whose agent takes the app's host tools, with a
+/// Desktop channel that takes host messages and contexts.
+fn host_tools_tab(
+    cx: &mut TestAppContext,
+    runs_on: gentle_core::backend::Backend,
+) -> (Entity<SessionView>, &mut VisualTestContext) {
+    let (view, cx) = tab(cx);
+    view.update(cx, |view, _| {
+        view.runs_on = Some(runs_on);
+        view.backend.host_tools = true;
         let probe = view.desktop.ready(true).sends.remove(0);
         view.desktop.ui(&response(
             probe.request.request_id(),
@@ -1845,6 +1858,39 @@ fn genui_server_tab(cx: &mut TestAppContext) -> (Entity<SessionView>, &mut Visua
         ));
     });
     (view, cx)
+}
+
+/// A Gentle Shell here with host tools: the app runs `gentle_ui` itself and
+/// answers the calls made to its own provider, `desktop`, as it does for a
+/// server's session.
+#[gpui::test]
+fn a_local_tab_with_host_tools_runs_the_apps_tools(cx: &mut TestAppContext) {
+    use gentle_core::genui::host::Mode;
+
+    let (view, cx) = host_tools_tab(cx, gentle_core::backend::Backend::Local);
+    view.read_with(cx, |view, _| {
+        assert_eq!(view.host_genui_mode(), Some(Mode::Proactive));
+    });
+    let call = |seq: u64, id: &str, provider: &str| {
+        host_event(
+            seq,
+            "host_tool_call",
+            json!({"callId": id, "provider": provider, "tool": "no_such_tool", "args": {}}),
+        )
+    };
+    view.update_in(cx, |view, window, cx| {
+        view.handle_batch(
+            vec![call(1, "c1", "desktop"), call(2, "c2", "dev_1")],
+            window,
+            cx,
+        );
+    });
+    cx.run_until_parked();
+    view.read_with(cx, |view, _| {
+        let ids: Vec<&str> = view.host.sent.iter().map(|(id, ..)| id.as_str()).collect();
+        assert_eq!(ids, ["c1"]);
+        assert!(view.host.sent[0].1.is_error);
+    });
 }
 
 #[gpui::test]

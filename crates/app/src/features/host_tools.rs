@@ -1,9 +1,11 @@
-//! Host tools: the app's own tools, offered to an agent that runs on a
-//! Gentle Shell server (`gentle-shell serve`) and run here, on the computer
-//! the user watches. Gentle Shell's Desktop RPC carries them
-//! (`set_host_tools`, `host_tool_call`, `host_tool_result`); the agent sees
-//! them as ordinary tools, with the guidance a local agent reads in the
-//! app's instructions moved into each tool's description and guidelines.
+//! Host tools: the app's own tools, offered to an agent that takes them (on
+//! a Gentle Shell server, `gentle-shell serve`, or a Gentle Shell here new
+//! enough to) and run here, on the computer the user watches. Gentle
+//! Shell's Desktop RPC carries them (`set_host_tools`, `host_tool_call`,
+//! `host_tool_result`); the agent sees them as ordinary tools, with the
+//! guidance an older Gentle Shell reads in the app's instructions moved into
+//! each tool's description and guidelines, worded for where the agent runs
+//! ([`Place`]).
 //!
 //! - `open_page`: what `gentle-open <url>` does.
 //! - `browser`: what `gentle-browser` does, on the app's browser cards.
@@ -11,11 +13,11 @@
 //! - `canvas_read`, `canvas_edit`, `canvas_shot`: for an agent opened beside
 //!   a canvas, on that open canvas.
 //! - `gentle_ui`: what the app's generative UI extension does
-//!   (`gentle_core::genui::host`), when the server takes host messages and
+//!   (`gentle_core::genui::host`), when Gentle Shell takes host messages and
 //!   Agent UI isn't off.
 //! - `maestro`: Maestro flows, the view hierarchy and screenshots on the
 //!   device panel's open simulator, with this computer's Maestro (in place
-//!   of Maestro's MCP server, which would run on the server).
+//!   of Maestro's MCP server).
 //!
 //! This module is the pure part: the definitions sent, how a call's
 //! arguments become the operation the app's existing code runs, and how its
@@ -77,9 +79,43 @@ const SCREEN_OPS: [&str; 8] = [
     "quit",
 ];
 
-/// What the agent is told the user's side is.
-const WHERE: &str =
-    "the user's computer, where the Gentle Shell app runs (not the machine you run on)";
+/// Where the agent runs, which the tools' descriptions tell it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Place {
+    /// On this computer, beside the app.
+    Here,
+    /// In WSL, a VM or a container on this computer.
+    Inside,
+    /// On a Gentle Shell server.
+    Server,
+}
+
+impl Place {
+    pub fn of(backend: &gentle_core::backend::Backend) -> Self {
+        use gentle_core::backend::Backend;
+        match backend {
+            Backend::Local => Self::Here,
+            Backend::Wsl { .. } | Backend::Command { .. } => Self::Inside,
+            Backend::Server { .. } => Self::Server,
+        }
+    }
+
+    /// What the agent is told the user's side is.
+    pub fn user_side(self) -> &'static str {
+        match self {
+            Self::Here => {
+                "the user's computer, where the Gentle Shell app runs (the same computer you run on)"
+            }
+            Self::Inside => {
+                "the user's computer, where the Gentle Shell app runs (you run in WSL, a VM or a \
+                 container on it)"
+            }
+            Self::Server => {
+                "the user's computer, where the Gentle Shell app runs (not the machine you run on)"
+            }
+        }
+    }
+}
 
 fn tool(
     name: &str,
@@ -97,16 +133,16 @@ fn tool(
     }
 }
 
-/// The tools the app offers a server session; the canvas tools only to an
-/// agent opened beside a canvas, `gentle_ui` with the rules of the Agent UI
-/// mode given (none: not offered).
-pub fn definitions(canvas: bool, genui: Option<Mode>) -> Vec<HostTool> {
-    let mut tools = vec![open_page(), browser(), screen()];
+/// The tools the app offers an agent running at `place`; the canvas tools
+/// only to an agent opened beside a canvas, `gentle_ui` with the rules of
+/// the Agent UI mode given (none: not offered).
+pub fn definitions(canvas: bool, genui: Option<Mode>, place: Place) -> Vec<HostTool> {
+    let mut tools = vec![open_page(place), browser(place), screen(place)];
     if device::offered() {
-        tools.push(device::definition());
+        tools.push(device::definition(place));
     }
     if maestro::offered() {
-        tools.push(maestro::definition());
+        tools.push(maestro::definition(place));
     }
     tools.push(themes::definition());
     if canvas {
@@ -128,14 +164,35 @@ fn gentle_ui(mode: Mode) -> HostTool {
     }
 }
 
-fn open_page() -> HostTool {
+fn open_page(place: Place) -> HostTool {
+    let side = place.user_side();
+    let localhost = match place {
+        Place::Here => "A page on localhost (a dev server you started) opens as it is.",
+        Place::Inside => {
+            "A page on your localhost opens at the same address there, which reaches it when \
+             your environment shares its ports with the user's computer (WSL does)."
+        }
+        Place::Server => {
+            "A page on your machine's localhost opens there through the server's authenticated \
+             forward of its port."
+        }
+    };
+    let guidelines: [&str; 2] = match place {
+        Place::Server => [
+            "To show the user a page, call open_page; never run open, xdg-open, start or a browser yourself: you run on a server and nothing you open there reaches the user.",
+            "Pass a dev server you started as its localhost URL (http://localhost:5173/...): the app forwards that port of your machine to the user's computer by itself. A page served over https on localhost can't be forwarded; serve it over plain http.",
+        ],
+        Place::Here | Place::Inside => [
+            "To show the user a page, call open_page; never run open, xdg-open, start or a browser yourself: open_page shows it in the app, where the user is looking.",
+            "Pass a dev server you started as its localhost URL (http://localhost:5173/...).",
+        ],
+    };
     tool(
         "open_page",
         "Open page",
         format!(
-            "Show a web page (a dev server, a preview, docs) to the user on {WHERE}: in the app's \
-             browser, or in their own browser when they chose that. A page on your machine's \
-             localhost opens there through the server's authenticated forward of its port."
+            "Show a web page (a dev server, a preview, docs) to the user on {side}: in the app's \
+             browser, or in their own browser when they chose that. {localhost}"
         ),
         json!({
             "type": "object",
@@ -145,19 +202,17 @@ fn open_page() -> HostTool {
             "required": ["url"],
             "additionalProperties": false
         }),
-        &[
-            "To show the user a page, call open_page; never run open, xdg-open, start or a browser yourself: you run on a server and nothing you open there reaches the user.",
-            "Pass a dev server you started as its localhost URL (http://localhost:5173/...): the app forwards that port of your machine to the user's computer by itself. A page served over https on localhost can't be forwarded; serve it over plain http.",
-        ],
+        &guidelines,
     )
 }
 
-fn browser() -> HostTool {
+fn browser(place: Place) -> HostTool {
+    let side = place.user_side();
     tool(
         "browser",
         "Browser",
         format!(
-            "Drive a web page in the Gentle Shell app's browser, on {WHERE}, where the user watches it. \
+            "Drive a web page in the Gentle Shell app's browser, on {side}, where the user watches it. \
              open {{url, name?, profile?, hidden?}} opens a page (named so later calls find it; profile agent by default, shared for the user's sign-ins). \
              tabs lists every page. snapshot {{tab, text?, root?}} is an outline with refs (e12) to act on. \
              click / hover / focus / check / uncheck {{tab, target}}; fill {{tab, target, text}}; type {{tab, target?, text}}; select {{tab, target, text: option}}; \
@@ -196,12 +251,24 @@ fn browser() -> HostTool {
     )
 }
 
-fn screen() -> HostTool {
+fn screen(place: Place) -> HostTool {
+    let side = place.user_side();
+    let runs = match place {
+        Place::Here => {
+            "screen runs on the computer you run on: launch starts a program installed here, or one you built."
+        }
+        Place::Inside => {
+            "screen runs on the user's computer, outside the environment you run in: launch starts a program installed there, and your files and builds are there only where the environment shares them."
+        }
+        Place::Server => {
+            "screen runs on the user's computer, not where you run: launch starts a program installed there, and your files and builds are not there unless the user's computer shares them."
+        }
+    };
     tool(
         "screen",
         "Screen",
         format!(
-            "Launch a desktop app on {WHERE}, look at its windows and use it, to check what you built. \
+            "Launch a desktop app on {side}, look at its windows and use it, to check what you built. \
              launch {{command: [program, ...args], app?, cwd?, wait?}} starts it there and answers its first window (app names the app when the command hands off, e.g. ['open', '-a', 'Calculator'] with app 'Calculator'). \
              windows {{app?, pid?}} lists windows (frontmost first). screenshot {{window | app | pid}} shows you a window (or the whole screen with none). \
              click {{window, x, y, button?, count?}}, type {{window, text}}, key {{window, keys: 'enter', 'cmd+s', 'ctrl+shift+tab'}}, scroll {{window, dy, x?, y?}}: x and y are pixels of that window's screenshot. \
@@ -229,7 +296,7 @@ fn screen() -> HostTool {
             "additionalProperties": false
         }),
         &[
-            "screen runs on the user's computer, not where you run: launch starts a program installed there, and your files and builds are not there unless the user's computer shares them.",
+            runs,
             "Take a screenshot after each step to check it; quit what you launched when you're done.",
         ],
     )
@@ -545,11 +612,13 @@ mod tests {
             Some(Mode::WhenAsked),
             Some(Mode::Off),
         ];
-        for (canvas, genui) in [false, true]
-            .into_iter()
-            .flat_map(|c| modes.map(|m| (c, m)))
-        {
-            let tools = definitions(canvas, genui);
+        let places = [Place::Here, Place::Inside, Place::Server];
+        for (canvas, genui, place) in [false, true].into_iter().flat_map(|c| {
+            modes
+                .into_iter()
+                .flat_map(move |m| places.map(|p| (c, m, p)))
+        }) {
+            let tools = definitions(canvas, genui, place);
             let names: Vec<&str> = tools.iter().map(|tool| tool.name.as_str()).collect();
             let mut expected = vec!["open_page", "browser", "screen"];
             if device::offered() {
@@ -574,7 +643,12 @@ mod tests {
             DesktopRequest::set_host_tools("host-1", PROVIDER, &tools).unwrap();
         }
         // Each mode's policy leads the rules.
-        let rules = |mode| definitions(false, Some(mode)).pop().unwrap().guidelines;
+        let rules = |mode| {
+            definitions(false, Some(mode), Place::Server)
+                .pop()
+                .unwrap()
+                .guidelines
+        };
         assert!(rules(Mode::Proactive)[0].starts_with("Use gentle_ui on your own initiative"));
         assert!(
             rules(Mode::WhenAsked)[0]
@@ -584,17 +658,51 @@ mod tests {
 
     #[test]
     fn no_tool_tells_the_agent_to_run_the_local_commands() {
-        for tool in definitions(true, Some(Mode::Proactive)) {
-            let text = format!("{} {}", tool.description, tool.guidelines.join(" "));
-            for command in [
-                "gentle-open",
-                "gentle-browser",
-                "gentle-screen",
-                "gentle-device",
-            ] {
-                assert!(!text.contains(command), "{} mentions {command}", tool.name);
+        for place in [Place::Here, Place::Inside, Place::Server] {
+            for tool in definitions(true, Some(Mode::Proactive), place) {
+                let text = format!("{} {}", tool.description, tool.guidelines.join(" "));
+                for command in [
+                    "gentle-open",
+                    "gentle-browser",
+                    "gentle-screen",
+                    "gentle-device",
+                ] {
+                    assert!(!text.contains(command), "{} mentions {command}", tool.name);
+                }
             }
         }
+    }
+
+    /// Only an agent on a server is told about the server and its forwards,
+    /// or that its own machine isn't the user's.
+    #[test]
+    fn the_wording_follows_where_the_agent_runs() {
+        let text = |place| {
+            definitions(true, Some(Mode::Proactive), place)
+                .iter()
+                .map(|tool| format!("{} {}", tool.description, tool.guidelines.join(" ")))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let here = text(Place::Here);
+        for remote in [
+            "the server",
+            "on a server",
+            "authenticated forward",
+            "forwards that port",
+            "not the machine you run on",
+            "not where you run",
+            "your own machine",
+        ] {
+            assert!(!here.contains(remote), "a local agent is told {remote:?}");
+        }
+        assert!(here.contains("the same computer you run on"));
+        let inside = text(Place::Inside);
+        assert!(!inside.contains("the server") && !inside.contains("on a server"));
+        assert!(inside.contains("WSL, a VM or a container"));
+        let server = text(Place::Server);
+        assert!(server.contains("the server's authenticated forward"));
+        assert!(server.contains("not the machine you run on"));
     }
 
     #[test]
@@ -784,7 +892,7 @@ mod tests {
         };
         assert!(capabilities.supports(DesktopMethod::SetHostTools));
         assert!(capabilities.supports(DesktopMethod::HostToolResult));
-        let tools = definitions(true, Some(Mode::Proactive));
+        let tools = definitions(true, Some(Mode::Proactive), Place::Server);
         let request = DesktopRequest::set_host_tools("live-2", PROVIDER, &tools).unwrap();
         let result = process.desktop(&request).unwrap().set_host_tools().unwrap();
         assert!(result.rejected.is_empty(), "{:?}", result.rejected);

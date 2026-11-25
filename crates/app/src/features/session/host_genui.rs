@@ -1,14 +1,15 @@
-//! `gentle_ui` in a tab whose agent runs on a Gentle Shell server, which
-//! doesn't load the app's generative UI extension: the app runs it itself
-//! (`gentle_core::genui::host`). The agent calls the `gentle_ui` host tool;
-//! the user's edits, sent by the surfaces as `/gentle-ui:event` commands,
-//! are answered here and reach the agent as `host_message`s; what html
-//! pages share, and the Off rule, go as the app's host context. The tool
-//! results and event messages carry the details the surfaces are drawn
-//! from, so the conversation draws and rebuilds them as it does a local
-//! tab's.
+//! `gentle_ui` in a tab whose agent takes the app's tools as host tools (a
+//! Gentle Shell server's session, or a Gentle Shell here new enough to),
+//! which doesn't load the app's generative UI extension: the app runs it
+//! itself (`gentle_core::genui::host`). The agent calls the `gentle_ui` host
+//! tool; the user's edits, sent by the surfaces as `/gentle-ui:event`
+//! commands, are answered here and reach the agent as `host_message`s; what
+//! html pages share, and the Off rule, go as the app's host context. The
+//! tool results and event messages carry the details the surfaces are drawn
+//! from, so the conversation draws and rebuilds them as it does a tab
+//! with the extension's.
 //!
-//! A tab on this computer (or WSL, or a command) keeps the extension.
+//! An older Gentle Shell keeps the extension.
 
 use gentle_core::genui::host::{self, Handled, Mode, Reply};
 use gentle_core::genui::{self, EVENT_COMMAND};
@@ -37,13 +38,10 @@ fn outcome(answer: host::Answer) -> (Outcome, Option<Map<String, Value>>) {
 
 impl SessionView {
     /// The Agent UI mode `gentle_ui` runs in here; `None` when this tab
-    /// doesn't run it (not a server session, or a server without host
-    /// messages and contexts).
+    /// doesn't run it (its agent loads the extension, or its Gentle Shell
+    /// takes no host messages and contexts).
     pub(super) fn host_genui_mode(&self) -> Option<Mode> {
-        let server = matches!(
-            self.runs_on,
-            Some(gentle_core::backend::Backend::Server { .. })
-        );
+        let host_tools = self.backend.host_tools;
         let takes = self.desktop.capabilities().is_some_and(|capabilities| {
             [
                 DesktopMethod::SetHostTools,
@@ -53,7 +51,7 @@ impl SessionView {
             .into_iter()
             .all(|method| capabilities.supports(method))
         });
-        (server && takes).then(|| self.host_genui.mode())
+        (host_tools && takes).then(|| self.host_genui.mode())
     }
 
     /// The surfaces follow the conversation after items `from..` changed

@@ -152,6 +152,26 @@ impl LaunchSpec {
         );
         self.bundled.is_some() || protected_launcher(&self.launcher, &candidates)
     }
+
+    /// Leave out what the app adds to every agent (its instructions,
+    /// `--append-system-prompt`, and its Pi extensions, `--extension`): a
+    /// Gentle Shell that takes host tools ([`takes_host_tools`]) gets the
+    /// same tools, with their guidance, over Desktop RPC instead. Only the
+    /// arguments after `--mode rpc` are the app's; launcher options before
+    /// it (`GENTLE_SHELL_ARGS`) stay as the user set them.
+    pub fn without_app_tools(&mut self) {
+        let Some(mode) = self.args.iter().position(|arg| arg == "--mode") else {
+            return;
+        };
+        let mut tail = self.args.split_off(mode).into_iter();
+        while let Some(arg) = tail.next() {
+            if arg == "--append-system-prompt" || arg == "--extension" {
+                tail.next();
+            } else {
+                self.args.push(arg);
+            }
+        }
+    }
 }
 
 fn protected_launcher(launcher: &Path, candidates: &[PathBuf]) -> bool {
@@ -811,11 +831,7 @@ static VERSION_RUN: Mutex<()> = Mutex::new(());
 /// self-contained or managed install that file is its `gentle-pi`'s
 /// `package.json`: an update replaces the package, not the launcher or Node.
 pub fn version_output(spec: &LaunchSpec) -> Option<String> {
-    let identity = spec.bundled.as_ref().map_or_else(
-        || spec.program.clone(),
-        |bundled| bundled.package.join("package.json"),
-    );
-    let program = dunce::canonicalize(&identity).unwrap_or(identity);
+    let program = identity(spec);
     let key = || {
         Some(VersionKey {
             program: Stamp::of(&program)?,
@@ -848,9 +864,77 @@ pub fn version_output(spec: &LaunchSpec) -> Option<String> {
     Some(text)
 }
 
-/// Drop every cached `--version` (after `gentle-shell upgrade`).
+/// Drop every cached `--version` and `serve --help` probe (after
+/// `gentle-shell upgrade`).
 pub fn forget_versions() {
     VERSIONS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    HOST_TOOLS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+}
+
+/// The file whose stamp tells one build of `spec`'s Gentle Shell from
+/// another: the launcher, or for a self-contained or managed install its
+/// `gentle-pi`'s `package.json` (an update replaces the package, not the
+/// launcher or Node).
+fn identity(spec: &LaunchSpec) -> PathBuf {
+    let identity = spec.bundled.as_ref().map_or_else(
+        || spec.program.clone(),
+        |bundled| bundled.package.join("package.json"),
+    );
+    dunce::canonicalize(&identity).unwrap_or(identity)
+}
+
+/// How long `<launcher> serve --help` may take before the launcher counts
+/// as one without host tools.
+const HOST_TOOLS_TIMEOUT: Duration = Duration::from_secs(5);
+
+static HOST_TOOLS: Mutex<BTreeMap<PathBuf, (Stamp, bool)>> = Mutex::new(BTreeMap::new());
+
+/// Whether `help`, what `<launcher> serve --help` printed, is Gentle Shell's
+/// own `serve` usage (`Usage: gentle-shell [home selectors] serve …`). A
+/// launcher older than `serve` hands `serve --help` to Pi, whose help names
+/// no such command.
+pub fn names_serve(help: &str) -> bool {
+    help.lines().any(|line| {
+        line.trim().strip_prefix("Usage:").is_some_and(|usage| {
+            let mut words = usage.split_whitespace();
+            words.next() == Some("gentle-shell") && words.any(|word| word == "serve")
+        })
+    })
+}
+
+/// Whether the Gentle Shell `spec` runs takes the app's tools as host tools
+/// over Desktop RPC (it has `serve`, which came with them): asks
+/// `<launcher> serve --help`, never `serve status` or anything else, which
+/// a launcher without `serve` would send to the model as a prompt. A
+/// launcher that doesn't answer within 5 seconds doesn't. Uncached.
+pub fn probe_host_tools(spec: &LaunchSpec) -> bool {
+    let mut command = spec.launcher_command(["serve", "--help"]);
+    command.stdin(Stdio::null()).stderr(Stdio::null());
+    output_within(&mut command, HOST_TOOLS_TIMEOUT).is_some_and(|(_, help)| names_serve(&help))
+}
+
+/// [`probe_host_tools`] for a launcher on this computer, cached until the
+/// launcher (or a self-contained install's package) changes.
+pub fn takes_host_tools(spec: &LaunchSpec) -> bool {
+    let program = identity(spec);
+    let Some(stamp) = Stamp::of(&program) else {
+        return probe_host_tools(spec);
+    };
+    let cached = HOST_TOOLS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&program)
+        .filter(|(known, _)| *known == stamp)
+        .map(|(_, takes)| *takes);
+    if let Some(takes) = cached {
+        return takes;
+    }
+    let takes = probe_host_tools(spec);
+    HOST_TOOLS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(program, (stamp, takes));
+    takes
 }
 
 /// How long `--version` may take: a Node start on a slow, busy machine.
@@ -1366,6 +1450,61 @@ mod tests {
         assert_eq!(run_count(), 3);
         std::fs::remove_dir_all(&dir).unwrap();
     }
+
+    /// `serve --help` decides: Gentle Shell's own `serve` usage means host
+    /// tools; an older launcher (Pi's help) doesn't. A rewritten launcher
+    /// is asked again.
+    #[test]
+    fn host_tools_are_probed_with_serve_help_per_launcher_build() {
+        let dir = std::env::temp_dir().join(format!("pi-rpc-host-tools-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let program = dir.join("gentle-shell");
+        let write = |script: &str, mtime: u64| {
+            std::fs::write(&program, script).unwrap();
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+            set_mtime(&program, mtime);
+        };
+        let args = dir.join("args");
+        write(
+            &format!(
+                "#!/bin/sh\necho \"$*\" > '{}'\ncase \" $* \" in *' serve --help '*) \
+                 echo 'Usage: gentle-shell [home selectors] serve status [--json]';; \
+                 *) echo 'Usage: pi [options]';; esac\n",
+                args.display()
+            ),
+            3_000_000,
+        );
+        let spec = LaunchSpec {
+            program: program.clone(),
+            args: vec!["--link".into(), "--mode".into(), "rpc".into()],
+            cwd: dir.clone(),
+            env: Vec::new(),
+            launcher: program.clone(),
+            bundled: None,
+        };
+        // A run refused with "Text file busy" (see above) isn't the answer.
+        let probed = (0..50).any(|_| {
+            probe_host_tools(&spec) || {
+                std::thread::sleep(Duration::from_millis(20));
+                false
+            }
+        });
+        assert!(probed);
+        // Launcher options stay; nothing but `serve --help` is asked.
+        assert_eq!(
+            std::fs::read_to_string(&args).unwrap().trim(),
+            "--link serve --help"
+        );
+        assert!(takes_host_tools(&spec));
+
+        // Replaced by a launcher older than `serve`.
+        write(
+            "#!/bin/sh\necho 'Usage: pi [options] [messages...]'\n",
+            3_000_001,
+        );
+        assert!(!takes_host_tools(&spec));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }
 
 /// gentle-ai's managed Windows install, as its installer lays it out
@@ -1521,6 +1660,91 @@ mod managed_tests {
                 "--extension".to_string(),
                 extension.to_string_lossy().into_owned(),
             ]
+        );
+    }
+
+    /// A Gentle Shell with `serve` prints its own usage for `serve --help`;
+    /// an older launcher hands it to Pi, whose help names no `serve`.
+    #[test]
+    fn host_tools_follow_the_serve_usage() {
+        let serve = "Usage: gentle-shell [home selectors] serve share [--port <n>] [--json]\n       \
+                     gentle-shell [home selectors] serve status [--json]\n\nRuns one server per agent home";
+        assert!(names_serve(serve));
+        assert!(names_serve(
+            "  Usage: gentle-shell serve [--listen <host>:<port>]"
+        ));
+        // Pi's own help, the top-level launcher's, or nothing at all.
+        assert!(!names_serve(
+            "pi - AI coding assistant\n\nUsage: pi [options] [@files...] [messages...]\n  --help"
+        ));
+        assert!(!names_serve(
+            "Usage: gentle-shell [home selectors] [pi args]\n  serve            Run a per-user server"
+        ));
+        assert!(!names_serve("gentle-shell serve: unknown option"));
+        assert!(!names_serve(""));
+    }
+
+    /// Host tools replace the app's instructions and extensions, nothing
+    /// else: launcher options before `--mode` and Pi's other arguments stay.
+    #[test]
+    fn host_tools_drop_only_the_apps_instructions_and_extensions() {
+        let args = |list: &[&str]| list.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
+        let mut spec = LaunchSpec {
+            program: PathBuf::from("gentle-shell"),
+            args: args(&[
+                "--extension",
+                "/user/own.ts",
+                "--mode",
+                "rpc",
+                "--append-system-prompt",
+                "/app/agent-instructions.md",
+                "--extension",
+                "/app/gentle-ui.ts",
+                "--extension",
+                "/app/browser.ts",
+                "--session",
+                "/sessions/a.jsonl",
+            ]),
+            cwd: PathBuf::from("/"),
+            env: Vec::new(),
+            launcher: PathBuf::from("gentle-shell"),
+            bundled: None,
+        };
+        spec.without_app_tools();
+        assert_eq!(
+            spec.args,
+            args(&[
+                "--extension",
+                "/user/own.ts",
+                "--mode",
+                "rpc",
+                "--session",
+                "/sessions/a.jsonl"
+            ])
+        );
+        // A backend's launch: the command prefix and its env stay.
+        let mut remote = remote_backend(
+            &args(&["wsl.exe", "-d", "Ubuntu", "--"]),
+            Some("/usr/bin"),
+            &[],
+            |file| Some(file.display().to_string()),
+        )
+        .unwrap();
+        remote.args.extend(args(&["--extension", "/x.ts"]));
+        remote.without_app_tools();
+        assert_eq!(
+            remote.args,
+            args(&[
+                "-d",
+                "Ubuntu",
+                "--",
+                "env",
+                "GENTLE_SHELL_INTERACTIVE_HOST=1",
+                "PATH=/usr/bin",
+                "gentle-shell",
+                "--mode",
+                "rpc"
+            ])
         );
     }
 

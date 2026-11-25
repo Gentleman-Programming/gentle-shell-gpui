@@ -1,12 +1,16 @@
-//! The app's host tools in a tab whose agent runs on a Gentle Shell server
-//! (`crate::features::host_tools`): registered once the server's Desktop
-//! channel says it takes them (and again after the stream reconnects),
-//! each call run where the app's own code runs it (the window for pages and
-//! browser cards, this process for the screen, the open canvas for an agent
-//! beside one), and its result sent back through the server's `/desktop`.
+//! The app's host tools in a tab whose agent takes them
+//! (`crate::features::host_tools`): a Gentle Shell server's session, or a
+//! Gentle Shell here (or in WSL, or through a command) new enough to, which
+//! then starts without the app's extensions and instructions. Registered
+//! once the Desktop channel says it takes them (and again after a server's
+//! stream reconnects), each call run where the app's own code runs it (the
+//! window for pages and browser cards, this process for the screen, the
+//! open canvas for an agent beside one), and its result sent back through
+//! the server's `/desktop`, or as a `/gentle:desktop` prompt on the child's
+//! stdin (`PiProcess::desktop`).
 //!
-//! A tab on this computer (or WSL, or a command) keeps the extensions and
-//! instructions it launches with: it registers nothing.
+//! An older Gentle Shell keeps the extensions and instructions it launches
+//! with: it registers nothing.
 
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
@@ -127,12 +131,12 @@ pub(super) fn is_host_event(event: &DesktopEvent) -> bool {
 }
 
 impl SessionView {
-    /// Offer the app's tools once this tab's server says it takes them.
+    /// Offer the app's tools once this tab's agent says it takes them.
     pub(super) fn sync_host_tools(&mut self, cx: &mut Context<Self>) {
-        if self.host.registered {
+        if self.host.registered || !self.backend.host_tools {
             return;
         }
-        let Some(process) = self.process().filter(|p| p.server_session().is_some()) else {
+        let Some(process) = self.process() else {
             return;
         };
         if !self
@@ -146,9 +150,13 @@ impl SessionView {
         let request = DesktopRequest::set_host_tools(
             self.host.request_id(),
             tools::PROVIDER,
-            &tools::definitions(self.canvas.is_some(), self.host_genui_mode()),
+            &tools::definitions(
+                self.canvas.is_some(),
+                self.host_genui_mode(),
+                tools::Place::of(&self.runs_on()),
+            ),
         );
-        // The server holds the context per session; offer it with the tools.
+        // Gentle Shell holds the context per session; offer it with the tools.
         self.host.context = None;
         self.send_host_context(cx);
         let request = match request {
@@ -177,12 +185,12 @@ impl SessionView {
                             .map(|tool| format!("{} ({})", tool.name, tool.reason))
                             .collect();
                         format!(
-                            "The server took only some of the app's tools; not: {}",
+                            "Gentle Shell took only some of the app's tools; not: {}",
                             names.join(", ")
                         )
                     }
                     Err(error) => {
-                        format!("The app's tools (browser, screen, pages) aren't available to this server session: {error}")
+                        format!("The app's tools (browser, screen, pages) aren't available to this session: {error}")
                     }
                 };
                 this.host_notice(problem, cx);

@@ -158,10 +158,9 @@ impl SettingsView {
         };
         let busy = self.maestro.job.is_some();
         let (state, color) = match (status.cli.is_some(), status.connected) {
-            (true, _) if status.host_tool => (
-                "Ready: the app runs it for the server's agents",
-                ui::success(),
-            ),
+            (true, _) if status.host_tool => {
+                ("Ready: the app runs it for its agents", ui::success())
+            }
             (false, _) if status.host_tool => ("Not installed on this computer", ui::faint()),
             (true, true) => ("Ready: the agent has the maestro tools", ui::success()),
             (true, false) => ("Installed, not connected to the agent", ui::warning()),
@@ -200,8 +199,8 @@ impl SettingsView {
             .child(row(
                 "Agent tools",
                 if host_tool {
-                    "The app's maestro tool: the server's agents run flows on the device \
-                     panel's simulators here (with Devices on), no MCP server"
+                    "The app's maestro tool: agents run flows on the device panel's \
+                     simulators here (with Devices on), no MCP server"
                 } else if status.connected {
                     "Connected (open tabs reload when idle)"
                 } else {
@@ -228,8 +227,8 @@ impl SettingsView {
                                     })
                                     .disabled(busy)
                                     .on_click(cx.listener(move |this, _, _, cx| {
-                                        // A server's agents need no restart: the
-                                        // tool is offered with the app's others.
+                                        // Agents with host tools need no restart:
+                                        // the tool is offered with the app's others.
                                         this.run_maestro(
                                             "Install",
                                             maestro::install,

@@ -908,18 +908,21 @@ impl PiProcess {
         }
     }
 
-    /// Send a Desktop request through the server's `/desktop` endpoint and
-    /// wait for its answer: the route `set_host_tools` and
-    /// `host_tool_result` must take there, since the server checks who
-    /// provides a tool and who answers its calls. The answer carries the
-    /// server's own `requestId`; it answers this HTTP request. A child
-    /// process has no such endpoint. Blocking.
+    /// Send a Desktop request outside the app's Desktop channel and wait
+    /// for its answer, as `set_host_tools`, `host_tool_result`,
+    /// `host_message` and `set_host_context` go. A server session sends it
+    /// to the server's `/desktop` endpoint, since the server checks who
+    /// provides a tool and who answers its calls; the answer carries the
+    /// server's own `requestId` and answers this HTTP request. A child gets
+    /// it as a `/gentle:desktop` prompt on stdin, its answer taken from
+    /// stdout by `requestId`. Blocking.
     pub fn desktop(
         &self,
         request: &crate::desktop_rpc::DesktopRequest,
     ) -> Result<crate::desktop_rpc::DesktopResponse> {
-        let Io::Server(remote) = &self.io else {
-            return Err(anyhow!("only a Gentle Shell server session has /desktop"));
+        let remote = match &self.io {
+            Io::Server(remote) => remote,
+            Io::Child { desktop, .. } => return self.desktop_stdin(desktop, request),
         };
         let answer = remote.client.desktop(&remote.session, request.payload())?;
         match crate::desktop_rpc::decode_value(answer)? {

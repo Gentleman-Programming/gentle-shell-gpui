@@ -593,6 +593,9 @@ pub fn forget_paths() {
     if let Ok(mut versions) = VERSIONS.lock() {
         versions.clear();
     }
+    if let Ok(mut takes) = HOST_TOOLS.lock() {
+        takes.clear();
+    }
 }
 
 /// Each backend's `gentle-shell` version, asked once: every `--version`
@@ -614,6 +617,31 @@ pub fn shell_version(choice: &Backend, spec: &pi_rpc::LaunchSpec) -> Option<Stri
         .ok()?
         .insert(choice.clone(), version.clone());
     version
+}
+
+/// Whether each backend's `gentle-shell` takes the app's tools as host
+/// tools, asked once: every `serve --help` there starts Node in the backend.
+static HOST_TOOLS: LazyLock<Mutex<HashMap<Backend, bool>>> = LazyLock::new(Mutex::default);
+
+/// Whether the `gentle-shell` `spec` runs on `choice` takes the app's tools
+/// as host tools over Desktop RPC (`pi_rpc::probe_host_tools`): cached per
+/// launcher build here, per backend there. A server's sessions always do,
+/// through the server.
+pub fn takes_host_tools(choice: &Backend, spec: &pi_rpc::LaunchSpec) -> bool {
+    match choice {
+        Backend::Local => pi_rpc::takes_host_tools(spec),
+        Backend::Server { .. } => true,
+        _ => {
+            if let Some(known) = HOST_TOOLS.lock().ok().and_then(|t| t.get(choice).copied()) {
+                return known;
+            }
+            let takes = pi_rpc::probe_host_tools(spec);
+            if let Ok(mut known) = HOST_TOOLS.lock() {
+                known.insert(choice.clone(), takes);
+            }
+            takes
+        }
+    }
 }
 
 /// The backend's login PATH, asked once per backend and kept.

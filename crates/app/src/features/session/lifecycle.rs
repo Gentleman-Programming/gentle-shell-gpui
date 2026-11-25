@@ -456,7 +456,7 @@ impl SessionView {
                             attach.as_deref(),
                             pi_session.as_deref(),
                         )?;
-                        return anyhow::Ok((process, rx, version, runs_on));
+                        return anyhow::Ok((process, rx, version, runs_on, true));
                     }
                     // The canvas this agent works on: its extension's tools.
                     let files: Vec<(String, &std::path::Path)> = canvas
@@ -466,6 +466,13 @@ impl SessionView {
                         .collect();
                     let mut spec =
                         crate::features::backend::launch_spec(&runs_on, &cwd, &env, &files)?;
+                    // A Gentle Shell with host tools gets the app's tools
+                    // that way, with their guidance, instead of its
+                    // extensions and instructions.
+                    let host_tools = crate::features::backend::takes_host_tools(&runs_on, &spec);
+                    if host_tools {
+                        spec.without_app_tools();
+                    }
                     if let Some(path) = &resume {
                         // A conversation listed from this computer's view of the
                         // backend's home reads there as the backend's path.
@@ -476,14 +483,15 @@ impl SessionView {
                     }
                     let version = crate::features::backend::shell_version(&runs_on, &spec);
                     let (process, rx) = PiProcess::spawn(&spec)?;
-                    anyhow::Ok((process, rx, version, runs_on))
+                    anyhow::Ok((process, rx, version, runs_on, host_tools))
                 })
                 .await;
             let rx = match spawned {
-                Ok((process, rx, version, runs_on)) => {
+                Ok((process, rx, version, runs_on, host_tools)) => {
                     let ok = this.update(cx, |this, cx| {
                         this.backend.status = BackendStatus::Ready(process);
                         this.backend.version = version;
+                        this.backend.host_tools = host_tools;
                         this.runs_on = Some(runs_on);
                         this.genui_mode = genui_mode;
                         this.sync_genui_mode(cx);

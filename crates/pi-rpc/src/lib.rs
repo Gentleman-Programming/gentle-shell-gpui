@@ -27,9 +27,9 @@ pub use job::contain;
 pub use launch::neutral_dir;
 pub use launch::{
     BundledInstall, LaunchSpec, backend_version, child_path, command, find_program, forget_cached,
-    forget_versions, managed_install_root, output_within, remote_backend, resolve_backend,
-    resolve_node, set_extensions, set_extra_path, set_system_prompt, split_args, version_output,
-    version_stderr,
+    forget_versions, managed_install_root, output_within, probe_host_tools, remote_backend,
+    resolve_backend, resolve_node, set_extensions, set_extra_path, set_system_prompt, split_args,
+    takes_host_tools, version_output, version_stderr,
 };
 pub use record::{Record, Response, UiMethod, UiRequest, parse_record};
 
@@ -39,7 +39,7 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, ChildStdin, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 /// Everything the backend reports that is not a correlated response.
@@ -65,6 +65,14 @@ pub enum Incoming {
 
 type Pending = Arc<Mutex<HashMap<String, async_channel::Sender<Response>>>>;
 
+/// Desktop requests a child was sent over stdin ([`PiProcess::desktop`]),
+/// by `requestId`: their answers go to the caller, never to `incoming`.
+type DesktopWaiters =
+    Arc<Mutex<HashMap<String, mpsc::Sender<Result<desktop_rpc::DesktopResponse, String>>>>>;
+
+/// How long a child has to answer a Desktop request sent over stdin.
+const DESKTOP_ANSWER: Duration = Duration::from_secs(30);
+
 /// A running Pi RPC backend: a child process, or a Gentle Shell server's
 /// session ([`Self::serve`]).
 pub struct PiProcess {
@@ -84,6 +92,7 @@ enum Io {
         stdin: Mutex<Option<ChildStdin>>,
         child: Arc<Mutex<Child>>,
         pid: u32,
+        desktop: DesktopWaiters,
     },
     /// A session of a Gentle Shell server (its client is several HTTP
     /// agents: boxed, so a child's `Io` stays small).
@@ -134,6 +143,7 @@ impl PiProcess {
 
         let (tx, rx) = async_channel::unbounded();
         let pending: Pending = Arc::default();
+        let desktop: DesktopWaiters = Arc::default();
         let child = Arc::new(Mutex::new(child));
 
         {
@@ -151,14 +161,16 @@ impl PiProcess {
         }
         {
             let pending = pending.clone();
+            let desktop = desktop.clone();
             let traffic = traffic.clone();
             let child = child.clone();
             std::thread::Builder::new()
                 .name("pi-rpc-stdout".into())
                 .spawn(move || {
-                    read_records(stdout, &pending, &traffic, &tx);
+                    read_records(stdout, &pending, &desktop, &traffic, &tx);
                     // Unblock every caller still waiting for a response.
                     pending.lock().unwrap().clear();
+                    desktop.lock().unwrap().clear();
                     let code = wait_child(&child);
                     let _ = tx.send_blocking(Incoming::Exited(code));
                 })?;
@@ -169,6 +181,7 @@ impl PiProcess {
                 stdin: Mutex::new(Some(stdin)),
                 child,
                 pid,
+                desktop,
             },
             pending,
             next_id: AtomicU64::new(1),
@@ -334,6 +347,66 @@ impl PiProcess {
         }
         true
     }
+
+    /// A Desktop request to a child, as the `/gentle:desktop` prompt on its
+    /// stdin, and its answer: the widget record with the request's
+    /// `requestId`, which the stdout reader hands here instead of to
+    /// `incoming`. A prompt the child refuses (any disposition but
+    /// `handled`) fails at once. Blocking, up to [`DESKTOP_ANSWER`].
+    fn desktop_stdin(
+        &self,
+        desktop: &DesktopWaiters,
+        request: &desktop_rpc::DesktopRequest,
+    ) -> Result<desktop_rpc::DesktopResponse> {
+        let id = request.request_id().to_string();
+        let (tx, answer) = mpsc::channel();
+        desktop.lock().unwrap().insert(id.clone(), tx.clone());
+        let taken = match self.send(request.prompt_command()) {
+            Ok(taken) => taken,
+            Err(error) => {
+                desktop.lock().unwrap().remove(&id);
+                return Err(error);
+            }
+        };
+        // The prompt's own response only says whether the request was
+        // taken; a refusal means no answer will come.
+        let _ = std::thread::Builder::new()
+            .name("pi-rpc-desktop".into())
+            .spawn(move || {
+                let refused = match taken.recv_blocking() {
+                    Ok(response)
+                        if response.success && response.data["disposition"] == "handled" =>
+                    {
+                        return;
+                    }
+                    Ok(response) => format!(
+                        "gentle-shell didn't take the request: {}",
+                        response.error.unwrap_or_else(|| {
+                            response.data["disposition"]
+                                .as_str()
+                                .unwrap_or("no disposition")
+                                .to_string()
+                        })
+                    ),
+                    Err(_) => "gentle-shell exited before answering".to_string(),
+                };
+                let _ = tx.send(Err(refused));
+            });
+        let answer = answer.recv_timeout(DESKTOP_ANSWER);
+        desktop.lock().unwrap().remove(&id);
+        match answer {
+            Ok(Ok(response)) => Ok(response),
+            Ok(Err(refused)) => Err(anyhow!(refused)),
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(anyhow!(
+                "gentle-shell didn't answer {} within {} s",
+                request.method(),
+                DESKTOP_ANSWER.as_secs()
+            )),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                Err(anyhow!("gentle-shell exited before answering"))
+            }
+        }
+    }
 }
 
 impl Drop for PiProcess {
@@ -353,6 +426,7 @@ pub enum UiAnswer {
 fn read_records(
     stdout: impl Read,
     pending: &Pending,
+    desktop: &DesktopWaiters,
     traffic: &Traffic,
     tx: &async_channel::Sender<Incoming>,
 ) {
@@ -367,10 +441,37 @@ fn read_records(
                 traffic.bytes.fetch_add(n as u64, Ordering::Relaxed);
             }
         }
-        if !dispatch(parse_record(&line), pending, tx) {
+        let record = parse_record(&line);
+        if let Ok(Record::Ui(request)) = &record
+            && answer_desktop(request, desktop)
+        {
+            continue;
+        }
+        if !dispatch(record, pending, tx) {
             return;
         }
     }
+}
+
+/// Hand a Desktop widget record to the [`PiProcess::desktop`] call waiting
+/// for it: a response whose `requestId` one awaits. `true` when taken, so
+/// the app's own Desktop channel never sees it (it carries no `seq`, and its
+/// id is none the channel issued). Events and every other record go on.
+fn answer_desktop(request: &UiRequest, desktop: &DesktopWaiters) -> bool {
+    let mut waiters = desktop.lock().unwrap();
+    if waiters.is_empty() {
+        return false;
+    }
+    let Ok(Some(desktop_rpc::DesktopRecord::Response(response))) =
+        desktop_rpc::decode_widget(request)
+    else {
+        return false;
+    };
+    let Some(waiter) = response.request_id().and_then(|id| waiters.remove(id)) else {
+        return false;
+    };
+    let _ = waiter.send(Ok(response));
+    true
 }
 
 /// Route one record: a response to the caller waiting for it (a failure

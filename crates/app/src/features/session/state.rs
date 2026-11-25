@@ -44,6 +44,11 @@ pub(super) struct Backend {
     /// user's home folder there, which the failed tab offers to open
     /// instead.
     pub(super) server_home: Option<String>,
+    /// The agent takes the app's tools as host tools over Desktop RPC: a
+    /// server's session, or a Gentle Shell here (or in WSL, or through a
+    /// command) new enough to (`backend::takes_host_tools`), started without
+    /// the app's extensions and instructions.
+    pub(super) host_tools: bool,
 }
 
 impl Backend {
@@ -58,6 +63,7 @@ impl Backend {
             restart_pending: false,
             attach: None,
             server_home: None,
+            host_tools: false,
         }
     }
 
