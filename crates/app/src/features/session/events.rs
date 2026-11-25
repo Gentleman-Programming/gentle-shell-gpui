@@ -350,6 +350,13 @@ impl SessionView {
             self.handle_host_event(request, event, cx);
             return;
         }
+        // A sign-in's or package job's step is the screen's that started it.
+        if let Ok(Some(DesktopRecord::Event(event))) = &decoded
+            && super::accounts::is_account_event(event)
+        {
+            self.handle_account_event(request, event, cx);
+            return;
+        }
         // An unrelated delta leaves the merged context untouched; it is not
         // fresh context data and must not replace a compaction estimate.
         let context_changed = match &decoded {

@@ -4819,7 +4819,7 @@ fn capabilities_expose_the_profile_apply_method_and_event() {
 
 /// The `capabilities` methods of Gentle Shell 5.0.0, as the spec and a live
 /// backend list them.
-const MAIN_METHODS: [&str; 37] = [
+const MAIN_METHODS: [&str; 45] = [
     "capabilities",
     "get_snapshot",
     "get_config",
@@ -4857,6 +4857,14 @@ const MAIN_METHODS: [&str; 37] = [
     "host_tool_progress",
     "host_message",
     "set_host_context",
+    "login_start",
+    "login_complete",
+    "login_cancel",
+    "set_api_key",
+    "remove_credentials",
+    "list_packages",
+    "install_package",
+    "remove_package",
 ];
 const MAIN_EVENTS: [&str; 10] = [
     "config_changed",
@@ -4896,7 +4904,7 @@ const RELEASE_4_8_EVENTS: [&str; 7] = [
     "profile_applied",
     "agents_update",
 ];
-const NEW_METHODS: [DesktopMethod; 23] = [
+const NEW_METHODS: [DesktopMethod; 31] = [
     DesktopMethod::GetJobOutput,
     DesktopMethod::GetSubagentThread,
     DesktopMethod::ListSessions,
@@ -4920,6 +4928,14 @@ const NEW_METHODS: [DesktopMethod; 23] = [
     DesktopMethod::HostToolProgress,
     DesktopMethod::HostMessage,
     DesktopMethod::SetHostContext,
+    DesktopMethod::LoginStart,
+    DesktopMethod::LoginComplete,
+    DesktopMethod::LoginCancel,
+    DesktopMethod::SetApiKey,
+    DesktopMethod::RemoveCredentials,
+    DesktopMethod::ListPackages,
+    DesktopMethod::InstallPackage,
+    DesktopMethod::RemovePackage,
 ];
 
 fn capabilities_of(methods: &[&str], events: &[&str]) -> Capabilities {
@@ -5256,6 +5272,7 @@ fn get_auth_status_reports_status_never_a_value() {
             configured: true,
             kind: Some(AuthType::OAuth),
             source: Some(AuthSource::Stored),
+            login_kinds: Vec::new(),
         }
     );
     assert_eq!(

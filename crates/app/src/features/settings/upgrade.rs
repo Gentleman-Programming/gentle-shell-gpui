@@ -446,7 +446,12 @@ impl SettingsView {
                 Some(&offer.current),
                 "Open agent tabs keep running on the server's current version until it restarts them.",
             )
-            .child(super::remote::note(server.run(super::remote::commands::UPGRADE)));
+            .child(
+                match self.server_upgrade_button("server-update", None, cx) {
+                    Some(button) => h_flex().child(button),
+                    None => super::remote::note(server.run(super::remote::commands::UPGRADE)),
+                },
+            );
         }
         let target = offer.clone();
         let skipped = offer.latest.clone();
@@ -477,9 +482,14 @@ impl SettingsView {
                 None,
                 "Open agent tabs keep running on the server's current build until it restarts them.",
             )
-            .child(super::remote::note(
-                server.run(super::remote::commands::UPGRADE_MAIN),
-            ));
+            .child(
+                match self.server_upgrade_button("server-update-main", Some("main"), cx) {
+                    Some(button) => h_flex().child(button),
+                    None => {
+                        super::remote::note(server.run(super::remote::commands::UPGRADE_MAIN))
+                    }
+                },
+            );
         }
         let target = commit.to_string();
         let busy = self.upgrading_on(UpgradeChannel::Main);

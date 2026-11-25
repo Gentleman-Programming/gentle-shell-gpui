@@ -108,14 +108,16 @@ mod changes;
 mod definitions;
 mod host_tools;
 mod output;
+mod packages;
 mod review;
 mod session_state;
 mod sessions;
+mod sign_in;
 mod stats;
 mod status;
 mod updates;
 
-pub use auth::{AuthSource, AuthStatus, AuthType, ProviderAuth, ReloadCredentials};
+pub use auth::{AuthSource, AuthStatus, AuthType, LoginKind, ProviderAuth, ReloadCredentials};
 pub use background::{
     BackgroundCapability, BackgroundConfirmation, BackgroundPolicy, BackgroundSource,
     BackgroundSubagents, PolicyFile, SetBackgroundSubagentsOutcome, SetBackgroundSubagentsResult,
@@ -139,6 +141,10 @@ pub use host_tools::{
     SetHostToolsResult, valid_custom_type, valid_tool_name,
 };
 pub use output::{JobOutput, SubagentThread, ThreadItem};
+pub use packages::{
+    InstalledPackage, PACKAGE_FINISHED, PACKAGE_PROGRESS, PackageFinished, PackageJob, PackageList,
+    PackageProgress,
+};
 pub use review::{
     ReviewConfirmation, ReviewEffective, ReviewMode, ReviewModeChanged, ReviewScope, ReviewScopes,
     ReviewSetting, ReviewSource, SetReviewModeOutcome, SetReviewModeResult,
@@ -157,6 +163,10 @@ pub use session_state::{
 pub use sessions::{
     ListSessionsQuery, MAX_SESSION_ID_UNITS, MAX_SESSIONS_LIMIT, SessionEntry, SessionList,
     SessionsScope, SwitchSessionResult,
+};
+pub use sign_in::{
+    ApiKeySaved, CredentialsRemoved, LOGIN_FINISHED, LOGIN_PROMPT, LoginFinished, LoginOption,
+    LoginPrompt, LoginPromptKind, LoginStarted,
 };
 pub use stats::{
     StatsRange, StatsScope, UsageStats, UsageStatsDay, UsageStatsModel, UsageStatsProject,
@@ -224,13 +234,21 @@ pub enum DesktopMethod {
     HostToolProgress,
     HostMessage,
     SetHostContext,
+    LoginStart,
+    LoginComplete,
+    LoginCancel,
+    SetApiKey,
+    RemoveCredentials,
+    ListPackages,
+    InstallPackage,
+    RemovePackage,
 }
 
 impl DesktopMethod {
     /// Every method this client knows, in the order `capabilities` lists
     /// them on Gentle Shell 5.0.0. Which ones a peer offers is only what its
     /// `capabilities` say: Gentle Shell 4.8.0 offers fourteen of them.
-    pub const ALL: [Self; 37] = [
+    pub const ALL: [Self; 45] = [
         Self::Capabilities,
         Self::GetSnapshot,
         Self::GetConfig,
@@ -268,6 +286,14 @@ impl DesktopMethod {
         Self::HostToolProgress,
         Self::HostMessage,
         Self::SetHostContext,
+        Self::LoginStart,
+        Self::LoginComplete,
+        Self::LoginCancel,
+        Self::SetApiKey,
+        Self::RemoveCredentials,
+        Self::ListPackages,
+        Self::InstallPackage,
+        Self::RemovePackage,
     ];
 
     /// The wire name of the method.
@@ -310,6 +336,14 @@ impl DesktopMethod {
             Self::HostToolProgress => "host_tool_progress",
             Self::HostMessage => "host_message",
             Self::SetHostContext => "set_host_context",
+            Self::LoginStart => "login_start",
+            Self::LoginComplete => "login_complete",
+            Self::LoginCancel => "login_cancel",
+            Self::SetApiKey => "set_api_key",
+            Self::RemoveCredentials => "remove_credentials",
+            Self::ListPackages => "list_packages",
+            Self::InstallPackage => "install_package",
+            Self::RemovePackage => "remove_package",
         }
     }
 
@@ -348,6 +382,14 @@ impl DesktopMethod {
                 | Self::HostToolProgress
                 | Self::HostMessage
                 | Self::SetHostContext
+                | Self::LoginStart
+                | Self::LoginComplete
+                | Self::LoginCancel
+                | Self::SetApiKey
+                | Self::RemoveCredentials
+                | Self::ListPackages
+                | Self::InstallPackage
+                | Self::RemovePackage
         )
     }
 
@@ -391,6 +433,14 @@ impl DesktopMethod {
             "host_tool_progress" => Ok(Self::HostToolProgress),
             "host_message" => Ok(Self::HostMessage),
             "set_host_context" => Ok(Self::SetHostContext),
+            "login_start" => Ok(Self::LoginStart),
+            "login_complete" => Ok(Self::LoginComplete),
+            "login_cancel" => Ok(Self::LoginCancel),
+            "set_api_key" => Ok(Self::SetApiKey),
+            "remove_credentials" => Ok(Self::RemoveCredentials),
+            "list_packages" => Ok(Self::ListPackages),
+            "install_package" => Ok(Self::InstallPackage),
+            "remove_package" => Ok(Self::RemovePackage),
             other => Err(DesktopRpcError::UnsupportedMethod(other.to_string())),
         }
     }
@@ -557,12 +607,32 @@ impl fmt::Display for DesktopAgentStep {
     }
 }
 
-/// One validated inner request, ready to be sent as a prompt.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// One validated inner request, ready to be sent as a prompt. Its `Debug`
+/// leaves out the payload of a request that carries a secret (a key, a
+/// pasted code or redirect URL).
+#[derive(Clone, PartialEq, Eq)]
 pub struct DesktopRequest {
     request_id: String,
     method: DesktopMethod,
     payload: String,
+}
+
+impl fmt::Debug for DesktopRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let secret = matches!(
+            self.method,
+            DesktopMethod::SetApiKey | DesktopMethod::LoginComplete
+        );
+        formatter
+            .debug_struct("DesktopRequest")
+            .field("request_id", &self.request_id)
+            .field("method", &self.method)
+            .field(
+                "payload",
+                &if secret { "<redacted>" } else { &self.payload },
+            )
+            .finish()
+    }
 }
 
 #[derive(serde::Serialize)]
@@ -1052,6 +1122,126 @@ impl DesktopRequest {
         )
     }
 
+    /// The `login_start` request: `{ provider }`. Like every sign-in and
+    /// package method, refused before anything is built when the peer's
+    /// `capabilities` don't list it.
+    pub fn login_start(
+        request_id: impl Into<String>,
+        capabilities: &Capabilities,
+        provider: &str,
+    ) -> Result<Self, DesktopRpcError> {
+        let params = sign_in::provider_params(provider)?;
+        Self::gated(request_id, capabilities, DesktopMethod::LoginStart, params)
+    }
+
+    /// The `login_complete` request: `{ loginId, value }`, a pasted code, an
+    /// answer, or the full redirect URL the client intercepted.
+    pub fn login_complete(
+        request_id: impl Into<String>,
+        capabilities: &Capabilities,
+        login_id: &str,
+        value: &str,
+    ) -> Result<Self, DesktopRpcError> {
+        let params = sign_in::login_complete_params(login_id, value)?;
+        Self::gated(
+            request_id,
+            capabilities,
+            DesktopMethod::LoginComplete,
+            params,
+        )
+    }
+
+    /// The `login_cancel` request: `{ loginId }`.
+    pub fn login_cancel(
+        request_id: impl Into<String>,
+        capabilities: &Capabilities,
+        login_id: &str,
+    ) -> Result<Self, DesktopRpcError> {
+        let params = sign_in::login_cancel_params(login_id)?;
+        Self::gated(request_id, capabilities, DesktopMethod::LoginCancel, params)
+    }
+
+    /// The `set_api_key` request: `{ provider, key }`.
+    pub fn set_api_key(
+        request_id: impl Into<String>,
+        capabilities: &Capabilities,
+        provider: &str,
+        key: &str,
+    ) -> Result<Self, DesktopRpcError> {
+        let params = sign_in::set_api_key_params(provider, key)?;
+        Self::gated(request_id, capabilities, DesktopMethod::SetApiKey, params)
+    }
+
+    /// The `remove_credentials` request: `{ provider }`.
+    pub fn remove_credentials(
+        request_id: impl Into<String>,
+        capabilities: &Capabilities,
+        provider: &str,
+    ) -> Result<Self, DesktopRpcError> {
+        let params = sign_in::provider_params(provider)?;
+        Self::gated(
+            request_id,
+            capabilities,
+            DesktopMethod::RemoveCredentials,
+            params,
+        )
+    }
+
+    /// The `list_packages` request. It takes no params.
+    pub fn list_packages(
+        request_id: impl Into<String>,
+        capabilities: &Capabilities,
+    ) -> Result<Self, DesktopRpcError> {
+        Self::gated(
+            request_id,
+            capabilities,
+            DesktopMethod::ListPackages,
+            json!({}),
+        )
+    }
+
+    /// The `install_package` request: `{ source }`, plus `scope` when given.
+    pub fn install_package(
+        request_id: impl Into<String>,
+        capabilities: &Capabilities,
+        source: &str,
+        scope: Option<PackageScope>,
+    ) -> Result<Self, DesktopRpcError> {
+        let params = packages::package_params(source, scope)?;
+        Self::gated(
+            request_id,
+            capabilities,
+            DesktopMethod::InstallPackage,
+            params,
+        )
+    }
+
+    /// The `remove_package` request: `{ source }`, plus `scope` when given.
+    pub fn remove_package(
+        request_id: impl Into<String>,
+        capabilities: &Capabilities,
+        source: &str,
+        scope: Option<PackageScope>,
+    ) -> Result<Self, DesktopRpcError> {
+        let params = packages::package_params(source, scope)?;
+        Self::gated(
+            request_id,
+            capabilities,
+            DesktopMethod::RemovePackage,
+            params,
+        )
+    }
+
+    fn gated(
+        request_id: impl Into<String>,
+        capabilities: &Capabilities,
+        method: DesktopMethod,
+        params: Value,
+    ) -> Result<Self, DesktopRpcError> {
+        capabilities.require(method)?;
+        Self::build(request_id, method, params)
+    }
+
     /// A request for a known method, validated against the id and size limits
     /// before anything reaches the transport. The config methods are refused
     /// here: their params come only from [`Self::get_config`] and
@@ -1424,6 +1614,43 @@ impl DesktopResponse {
         SetHostContextAck::from_data(self.data()?)
     }
 
+    /// The response to `login_start`: the login its events name.
+    pub fn login_started(&self) -> Result<LoginStarted, DesktopRpcError> {
+        LoginStarted::from_data(self.data()?)
+    }
+
+    /// The response to `login_complete` or `login_cancel`: accepted.
+    pub fn login_acknowledged(&self) -> Result<(), DesktopRpcError> {
+        if self.data()?.is_object() {
+            Ok(())
+        } else {
+            Err(DesktopRpcError::MalformedPayload(
+                "a login answer must be an object".into(),
+            ))
+        }
+    }
+
+    /// The response to `set_api_key`.
+    pub fn api_key_saved(&self) -> Result<ApiKeySaved, DesktopRpcError> {
+        decode_data(self.data()?)
+    }
+
+    /// The response to `remove_credentials`.
+    pub fn credentials_removed(&self) -> Result<CredentialsRemoved, DesktopRpcError> {
+        decode_data(self.data()?)
+    }
+
+    /// The response to `list_packages`.
+    pub fn packages(&self) -> Result<PackageList, DesktopRpcError> {
+        PackageList::from_data(self.data()?)
+    }
+
+    /// The response to `install_package` or `remove_package`: the job its
+    /// events name.
+    pub fn package_job(&self) -> Result<PackageJob, DesktopRpcError> {
+        packages::job_record(self.data()?, |job: &PackageJob| &job.job_id)
+    }
+
     fn data(&self) -> Result<&Value, DesktopRpcError> {
         self.result
             .as_ref()
@@ -1524,6 +1751,34 @@ impl DesktopEvent {
     pub fn host_tool_cancel(&self) -> Result<HostToolCancel, DesktopRpcError> {
         expect_event(self, HOST_TOOL_CANCEL)?;
         HostToolCancel::from_data(&self.data)
+    }
+
+    /// Decode the data of a `login_prompt` event, verifying the exact event
+    /// name before the shape.
+    pub fn login_prompt(&self) -> Result<LoginPrompt, DesktopRpcError> {
+        expect_event(self, LOGIN_PROMPT)?;
+        LoginPrompt::from_data(&self.data)
+    }
+
+    /// Decode the data of a `login_finished` event, verifying the exact
+    /// event name before the shape.
+    pub fn login_finished(&self) -> Result<LoginFinished, DesktopRpcError> {
+        expect_event(self, LOGIN_FINISHED)?;
+        LoginFinished::from_data(&self.data)
+    }
+
+    /// Decode the data of a `package_progress` event, verifying the exact
+    /// event name before the shape.
+    pub fn package_progress(&self) -> Result<PackageProgress, DesktopRpcError> {
+        expect_event(self, PACKAGE_PROGRESS)?;
+        packages::job_record(&self.data, |progress: &PackageProgress| &progress.job_id)
+    }
+
+    /// Decode the data of a `package_finished` event, verifying the exact
+    /// event name before the shape.
+    pub fn package_finished(&self) -> Result<PackageFinished, DesktopRpcError> {
+        expect_event(self, PACKAGE_FINISHED)?;
+        packages::job_record(&self.data, |finished: &PackageFinished| &finished.job_id)
     }
 }
 
@@ -4119,6 +4374,95 @@ impl DesktopSession {
             DesktopMethod::SetBackgroundSubagents,
             background::set_background_subagents_params(policy, confirmation_token)?,
         )
+    }
+
+    /// Issue `login_start` with `{ provider }`, when `capabilities` list it.
+    pub fn issue_login_start(
+        &mut self,
+        capabilities: &Capabilities,
+        provider: &str,
+    ) -> Result<DesktopRequest, DesktopRpcError> {
+        let params = sign_in::provider_params(provider)?;
+        self.issue_gated(capabilities, DesktopMethod::LoginStart, params)
+    }
+
+    /// Issue `login_complete` with `{ loginId, value }`.
+    pub fn issue_login_complete(
+        &mut self,
+        capabilities: &Capabilities,
+        login_id: &str,
+        value: &str,
+    ) -> Result<DesktopRequest, DesktopRpcError> {
+        let params = sign_in::login_complete_params(login_id, value)?;
+        self.issue_gated(capabilities, DesktopMethod::LoginComplete, params)
+    }
+
+    /// Issue `login_cancel` with `{ loginId }`.
+    pub fn issue_login_cancel(
+        &mut self,
+        capabilities: &Capabilities,
+        login_id: &str,
+    ) -> Result<DesktopRequest, DesktopRpcError> {
+        let params = sign_in::login_cancel_params(login_id)?;
+        self.issue_gated(capabilities, DesktopMethod::LoginCancel, params)
+    }
+
+    /// Issue `set_api_key` with `{ provider, key }`.
+    pub fn issue_set_api_key(
+        &mut self,
+        capabilities: &Capabilities,
+        provider: &str,
+        key: &str,
+    ) -> Result<DesktopRequest, DesktopRpcError> {
+        let params = sign_in::set_api_key_params(provider, key)?;
+        self.issue_gated(capabilities, DesktopMethod::SetApiKey, params)
+    }
+
+    /// Issue `remove_credentials` with `{ provider }`.
+    pub fn issue_remove_credentials(
+        &mut self,
+        capabilities: &Capabilities,
+        provider: &str,
+    ) -> Result<DesktopRequest, DesktopRpcError> {
+        let params = sign_in::provider_params(provider)?;
+        self.issue_gated(capabilities, DesktopMethod::RemoveCredentials, params)
+    }
+
+    /// Issue `list_packages`.
+    pub fn issue_list_packages(
+        &mut self,
+        capabilities: &Capabilities,
+    ) -> Result<DesktopRequest, DesktopRpcError> {
+        self.issue_gated(capabilities, DesktopMethod::ListPackages, json!({}))
+    }
+
+    /// Issue `install_package` (`install`) or `remove_package` with
+    /// `{ source }` and `scope` when given.
+    pub fn issue_package_job(
+        &mut self,
+        capabilities: &Capabilities,
+        install: bool,
+        source: &str,
+        scope: Option<PackageScope>,
+    ) -> Result<DesktopRequest, DesktopRpcError> {
+        let method = if install {
+            DesktopMethod::InstallPackage
+        } else {
+            DesktopMethod::RemovePackage
+        };
+        let params = packages::package_params(source, scope)?;
+        self.issue_gated(capabilities, method, params)
+    }
+
+    /// [`Self::issue_with`] for a method only `capabilities` may allow.
+    fn issue_gated(
+        &mut self,
+        capabilities: &Capabilities,
+        method: DesktopMethod,
+        params: Value,
+    ) -> Result<DesktopRequest, DesktopRpcError> {
+        capabilities.require(method)?;
+        self.issue_with(method, params)
     }
 
     /// A new request with a fresh id; `params` is built by the typed callers

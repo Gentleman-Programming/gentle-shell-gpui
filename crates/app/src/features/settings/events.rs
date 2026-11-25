@@ -13,6 +13,9 @@ pub enum SettingsEvent {
     OpenProfiles,
     /// Packages or sign-ins changed: tabs should reload their backend.
     Changed,
+    /// Credentials changed on a Gentle Shell server (a sign-in, a key, a
+    /// removal): tabs pick them up, in place where their Shell reloads them.
+    CredentialsChanged,
     /// Run this Gentle Shell slash command in the active agent pane and
     /// report back through [`super::SettingsView::shell_done`].
     ShellCommand(String),

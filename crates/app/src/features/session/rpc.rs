@@ -654,7 +654,15 @@ impl SessionView {
             | DesktopMethod::GetBackgroundSubagents
             | DesktopMethod::SetBackgroundSubagents
             | DesktopMethod::GetAuthStatus
-            | DesktopMethod::ReloadCredentials => {
+            | DesktopMethod::ReloadCredentials
+            | DesktopMethod::LoginStart
+            | DesktopMethod::LoginComplete
+            | DesktopMethod::LoginCancel
+            | DesktopMethod::SetApiKey
+            | DesktopMethod::RemoveCredentials
+            | DesktopMethod::ListPackages
+            | DesktopMethod::InstallPackage
+            | DesktopMethod::RemovePackage => {
                 let applied = self.desktop.reads_expire(generation);
                 self.apply_reads(applied, cx);
             }
@@ -736,7 +744,15 @@ impl SessionView {
             | DesktopMethod::GetBackgroundSubagents
             | DesktopMethod::SetBackgroundSubagents
             | DesktopMethod::GetAuthStatus
-            | DesktopMethod::ReloadCredentials => {
+            | DesktopMethod::ReloadCredentials
+            | DesktopMethod::LoginStart
+            | DesktopMethod::LoginComplete
+            | DesktopMethod::LoginCancel
+            | DesktopMethod::SetApiKey
+            | DesktopMethod::RemoveCredentials
+            | DesktopMethod::ListPackages
+            | DesktopMethod::InstallPackage
+            | DesktopMethod::RemovePackage => {
                 let applied = self.desktop.reads_outer(generation, handled);
                 self.apply_reads(applied, cx);
             }

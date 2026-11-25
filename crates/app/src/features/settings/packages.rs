@@ -1,8 +1,9 @@
 //! Packages: `gentle-shell install|remove`, Pi's own package manager
 //! against the resolved home. Update badges come from the active agent
-//! tab's Desktop RPC when available. On a Gentle Shell server the packages
-//! are those its update status lists, and installing or removing one is
-//! done there (no Desktop RPC method does it).
+//! tab's Desktop RPC when available. On a Gentle Shell server whose Shell
+//! lists and installs packages, that happens there ([`super::server_packages`]);
+//! on an older one the packages are those its update status lists, and
+//! installing or removing one is done there by hand.
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -58,17 +59,21 @@ impl PackageUiState {
 
 impl SettingsView {
     /// `gentle-shell install|remove <source>`: Pi's own package manager
-    /// against the resolved home.
+    /// against the resolved home. On a server, its Shell installs or
+    /// removes it there ([`Self::run_server_package`]).
     pub(super) fn run_package(
         &mut self,
         verb: &'static str,
         source: String,
         cx: &mut Context<Self>,
     ) {
-        if self.package.running.is_some()
-            || self.shell_update.blocks_packages()
-            || self.server().is_some()
-        {
+        if self.server().is_some() {
+            if matches!(verb, "install" | "remove") {
+                self.run_server_package(verb == "install", source, cx);
+            }
+            return;
+        }
+        if self.package.running.is_some() || self.shell_update.blocks_packages() {
             return;
         }
         self.package.running = Some(format!("{verb} {source}"));
@@ -110,7 +115,9 @@ impl SettingsView {
     /// Installed packages (remove each) and a field to install any source.
     pub(super) fn packages_section(&self, s: &Snapshot, cx: &mut Context<Self>) -> Div {
         if let Some(server) = self.server() {
-            return self.server_packages_section(server);
+            return self
+                .server_packages_live(server, cx)
+                .unwrap_or_else(|| self.server_packages_section(server));
         }
         let updates = self.shell_updates.status.as_ref();
         let updating_shell = self.shell_update.blocks_packages();

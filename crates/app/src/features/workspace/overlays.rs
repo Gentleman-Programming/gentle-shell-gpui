@@ -520,6 +520,14 @@ impl Workspace {
                         tab.update(cx, |session, cx| session.reload_models(window, cx));
                     }
                 }
+                SettingsEvent::CredentialsChanged => {
+                    // Only a server's tabs share its credentials.
+                    for tab in this.sessions() {
+                        if tab.read(cx).runs_on().is_server() {
+                            tab.update(cx, |session, cx| session.reload_credentials(window, cx));
+                        }
+                    }
+                }
                 SettingsEvent::DevicesChanged(prefs) => {
                     let prefs = *prefs;
                     crate::features::devices::hub(cx)

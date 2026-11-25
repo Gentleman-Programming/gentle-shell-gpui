@@ -37,7 +37,14 @@ pub(super) fn models_section(s: &Snapshot) -> Div {
         ))
 }
 
-pub(super) fn providers_section(s: &Snapshot, cx: &mut Context<SettingsView>) -> Div {
+/// The inventory; on a server whose Shell signs in itself
+/// (`signs_in_there`), Sign-ins below does it instead of the "Do this on"
+/// note.
+pub(super) fn providers_section(
+    s: &Snapshot,
+    signs_in_there: bool,
+    cx: &mut Context<SettingsView>,
+) -> Div {
     let server = s.server.as_ref().map(|server| server.name.as_str());
     // On a server, nothing here is a file read: an empty list means its
     // Gentle Shell didn't report one.
@@ -79,7 +86,11 @@ pub(super) fn providers_section(s: &Snapshot, cx: &mut Context<SettingsView>) ->
                 None => s.custom_providers.join(", "),
             },
         ))
-        .children(server.map(|name| note(run_on(name, commands::LOGIN))))
+        .children(
+            server
+                .filter(|_| !signs_in_there)
+                .map(|name| note(run_on(name, commands::LOGIN))),
+        )
         .child(
             div().pt_2().text_xs().text_color(ui::faint()).child(
                 "Model and sign-in details are read-only here. Use Profiles to edit agent routing and defaults.",

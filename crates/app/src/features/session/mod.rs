@@ -14,6 +14,7 @@ use pi_rpc::{UiAnswer, UiMethod};
 use crate::shared::ui;
 use gentle_core::transcript::{NoticeLevel, Transcript};
 
+mod accounts;
 mod agents;
 mod attachments;
 mod builtins;
@@ -30,11 +31,12 @@ mod view;
 #[cfg(test)]
 mod view_tests;
 
+pub(crate) use accounts::AccountEvent;
 pub use agents::{AgentsPanel, AgentsTab};
 pub use host_tools::{CanvasAnswer, HostToolRequest};
 pub(crate) use reads::READ_DECIDE_WAIT;
 pub(crate) use state::desktop::reads::{
-    ReadFailure, ReadOutcome, ReadRequest, ReadSupport, ReadTicket,
+    ReadFailure, ReadOutcome, ReadRequest, ReadSupport, ReadTicket, Secret,
 };
 
 actions!(session, [Abort, Stop, ToggleAgents, NewSession]);
@@ -232,6 +234,8 @@ pub struct SessionView {
     /// `gentle_ui` run by the app for a server session (`host_genui`):
     /// the conversation's surfaces, rebuilt from it.
     host_genui: gentle_core::genui::host::Engine,
+    /// Sign-in and package events waiting for the screen that started them.
+    accounts: accounts::AccountEvents,
     /// The host messages sent, for the tests (a test tab has no server).
     #[cfg(test)]
     host_messages: Vec<pi_rpc::desktop_rpc::HostMessage>,
@@ -422,6 +426,7 @@ impl SessionView {
             host_genui: gentle_core::genui::host::Engine::new(crate::features::genui::mode::mode(
                 cx,
             )),
+            accounts: accounts::AccountEvents::default(),
             #[cfg(test)]
             host_messages: Vec::new(),
         };

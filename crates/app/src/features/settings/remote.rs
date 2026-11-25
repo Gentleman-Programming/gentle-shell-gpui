@@ -3,7 +3,11 @@
 //! on these screens reads or writes this computer's Gentle Shell home, runs
 //! its `gentle-shell` or starts its login helper; what the server's Gentle
 //! Shell serves over Desktop RPC is read (and written) through a session on
-//! the server, and anything else shows "Do this on <server>: run <command>".
+//! the server — signing in, API keys and packages included
+//! ([`super::server_sign_in`], [`super::server_packages`]) — upgrading it
+//! goes to the server itself ([`super::server_upgrade`]), and anything else
+//! (or a server too old for those) shows "Do this on <server>: run
+//! <command>".
 //!
 //! # The control session
 //!

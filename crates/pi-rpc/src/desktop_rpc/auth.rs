@@ -2,10 +2,12 @@
 //! has credentials for, read from Pi's model registry in memory, and an
 //! offline refresh of that registry so credentials added or removed
 //! elsewhere (another terminal's `/login`, the app's own sign-in) apply
-//! without restarting. Status only: no credential value ever crosses.
+//! without restarting. Status only: no credential value ever crosses. A
+//! Shell that signs in itself (`login_start`) also says how each provider
+//! signs in (`loginKinds`).
 
 use super::DesktopRpcError;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 
 wire_enum! {
@@ -27,8 +29,34 @@ wire_enum! {
     }
 }
 
+wire_enum! {
+    /// How a provider can sign in on the Shell's side: a browser login
+    /// (`oauth`) or a device code (`device`), both through `login_start`, or
+    /// a key (`api_key`, `set_api_key`).
+    LoginKind, "loginKinds" {
+        OAuth => "oauth",
+        Device => "device",
+        ApiKey => "api_key",
+    }
+}
+
+/// `loginKinds` as listed, without the kinds this client doesn't know (a
+/// newer Shell's): those are not offered, the rest still are.
+fn known_login_kinds<'de, D>(deserializer: D) -> Result<Vec<LoginKind>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let kinds: Option<Vec<String>> = Option::deserialize(deserializer)?;
+    Ok(kinds
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|kind| kind.parse().ok())
+        .collect())
+}
+
 /// One provider Pi knows models for. `kind` and `source` are `None` exactly
-/// when it is not configured.
+/// when it is not configured. `login_kinds` is empty from a Shell that
+/// doesn't sign in itself.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderAuth {
@@ -38,6 +66,8 @@ pub struct ProviderAuth {
     #[serde(rename = "type")]
     pub kind: Option<AuthType>,
     pub source: Option<AuthSource>,
+    #[serde(default, deserialize_with = "known_login_kinds")]
+    pub login_kinds: Vec<LoginKind>,
 }
 
 /// The decoded `get_auth_status` data: providers sorted by id, at most 200.

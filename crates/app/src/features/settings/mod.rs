@@ -35,6 +35,9 @@ mod reading_desk;
 pub(crate) mod remote;
 mod runs_on;
 pub(crate) use runs_on::{ConnectEvent, ServerConnect};
+mod server_packages;
+mod server_sign_in;
+mod server_upgrade;
 mod services;
 mod shell_config;
 mod shell_status;
@@ -114,6 +117,12 @@ pub struct SettingsView {
     sign_ins: sign_ins::SignIns,
     /// Where agents run: this computer, a WSL distro or a command.
     runs_on: runs_on::RunsOn,
+    /// Models › Sign-ins on a server: signing in, keys, removals.
+    server_sign_in: server_sign_in::ServerSignIn,
+    /// Extensions › Packages on a server: the list and the job running.
+    server_packages: server_packages::ServerPackages,
+    /// Updates on a server: whether this device may upgrade it, and how.
+    server_upgrade: server_upgrade::ServerUpgradeUi,
 }
 
 impl EventEmitter<SettingsEvent> for SettingsView {}
@@ -189,6 +198,9 @@ impl SettingsView {
             shell_status: shell_status::ShellStatusRead::default(),
             sign_ins: sign_ins::SignIns::default(),
             runs_on: runs_on::RunsOn::new(window, cx),
+            server_sign_in: server_sign_in::ServerSignIn::new(window, cx),
+            server_packages: server_packages::ServerPackages::default(),
+            server_upgrade: server_upgrade::ServerUpgradeUi::default(),
         };
         this.reload(cx);
         this.refresh_maestro(cx);
@@ -224,6 +236,7 @@ impl SettingsView {
             self.page = page;
             self.body_scroll.scroll_to_item(0);
         }
+        self.login_page_shown(page == SettingsPage::Models, cx);
         cx.notify();
     }
 
@@ -240,6 +253,7 @@ impl SettingsView {
         self.background_changed(cx);
         self.sign_ins_changed(cx);
         self.permission_changed(cx);
+        self.server_accounts_changed(cx);
     }
 
     /// The server agents run on, when they do: what Configuration can't do
@@ -317,6 +331,11 @@ impl SettingsView {
         self.ask_shell_config(cx);
         self.ask_sign_ins(cx);
         self.ask_background(cx);
+        if self.server().is_some() {
+            self.server_packages.forget_list();
+            self.ask_server_packages(cx);
+            self.ask_server_upgrade(cx);
+        }
         let cwd = self.cwd.clone();
         let server = self.server().cloned();
         self._load = cx.spawn(async move |this, cx| {
