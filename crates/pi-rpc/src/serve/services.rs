@@ -2,6 +2,8 @@
 //! `GET /api/services` lists, and server-level forwards to them
 //! (`POST /api/forwards`), not tied to a session.
 
+use std::time::Duration;
+
 use serde_json::{Value, json};
 
 use super::{Forward, ServeClient, ServeError, malformed};
@@ -59,34 +61,33 @@ impl ServeClient {
         )?;
         Forward::parse(&answer).ok_or_else(malformed)
     }
-}
 
-/// A page behind a forward, read by the app's own HTTP client (Engram's
-/// API): the first visit trades the link's single-use ticket for the
-/// forward's cookie (`303` + `Set-Cookie: gs_fwd_<id>=…`), which every later
-/// request carries.
-#[derive(Clone)]
-pub struct ForwardedPage {
-    agent: ureq::Agent,
-    /// `http://host:port` of the forward.
-    origin: String,
-    /// `gs_fwd_<id>=<secret>`.
-    cookie: String,
-}
-
-impl ForwardedPage {
-    /// Visit `forward`'s link once for its cookie. Blocking.
-    pub fn open(forward: &Forward, timeout: std::time::Duration) -> Result<Self, String> {
-        let agent: ureq::Agent = ureq::Agent::config_builder()
-            .http_status_as_error(false)
-            .max_redirects(0)
-            .timeout_global(Some(timeout))
-            .build()
-            .into();
-        let response = agent
-            .get(&forward.url)
-            .call()
-            .map_err(|e| format!("Couldn't reach the forwarded page: {e}"))?;
+    /// Visit `forward`'s link once for its cookie, reached as this client
+    /// reaches its server (the forward's listener has the same certificate;
+    /// through a relay, the relay is asked for the forward's port). Blocking.
+    pub fn open_page(&self, forward: &Forward, timeout: Duration) -> Result<ForwardedPage, String> {
+        let (origin, path) = split_link(&forward.url).ok_or("The forward's link has no host.")?;
+        let base = self.url();
+        // Through a relay the link names the relay's host (the one this
+        // client used) and the forward's port: it goes to the relay instead.
+        let (origin, link) = match base.strip_prefix(gentle_core::serve::RELAY_PREFIX) {
+            Some(relay) => {
+                let port = origin
+                    .rsplit_once(':')
+                    .and_then(|(_, port)| port.parse::<u16>().ok())
+                    .ok_or("The forward's link has no port.")?;
+                (format!("https://{relay}"), self.trust().link(Some(port)))
+            }
+            None => (origin, self.trust().link(None)),
+        };
+        let agent = super::linked_agent(&link, |c| c.timeout_global(Some(timeout)));
+        let response = agent.get(format!("{origin}{path}")).call().map_err(|e| {
+            if link.changed() {
+                gentle_core::serve::CERTIFICATE_CHANGED.to_string()
+            } else {
+                format!("Couldn't reach the forwarded page: {e}")
+            }
+        })?;
         let cookie = response
             .headers()
             .get_all("set-cookie")
@@ -101,14 +102,28 @@ impl ForwardedPage {
                     response.status().as_u16()
                 )
             })?;
-        let origin = forward_origin(&forward.url).ok_or("The forward's link has no host.")?;
-        Ok(Self {
+        Ok(ForwardedPage {
             agent,
             origin,
             cookie,
         })
     }
+}
 
+/// A page behind a forward, read by the app's own HTTP client (Engram's
+/// API): the first visit trades the link's single-use ticket for the
+/// forward's cookie (`303` + `Set-Cookie: gs_fwd_<id>=…`), which every later
+/// request carries ([`ServeClient::open_page`]).
+#[derive(Clone)]
+pub struct ForwardedPage {
+    agent: ureq::Agent,
+    /// `scheme://host:port` requests go to.
+    origin: String,
+    /// `gs_fwd_<id>=<secret>`.
+    cookie: String,
+}
+
+impl ForwardedPage {
     /// `GET path` (with its query) on the page: its status and body.
     pub fn get(&self, path: &str) -> Result<(u16, String), String> {
         let mut response = self
@@ -126,25 +141,31 @@ impl ForwardedPage {
     }
 }
 
-/// `http://host:port` of a forward's link.
-fn forward_origin(url: &str) -> Option<String> {
-    let rest = url.strip_prefix("http://")?;
-    let host = rest.split(['/', '?', '#']).next()?;
-    (!host.is_empty()).then(|| format!("http://{host}"))
+/// A forward's link as `scheme://host:port` and the rest (path and query).
+fn split_link(url: &str) -> Option<(String, &str)> {
+    let (scheme, rest) = url.split_once("://")?;
+    if !matches!(scheme, "http" | "https") {
+        return None;
+    }
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (host, path) = rest.split_at(end);
+    (!host.is_empty()).then(|| (format!("{scheme}://{host}"), path))
 }
 
 #[cfg(test)]
 mod tests {
     #[test]
-    fn a_forward_link_names_its_origin() {
+    fn a_forward_link_names_its_origin_and_path() {
+        let split = |url| super::split_link(url).map(|(o, p)| (o, p.to_string()));
         assert_eq!(
-            super::forward_origin("http://10.0.0.2:8801/x?gs_ticket=t").as_deref(),
-            Some("http://10.0.0.2:8801")
+            split("http://10.0.0.2:8801/x?gs_ticket=t"),
+            Some(("http://10.0.0.2:8801".into(), "/x?gs_ticket=t".into()))
         );
         assert_eq!(
-            super::forward_origin("http://h:1?gs_ticket=t").as_deref(),
-            Some("http://h:1")
+            split("https://h:1?gs_ticket=t"),
+            Some(("https://h:1".into(), "?gs_ticket=t".into()))
         );
-        assert_eq!(super::forward_origin("https://h/"), None);
+        assert_eq!(split("ftp://h/"), None);
+        assert_eq!(split("https:///x"), None);
     }
 }

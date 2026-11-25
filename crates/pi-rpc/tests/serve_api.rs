@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
-use pi_rpc::serve::{EntryKind, ForwardedPage, ServeClient, TermEvent, WatchEvent};
+use pi_rpc::serve::{EntryKind, ServeClient, TermEvent, WatchEvent};
 use serde_json::{Value, json};
 
 const TOKEN: &str = "gss_test";
@@ -598,7 +598,9 @@ fn a_forwarded_page_trades_its_ticket_for_the_cookie() {
         port: 7437,
         url: format!("http://127.0.0.1:{port}/?gs_ticket=t9"),
     };
-    let page = ForwardedPage::open(&forward, std::time::Duration::from_secs(5)).unwrap();
+    let page = ServeClient::new(&format!("http://127.0.0.1:{port}"), None)
+        .open_page(&forward, std::time::Duration::from_secs(5))
+        .unwrap();
     let (status, body) = page.get("/project/current?cwd=%2Fsrv%2Fp").unwrap();
     assert_eq!(status, 200);
     assert_eq!(

@@ -104,7 +104,7 @@ fn open_page(client: &ServeClient, cwd: &Path) -> Result<ForwardedPage, String> 
     let services = client.services().map_err(|e| e.message)?;
     let port = engram_port(&services)?;
     let forward = client.server_forward(port, "/").map_err(|e| e.message)?;
-    ForwardedPage::open(&forward, TIMEOUT)
+    client.open_page(&forward, TIMEOUT)
 }
 
 /// The port of the server's Engram when a forward can reach it, else why

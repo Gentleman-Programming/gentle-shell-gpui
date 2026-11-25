@@ -1,13 +1,15 @@
 //! Gentle Shell servers (`gentle-shell serve`) as where agents run: pairing
 //! this device with one (at a typed address, found on the local network for
-//! a short pairing code, or wherever on the network a connection code's
-//! server answers), and the device token pairing returns. The token is a
-//! secret, so it stays out of `settings.json` (which names only the server,
-//! the device id and the server's name): it lives in `server-tokens.json` in
-//! the app's folder, owner-only (`0600`), keyed by the address the server
-//! was paired at. Beside it are what finds the server again when its
-//! computer gets another address: its server id, its machine's host name,
-//! the addresses it was reached at and the one it answers at now
+//! a short pairing code, or wherever on the network or through its relay a
+//! connection code's server answers), and the device token pairing returns.
+//! The token is a secret, so it stays out of `settings.json` (which names
+//! only the server, the device id and the server's name): it lives in
+//! `server-tokens.json` in the app's folder, owner-only (`0600`), keyed by
+//! the address the server was paired at. Beside it are how the server is
+//! reached safely (`fp`, the certificate pinned when it speaks HTTPS, and
+//! `relay`, the relay that reaches it from anywhere) and what finds it again
+//! when its computer gets another address: its server id, its machine's host
+//! name, the addresses it was reached at and the one it answers at now
 //! ([`relocate`]).
 
 use std::collections::HashMap;
@@ -17,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use gentle_core::backend::Backend;
 use gentle_core::serve::{ConnectionCode, Nearby, ServerPage, ServerSession};
-use pi_rpc::serve::{Paired, ServeClient, ServerInfo};
+use pi_rpc::serve::{Paired, ServeClient, ServerInfo, Trust};
 use serde_json::{Map, Value, json};
 
 /// What a server can't do for its devices: its `gentle-shell serve` is
@@ -150,6 +152,16 @@ fn answers_at<'a>(url: &'a str, entry: &'a Value) -> &'a str {
     entry["at"].as_str().unwrap_or(url)
 }
 
+/// How the server a token entry is for is reached: the certificate pinned
+/// and its relay, as pairing found them.
+fn trust_of(entry: &Value) -> Trust {
+    let field = |key: &str| entry[key].as_str().map(str::to_string);
+    Trust {
+        fingerprint: field("fp"),
+        relay: field("relay"),
+    }
+}
+
 /// A client of `choice` with its token; an error in words when this device
 /// isn't paired with it (any more).
 pub fn client(choice: &Backend) -> anyhow::Result<ServeClient> {
@@ -173,7 +185,7 @@ fn client_at(url: &str) -> Option<ServeClient> {
     let token = entry["token"].as_str()?.to_string();
     let key = url.to_string();
     Some(
-        ServeClient::new(answers_at(url, entry), Some(token))
+        ServeClient::with_trust(answers_at(url, entry), Some(token), trust_of(entry))
             .relocating(Arc::new(move |failed| relocate(&key, failed))),
     )
 }
@@ -188,12 +200,14 @@ static SEARCHED: LazyLock<Mutex<HashMap<String, Instant>>> = LazyLock::new(Mutex
 
 /// The server paired at `url` doesn't answer at `failed` any more (its
 /// computer got another address on the network, DHCP): look for it on the
-/// local network (discovery) and at every address it was reached at, its
-/// host name and `<host>.local`; the first where `GET /.well-known/
-/// gentle-shell` names its server id is where it went. That address is
-/// saved (`at`, beside the token), so the next launch starts there. `None`
-/// when it isn't found, or this pairing predates knowing its id. Blocking:
-/// up to about 6 s.
+/// local network (discovery), at every address it was reached at, its host
+/// name and `<host>.local`, and through its relay; the first where
+/// `GET /.well-known/gentle-shell` names its server id, over HTTPS with the
+/// certificate pinned at pairing when it has one, is where it went (a
+/// server answering with its id but another certificate isn't it). That
+/// address is saved (`at`, beside the token), so the next launch starts
+/// there. `None` when it isn't found, or this pairing predates knowing its
+/// id. Blocking: up to about 6 s.
 fn relocate(url: &str, failed: &str) -> Option<String> {
     let mut searched = SEARCHED.lock().unwrap_or_else(|e| e.into_inner());
     let tokens = read_tokens();
@@ -209,23 +223,29 @@ fn relocate(url: &str, failed: &str) -> Option<String> {
         return None;
     }
     let server_id = entry["serverId"].as_str().filter(|id| !id.is_empty())?;
+    let trust = trust_of(entry);
     let candidates = gentle_core::serve::relocation_urls(
         failed,
         &known_addresses(entry),
         entry["host"].as_str(),
+        trust.relay.as_deref(),
     );
     let discovery = std::thread::Builder::new()
         .name("serve-relocate".into())
         .spawn(nearby)
         .ok();
-    let found = pi_rpc::serve::find(server_id, &candidates).or_else(|| {
-        discovery?
+    let found = pi_rpc::serve::find(server_id, &candidates, &trust).or_else(|| {
+        // Anyone can answer discovery: what answered with the server's id
+        // is asked again, pinned.
+        let heard: Vec<String> = discovery?
             .join()
             .ok()?
             .ok()?
             .into_iter()
-            .find(|server| server.server_id == server_id)
+            .filter(|server| server.server_id == server_id)
             .map(|server| server.url())
+            .collect();
+        pi_rpc::serve::find(server_id, &heard, &trust)
     });
     let Some(found) = found else {
         searched.insert(url.to_string(), Instant::now());
@@ -270,27 +290,33 @@ fn moved(entry: &mut Value, url: &str, found: &str) {
 }
 
 /// Pair this device with the server at `url` (typed) using `code`: the
-/// backend to save, with what the server says about itself. The token is
-/// saved here. Blocking.
+/// backend to save, with what the server says about itself. A server that
+/// speaks HTTPS is paired with over HTTPS once it proved it knows the code
+/// (`pi_rpc::serve::pair_at`). The token is saved here. Blocking.
 pub fn pair(url: &str, code: &str) -> Result<(Backend, ServerInfo), String> {
     let url = gentle_core::serve::normalize_url(url)?;
     let code = gentle_core::serve::normalize_code(code)?;
-    let paired = ServeClient::new(&url, None)
-        .pair(&code, &device_name())
-        .map_err(|e| e.message)?;
+    let (url, paired) = pi_rpc::serve::pair_at(&url, &code, &device_name())?;
     let name = host_of(&url);
     // Its machine's host name, to look for it by should its address change.
-    let host = pi_rpc::serve::identify(&url).map(|(_, host)| host);
-    paired_with(url, name, host, &[], paired)
+    let host = pi_rpc::serve::identify(&url, &paired.trust).map(|(_, host)| host);
+    paired_with(url.clone(), &url, name, host, &[], paired)
 }
 
 /// Pair this device with the server a connection code names, at `url`
-/// (where `pi_rpc::serve::locate` found it on the network), named as the
-/// code names it. Blocking.
+/// (where `pi_rpc::serve::locate` found it on the network, or its relay),
+/// named as the code names it. Through a relay the server is still saved
+/// under an address of its own (several servers can share a relay), and
+/// answers at the relay until it is found on the network. Blocking.
 pub fn pair_code(code: &ConnectionCode, url: &str) -> Result<(Backend, ServerInfo), String> {
     let paired = pi_rpc::serve::pair_code(code, url, &device_name())?;
+    let key = match code.urls.first() {
+        Some(own) if gentle_core::serve::is_relay(url) => own.clone(),
+        _ => url.to_string(),
+    };
     paired_with(
-        url.to_string(),
+        key,
+        url,
         code.name.clone(),
         Some(code.name.clone()),
         &code.urls,
@@ -313,8 +339,10 @@ pub fn nearby() -> Result<Vec<Nearby>, String> {
 /// pairing `code`, named as it names itself. Blocking.
 pub fn pair_nearby(server: &Nearby, code: &str) -> Result<(Backend, ServerInfo), String> {
     let paired = pi_rpc::serve::pair_nearby(server, code, &device_name())?;
+    let url = server.url();
     paired_with(
-        server.url(),
+        url.clone(),
+        &url,
         server.name.clone(),
         Some(server.name.clone()),
         &[],
@@ -337,12 +365,13 @@ fn device_name() -> String {
 /// change.
 fn paired_with(
     url: String,
+    answers: &str,
     name: String,
     host: Option<String>,
     others: &[String],
     paired: Paired,
 ) -> Result<(Backend, ServerInfo), String> {
-    let client = ServeClient::new(&url, Some(paired.token.clone()));
+    let client = ServeClient::with_trust(answers, Some(paired.token.clone()), paired.trust.clone());
     let info = client.server().map_err(|e| e.message)?;
     let mut tokens = read_tokens();
     let mut addresses = others.to_vec();
@@ -353,6 +382,15 @@ fn paired_with(
         "serverId": info.server_id,
         "addresses": addresses,
     });
+    if answers != url {
+        moved(&mut entry, &url, answers);
+    }
+    if let Some(fp) = &paired.trust.fingerprint {
+        entry["fp"] = fp.clone().into();
+    }
+    if let Some(relay) = &paired.trust.relay {
+        entry["relay"] = relay.clone().into();
+    }
     if let Some(home) = &info.home {
         entry["home"] = home.clone().into();
     }
@@ -373,7 +411,7 @@ fn paired_with(
 
 /// The host part of a server address, as its default name.
 fn host_of(url: &str) -> String {
-    let rest = url.trim_start_matches("http://");
+    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
     match rest.rsplit_once(':') {
         Some((host, port)) if port.chars().all(|c| c.is_ascii_digit()) => host.to_string(),
         _ => rest.to_string(),

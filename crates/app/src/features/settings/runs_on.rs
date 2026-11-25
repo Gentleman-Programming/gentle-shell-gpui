@@ -564,10 +564,12 @@ impl SettingsView {
                         }
                         Kind::Server => {
                             "On the other computer, run gentle-shell serve share and enter the \
-                             code it shows. Use it on a network you trust: the server speaks \
-                             plain HTTP. It runs the agents and keeps them running while this \
-                             app is closed. Project folders are paths on the server; files, \
-                             git, terminals and Setup aren't available there yet."
+                             code it shows (from outside its network, paste the long code: it \
+                             goes through the server's relay). The connection is encrypted and \
+                             pinned to that server's certificate. It runs the agents and keeps \
+                             them running while this app is closed. Project folders are paths \
+                             on the server; files, git, terminals and Setup aren't available \
+                             there yet."
                         }
                         _ => {
                             "Agents, terminals, git and Setup run here; open agent tabs stay \

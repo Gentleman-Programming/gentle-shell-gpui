@@ -5,7 +5,10 @@
 //! code, or the connection code and how the server it names is found,
 //! [`decode_connection_code`], [`search`]), finding servers on the local
 //! network by UDP broadcast ([`discovery_targets`], [`read_announce`],
-//! [`pick`]), what its errors mean to them ([`error_text`]), its
+//! [`pick`]), the certificate a server on the network is pinned by and the
+//! proof it gives before a pairing code is sent ([`certificate_fingerprint`],
+//! [`verify_pair_proof`]), the relay that reaches it from anywhere
+//! ([`relay_url`]), what its errors mean to them ([`error_text`]), its
 //! Server-Sent Events framing ([`SseParser`]), the stream's cursor and what
 //! each event asks of the client ([`Stream`]), and the Pi responses the
 //! stream repeats under the server's own ids ([`RpcIds`]).
@@ -43,34 +46,30 @@ pub struct ServerSession {
     pub id: String,
 }
 
-/// `input` as the base URL requests are made against: `http://host[:port]`,
-/// the host lowercased and any trailing `/` dropped. A bare `host:port` gets
-/// `http://`. The server speaks plain HTTP (no TLS in phase 1) and serves
-/// from its root, so `https://`, a path, a query or credentials are refused
-/// with what to type instead.
+/// `input` as the base URL requests are made against: `http://host[:port]`
+/// or `https://host[:port]`, the host lowercased and any trailing `/`
+/// dropped. A bare `host:port` gets `http://` (a server that speaks HTTPS
+/// says so, and the client moves to it). The server serves from its root,
+/// so a path, a query or credentials are refused with what to type instead.
 pub fn normalize_url(input: &str) -> Result<String, String> {
     let input = input.trim();
     if input.is_empty() {
         return Err("Enter the server's address, like http://127.0.0.1:8787.".into());
     }
-    let rest = match input.split_once("://") {
-        Some((scheme, rest)) if scheme.eq_ignore_ascii_case("http") => rest,
-        Some((scheme, _)) if scheme.eq_ignore_ascii_case("https") => {
-            return Err(
-                "Gentle Shell servers speak plain HTTP: use http://, through an SSH \
-                 tunnel or a network you trust."
-                    .into(),
-            );
-        }
-        Some((scheme, _)) => return Err(format!("Use http://, not {scheme}://.")),
-        None => input,
+    let (scheme, rest) = match input.split_once("://") {
+        Some((scheme, rest)) if scheme.eq_ignore_ascii_case("http") => ("http", rest),
+        Some((scheme, rest)) if scheme.eq_ignore_ascii_case("https") => ("https", rest),
+        Some((scheme, _)) => return Err(format!("Use http:// or https://, not {scheme}://.")),
+        None => ("http", input),
     };
     let (authority, path) = match rest.find(['/', '?', '#']) {
         Some(at) => rest.split_at(at),
         None => (rest, ""),
     };
     if !(path.is_empty() || path == "/") {
-        return Err("Use the server's address only (http://host:port), without a path.".into());
+        return Err(format!(
+            "Use the server's address only ({scheme}://host:port), without a path."
+        ));
     }
     if authority.contains('@') {
         return Err(
@@ -108,10 +107,10 @@ pub fn normalize_url(input: &str) -> Result<String, String> {
         (host.to_ascii_lowercase(), port)
     };
     match port {
-        None => Ok(format!("http://{host}")),
+        None => Ok(format!("{scheme}://{host}")),
         Some(port) => match port.parse::<u16>() {
             Ok(n) if n > 0 && port.chars().all(|c| c.is_ascii_digit()) => {
-                Ok(format!("http://{host}:{n}"))
+                Ok(format!("{scheme}://{host}:{n}"))
             }
             _ => Err(format!("{port} isn't a port number.")),
         },
@@ -146,8 +145,8 @@ const PAIRING_ALPHABET: &str = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
 /// A server and a pairing code for it, as one string to copy and paste:
 /// `gsc1.` and the base64url (no padding) of
-/// `{"v":1,"id","n","p","a":[…],"c"}`. A secret while the pairing code in
-/// it is valid (5 minutes, once).
+/// `{"v":1,"id","n","p","a":[…],"c"[,"fp"][,"r"]}`. A secret while the
+/// pairing code in it is valid (5 minutes, once).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConnectionCode {
     /// The server's id (`srv_…`): only the server answering with it is
@@ -157,10 +156,18 @@ pub struct ConnectionCode {
     pub name: String,
     pub port: u16,
     /// The base URLs to look for the server at, in the code's order (its
-    /// network addresses, then its host names), each `http://host:port`.
+    /// network addresses, then its host names), each `http://host:port`,
+    /// or `https://host:port` when the server speaks HTTPS.
     pub urls: Vec<String>,
     /// `XXXX-XXXX`, as the server prints it.
     pub pairing_code: String,
+    /// The server's certificate fingerprint (`fp`, base64url SHA-256 of its
+    /// DER) when it speaks HTTPS: the code came from the server itself, so
+    /// it is pinned as it is, with no pairing proof.
+    pub fingerprint: Option<String>,
+    /// The relay that reaches the server from anywhere (`r`,
+    /// `gsr://host:port`), routed by the fingerprint; only with one.
+    pub relay: Option<String>,
 }
 
 /// Why a pasted connection code can't be used.
@@ -288,9 +295,34 @@ pub fn decode_connection_code(input: &str) -> Result<ConnectionCode, CodeError> 
         .as_str()
         .and_then(short_code)
         .ok_or(CodeError::BadPairingCode)?;
+    let fingerprint = match &value["fp"] {
+        Value::Null => None,
+        fp => Some(
+            fp.as_str()
+                .filter(|fp| fingerprint_bytes(fp).is_some())
+                .ok_or(CodeError::Damaged)?
+                .to_string(),
+        ),
+    };
+    // A relay only ever carries TLS, so it needs the fingerprint.
+    let relay = match &value["r"] {
+        Value::Null => None,
+        relay => Some(
+            relay
+                .as_str()
+                .and_then(relay_url)
+                .filter(|_| fingerprint.is_some())
+                .ok_or(CodeError::Damaged)?,
+        ),
+    };
+    let scheme = if fingerprint.is_some() {
+        "https"
+    } else {
+        "http"
+    };
     let mut urls: Vec<String> = Vec::new();
     for address in value["a"].as_array().into_iter().flatten() {
-        let Some(url) = address.as_str().and_then(|a| address_url(a, port)) else {
+        let Some(url) = address.as_str().and_then(|a| address_url(scheme, a, port)) else {
             continue;
         };
         if !urls.contains(&url) {
@@ -300,7 +332,11 @@ pub fn decode_connection_code(input: &str) -> Result<ConnectionCode, CodeError> 
             break;
         }
     }
-    let first = urls.first().ok_or(CodeError::NoAddress)?;
+    // Through a relay the server needs no address of its own.
+    let first = urls
+        .first()
+        .or(relay.as_ref())
+        .ok_or(CodeError::NoAddress)?;
     let name = match value["n"].as_str().map(str::trim) {
         Some(name) if !name.is_empty() => name.to_string(),
         _ => url_host(first).to_string(),
@@ -311,12 +347,14 @@ pub fn decode_connection_code(input: &str) -> Result<ConnectionCode, CodeError> 
         port,
         urls,
         pairing_code,
+        fingerprint,
+        relay,
     })
 }
 
-/// `http://address:port` for an address in a connection code (a host name,
-/// an IPv4 or an IPv6 address); `None` for anything else.
-fn address_url(address: &str, port: u16) -> Option<String> {
+/// `scheme://address:port` for an address in a connection code (a host
+/// name, an IPv4 or an IPv6 address); `None` for anything else.
+fn address_url(scheme: &str, address: &str, port: u16) -> Option<String> {
     let address = address.trim();
     let host = if address.contains(':') {
         let ip: std::net::Ipv6Addr = address
@@ -328,16 +366,57 @@ fn address_url(address: &str, port: u16) -> Option<String> {
     } else {
         address.to_string()
     };
-    normalize_url(&format!("http://{host}:{port}")).ok()
+    normalize_url(&format!("{scheme}://{host}:{port}")).ok()
 }
 
-/// The host of a base URL [`normalize_url`] made.
+/// The scheme of a base URL (`http`, `https`, `gsr`); `http` without one.
+pub fn url_scheme(url: &str) -> &str {
+    url.split_once("://").map_or("http", |(scheme, _)| scheme)
+}
+
+/// The `host:port` of a base URL.
+fn url_authority(url: &str) -> &str {
+    url.split_once("://").map_or(url, |(_, rest)| rest)
+}
+
+/// The host of a base URL [`normalize_url`] or [`relay_url`] made.
 fn url_host(url: &str) -> &str {
-    let rest = url.trim_start_matches("http://");
+    let rest = url_authority(url);
     match rest.rsplit_once(':') {
         Some((host, port)) if port.chars().all(|c| c.is_ascii_digit()) => host,
         _ => rest,
     }
+}
+
+/// The port of a base URL, when it names one.
+fn url_port(url: &str) -> Option<u16> {
+    let rest = url_authority(url);
+    let (_, port) = rest.rsplit_once(':')?;
+    port.chars()
+        .all(|c| c.is_ascii_digit())
+        .then(|| port.parse().ok())
+        .flatten()
+}
+
+/// What a relay URL starts with.
+pub const RELAY_PREFIX: &str = "gsr://";
+
+/// A relay URL (`gentle-shell relay`) as `gsr://host:port`: host and port,
+/// nothing else, the host lowercased; `None` for anything else.
+pub fn relay_url(input: &str) -> Option<String> {
+    let input = input.trim();
+    let (scheme, rest) = input.split_once("://")?;
+    if !scheme.eq_ignore_ascii_case("gsr") {
+        return None;
+    }
+    let url = normalize_url(&format!("https://{rest}")).ok()?;
+    url_port(&url)?;
+    Some(format!("{RELAY_PREFIX}{}", url_authority(&url)))
+}
+
+/// Whether a base URL reaches its server through a relay (`gsr://…`).
+pub fn is_relay(url: &str) -> bool {
+    url.starts_with(RELAY_PREFIX)
 }
 
 /// The most addresses kept for one paired server, newest last.
@@ -346,22 +425,41 @@ pub const KNOWN_ADDRESSES: usize = 16;
 /// Where to look for a paired server whose address `failed` stopped
 /// answering (its computer got another address on the network): the
 /// addresses it was reached at before (`known`, newest first), then its
-/// machine's `host` name and `<host>.local` on the same port. Never `failed`
-/// itself, nor one address twice. Discovery on the local network finds it
-/// too; these are for where discovery doesn't reach.
-pub fn relocation_urls(failed: &str, known: &[String], host: Option<&str>) -> Vec<String> {
-    let port = failed
-        .rsplit_once(':')
-        .and_then(|(_, port)| port.parse::<u16>().ok());
+/// machine's `host` name and `<host>.local` on the port and scheme it was
+/// reached at, then its `relay`. Never `failed` itself, nor one address
+/// twice. Discovery on the local network finds it too; these are for where
+/// discovery doesn't reach.
+pub fn relocation_urls(
+    failed: &str,
+    known: &[String],
+    host: Option<&str>,
+    relay: Option<&str>,
+) -> Vec<String> {
+    // Through a relay the port is the relay's: the names take the newest
+    // address the server itself was reached at.
+    let direct = if is_relay(failed) {
+        known
+            .iter()
+            .rev()
+            .find(|url| !is_relay(url))
+            .map(String::as_str)
+    } else {
+        Some(failed)
+    };
+    let base = direct.and_then(|url| Some((url_scheme(url), url_port(url)?)));
     let host = host.map(str::trim).filter(|host| !host.is_empty());
-    let names = port.zip(host).into_iter().flat_map(|(port, host)| {
-        let bare = host.strip_suffix(".local").unwrap_or(host);
-        [bare.to_string(), format!("{bare}.local")]
-            .into_iter()
-            .filter_map(move |name| address_url(&name, port))
-    });
+    let names = base
+        .zip(host)
+        .into_iter()
+        .flat_map(|((scheme, port), host)| {
+            let bare = host.strip_suffix(".local").unwrap_or(host);
+            [bare.to_string(), format!("{bare}.local")]
+                .into_iter()
+                .filter_map(move |name| address_url(scheme, &name, port))
+        });
+    let relay = relay.and_then(relay_url);
     let mut urls: Vec<String> = Vec::new();
-    for url in known.iter().rev().cloned().chain(names) {
+    for url in known.iter().rev().cloned().chain(names).chain(relay) {
         if url != failed && !urls.contains(&url) {
             urls.push(url);
         }
@@ -398,12 +496,20 @@ pub fn short_code(code: &str) -> Option<String> {
 impl ConnectionCode {
     /// No address answered as this server.
     pub fn not_found(&self) -> String {
-        format!(
-            "Couldn't find {} on your network. Is it on and on the same Wi-Fi? On it, run \
-             gentle-shell serve share again. If it still can't be found, its firewall may \
-             block port {}: allow it there.",
-            self.name, self.port
-        )
+        match &self.relay {
+            Some(relay) => format!(
+                "Couldn't reach {} on your network or through its relay {relay}. Is it on? \
+                 On it, gentle-shell serve status says whether it is connected to the relay; \
+                 then run gentle-shell serve share again.",
+                self.name
+            ),
+            None => format!(
+                "Couldn't find {} on your network. Is it on and on the same Wi-Fi? On it, \
+                 run gentle-shell serve share again. If it still can't be found, its \
+                 firewall may block port {}: allow it there.",
+                self.name, self.port
+            ),
+        }
     }
 
     /// A Gentle Shell server answered, but not the one in the code.
@@ -444,6 +550,18 @@ pub fn identity(body: &Value) -> Probe {
         }
         _ => Probe::NotAServer,
     }
+}
+
+/// The certificate fingerprint an identity answer (or a discovery reply)
+/// names when its server speaks HTTPS (`"tls":true,"fp"`): a hint only,
+/// since anyone can answer; the client pins the certificate the handshake
+/// shows, after a pairing proof.
+pub fn announced_fingerprint(body: &Value) -> Option<String> {
+    (body["tls"] == true)
+        .then(|| body["fp"].as_str())
+        .flatten()
+        .filter(|fp| fingerprint_bytes(fp).is_some())
+        .map(str::to_string)
 }
 
 /// Where the search for a connection code's server stands.
@@ -511,11 +629,15 @@ pub struct Announce {
     /// The server's host name, cleaned for showing (may be empty).
     pub name: String,
     pub port: u16,
+    /// The certificate it says it has when it speaks HTTPS
+    /// ([`announced_fingerprint`]).
+    pub fingerprint: Option<String>,
 }
 
 /// A datagram read as a server's answer
-/// (`{"t":"gentle-shell/here","v":1,"id","n","p"}`); `None` for anything
-/// else: too long, not JSON, another type or version, no valid id or port.
+/// (`{"t":"gentle-shell/here","v":1,"id","n","p"[,"tls":true,"fp"]}`);
+/// `None` for anything else: too long, not JSON, another type or version,
+/// no valid id or port.
 pub fn read_announce(datagram: &[u8]) -> Option<Announce> {
     if datagram.len() > DATAGRAM_MAX {
         return None;
@@ -540,6 +662,7 @@ pub fn read_announce(datagram: &[u8]) -> Option<Announce> {
         server_id: server_id.to_string(),
         name: name.trim().to_string(),
         port,
+        fingerprint: announced_fingerprint(&value),
     })
 }
 
@@ -594,6 +717,10 @@ pub struct Nearby {
     pub name: String,
     pub ip: IpAddr,
     pub port: u16,
+    /// When it speaks HTTPS: the certificate it announced, and once
+    /// checked, the one its handshake showed (what the pairing proof is
+    /// checked against).
+    pub fingerprint: Option<String>,
 }
 
 impl Nearby {
@@ -608,14 +735,21 @@ impl Nearby {
             },
             ip,
             port: announce.port,
+            fingerprint: announce.fingerprint.clone(),
         }
     }
 
-    /// Its base URL, `http://ip:port`.
+    /// Its base URL: `https://ip:port` when it speaks HTTPS, else
+    /// `http://ip:port`.
     pub fn url(&self) -> String {
+        let scheme = if self.fingerprint.is_some() {
+            "https"
+        } else {
+            "http"
+        };
         match self.ip {
-            IpAddr::V4(ip) => format!("http://{ip}:{}", self.port),
-            IpAddr::V6(ip) => format!("http://[{ip}]:{}", self.port),
+            IpAddr::V4(ip) => format!("{scheme}://{ip}:{}", self.port),
+            IpAddr::V6(ip) => format!("{scheme}://[{ip}]:{}", self.port),
         }
     }
 }
@@ -666,6 +800,134 @@ pub fn short_code_refused(name: &str) -> String {
     format!(
         "{name} doesn't know that code, or it expired or was already used. On {name}, run \
          gentle-shell serve share again and enter the new code."
+    )
+}
+
+/// Where a server on the network proves it knows a pairing code, before a
+/// client that found it through untrusted discovery sends it one
+/// (`POST /api/pair/proof {nonce}` → `{proofs}`).
+pub const PROOF_PATH: &str = "/api/pair/proof";
+
+/// The random bytes in a proof request's nonce (the server takes 16-64).
+pub const PROOF_NONCE_BYTES: usize = 32;
+
+/// The proof key's scrypt salt, before the raw fingerprint. This and the
+/// scrypt cost below are the server's contract (`PAIR_PROOF`).
+const PROOF_SALT: &[u8] = b"gentle-shell/pair-proof/v1";
+/// scrypt's N = 2^15, r = 8, p = 1, 32 bytes.
+const PROOF_LOG_N: u8 = 15;
+const PROOF_R: u32 = 8;
+const PROOF_P: u32 = 1;
+
+/// A certificate fingerprint (base64url, no padding, of the SHA-256 of its
+/// DER) as its 32 bytes; `None` for anything else.
+pub fn fingerprint_bytes(fingerprint: &str) -> Option<[u8; 32]> {
+    use base64::Engine as _;
+    if fingerprint.len() != 43
+        || !fingerprint
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return None;
+    }
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(fingerprint)
+        .ok()?
+        .try_into()
+        .ok()
+}
+
+/// What a server's certificate is pinned by: base64url (no padding) of the
+/// SHA-256 of its DER.
+pub fn certificate_fingerprint(der: &[u8]) -> String {
+    use base64::Engine as _;
+    use sha2::Digest as _;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sha2::Sha256::digest(der))
+}
+
+/// A pairing code as the server keys its proof by: upper case, without
+/// white space or dashes, O as 0, I and L as 1.
+fn proof_code(code: &str) -> String {
+    code.to_uppercase()
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '-')
+        .map(|c| match c {
+            'O' => '0',
+            'I' | 'L' => '1',
+            c => c,
+        })
+        .collect()
+}
+
+/// The proof key for `code` and the certificate `fingerprint` (raw):
+/// scrypt(code, "gentle-shell/pair-proof/v1" ‖ fingerprint, N = 2^15,
+/// r = 8, p = 1, 32 bytes). Stretched because a proof is a function of a
+/// 40-bit code. About 32 MiB and a fraction of a second.
+pub fn pair_proof_key(code: &str, fingerprint: &[u8; 32]) -> [u8; 32] {
+    let params = scrypt::Params::new(PROOF_LOG_N, PROOF_R, PROOF_P, 32)
+        .expect("the proof's scrypt parameters are valid");
+    let salt = [PROOF_SALT, fingerprint.as_slice()].concat();
+    let mut key = [0u8; 32];
+    scrypt::scrypt(proof_code(code).as_bytes(), &salt, &params, &mut key)
+        .expect("a 32-byte scrypt output is valid");
+    key
+}
+
+/// HMAC-SHA256 under `key` of the raw `fingerprint` ‖ `nonce`.
+fn proof_mac(key: &[u8; 32], fingerprint: &[u8; 32], nonce: &[u8]) -> hmac::Hmac<sha2::Sha256> {
+    use hmac::Mac as _;
+    let mut mac =
+        <hmac::Hmac<sha2::Sha256>>::new_from_slice(key).expect("HMAC takes a key of any length");
+    mac.update(fingerprint);
+    mac.update(nonce);
+    mac
+}
+
+/// The proof a server that knows `key`'s code gives for `nonce`.
+pub fn pair_proof(key: &[u8; 32], fingerprint: &[u8; 32], nonce: &[u8]) -> [u8; 32] {
+    use hmac::Mac as _;
+    proof_mac(key, fingerprint, nonce)
+        .finalize()
+        .into_bytes()
+        .into()
+}
+
+/// Whether one of a server's `proofs` (its answer's `proofs`, base64url
+/// strings) binds `code` to the certificate `fingerprint` this client saw
+/// in the handshake, for the `nonce` it sent. Each is compared in constant
+/// time.
+pub fn verify_pair_proof(code: &str, fingerprint: &str, nonce: &[u8], proofs: &Value) -> bool {
+    use base64::Engine as _;
+    use hmac::Mac as _;
+    let Some(fp) = fingerprint_bytes(fingerprint) else {
+        return false;
+    };
+    let key = pair_proof_key(code, &fp);
+    proofs
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter_map(|proof| {
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(proof.trim_end_matches('='))
+                .ok()
+        })
+        .any(|given| proof_mac(&key, &fp, nonce).verify_slice(&given).is_ok())
+}
+
+/// A paired server showed another certificate than the one pinned.
+pub const CERTIFICATE_CHANGED: &str = "The server's certificate changed since this device \
+     paired with it, so nothing was sent to it: pair again. If nobody reset the certificate \
+     there, something else may be answering at its address.";
+
+/// The server `name` found on the network couldn't prove it knows the
+/// pairing code: the code was not sent.
+pub fn proof_failed(name: &str) -> String {
+    format!(
+        "{name} couldn't prove it knows that pairing code, so the code wasn't sent to it: \
+         something else on the network may be answering in its place. Check the code {name} \
+         shows, or paste the long gsc1.… code gentle-shell serve share prints there."
     )
 }
 
@@ -724,6 +986,9 @@ pub fn error_text(status: u16, code: Option<&str>, message: Option<&str>) -> Str
         },
         (501, Some("not_supported")) => {
             "The server can't do that: its gentle-shell serve doesn't support it.".into()
+        }
+        (400, Some("tls_required")) => {
+            "This server speaks HTTPS on the network: use https:// for its address.".into()
         }
         // `POST /api/print`: a one-shot `gentle-shell --print` there.
         (502, Some("print_failed")) => match message {
@@ -1199,12 +1464,12 @@ mod tests {
             ("http://[::1]:8787", "http://[::1]:8787"),
             ("http://[FE80::1]", "http://[fe80::1]"),
             ("pc.tailnet.ts.net", "http://pc.tailnet.ts.net"),
+            ("HTTPS://192.168.1.20:8787/", "https://192.168.1.20:8787"),
         ] {
             assert_eq!(normalize_url(typed).as_deref(), Ok(url), "{typed}");
         }
         for typed in [
             "",
-            "https://127.0.0.1:8787",
             "ws://127.0.0.1:8787",
             "http://127.0.0.1:8787/api",
             "http://127.0.0.1:8787?x=1",
@@ -1218,9 +1483,14 @@ mod tests {
             assert!(normalize_url(typed).is_err(), "{typed}");
         }
         assert!(
-            normalize_url("https://x")
+            normalize_url("gsr://x:1")
                 .unwrap_err()
-                .contains("plain HTTP")
+                .contains("Use http:// or https://")
+        );
+        assert!(
+            normalize_url("https://x/a")
+                .unwrap_err()
+                .contains("(https://host:port)")
         );
     }
 
@@ -1586,6 +1856,8 @@ mod tests {
                     "http://omarchy.local:8787".into(),
                 ],
                 pairing_code: "ABCD-EFGH".into(),
+                fingerprint: None,
+                relay: None,
             }
         );
         assert!(is_connection_code(&format!("  {}", encode(&shared()))));
@@ -1783,7 +2055,8 @@ mod tests {
             Some(Announce {
                 server_id: "srv_1".into(),
                 name: "omarchy".into(),
-                port: 8788
+                port: 8788,
+                fingerprint: None,
             })
         );
         // A name is cleaned for showing; none is allowed.
@@ -1881,6 +2154,7 @@ mod tests {
                     server_id: id.into(),
                     name: name.into(),
                     port: 8787,
+                    fingerprint: None,
                 },
                 ip.parse().unwrap(),
             )
@@ -1918,7 +2192,7 @@ mod tests {
         ];
         // Newest first, never the one that failed, then the machine's names.
         assert_eq!(
-            relocation_urls("http://192.168.1.31:8787", &known, Some("linux-box")),
+            relocation_urls("http://192.168.1.31:8787", &known, Some("linux-box"), None),
             [
                 "http://100.101.102.103:8787",
                 "http://192.168.1.20:8787",
@@ -1929,11 +2203,16 @@ mod tests {
         // A name already `.local` isn't doubled; a known one isn't repeated.
         let known = ["http://linux-box.local:8787".to_string()];
         assert_eq!(
-            relocation_urls("http://10.0.0.2:8787", &known, Some("linux-box.local")),
+            relocation_urls(
+                "http://10.0.0.2:8787",
+                &known,
+                Some("linux-box.local"),
+                None
+            ),
             ["http://linux-box.local:8787", "http://linux-box:8787"]
         );
         // Without a name, only what was known.
-        assert!(relocation_urls("http://10.0.0.2:8787", &[], None).is_empty());
+        assert!(relocation_urls("http://10.0.0.2:8787", &[], None, None).is_empty());
 
         let mut known: Vec<String> = (0..KNOWN_ADDRESSES)
             .map(|n| format!("http://10.0.0.{n}:8787"))
@@ -1944,5 +2223,215 @@ mod tests {
         remember_address(&mut known, "http://10.0.0.99:8787");
         assert_eq!(known.len(), KNOWN_ADDRESSES);
         assert_eq!(known[0], "http://10.0.0.1:8787");
+    }
+
+    /// A fingerprint: base64url of 32 bytes of `byte`.
+    fn fp(byte: u8) -> String {
+        use base64::Engine as _;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([byte; 32])
+    }
+
+    #[test]
+    fn a_server_on_a_relay_is_looked_for_there_last() {
+        let known = [
+            "https://192.168.1.20:8787".to_string(),
+            "gsr://relay.example.com:7700".to_string(),
+        ];
+        // Found through its relay before: its names take the port and the
+        // scheme of the newest address of its own.
+        assert_eq!(
+            relocation_urls(
+                "gsr://relay.example.com:7700",
+                &known,
+                Some("box"),
+                Some("gsr://relay.example.com:7700")
+            ),
+            [
+                "https://192.168.1.20:8787",
+                "https://box:8787",
+                "https://box.local:8787"
+            ]
+        );
+        assert_eq!(
+            relocation_urls(
+                "https://192.168.1.31:8787",
+                &[],
+                None,
+                Some("GSR://Relay.Example.com:7700")
+            ),
+            ["gsr://relay.example.com:7700"]
+        );
+    }
+
+    #[test]
+    fn relay_urls_are_host_and_port_only() {
+        for (typed, url) in [
+            (
+                "gsr://relay.example.com:7700",
+                "gsr://relay.example.com:7700",
+            ),
+            (
+                "GSR://Relay.Example.COM:7700/",
+                "gsr://relay.example.com:7700",
+            ),
+            ("gsr://[::1]:7700", "gsr://[::1]:7700"),
+            ("gsr://10.0.0.1:1", "gsr://10.0.0.1:1"),
+        ] {
+            assert_eq!(relay_url(typed).as_deref(), Some(url), "{typed}");
+        }
+        for bad in [
+            "gsr://relay.example.com",
+            "gsr://relay.example.com:0",
+            "gsr://me@relay:7700",
+            "gsr://relay:7700/x",
+            "https://relay:7700",
+            "relay:7700",
+            "",
+        ] {
+            assert_eq!(relay_url(bad), None, "{bad}");
+        }
+        assert!(is_relay("gsr://relay:7700"));
+        assert!(!is_relay("https://relay:7700"));
+    }
+
+    #[test]
+    fn a_connection_code_with_a_certificate_and_a_relay() {
+        let mut value = shared();
+        value["fp"] = fp(0x11).into();
+        value["r"] = "gsr://Relay.example.com:7700".into();
+        let code = decode_connection_code(&encode(&value)).unwrap();
+        assert_eq!(code.fingerprint, Some(fp(0x11)));
+        assert_eq!(code.relay.as_deref(), Some("gsr://relay.example.com:7700"));
+        // A server that speaks HTTPS is looked for over HTTPS.
+        assert_eq!(code.urls[0], "https://192.168.1.20:8787");
+        assert!(code.urls.iter().all(|url| url.starts_with("https://")));
+        assert!(
+            code.not_found()
+                .contains("through its relay gsr://relay.example.com:7700")
+        );
+
+        // Only the relay: still reachable, named by it when unnamed.
+        value["a"] = json!([]);
+        value["n"] = Value::Null;
+        let code = decode_connection_code(&encode(&value)).unwrap();
+        assert!(code.urls.is_empty());
+        assert_eq!(code.name, "relay.example.com");
+
+        let with = |key: &str, field: Value| {
+            let mut value = shared();
+            value["fp"] = fp(0x11).into();
+            value[key] = field;
+            decode_connection_code(&encode(&value))
+        };
+        assert_eq!(with("fp", "short".into()), Err(CodeError::Damaged));
+        assert_eq!(with("fp", json!(7)), Err(CodeError::Damaged));
+        assert_eq!(
+            with("r", "https://relay:7700".into()),
+            Err(CodeError::Damaged)
+        );
+        // A relay without a certificate to pin can't be used.
+        let mut plain = shared();
+        plain["r"] = "gsr://relay:7700".into();
+        assert_eq!(
+            decode_connection_code(&encode(&plain)),
+            Err(CodeError::Damaged)
+        );
+    }
+
+    #[test]
+    fn a_server_announces_its_certificate_only_with_tls() {
+        let here = |value: Value| read_announce(value.to_string().as_bytes()).unwrap();
+        let base = json!({"t": HERE_TYPE, "v": 1, "id": "srv_1", "n": "pc", "p": 8787});
+        let mut tls = base.clone();
+        tls["tls"] = true.into();
+        tls["fp"] = fp(0x22).into();
+        let announce = here(tls.clone());
+        assert_eq!(announce.fingerprint, Some(fp(0x22)));
+        let server = Nearby::new(&announce, "192.168.1.20".parse().unwrap());
+        assert_eq!(server.url(), "https://192.168.1.20:8787");
+        assert_eq!(server.fingerprint, Some(fp(0x22)));
+
+        tls["tls"] = false.into();
+        assert_eq!(here(tls.clone()).fingerprint, None);
+        tls["tls"] = true.into();
+        tls["fp"] = "nope".into();
+        assert_eq!(here(tls).fingerprint, None);
+        assert_eq!(here(base).fingerprint, None);
+        assert_eq!(
+            announced_fingerprint(&json!({"schema": IDENTITY_SCHEMA, "tls": true, "fp": fp(1)})),
+            Some(fp(1))
+        );
+    }
+
+    #[test]
+    fn a_certificate_is_pinned_by_its_sha256() {
+        // SHA-256 of "abc", base64url without padding.
+        assert_eq!(
+            certificate_fingerprint(b"abc"),
+            "ungWv48Bz-pBQUDeXa4iI7ADYaOWF3qctBD_YfIAFa0"
+        );
+        assert_eq!(fingerprint_bytes(&fp(0x11)), Some([0x11; 32]));
+        for bad in ["", "abc", &format!("{}=", fp(0x11)), &fp(0x11)[1..], "+"] {
+            assert_eq!(fingerprint_bytes(bad), None, "{bad}");
+        }
+        let mut padded = fp(0x11);
+        padded.replace_range(0..1, "+");
+        assert_eq!(fingerprint_bytes(&padded), None);
+    }
+
+    #[test]
+    fn the_pairing_proof_matches_the_servers_numbers() {
+        use base64::Engine as _;
+        let b64 = |bytes: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+        // The fork's known-answer vector (tests/serve-tls.test.ts).
+        let vector_fp = [0x11u8; 32];
+        let key = pair_proof_key("7PH3-DM9V", &vector_fp);
+        let proof = pair_proof(&key, &vector_fp, &[0x22; 16]);
+        assert_eq!(b64(&proof), "fVUUvh7KIXU0NWi6IYymHsCbVNxnxvrPSpB9O0h_XKs");
+
+        // The key reads the code as the server does.
+        let fp_raw = [0x33u8; 32];
+        let key = pair_proof_key("abcd-efgh", &fp_raw);
+        assert_eq!(key, pair_proof_key("ABCDEFGH", &fp_raw));
+        assert_eq!(
+            pair_proof_key("0111-2222", &fp_raw),
+            pair_proof_key("oIl1-2222", &fp_raw)
+        );
+
+        let nonce = [7u8; 24];
+        let fingerprint = b64(&fp_raw);
+        let proof = b64(&pair_proof(&key, &fp_raw, &nonce));
+        let proofs = json!(["junk", 3, proof]);
+        assert!(verify_pair_proof(
+            "ABCD-EFGH",
+            &fingerprint,
+            &nonce,
+            &proofs
+        ));
+        assert!(
+            !verify_pair_proof("ABCD-EFGX", &fingerprint, &nonce, &proofs),
+            "another code"
+        );
+        assert!(
+            !verify_pair_proof("ABCD-EFGH", &fp(0x44), &nonce, &proofs),
+            "another certificate"
+        );
+        assert!(
+            !verify_pair_proof("ABCD-EFGH", &fingerprint, &[8u8; 24], &proofs),
+            "another nonce"
+        );
+        assert!(!verify_pair_proof("ABCD-EFGH", "bad", &nonce, &proofs));
+        assert!(!verify_pair_proof(
+            "ABCD-EFGH",
+            &fingerprint,
+            &nonce,
+            &json!({})
+        ));
+        assert!(proof_failed("pc").contains("the code wasn't sent"));
+        assert!(CERTIFICATE_CHANGED.contains("pair again"));
+        assert_eq!(
+            error_text(400, Some("tls_required"), None),
+            "This server speaks HTTPS on the network: use https:// for its address."
+        );
     }
 }

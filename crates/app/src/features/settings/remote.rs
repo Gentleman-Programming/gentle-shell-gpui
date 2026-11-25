@@ -54,7 +54,9 @@ impl ServerPlace {
             return None;
         };
         let name = if name.trim().is_empty() {
-            url.trim_start_matches("http://").to_string()
+            url.split_once("://")
+                .map_or(url.as_str(), |(_, rest)| rest)
+                .to_string()
         } else {
             name.trim().to_string()
         };

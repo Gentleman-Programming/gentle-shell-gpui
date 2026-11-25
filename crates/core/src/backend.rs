@@ -29,7 +29,8 @@ pub enum Backend {
     /// this computer's paths as they are, as OrbStack and Lima mount them.
     Command { prefix: Vec<String> },
     /// A Gentle Shell server (`gentle-shell serve`) at `url`
-    /// ([`crate::serve::normalize_url`]), paired as the device `device` and
+    /// ([`crate::serve::normalize_url`], or the relay it was paired through,
+    /// [`crate::serve::relay_url`]), paired as the device `device` and
     /// named `name` there. Its token is a secret the app keeps outside
     /// `settings.json`.
     Server {
@@ -70,9 +71,11 @@ impl Backend {
                 }
             }
             Some("server") => {
-                let url = value["url"]
-                    .as_str()
-                    .and_then(|url| crate::serve::normalize_url(url).ok());
+                let url = value["url"].as_str().and_then(|url| {
+                    crate::serve::normalize_url(url)
+                        .ok()
+                        .or_else(|| crate::serve::relay_url(url))
+                });
                 let device = value["device"].as_str().map(str::trim).unwrap_or_default();
                 match url {
                     Some(url) if !device.is_empty() => Self::Server {
@@ -227,7 +230,10 @@ impl Backend {
             Self::Server { name, .. } if !name.trim().is_empty() => {
                 format!("{} (server)", name.trim())
             }
-            Self::Server { url, .. } => url.trim_start_matches("http://").to_string(),
+            Self::Server { url, .. } => url
+                .split_once("://")
+                .map_or(url.as_str(), |(_, rest)| rest)
+                .to_string(),
         }
     }
 }
@@ -343,6 +349,16 @@ mod tests {
                 device: "dev_1".into(),
                 name: "pc".into(),
             },
+            Backend::Server {
+                url: "https://192.168.1.20:8787".into(),
+                device: "dev_1".into(),
+                name: "pc".into(),
+            },
+            Backend::Server {
+                url: "gsr://relay.example.com:7700".into(),
+                device: "dev_1".into(),
+                name: "pc".into(),
+            },
         ] {
             assert_eq!(Backend::from_json(&backend.to_json().unwrap()), backend);
         }
@@ -362,7 +378,7 @@ mod tests {
             json!({"kind": "command", "prefix": []}),
             json!({"kind": "command", "prefix": [""]}),
             json!({"kind": "ssh"}),
-            json!({"kind": "server", "url": "https://pc:8787", "device": "d"}),
+            json!({"kind": "server", "url": "ftp://pc:8787", "device": "d"}),
             json!({"kind": "server", "url": "http://pc:8787", "device": " "}),
             json!({"kind": "server", "device": "d"}),
         ] {

@@ -2,8 +2,9 @@
 //! against a small stand-in for `gentle-shell serve`: plain HTTP/1.1 and a
 //! Server-Sent Events stream, with the server's own ids on the stream's
 //! copies of responses, `202 pending`, reconnects and `snapshot-required`;
-//! and finding the server a connection code names, or the servers on the
-//! network (a stand-in UDP responder on 127.0.0.1), then pairing there.
+//! finding the server a connection code names, or the servers on the
+//! network (a stand-in UDP responder on 127.0.0.1), then pairing there; and
+//! the same over pinned TLS with the pairing proof (a TLS front).
 
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
@@ -37,6 +38,11 @@ struct State {
     desktop: Vec<Value>,
     /// The server predates `POST /api/tower`.
     no_tower: bool,
+    /// The certificate a TLS front ([`TlsFront`]) shows for it: said in its
+    /// identity, and what its pairing proofs bind the code to.
+    fingerprint: Option<String>,
+    /// Its pairing proofs are made up: it doesn't know the code.
+    proof_lies: bool,
 }
 
 #[derive(Clone)]
@@ -140,17 +146,36 @@ impl Fake {
         // Who the server is, and pairing: no token.
         match (method.as_str(), target.as_str()) {
             ("GET", "/.well-known/gentle-shell") => {
-                return reply(
-                    &mut stream,
-                    200,
-                    &json!({
-                        "schema": "gentle-shell.serve.identity/v1",
-                        "serverId": SERVER_ID,
-                        "name": "fake",
-                        "protocol": "gentle-shell.serve/v1",
-                        "version": "0.0.0"
-                    }),
-                );
+                let mut identity = json!({
+                    "schema": "gentle-shell.serve.identity/v1",
+                    "serverId": SERVER_ID,
+                    "name": "fake",
+                    "protocol": "gentle-shell.serve/v1",
+                    "version": "0.0.0",
+                    "tls": false
+                });
+                if let Some(fp) = &self.state.lock().unwrap().fingerprint {
+                    identity["tls"] = true.into();
+                    identity["fp"] = fp.clone().into();
+                }
+                return reply(&mut stream, 200, &identity);
+            }
+            ("POST", "/api/pair/proof") => {
+                use base64::Engine as _;
+                let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+                let state = self.state.lock().unwrap();
+                let fp = gentle_core::serve::fingerprint_bytes(state.fingerprint.as_ref().unwrap())
+                    .unwrap();
+                let nonce = b64.decode(body["nonce"].as_str().unwrap()).unwrap();
+                assert!((16..=64).contains(&nonce.len()));
+                let code = if state.proof_lies {
+                    "ZZZZ-ZZZZ"
+                } else {
+                    PAIRING_CODE
+                };
+                let key = gentle_core::serve::pair_proof_key(code, &fp);
+                let proof = gentle_core::serve::pair_proof(&key, &fp, &nonce);
+                return reply(&mut stream, 200, &json!({"proofs": [b64.encode(proof)]}));
             }
             ("POST", "/api/pair") => {
                 let mut state = self.state.lock().unwrap();
@@ -591,21 +616,22 @@ fn gone() -> String {
 fn a_server_that_moved_is_found_by_its_id() {
     let fake = Fake::start();
     let gone = gone();
+    let plain = pi_rpc::serve::Trust::default();
     assert_eq!(
-        pi_rpc::serve::find(SERVER_ID, &[gone.clone(), fake.url.clone()]),
+        pi_rpc::serve::find(SERVER_ID, &[gone.clone(), fake.url.clone()], &plain),
         Some(fake.url.clone())
     );
     // Another server at a known address isn't this one.
     assert_eq!(
-        pi_rpc::serve::find("srv_other", std::slice::from_ref(&fake.url)),
+        pi_rpc::serve::find("srv_other", std::slice::from_ref(&fake.url), &plain),
         None
     );
-    assert_eq!(pi_rpc::serve::find(SERVER_ID, &[]), None);
+    assert_eq!(pi_rpc::serve::find(SERVER_ID, &[], &plain), None);
     assert_eq!(
-        pi_rpc::serve::identify(&fake.url),
+        pi_rpc::serve::identify(&fake.url, &plain),
         Some((SERVER_ID.to_string(), "fake".to_string()))
     );
-    assert_eq!(pi_rpc::serve::identify(&gone), None);
+    assert_eq!(pi_rpc::serve::identify(&gone, &plain), None);
 }
 
 #[test]
@@ -672,6 +698,8 @@ fn code_for(fake: &Fake, server_id: &str, hosts: &[&str]) -> ConnectionCode {
             .map(|host| format!("http://{host}:{port}"))
             .collect(),
         pairing_code: PAIRING_CODE.into(),
+        fingerprint: None,
+        relay: None,
     }
 }
 
@@ -855,4 +883,239 @@ fn a_server_without_tower_says_to_upgrade_it() {
         "{}",
         error.message
     );
+}
+
+// --- TLS and the pairing proof ------------------------------------------------------
+
+fn fixture(name: &str) -> Vec<u8> {
+    std::fs::read(format!(
+        "{}/tests/fixtures/serve-tls/{name}",
+        env!("CARGO_MANIFEST_DIR")
+    ))
+    .unwrap()
+}
+
+/// TLS in front of a fake, as `gentle-shell serve` speaks it on the
+/// network: a self-signed certificate (`tests/fixtures/serve-tls`), and
+/// `400 tls_required` for a connection that doesn't start a handshake.
+struct TlsFront {
+    port: u16,
+    fingerprint: String,
+}
+
+impl TlsFront {
+    fn start(fake: &Fake, cert: &str) -> Self {
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+        let der = fixture(&format!("cert-{cert}.der"));
+        let key = PrivatePkcs8KeyDer::from(fixture(&format!("key-{cert}.der")));
+        let fingerprint = gentle_core::serve::certificate_fingerprint(&der);
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let config = rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![CertificateDer::from(der)], PrivateKeyDer::Pkcs8(key))
+            .unwrap();
+        let config = Arc::new(config);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let backend = fake.url.trim_start_matches("http://").to_string();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { return };
+                let (config, backend) = (config.clone(), backend.clone());
+                std::thread::spawn(move || terminate_tls(stream, config, &backend));
+            }
+        });
+        Self { port, fingerprint }
+    }
+
+    fn url(&self) -> String {
+        format!("https://127.0.0.1:{}", self.port)
+    }
+}
+
+/// One connection to a [`TlsFront`]: its plaintext to and from the fake,
+/// one blocking thread each way (no read timeouts: on Windows a timed-out
+/// socket read leaves the socket unusable).
+fn terminate_tls(mut client: TcpStream, config: Arc<rustls::ServerConfig>, backend: &str) {
+    let mut first = [0u8; 1];
+    if client.peek(&mut first).unwrap_or(0) == 0 {
+        return;
+    }
+    if first[0] != 0x16 {
+        // Read the request first, as the server does: closing on unread
+        // bytes would reset the connection.
+        let _ = client.read(&mut [0u8; 4096]);
+        return reply(
+            &mut client,
+            400,
+            &json!({"error": {"code": "tls_required", "message": "This server speaks HTTPS on the network"}}),
+        );
+    }
+    let Ok(plain) = TcpStream::connect(backend) else {
+        return;
+    };
+    let conn = Arc::new(Mutex::new(rustls::ServerConnection::new(config).unwrap()));
+    // What rustls has to send, sent.
+    fn flush(conn: &mut rustls::ServerConnection, to: &mut TcpStream) -> std::io::Result<()> {
+        while conn.wants_write() {
+            conn.write_tls(to)?;
+        }
+        Ok(())
+    }
+    // The fake's answers, encrypted; its end closes the TLS session.
+    let (mut from_fake, mut to_client) = (plain.try_clone().unwrap(), client.try_clone().unwrap());
+    let down = conn.clone();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 16 * 1024];
+        loop {
+            let n = from_fake.read(&mut buf).unwrap_or(0);
+            let mut conn = down.lock().unwrap();
+            if n == 0 {
+                conn.send_close_notify();
+                let _ = flush(&mut conn, &mut to_client);
+                let _ = to_client.shutdown(std::net::Shutdown::Write);
+                return;
+            }
+            if conn.writer().write_all(&buf[..n]).is_err()
+                || flush(&mut conn, &mut to_client).is_err()
+            {
+                return;
+            }
+        }
+    });
+    // The client's handshake and requests, decrypted for the fake.
+    let (mut from_client, mut to_fake) = (client, plain);
+    let mut buf = [0u8; 16 * 1024];
+    let mut text = [0u8; 16 * 1024];
+    loop {
+        let n = from_client.read(&mut buf).unwrap_or(0);
+        if n == 0 {
+            let _ = to_fake.shutdown(std::net::Shutdown::Write);
+            return;
+        }
+        let mut conn = conn.lock().unwrap();
+        let mut incoming = &buf[..n];
+        while !incoming.is_empty() {
+            if conn.read_tls(&mut incoming).is_err() || conn.process_new_packets().is_err() {
+                let _ = flush(&mut conn, &mut from_client);
+                return;
+            }
+        }
+        loop {
+            match conn.reader().read(&mut text) {
+                Ok(0) => return,
+                Ok(n) if to_fake.write_all(&text[..n]).is_err() => return,
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        if flush(&mut conn, &mut from_client).is_err() {
+            return;
+        }
+    }
+}
+
+#[test]
+fn a_server_on_https_answers_only_with_the_pinned_certificate() {
+    use pi_rpc::serve::Trust;
+    let fake = Fake::start();
+    let front = TlsFront::start(&fake, "a");
+    let other = TlsFront::start(&fake, "b").fingerprint;
+    let pinned = Trust::pinned(&front.fingerprint, None);
+    let client = ServeClient::with_trust(&front.url(), Some(TOKEN.into()), pinned.clone());
+    assert_eq!(client.server().unwrap().server_id, SERVER_ID);
+    assert_eq!(fake.log(), ["GET /api/server"]);
+
+    // Another certificate at its address: refused before a byte of the
+    // request (or the token) is sent, in words.
+    let changed = Trust::pinned(&other, None);
+    let error = ServeClient::with_trust(&front.url(), Some(TOKEN.into()), changed.clone())
+        .relocating(Arc::new(|_: &str| {
+            panic!("a changed certificate isn't a move")
+        }))
+        .server()
+        .unwrap_err();
+    assert_eq!(error.error.as_deref(), Some("certificate_changed"));
+    assert_eq!(error.message, gentle_core::serve::CERTIFICATE_CHANGED);
+    assert!(error.message.contains("pair again"));
+    // Without a certificate to pin, HTTPS isn't spoken at all.
+    let error = ServeClient::new(&front.url(), Some(TOKEN.into()))
+        .server()
+        .unwrap_err();
+    assert!(error.message.contains("pair it again"), "{}", error.message);
+    assert_eq!(fake.log(), ["GET /api/server"]);
+
+    // Looking for a server that moved checks the certificate too.
+    assert_eq!(
+        pi_rpc::serve::find(SERVER_ID, &[gone(), front.url()], &pinned),
+        Some(front.url())
+    );
+    assert_eq!(
+        pi_rpc::serve::find(SERVER_ID, &[front.url()], &changed),
+        None
+    );
+}
+
+#[test]
+fn a_typed_address_moves_to_https_and_the_code_waits_for_the_proof() {
+    let fake = Fake::start();
+    let front = TlsFront::start(&fake, "a");
+    fake.state.lock().unwrap().fingerprint = Some(front.fingerprint.clone());
+    // Typed as plain HTTP: the server refuses it from the network, so the
+    // pairing moves to HTTPS.
+    let typed = format!("http://127.0.0.1:{}", front.port);
+    let (url, paired) = pi_rpc::serve::pair_at(&typed, PAIRING_CODE, "test").unwrap();
+    assert_eq!(url, front.url());
+    assert_eq!(paired.token, TOKEN);
+    assert_eq!(
+        paired.trust,
+        pi_rpc::serve::Trust::pinned(&front.fingerprint, None)
+    );
+    assert_eq!(fake.log(), ["POST /api/pair/proof", "POST /api/pair"]);
+    assert_eq!(
+        pi_rpc::serve::identify(&url, &paired.trust),
+        Some((SERVER_ID.to_string(), "fake".to_string()))
+    );
+}
+
+#[test]
+fn a_server_that_cant_prove_the_code_never_gets_it() {
+    let fake = Fake::start();
+    let front = TlsFront::start(&fake, "a");
+    {
+        let mut state = fake.state.lock().unwrap();
+        state.fingerprint = Some(front.fingerprint.clone());
+        state.proof_lies = true;
+    }
+    let error = pi_rpc::serve::pair_at(&front.url(), PAIRING_CODE, "test").unwrap_err();
+    assert_eq!(error, gentle_core::serve::proof_failed("127.0.0.1"));
+
+    // Found on the network: the certificate checked is the one the
+    // handshake shows, whatever the reply announced.
+    let other = TlsFront::start(&fake, "b").fingerprint;
+    let mut announce: Value = serde_json::from_slice(&here(SERVER_ID, front.port)).unwrap();
+    announce["tls"] = true.into();
+    announce["fp"] = other.into();
+    let (addr, _) = responder(vec![announce.to_string().into_bytes()]);
+    let found = pi_rpc::serve::nearby(&[addr]).unwrap();
+    assert_eq!(found.len(), 1);
+    assert_eq!(
+        found[0].fingerprint.as_deref(),
+        Some(front.fingerprint.as_str())
+    );
+    assert_eq!(found[0].url(), front.url());
+    let error = pi_rpc::serve::pair_nearby(&found[0], PAIRING_CODE, "test").unwrap_err();
+    assert_eq!(error, gentle_core::serve::proof_failed("omarchy"));
+    assert!(
+        !fake.log().iter().any(|l| l == "POST /api/pair"),
+        "the code went out: {:?}",
+        fake.log()
+    );
+
+    // Once it proves the code, it is paired with, pinned.
+    fake.state.lock().unwrap().proof_lies = false;
+    let paired = pi_rpc::serve::pair_nearby(&found[0], PAIRING_CODE, "test").unwrap();
+    assert_eq!(paired.trust.fingerprint, Some(front.fingerprint.clone()));
 }

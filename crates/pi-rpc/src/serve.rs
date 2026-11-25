@@ -1,7 +1,9 @@
 //! A Gentle Shell server's session as a backend (`gentle-shell serve`,
 //! protocol `gentle-shell.serve/v1`, Gentle Shell's `docs/serve.md`): the
 //! same records and commands as a child's stdio, over HTTP and Server-Sent
-//! Events, so a tab reads and drives it exactly like a local one.
+//! Events, so a tab reads and drives it exactly like a local one. A server
+//! on the network speaks HTTPS with a certificate this device pins, and may
+//! be reached through a relay ([`Trust`], `tls`).
 //!
 //! - **Commands** go one at a time to `POST /api/sessions/:id/rpc`; its
 //!   answer (the Pi response, under this client's id) is read as if the
@@ -21,6 +23,7 @@
 mod files;
 mod services;
 mod terminals;
+mod tls;
 
 pub use files::{
     Entry, EntryKind, FileChunk, GitOutput, Listing, READ_CHUNK, SearchHit, Stat, Uploaded,
@@ -97,6 +100,40 @@ pub struct Paired {
     pub name: String,
     /// The device token (`gss_…`): shown once, a secret.
     pub token: String,
+    /// How the server it paired with is reached: kept with the token.
+    pub trust: Trust,
+}
+
+/// How a server is reached safely, kept with its device token: the
+/// certificate pinned when it speaks HTTPS, and the relay that reaches it
+/// from anywhere. The default is plain HTTP (a server on this computer, or
+/// one started with `--no-tls`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Trust {
+    /// Its certificate's fingerprint (base64url SHA-256 of its DER): every
+    /// `https://` connection accepts that certificate and no other.
+    pub fingerprint: Option<String>,
+    /// `gsr://host:port`: requests to that address go through the relay to
+    /// the server with [`Self::fingerprint`].
+    pub relay: Option<String>,
+}
+
+impl Trust {
+    /// Pinning `fingerprint`, through `relay` when given.
+    pub fn pinned(fingerprint: &str, relay: Option<&str>) -> Self {
+        Self {
+            fingerprint: Some(fingerprint.to_string()),
+            relay: relay.map(str::to_string),
+        }
+    }
+
+    fn link(&self, relay_port: Option<u16>) -> Arc<tls::Link> {
+        let pin = match &self.fingerprint {
+            Some(fp) => tls::Pin::Exact(fp.clone()),
+            None => tls::Pin::None,
+        };
+        tls::Link::new(pin, self.relay.as_deref(), relay_port)
+    }
 }
 
 /// `GET /api/server`.
@@ -200,47 +237,97 @@ pub struct ServeClient {
     /// Work the server bounds itself (a `git fetch`, an upload, a
     /// binary): answers within [`LONG`].
     long: ureq::Agent,
-    url: Arc<RwLock<String>>,
+    shared: Arc<Shared>,
     token: Option<String>,
     relocate: Option<Relocate>,
 }
 
+/// What every clone of a [`ServeClient`] shares.
+struct Shared {
+    /// The address requests go to now.
+    url: RwLock<String>,
+    trust: Trust,
+    /// The connections' certificate pin and relay.
+    link: Arc<tls::Link>,
+}
+
+/// An agent whose connections go over `link` (plain, pinned TLS or a
+/// relay), never redirected, with the server's errors as answers.
+fn linked_agent(
+    link: &Arc<tls::Link>,
+    timeouts: impl FnOnce(ConfigBuilder) -> ConfigBuilder,
+) -> ureq::Agent {
+    let config = timeouts(
+        ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .max_redirects(0),
+    )
+    .build();
+    ureq::Agent::with_parts(
+        config,
+        tls::LinkConnector(link.clone()),
+        ureq::unversioned::resolver::DefaultResolver::default(),
+    )
+}
+
+type ConfigBuilder = ureq::config::ConfigBuilder<ureq::typestate::AgentScope>;
+
 impl ServeClient {
     /// A client of the server at `url` (`http://host:port`, as
-    /// [`protocol::normalize_url`] makes it), with the device `token`.
+    /// [`protocol::normalize_url`] makes it) over plain HTTP, with the
+    /// device `token`.
     pub fn new(url: &str, token: Option<String>) -> Self {
-        let agent = ureq::Agent::config_builder()
-            .http_status_as_error(false)
-            .max_redirects(0)
-            .timeout_connect(Some(CONNECT))
-            .timeout_recv_response(Some(ANSWER))
-            .timeout_per_read(Some(ANSWER))
-            .build()
-            .into();
-        let stream = ureq::Agent::config_builder()
-            .http_status_as_error(false)
-            .max_redirects(0)
-            .timeout_connect(Some(CONNECT))
-            .timeout_recv_response(Some(SILENCE))
-            .timeout_per_read(Some(SILENCE))
-            .build()
-            .into();
-        let long = ureq::Agent::config_builder()
-            .http_status_as_error(false)
-            .max_redirects(0)
-            .timeout_connect(Some(CONNECT))
-            .timeout_recv_response(Some(LONG))
-            .timeout_per_read(Some(LONG))
-            .build()
-            .into();
+        Self::with_trust(url, token, Trust::default())
+    }
+
+    /// A client of the server at `url` (`https://host:port`, or the
+    /// relay's `gsr://host:port`) reached as `trust` says, with the device
+    /// `token`.
+    pub fn with_trust(url: &str, token: Option<String>, trust: Trust) -> Self {
+        let link = trust.link(None);
+        Self::over(url, token, trust, link)
+    }
+
+    /// First contact with a server that speaks HTTPS, before a pairing
+    /// proof: any certificate is accepted and the one seen remembered.
+    fn first_contact(url: &str) -> Self {
+        let link = tls::Link::new(tls::Pin::FirstContact, None, None);
+        Self::over(url, None, Trust::default(), link)
+    }
+
+    fn over(url: &str, token: Option<String>, trust: Trust, link: Arc<tls::Link>) -> Self {
+        let agent = linked_agent(&link, |c| {
+            c.timeout_connect(Some(CONNECT))
+                .timeout_recv_response(Some(ANSWER))
+                .timeout_per_read(Some(ANSWER))
+        });
+        let stream = linked_agent(&link, |c| {
+            c.timeout_connect(Some(CONNECT))
+                .timeout_recv_response(Some(SILENCE))
+                .timeout_per_read(Some(SILENCE))
+        });
+        let long = linked_agent(&link, |c| {
+            c.timeout_connect(Some(CONNECT))
+                .timeout_recv_response(Some(LONG))
+                .timeout_per_read(Some(LONG))
+        });
         Self {
             agent,
             stream,
             long,
-            url: Arc::new(RwLock::new(url.trim_end_matches('/').to_string())),
+            shared: Arc::new(Shared {
+                url: RwLock::new(url.trim_end_matches('/').to_string()),
+                trust,
+                link,
+            }),
             token,
             relocate: None,
         }
+    }
+
+    /// How this client reaches its server.
+    pub fn trust(&self) -> &Trust {
+        &self.shared.trust
     }
 
     /// This client, finding the server again with `relocate` when its
@@ -256,10 +343,21 @@ impl ServeClient {
 
     /// The address requests go to now.
     pub fn url(&self) -> String {
-        self.url.read().unwrap_or_else(|e| e.into_inner()).clone()
+        self.shared
+            .url
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     fn unreachable(&self, error: ureq::Error) -> ServeError {
+        if self.shared.link.changed() {
+            return ServeError {
+                status: None,
+                error: Some("certificate_changed".into()),
+                message: protocol::CERTIFICATE_CHANGED.into(),
+            };
+        }
         ServeError {
             status: None,
             error: None,
@@ -304,7 +402,7 @@ impl ServeClient {
                 let Some(moved) = moved.map(|url| url.trim_end_matches('/').to_string()) else {
                     return Err(self.unreachable(error));
                 };
-                *self.url.write().unwrap_or_else(|e| e.into_inner()) = moved.clone();
+                *self.shared.url.write().unwrap_or_else(|e| e.into_inner()) = moved.clone();
                 self.run(agent, &moved, method, path, body, headers)?
                     .map_err(|e| self.unreachable(e))?
             }
@@ -334,7 +432,7 @@ impl ServeClient {
         body: Option<Body<'_>>,
         headers: &[(&str, &str)],
     ) -> Result<Result<ureq::http::Response<ureq::Body>, ureq::Error>, ServeError> {
-        let url = format!("{base}{path}");
+        let url = format!("{}{path}", tls::transport_url(base));
         let mut request = ureq::http::Request::builder().method(method).uri(&url);
         if let Some(token) = &self.token {
             request = request.header("Authorization", format!("Bearer {token}"));
@@ -387,6 +485,7 @@ impl ServeClient {
                 device,
                 name: field("name").unwrap_or_else(|| name.to_string()),
                 token,
+                trust: self.shared.trust.clone(),
             }),
             _ => Err(ServeError {
                 status: None,
@@ -547,24 +646,38 @@ impl ServeClient {
 }
 
 /// The server a connection code names, looked for at every address in it
-/// at once (`GET /.well-known/gentle-shell`, no token): the base URL of the
-/// first that answers as that server, or what to do in words. Each address
-/// gets [`PROBE`], the whole search [`SEARCH`]. The pairing code is sent
-/// nowhere here. Blocking.
+/// and through its relay at once (`GET /.well-known/gentle-shell`, no
+/// token; over HTTPS pinned to the code's certificate when it has one): the
+/// base URL of the first that answers as that server (the relay's
+/// `gsr://host:port` when only it reached the server), or what to do in
+/// words. Each address gets [`PROBE`], the whole search [`SEARCH`]. The
+/// pairing code is sent nowhere here. Blocking.
 pub fn locate(code: &ConnectionCode) -> Result<String, String> {
-    match search(&code.server_id, &code.urls) {
-        Search::Found(index) => Ok(code.urls[index].clone()),
+    let trust = code_trust(code);
+    let urls: Vec<String> = code.urls.iter().chain(&code.relay).cloned().collect();
+    match search(&code.server_id, &urls, &trust) {
+        Search::Found(index) => Ok(urls[index].clone()),
         Search::OtherServer => Err(code.other_server()),
         Search::NotFound | Search::Waiting => Err(code.not_found()),
     }
 }
 
+/// How the server a connection code names is reached: the code came from
+/// the server itself, so its certificate is pinned as it is.
+fn code_trust(code: &ConnectionCode) -> Trust {
+    Trust {
+        fingerprint: code.fingerprint.clone(),
+        relay: code.relay.clone(),
+    }
+}
+
 /// The first of `urls` where the server `server_id` answers
 /// (`GET /.well-known/gentle-shell` at all of them at once, no token, as
-/// [`locate`] does): where a paired server went after its address changed.
-/// Blocking, [`SEARCH`] at most.
-pub fn find(server_id: &str, urls: &[String]) -> Option<String> {
-    match search(server_id, urls) {
+/// [`locate`] does), reached as `trust` says: where a paired server went
+/// after its address changed. A server showing another certificate than
+/// the pinned one isn't it. Blocking, [`SEARCH`] at most.
+pub fn find(server_id: &str, urls: &[String], trust: &Trust) -> Option<String> {
+    match search(server_id, urls, trust) {
         Search::Found(index) => Some(urls[index].clone()),
         _ => None,
     }
@@ -572,12 +685,12 @@ pub fn find(server_id: &str, urls: &[String]) -> Option<String> {
 
 /// Ask every one of `urls` who it is, at once, until the server
 /// `server_id` answers or [`SEARCH`] passes.
-fn search(server_id: &str, urls: &[String]) -> Search {
-    let agent = probe_agent();
+fn search(server_id: &str, urls: &[String], trust: &Trust) -> Search {
+    let agent = probe_agent(&trust.link(None));
     let (tx, rx) = mpsc::channel();
     for (index, url) in urls.iter().enumerate() {
         let (agent, tx) = (agent.clone(), tx.clone());
-        let url = format!("{url}{}", protocol::IDENTITY_PATH);
+        let url = url.clone();
         // One that can't start counts as unreachable: its sender is gone.
         let _ = std::thread::Builder::new()
             .name("serve-probe".into())
@@ -604,19 +717,29 @@ fn search(server_id: &str, urls: &[String]) -> Search {
     }
 }
 
-/// Who answers at `url` (`GET /.well-known/gentle-shell`, no token): its
-/// server id and its machine's host name. Blocking, [`PROBE`] at most.
-pub fn identify(url: &str) -> Option<(String, String)> {
-    let url = format!("{url}{}", protocol::IDENTITY_PATH);
-    let mut response = probe_agent().get(&url).call().ok()?;
-    if !response.status().is_success() {
-        return None;
-    }
-    let body = read_json(&mut response).ok()?;
+/// Who answers at `url` (`GET /.well-known/gentle-shell`, no token),
+/// reached as `trust` says: its server id and its machine's host name.
+/// Blocking, [`PROBE`] at most.
+pub fn identify(url: &str, trust: &Trust) -> Option<(String, String)> {
+    let body = identity_at(&probe_agent(&trust.link(None)), url).ok()?;
     let Probe::Server(id) = protocol::identity(&body) else {
         return None;
     };
     Some((id, body["name"].as_str().unwrap_or_default().to_string()))
+}
+
+/// The identity answer at the base URL `url`: its body for a 2xx, else
+/// the status and body; `None` when nothing answered.
+fn identity_at(agent: &ureq::Agent, url: &str) -> Result<Value, Option<(u16, Value)>> {
+    let url = format!("{}{}", tls::transport_url(url), protocol::IDENTITY_PATH);
+    let mut response = agent.get(&url).call().map_err(|_| None)?;
+    let status = response.status().as_u16();
+    let body = read_json(&mut response).unwrap_or_default();
+    if (200..300).contains(&status) {
+        Ok(body)
+    } else {
+        Err(Some((status, body)))
+    }
 }
 
 /// Whether a request failed before reaching the server (no such host, or
@@ -640,25 +763,19 @@ fn never_connected(error: &ureq::Error) -> bool {
     }
 }
 
-/// What the address at `url` says it is.
+/// What the server at the base URL `url` says it is.
 fn probe(agent: &ureq::Agent, url: &str) -> Probe {
-    let Ok(mut response) = agent.get(url).call() else {
-        return Probe::Unreachable;
-    };
-    if !response.status().is_success() {
-        return Probe::NotAServer;
+    match identity_at(agent, url) {
+        Ok(body) => protocol::identity(&body),
+        Err(Some(_)) => Probe::NotAServer,
+        Err(None) => Probe::Unreachable,
     }
-    read_json(&mut response).map_or(Probe::NotAServer, |body| protocol::identity(&body))
 }
 
-/// An agent for `GET /.well-known/gentle-shell`: [`PROBE`] in all.
-fn probe_agent() -> ureq::Agent {
-    ureq::Agent::config_builder()
-        .http_status_as_error(false)
-        .max_redirects(0)
-        .timeout_global(Some(PROBE))
-        .build()
-        .into()
+/// An agent for `GET /.well-known/gentle-shell` over `link`: [`PROBE`] in
+/// all.
+fn probe_agent(link: &Arc<tls::Link>) -> ureq::Agent {
+    linked_agent(link, |c| c.timeout_global(Some(PROBE)))
 }
 
 /// The Gentle Shell servers on the local network: the discovery query
@@ -708,16 +825,26 @@ pub fn nearby(targets: &[SocketAddr]) -> Result<Vec<Nearby>, String> {
             Err(_) => {}
         }
     }
-    let agent = probe_agent();
     let (tx, rx) = mpsc::channel();
     for (index, (announce, ip)) in heard.into_iter().enumerate() {
-        let (agent, tx) = (agent.clone(), tx.clone());
+        let tx = tx.clone();
         let _ = std::thread::Builder::new()
             .name("serve-verify".into())
             .spawn(move || {
-                let server = Nearby::new(&announce, ip);
-                let url = format!("{}{}", server.url(), protocol::IDENTITY_PATH);
-                let verified = probe(&agent, &url) == Probe::Server(server.server_id.clone());
+                let mut server = Nearby::new(&announce, ip);
+                // Over HTTPS, the certificate the handshake shows is the
+                // one a pairing proof is then checked against: the reply's
+                // is only a hint.
+                let link = if server.fingerprint.is_some() {
+                    tls::Link::new(tls::Pin::FirstContact, None, None)
+                } else {
+                    Trust::default().link(None)
+                };
+                let verified = probe(&probe_agent(&link), &server.url())
+                    == Probe::Server(server.server_id.clone());
+                if server.fingerprint.is_some() {
+                    server.fingerprint = link.seen();
+                }
                 let _ = tx.send((index, verified.then_some(server)));
             });
     }
@@ -731,10 +858,20 @@ pub fn nearby(targets: &[SocketAddr]) -> Result<Vec<Nearby>, String> {
 }
 
 /// Pair this device, named `name`, with `server` (found on the network by
-/// [`nearby`]) using the short pairing `code`. A code the server doesn't
-/// take reads as one to make again. Blocking.
+/// [`nearby`]) using the short pairing `code`. Over HTTPS the server first
+/// proves it knows the code for the certificate it shows ([`prove`]), and
+/// the code goes only to that certificate. A code the server doesn't take
+/// reads as one to make again. Blocking.
 pub fn pair_nearby(server: &Nearby, code: &str, name: &str) -> Result<Paired, String> {
-    ServeClient::new(&server.url(), None)
+    let url = server.url();
+    let trust = match server.fingerprint {
+        Some(_) => Trust {
+            fingerprint: Some(prove(&url, code, &server.name)?),
+            relay: None,
+        },
+        None => Trust::default(),
+    };
+    ServeClient::with_trust(&url, None, trust)
         .pair(code, name)
         .map_err(|e| match (e.status, e.error.as_deref()) {
             (Some(403), Some("invalid_code")) => protocol::short_code_refused(&server.name),
@@ -743,15 +880,89 @@ pub fn pair_nearby(server: &Nearby, code: &str, name: &str) -> Result<Paired, St
 }
 
 /// Pair this device, named `name`, with the server a connection code names
-/// at `url` (where [`locate`] found it). A code the server no longer takes
-/// reads as one to make again. Blocking.
+/// at `url` (where [`locate`] found it, maybe its relay), pinned to the
+/// code's certificate. A code the server no longer takes reads as one to
+/// make again. Blocking.
 pub fn pair_code(code: &ConnectionCode, url: &str, name: &str) -> Result<Paired, String> {
-    ServeClient::new(url, None)
+    ServeClient::with_trust(url, None, code_trust(code))
         .pair(&code.pairing_code, name)
         .map_err(|e| match (e.status, e.error.as_deref()) {
             (Some(403), Some("invalid_code")) => code.expired(),
             _ => e.message,
         })
+}
+
+/// Pair this device, named `name`, with the server at the typed `url`
+/// using `code`: where it paired (`https://` when the server speaks HTTPS:
+/// its identity says so, or it refuses plain HTTP from the network) and the
+/// pairing. Over HTTPS the server first proves it knows the code
+/// ([`prove`]). Blocking.
+pub fn pair_at(url: &str, code: &str, name: &str) -> Result<(String, Paired), String> {
+    let mut url = url.to_string();
+    if let Some(rest) = url.strip_prefix("http://").map(str::to_string) {
+        let tls = match identity_at(&probe_agent(&Trust::default().link(None)), &url) {
+            Ok(body) => protocol::announced_fingerprint(&body).is_some(),
+            Err(Some((status, body))) => {
+                protocol::error_body(&body).0 == Some("tls_required") && status == 400
+            }
+            Err(None) => false,
+        };
+        if tls {
+            url = format!("https://{rest}");
+        }
+    }
+    let trust = if url.starts_with("https://") {
+        Trust {
+            fingerprint: Some(prove(&url, code, &host_of(&url))?),
+            relay: None,
+        }
+    } else {
+        Trust::default()
+    };
+    let paired = ServeClient::with_trust(&url, None, trust)
+        .pair(code, name)
+        .map_err(|e| e.message)?;
+    Ok((url, paired))
+}
+
+/// The host of a base URL.
+fn host_of(url: &str) -> String {
+    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+    match rest.rsplit_once(':') {
+        Some((host, port)) if port.chars().all(|c| c.is_ascii_digit()) => host.to_string(),
+        _ => rest.to_string(),
+    }
+}
+
+/// Before a pairing code goes to the server at `url` (`https://`, found
+/// through something anyone can answer, like discovery or a typed
+/// address): the certificate it shows, once it proved it knows `code` for
+/// it (`POST /api/pair/proof` with a fresh nonce; one of its proofs must
+/// be HMAC(scrypt(code, salt ‖ fingerprint), fingerprint ‖ nonce)). The
+/// code itself is never sent here. `name` names the server in what went
+/// wrong. Blocking: the proof's scrypt takes a fraction of a second.
+pub fn prove(url: &str, code: &str, name: &str) -> Result<String, String> {
+    use base64::Engine as _;
+    let mut nonce = [0u8; protocol::PROOF_NONCE_BYTES];
+    rustls::crypto::ring::default_provider()
+        .secure_random
+        .fill(&mut nonce)
+        .map_err(|_| "Couldn't make a random number for the pairing proof.".to_string())?;
+    let client = ServeClient::first_contact(url);
+    let body = json!({"nonce": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(nonce)});
+    let answer = client
+        .json("POST", protocol::PROOF_PATH, Some(&body))
+        .map_err(|e| e.message)?;
+    let seen = client
+        .shared
+        .link
+        .seen()
+        .ok_or_else(|| protocol::proof_failed(name))?;
+    if protocol::verify_pair_proof(code, &seen, &nonce, &answer["proofs"]) {
+        Ok(seen)
+    } else {
+        Err(protocol::proof_failed(name))
+    }
 }
 
 fn session_path(id: &str, rest: &str) -> Result<String, ServeError> {

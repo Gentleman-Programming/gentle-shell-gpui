@@ -12,8 +12,15 @@ name = "gentle_core"
 # A Gentle Shell server's connection code (`serve::decode_connection_code`):
 # base64url. The version the app already locks.
 base64 = "0.23"
+# A Gentle Shell server's pairing proof (`serve::verify_pair_proof`):
+# HMAC-SHA256 under a scrypt key, and its certificate's SHA-256
+# fingerprint. hmac and sha2 are the versions scrypt itself uses (already
+# locked through pbkdf2); scrypt adds only itself and salsa20.
+hmac = "0.12"
 # A sent message's HTML fragments, found as the Markdown renderer sees them.
 markdown = "1"
 regex.workspace = true
+scrypt = { version = "0.11", default-features = false }
 serde.workspace = true
 serde_json.workspace = true
+sha2 = "0.10"
