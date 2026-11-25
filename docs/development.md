@@ -286,7 +286,7 @@ It ignores the crates that move with GPUI: `gpui-kit` and `resvg`/`fontdb`/`gtk`
 
 ## Releases
 
-Assets produced by `release.yml` (the updater consumes these names):
+Assets produced by `release.yml` (the updater consumes the app's names; a client installing a server's terminal host, the `gentle-term-host-*` ones):
 
 | Platform | Runner / target | Assets |
 | --- | --- | --- |
@@ -294,13 +294,15 @@ Assets produced by `release.yml` (the updater consumes these names):
 | macOS Intel | `macos-latest` (cross-compiled), `x86_64-apple-darwin` | `gentle-shell-gpui-<v>-macos-x86_64.dmg`, `.zip` |
 | Windows | `windows-latest`, `x86_64-pc-windows-msvc` | `gentle-shell-gpui-<v>-windows-x86_64.zip` (exe), `…-windows-x86_64-setup.exe` |
 | Linux | `ubuntu-22.04`, `x86_64-unknown-linux-gnu` | `gentle-shell-gpui-<v>-linux-x86_64.tar.gz` |
-| All | `ubuntu-latest` | `SHA256SUMS` (`sha256sum` of the seven assets) |
+| Servers (terminal host) | `ubuntu-22.04` / `ubuntu-22.04-arm` (static musl), `macos-latest` (x86_64 cross-compiled), `windows-latest` (static CRT) | `gentle-term-host-linux-x64`, `-linux-arm64`, `-macos-arm64`, `-macos-x64`, `-windows-x64.exe` |
+| All | `ubuntu-latest` | `SHA256SUMS` (`sha256sum` of the twelve assets) |
 
 Workflow steps:
 
 1. `version`: reads `[workspace.package] version` from `Cargo.toml`. On a tag, it fails if `GITHUB_REF_NAME != v<version>`; on `workflow_dispatch`, the optional `version` input must match.
 2. `build`: restores the `dist-<target>` cache (`save-if: false`), installs libraries on Linux and packages: `packaging/macos/bundle.sh <target> <v>` (with `MACOSX_DEPLOYMENT_TARGET=11.0`, ad hoc signing `codesign --sign -`, zip with `ditto` without `._*`, DMG with a shortcut to `/Applications`), `packaging/linux/package.sh <target> <v>` (binary, `.desktop`, `icon-512.png`), and on Windows `cargo build --profile dist`, `Compress-Archive` and `ISCC` on `packaging/windows/installer.iss` (installs Inno Setup with `choco` if missing).
-3. `release`: checks that all seven assets are present, writes `SHA256SUMS` and, only on `push`, publishes with `gh release create --verify-tag --generate-notes`, title `Gentle Shell <v>`. A version with `-` (`0.2.0-rc.1`) is published as `--prerelease`. On `workflow_dispatch` it uploads everything as a `release-dry-run-<v>` artifact without publishing.
+3. `term-host` (in parallel with `build`, no Rust cache): `cargo build --profile dist -p gentle-term-host` per target, renamed to `gentle-term-host-<os>-<arch>[.exe]`; checks `--version` prints `gentle-term-host <v>` (except the cross-compiled macOS x64) and that the Linux builds are static.
+4. `release`: checks that all twelve assets are present, writes `SHA256SUMS` and, only on `push`, publishes with `gh release create --verify-tag --generate-notes`, title `Gentle Shell <v>`. A version with `-` (`0.2.0-rc.1`) is published as `--prerelease`. On `workflow_dispatch` it uploads everything as a `release-dry-run-<v>` artifact without publishing.
 
 ### Cutting a release
 
@@ -309,7 +311,7 @@ Workflow steps:
 3. Wait for CI on `main` to pass (and Cache warm, which triggers because `Cargo.lock` changed, so the tag reuses the cache).
 4. Optional: dry run from Actions → Release → Run workflow.
 5. `git tag vX.Y.Z && git push origin vX.Y.Z`.
-6. Check that the release has all eight files.
+6. Check that the release has all thirteen files (twelve assets and `SHA256SUMS`).
 
 ### How the updater consumes them
 

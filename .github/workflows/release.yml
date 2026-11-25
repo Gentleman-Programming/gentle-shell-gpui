@@ -3,6 +3,10 @@ name: Release
 # Push a `v<version>` tag matching `[workspace.package] version` to publish a
 # GitHub release. `workflow_dispatch` is a dry run: it builds and packages
 # everything (incl. SHA256SUMS) as workflow artifacts but publishes nothing.
+#
+# Besides the app, each release carries the terminal host a Gentle Shell
+# server (`gentle-shell serve`) runs, `gentle-term-host-<os>-<arch>[.exe]`
+# (os: linux, macos, windows; arch: x64, arm64), listed in SHA256SUMS too.
 
 on:
   push:
@@ -153,8 +157,77 @@ jobs:
             dist/gentle-shell-gpui-${{ env.VERSION }}-*-setup.exe
           if-no-files-found: error
 
+  # The terminal host for servers: a small binary per platform a server may
+  # run on. Built without the shared Rust cache (it compiles in a minute or
+  # two), so nothing restored from a cache goes into it.
+  term-host:
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux builds are static (musl): they run on any distribution.
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-musl
+            asset: gentle-term-host-linux-x64
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-musl
+            asset: gentle-term-host-linux-arm64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            asset: gentle-term-host-macos-arm64
+          # Cross-compiled on Apple silicon, so not run here.
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            asset: gentle-term-host-macos-x64
+            cross: true
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset: gentle-term-host-windows-x64.exe
+    runs-on: ${{ matrix.os }}
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      TARGET: ${{ matrix.target }}
+      ASSET: ${{ matrix.asset }}
+      CROSS: ${{ matrix.cross && 'true' || 'false' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+      - name: Build gentle-term-host
+        shell: bash
+        run: |
+          # The config only sets a static CRT for the Windows target, so the
+          # .exe needs no Visual C++ runtime on the server.
+          cargo --config packaging/windows/cargo-config.toml build --profile dist --locked \
+            -p gentle-term-host --target "$TARGET"
+          exe=""
+          [[ "$TARGET" == *windows* ]] && exe=".exe"
+          mkdir -p dist
+          cp "target/$TARGET/dist/gentle-term-host$exe" "dist/$ASSET"
+          if [[ "$CROSS" != true ]]; then
+            got="$("dist/$ASSET" --version)"
+            if [[ "$got" != "gentle-term-host $VERSION" ]]; then
+              echo "::error::$ASSET --version says '$got', expected 'gentle-term-host $VERSION'"
+              exit 1
+            fi
+          fi
+          if [[ "$TARGET" == *linux* ]] && ! file "dist/$ASSET" | grep -Eq 'static(ally|-pie) linked'; then
+            echo "::error::$ASSET is not statically linked: $(file "dist/$ASSET")"
+            exit 1
+          fi
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: asset-term-host-${{ matrix.target }}
+          path: dist/${{ matrix.asset }}
+          if-no-files-found: error
+
   release:
-    needs: [version, build]
+    needs: [version, build, term-host]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -177,6 +250,11 @@ jobs:
             "gentle-shell-gpui-$VERSION-windows-x86_64.zip"
             "gentle-shell-gpui-$VERSION-windows-x86_64-setup.exe"
             "gentle-shell-gpui-$VERSION-linux-x86_64.tar.gz"
+            "gentle-term-host-linux-x64"
+            "gentle-term-host-linux-arm64"
+            "gentle-term-host-macos-arm64"
+            "gentle-term-host-macos-x64"
+            "gentle-term-host-windows-x64.exe"
           )
           for asset in "${expected[@]}"; do
             [[ -f "$asset" ]] || { echo "::error::missing $asset"; exit 1; }
