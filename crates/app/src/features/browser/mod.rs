@@ -789,8 +789,10 @@ impl BrowserPanel {
         } else {
             IconName::Globe
         };
-        let address = self
-            .url
+        // A forwarded page's link carries a single-use ticket its forward
+        // trades for a cookie, answering with the address without it.
+        let shown = gentle_core::serve::without_ticket(&self.url);
+        let address = shown
             .trim_start_matches("http://")
             .trim_start_matches("https://")
             .to_string();
