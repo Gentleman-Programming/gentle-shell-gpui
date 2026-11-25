@@ -230,6 +230,7 @@ sequenceDiagram
 ```
 
 - **Closing and quitting.** Closing a server tab stops its session there (`DELETE /api/sessions/:id`, in the background). Quitting the app leaves every server session running (`SessionView::quit_backend` → `PiProcess::detach`); the pane is saved with `server: { url, id }` (`SavedPane`), and the next launch reattaches: `GET /api/sessions/:id` and, while it still runs, follows it live and reads the state (`get_messages` rebuilds the conversation, so nothing is replayed). A session the server no longer has (stopped, or the server restarted) starts again in the same folder, resuming the Pi session from the saved session file (the server opens it by exact id, `--session-id`, and creates it when Pi never wrote it: a conversation with no messages yet). A server unreachable at that moment is an error on the tab rather than a second session; Start again on it tries once more.
+- **A canvas's agent.** The agent floating over a canvas behaves the same: quitting detaches it (`CanvasView`'s quit hook → `quit_backend`), the canvas pane is saved with its `server: { url, id }` (`CanvasView::agent_server_session`) beside the conversation, and on restore the canvas reattaches to it at once, the card hidden (`CanvasView::reattach_agent`), so the agent's `canvas_*` host tool calls reach the canvas again; the Agent button shows it. Closing the card (or the canvas pane) stops the session there.
 
 ##### Host tools
 

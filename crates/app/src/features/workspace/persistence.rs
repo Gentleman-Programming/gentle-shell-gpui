@@ -101,10 +101,13 @@ impl Workspace {
                 None if pane.item.kind == PaneKind::Canvas => pane.session_file.clone(),
                 None => None,
             },
-            server: pane
-                .session
-                .as_ref()
-                .and_then(|session| session.read(cx).server_session()),
+            // A canvas's floating agent on a server reattaches like a tab.
+            server: match &pane.session {
+                Some(session) => session.read(cx).server_session(),
+                None => self
+                    .canvas_view(id)
+                    .and_then(|canvas| canvas.read(cx).agent_server_session(cx)),
+            },
             terminal: self
                 .terminal_view(id)
                 .and_then(|terminal| terminal.read(cx).server_terminal()),

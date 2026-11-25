@@ -553,17 +553,23 @@ impl Workspace {
                 PaneFactories::get(cx).canvas.as_ref()?;
                 let id = self.new_factory_pane_at(PaneKind::Canvas, path, &root, window, cx)?;
                 // Its agent works in the folder it had and picks up its
-                // conversation the next time it opens.
-                let resume = saved.session.clone().filter(|p| p.exists());
+                // conversation the next time it opens (on a server, a path
+                // there); a server session that kept running is reattached
+                // to now, the agent hidden.
+                let resume = saved.session.clone().filter(|p| on_server || p.exists());
                 if let Some(pane) = self.panes.get_mut(&id) {
                     pane.cwd = cwd.clone();
                     pane.session_file = resume.clone();
                 }
                 if let Some(canvas) = self.canvas_view(id) {
-                    canvas.update(cx, |canvas, _| {
+                    let server = saved.server.clone();
+                    canvas.update(cx, |canvas, cx| {
                         canvas.set_cwd(cwd);
                         if let Some(resume) = resume {
                             canvas.resume_agent(resume);
+                        }
+                        if let Some(server) = server {
+                            canvas.reattach_agent(server, window, cx);
                         }
                     });
                 }

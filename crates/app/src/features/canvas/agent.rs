@@ -201,6 +201,26 @@ impl CanvasView {
         self.agent_resume = Some(session);
     }
 
+    /// The Gentle Shell server session the agent follows, saved with the
+    /// pane: quitting leaves it running there.
+    pub fn agent_server_session(&self, cx: &App) -> Option<gentle_core::serve::ServerSession> {
+        self.agent.as_ref()?.session.read(cx).server_session()
+    }
+
+    /// The agent's server session kept running while the app was closed:
+    /// reattach to it now, the agent hidden (its button shows it), so its
+    /// canvas tools reach this canvas again.
+    pub fn reattach_agent(
+        &mut self,
+        server: gentle_core::serve::ServerSession,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.agent.is_none() {
+            self.start_agent(false, Some(server), window, cx);
+        }
+    }
+
     /// Opens the agent over the canvas (starting it the first time), or
     /// hides it; hidden, it keeps working.
     pub(super) fn toggle_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -214,37 +234,51 @@ impl CanvasView {
                 let composer = agent.session.read(cx).composer();
                 composer.update(cx, |c, cx| c.focus(window, cx));
             }
-            None => {
-                let (cwd, canvas) = (self.cwd.clone(), self.path.clone());
-                let resume = self.agent_resume.take();
-                let session = cx.new(|cx| {
-                    let mut session = SessionView::new(cwd, None, window, cx, false);
-                    session.set_canvas(canvas);
-                    if let Some(path) = resume {
-                        session.resume_when_ready(path, cx);
-                    }
-                    session.ensure_started(window, cx);
-                    session
-                });
-                let composer = session.read(cx).composer();
-                composer.update(cx, |c, cx| c.focus(window, cx));
-                cx.emit(CanvasEvent::AgentStarted(session.clone()));
-                // A server session's canvas tools reach this canvas here.
-                let host = cx.subscribe(&session, |this, _, event: &SessionEvent, cx| {
-                    if let SessionEvent::HostTool(HostToolRequest::Canvas { request, reply }) =
-                        event
-                    {
-                        let (json, shot) = this.respond(request, cx);
-                        let _ = reply.send(CanvasAnswer { json, shot });
-                    }
-                });
-                self.agent = Some(FloatingAgent {
-                    session,
-                    shown: true,
-                    _host: host,
-                });
-            }
+            None => self.start_agent(true, None, window, cx),
         }
+        cx.notify();
+    }
+
+    /// Start the agent (on `attach`, a server session still running there),
+    /// `shown` over the page or hidden.
+    fn start_agent(
+        &mut self,
+        shown: bool,
+        attach: Option<gentle_core::serve::ServerSession>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (cwd, canvas) = (self.cwd.clone(), self.path.clone());
+        let resume = self.agent_resume.take();
+        let session = cx.new(|cx| {
+            let mut session = SessionView::new(cwd, None, window, cx, false);
+            session.set_canvas(canvas);
+            if let Some(server) = attach {
+                session.attach_server_session(server);
+            }
+            if let Some(path) = resume {
+                session.resume_when_ready(path, cx);
+            }
+            session.ensure_started(window, cx);
+            session
+        });
+        if shown {
+            let composer = session.read(cx).composer();
+            composer.update(cx, |c, cx| c.focus(window, cx));
+        }
+        cx.emit(CanvasEvent::AgentStarted(session.clone()));
+        // A server session's canvas tools reach this canvas here.
+        let host = cx.subscribe(&session, |this, _, event: &SessionEvent, cx| {
+            if let SessionEvent::HostTool(HostToolRequest::Canvas { request, reply }) = event {
+                let (json, shot) = this.respond(request, cx);
+                let _ = reply.send(CanvasAnswer { json, shot });
+            }
+        });
+        self.agent = Some(FloatingAgent {
+            session,
+            shown,
+            _host: host,
+        });
         cx.notify();
     }
 
