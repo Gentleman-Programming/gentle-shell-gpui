@@ -483,6 +483,10 @@ pub struct Workspace {
     music: Entity<Music>,
     /// Simulators and emulators, docked at the right or floating.
     devices: Entity<DevicePanel>,
+    /// The window's keyboard focus when nothing in it has one (no tab, a
+    /// pane just closed): keys reach the workspace's actions (⌘O, ⌘K, …)
+    /// only along the focus path.
+    focus: FocusHandle,
 }
 
 impl EventEmitter<WorkspaceEvent> for Workspace {}
@@ -618,6 +622,7 @@ impl Workspace {
             closed: Vec::new(),
             music,
             devices,
+            focus: cx.focus_handle(),
             _surge_end: None,
             _title_poll: cx.spawn(async move |this, cx| {
                 loop {
@@ -646,10 +651,7 @@ impl Workspace {
             space.tabs = tabs;
         }
         let target = match folder {
-            Some(folder) => match this.spaces.iter().position(|s| s.root == folder) {
-                Some(index) => index,
-                None => this.push_space(None, folder),
-            },
+            Some(folder) => this.space_for(folder, Self::agents_server()),
             // Agents on a Gentle Shell server: the first workspace is the
             // server's home folder, not one on this computer.
             None if this.spaces.is_empty() => match crate::features::backend::saved() {

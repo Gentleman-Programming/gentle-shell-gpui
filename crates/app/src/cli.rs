@@ -56,27 +56,40 @@ pub fn default_cwd() -> PathBuf {
 /// `--cwd` the folder the app was launched in; `None` restores the last
 /// workspace.
 pub fn requested_folder(cli: &Cli) -> Option<PathBuf> {
-    resolve_folder(cli.folder.clone(), cli.here, launch_dir())
+    let on_server = crate::features::backend::saved().is_server();
+    resolve_folder(cli.folder.clone(), cli.here, launch_dir(), on_server)
 }
 
 /// `folder`, else with `here` the launch folder `launch`, as an existing
 /// canonical folder (see [`cli_folder`]).
-fn resolve_folder(folder: Option<PathBuf>, here: bool, launch: Option<PathBuf>) -> Option<PathBuf> {
+fn resolve_folder(
+    folder: Option<PathBuf>,
+    here: bool,
+    launch: Option<PathBuf>,
+    on_server: bool,
+) -> Option<PathBuf> {
     let folder = folder.or_else(|| (here && launch.is_some()).then(|| PathBuf::from(".")));
-    cli_folder(folder, launch)
+    cli_folder(folder, launch, on_server)
 }
 
 /// The CLI folder argument as an existing folder. A relative argument (`.`,
 /// `myproject`) names a folder under `launch`, the folder the app was launched
 /// in, not under the app's current folder, which startup moves (`main`, on
-/// Windows).
-fn cli_folder(arg: Option<PathBuf>, launch: Option<PathBuf>) -> Option<PathBuf> {
-    arg.map(|p| match &launch {
+/// Windows). Where agents run on a Gentle Shell server (`on_server`) it is
+/// one of the server's folders: never looked for nor resolved on this
+/// computer, only normalized ([`gentle_core::serve::folder_key`]).
+fn cli_folder(arg: Option<PathBuf>, launch: Option<PathBuf>, on_server: bool) -> Option<PathBuf> {
+    let folder = arg.map(|p| match &launch {
         Some(launch) if p.is_relative() => launch.join(p),
         _ => p,
-    })
-    .filter(|p| p.is_dir())
-    .and_then(|p| dunce::canonicalize(p).ok())
+    })?;
+    if on_server {
+        return Some(gentle_core::serve::folder_key(&folder.to_string_lossy()).into());
+    }
+    if !folder.is_dir() {
+        return None;
+    }
+    dunce::canonicalize(folder).ok()
 }
 
 static LAUNCH_DIR: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
@@ -128,19 +141,19 @@ mod tests {
 
         // `gsd` in a folder: that folder.
         assert_eq!(
-            resolve_folder(None, true, Some(here.clone())),
+            resolve_folder(None, true, Some(here.clone()), false),
             Some(canon(&here))
         );
         // `gsd <folder>`: the folder wins over the launch folder.
         assert_eq!(
-            resolve_folder(Some(there.clone()), true, Some(here.clone())),
+            resolve_folder(Some(there.clone()), true, Some(here.clone()), false),
             Some(canon(&there))
         );
         // A plain launch (Start menu, Finder) keeps restoring the last workspace.
-        assert_eq!(resolve_folder(None, false, Some(here.clone())), None);
+        assert_eq!(resolve_folder(None, false, Some(here.clone()), false), None);
         // A folder that doesn't exist never falls back to the launch folder.
         assert_eq!(
-            resolve_folder(Some(base.join("missing")), true, Some(here)),
+            resolve_folder(Some(base.join("missing")), true, Some(here), false),
             None
         );
         std::fs::remove_dir_all(&base).unwrap();
@@ -195,8 +208,12 @@ mod tests {
         let project = launch.join("myproject");
         std::fs::create_dir_all(&project).unwrap();
         let expected = dunce::canonicalize(&project).unwrap();
-        let resolved = cli_folder(Some(PathBuf::from("myproject")), Some(launch.clone()));
-        let dot = cli_folder(Some(PathBuf::from(".")), Some(project.clone()));
+        let resolved = cli_folder(
+            Some(PathBuf::from("myproject")),
+            Some(launch.clone()),
+            false,
+        );
+        let dot = cli_folder(Some(PathBuf::from(".")), Some(project.clone()), false);
         std::fs::remove_dir_all(&launch).unwrap();
         assert_eq!(resolved, Some(expected.clone()));
         assert_eq!(dot, Some(expected));
@@ -207,7 +224,31 @@ mod tests {
     fn an_absolute_folder_argument_opens_as_given() {
         let folder = dunce::canonicalize(std::env::temp_dir()).unwrap();
         let elsewhere = Some(PathBuf::from("Z:\nowhere"));
-        assert_eq!(cli_folder(Some(folder.clone()), elsewhere), Some(folder));
-        assert_eq!(cli_folder(None, Some(std::env::temp_dir())), None);
+        assert_eq!(
+            cli_folder(Some(folder.clone()), elsewhere, false),
+            Some(folder)
+        );
+        assert_eq!(cli_folder(None, Some(std::env::temp_dir()), false), None);
+    }
+
+    /// Where agents run on a Gentle Shell server, `gsd <folder>` names one
+    /// of its folders: not looked for here, nor rewritten by this
+    /// computer's links, only normalized.
+    #[test]
+    fn a_server_folder_argument_is_never_resolved_here() {
+        let launch = Some(PathBuf::from("/Users/ana"));
+        assert_eq!(
+            cli_folder(
+                Some(PathBuf::from("/home/ana/./api/")),
+                launch.clone(),
+                true
+            ),
+            Some(PathBuf::from("/home/ana/api"))
+        );
+        assert_eq!(
+            cli_folder(Some(PathBuf::from("/tmp/x/../api")), launch.clone(), true),
+            Some(PathBuf::from("/tmp/api"))
+        );
+        assert_eq!(cli_folder(None, launch, true), None);
     }
 }

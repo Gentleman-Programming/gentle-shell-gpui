@@ -378,6 +378,7 @@ mod tests {
                     closed: vec![closed],
                     music: cx.new(|cx| Music::new(window, cx)),
                     devices: cx.new(DevicePanel::new),
+                    focus: cx.focus_handle(),
                 });
                 workspace.update(cx, |workspace, cx| workspace.reopen_closed(window, cx));
                 let workspace = workspace.read(cx);

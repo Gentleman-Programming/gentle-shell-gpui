@@ -234,27 +234,24 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let index = match self.spaces.iter().position(|space| space.root == folder) {
-            Some(index) => index,
-            None => self.push_space(None, folder),
-        };
-        self.spaces[index].server = Some(url);
+        let index = self.space_for(folder, Some(url));
         self.switch_workspace(index, window, cx);
     }
 
     /// Show the workspace rooted at `folder`, creating it (a new workspace
-    /// opens with an agent tab). `gsd <folder>` and the explorer both land here.
+    /// opens with an agent tab). `gsd <folder>` and the explorer both land
+    /// here. Where agents run on a Gentle Shell server, `folder` is one of
+    /// its folders ([`Self::show_server_folder`]).
     pub(super) fn show_folder(
         &mut self,
         folder: PathBuf,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let folder = workspaces::root_key(folder);
-        let index = match workspaces::find_root(self.spaces.iter().map(|s| &s.root), &folder) {
-            Some(index) => index,
-            None => self.push_space(None, folder),
-        };
+        if let Some(url) = Self::agents_server() {
+            return self.show_server_folder(folder, url, window, cx);
+        }
+        let index = self.space_for(folder, None);
         self.switch_workspace(index, window, cx);
     }
 

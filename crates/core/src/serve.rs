@@ -1070,6 +1070,47 @@ pub fn tab_folder(cwd: &std::path::Path, there: bool, home: Option<&str>) -> std
     }
 }
 
+/// A folder on a Gentle Shell server as workspaces compare it: normalized
+/// by its text alone, since this computer can't resolve the server's links
+/// (resolving it here would read this computer's file system). `.` segments
+/// and repeated or trailing separators go; `..` drops the segment before it,
+/// never climbing above the root. The separator is the path's own: `/`, or
+/// `\` for a path written only with those (a Windows server's).
+pub fn folder_key(path: &str) -> String {
+    let sep = if !path.contains('/') && path.contains('\\') {
+        '\\'
+    } else {
+        '/'
+    };
+    let rooted = path.starts_with(sep);
+    let mut parts: Vec<&str> = Vec::new();
+    for part in path.split(sep) {
+        match part {
+            "" | "." => {}
+            ".." => {
+                let drive = parts.len() == 1 && parts[0].ends_with(':');
+                match parts.last() {
+                    Some(&last) if last != ".." && !drive => {
+                        parts.pop();
+                    }
+                    // Above the root (or a drive) there is nothing.
+                    _ if rooted || drive => {}
+                    _ => parts.push(".."),
+                }
+            }
+            _ => parts.push(part),
+        }
+    }
+    let sep = sep.to_string();
+    let joined = parts.join(&sep);
+    match (rooted, parts.as_slice()) {
+        (true, _) => format!("{sep}{joined}"),
+        (false, [drive]) if drive.ends_with(':') => format!("{drive}{sep}"),
+        (false, []) => ".".into(),
+        (false, _) => joined,
+    }
+}
+
 /// Whether `host` (no brackets) names the machine it is read on.
 fn is_loopback_host(host: &str) -> bool {
     let host = host.trim_end_matches('.').to_ascii_lowercase();
@@ -1182,6 +1223,23 @@ mod tests {
         let there = Path::new("/home/ana/api");
         assert_eq!(tab_folder(there, true, Some("/home/ana")), there);
         assert_eq!(tab_folder(mac, false, None), mac);
+    }
+
+    #[test]
+    fn server_folders_compare_by_their_text_alone() {
+        for (path, key) in [
+            ("/tmp/repo", "/tmp/repo"),
+            ("/tmp//repo/", "/tmp/repo"),
+            ("/tmp/./x/../repo", "/tmp/repo"),
+            ("/../..", "/"),
+            ("/", "/"),
+            ("home/./ana/..", "home"),
+            ("../a", "../a"),
+            (r"C:\Users\ana\..\bob\", r"C:\Users\bob"),
+            (r"C:\..", r"C:\"),
+        ] {
+            assert_eq!(folder_key(path), key, "{path}");
+        }
     }
 
     #[test]

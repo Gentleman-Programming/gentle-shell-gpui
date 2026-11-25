@@ -332,22 +332,29 @@ impl Default for SavedState {
 
 pub const VERSION: u32 = 1;
 
-/// How a workspace root is compared: canonical, so a folder reached through
-/// a symlink, `..` or another drive-letter case finds the same workspace as
-/// `gsd` (which passes canonical paths). Unresolvable paths stay as given.
-pub fn root_key(path: PathBuf) -> PathBuf {
+/// How a workspace root is compared. On this computer canonical, so a
+/// folder reached through a symlink, `..` or another drive-letter case
+/// finds the same workspace as `gsd` (which passes canonical paths);
+/// unresolvable paths stay as given. A Gentle Shell server's folder
+/// (`on_server`) is normalized by its text alone
+/// ([`gentle_core::serve::folder_key`]): it is never resolved here.
+pub fn root_key(path: PathBuf, on_server: bool) -> PathBuf {
+    if on_server {
+        return gentle_core::serve::folder_key(&path.to_string_lossy()).into();
+    }
     dunce::canonicalize(&path).unwrap_or(path)
 }
 
 /// The position of the root that is `folder` (already a [`root_key`]),
-/// comparing saved roots canonically too: older saves and other entry points
-/// may hold a root reached another way.
+/// comparing saved roots the same way (`on_server` as for `folder`): older
+/// saves and other entry points may hold a root reached another way.
 pub fn find_root<'a>(
     roots: impl Iterator<Item = &'a PathBuf>,
     folder: &std::path::Path,
+    on_server: bool,
 ) -> Option<usize> {
     roots
-        .map(|root| root_key(root.clone()))
+        .map(|root| root_key(root.clone(), on_server))
         .position(|root| root == folder)
 }
 

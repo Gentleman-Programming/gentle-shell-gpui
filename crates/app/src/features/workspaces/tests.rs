@@ -281,13 +281,13 @@ fn a_folder_reached_another_way_keys_the_same_workspace() {
     let canonical = dunce::canonicalize(base.join("a")).unwrap();
     // The explorer builds `dir.join(name)`; `gsd` passes a canonical path.
     assert_eq!(
-        super::root_key(base.join("a").join("..").join("a")),
+        super::root_key(base.join("a").join("..").join("a"), false),
         canonical
     );
-    assert_eq!(super::root_key(canonical.clone()), canonical);
+    assert_eq!(super::root_key(canonical.clone(), false), canonical);
     // A folder that can't be resolved keeps its path.
     let missing = base.join("missing");
-    assert_eq!(super::root_key(missing.clone()), missing);
+    assert_eq!(super::root_key(missing.clone(), false), missing);
     std::fs::remove_dir_all(&base).unwrap();
 }
 
@@ -299,7 +299,29 @@ fn a_workspace_saved_with_a_non_canonical_root_is_still_found() {
     // Saved before roots were canonical: `a/../a`.
     let roots = [base.join("b"), base.join("a").join("..").join("a")];
     let canonical = dunce::canonicalize(base.join("a")).unwrap();
-    assert_eq!(super::find_root(roots.iter(), &canonical), Some(1));
-    assert_eq!(super::find_root(roots.iter(), &base.join("missing")), None);
+    assert_eq!(super::find_root(roots.iter(), &canonical, false), Some(1));
+    assert_eq!(
+        super::find_root(roots.iter(), &base.join("missing"), false),
+        None
+    );
+    std::fs::remove_dir_all(&base).unwrap();
+}
+
+/// A server's folder names the server's file system: a link of the same
+/// name on this computer must not rewrite it.
+#[cfg(unix)]
+#[test]
+fn a_server_folder_is_never_resolved_on_this_computer() {
+    let base = std::env::temp_dir().join(format!("ws-server-key-test-{}", std::process::id()));
+    std::fs::create_dir_all(base.join("real")).unwrap();
+    std::os::unix::fs::symlink(base.join("real"), base.join("link")).unwrap();
+    let link = base.join("link");
+    assert_eq!(
+        super::root_key(link.join(".").join("x").join(".."), true),
+        link
+    );
+    assert_ne!(super::root_key(link.clone(), false), link);
+    let roots = [base.join("real"), base.join("link").join(".")];
+    assert_eq!(super::find_root(roots.iter(), &link, true), Some(1));
     std::fs::remove_dir_all(&base).unwrap();
 }

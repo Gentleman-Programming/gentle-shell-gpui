@@ -995,6 +995,7 @@ mod tests {
                         closed: Vec::new(),
                         music: cx.new(|cx| Music::new(window, cx)),
                         devices: cx.new(DevicePanel::new),
+                        focus: cx.focus_handle(),
                     });
                     workspace.update(cx, |workspace, cx| body(workspace, window, cx));
                 })

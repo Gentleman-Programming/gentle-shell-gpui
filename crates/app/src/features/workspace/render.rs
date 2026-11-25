@@ -145,6 +145,14 @@ impl Render for Workspace {
         {
             tab.state.set_focused(inside);
         }
+        // Nothing focused: the workspace takes the keyboard, so its keys
+        // (⌘O, ⌘K, ⌘T, …) work with no pane to carry them.
+        if window.focused(cx).is_none()
+            && !window.has_active_dialog(cx)
+            && !window.has_active_sheet(cx)
+        {
+            self.focus.focus(window, cx);
+        }
         let has_files_sidebar = self.sidebar.is_some();
         let vertical_tabs = self.tab_layout == TabLayout::Vertical;
         let window_px_at_100 =
@@ -230,6 +238,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_open_explorer))
             .on_action(cx.listener(Self::on_close_overlay))
             .key_context("GentleWorkspace")
+            .track_focus(&self.focus)
             .relative()
             .left(px(shake_x))
             .top(px(shake_y))
