@@ -34,7 +34,13 @@ impl SessionView {
                         d.max_h(rems((INPUT_LINES as f32 * 21.) / 16.))
                             .overflow_hidden()
                     })
-                    .child(self.markdown_view(state, text, ("mermaid-install-custom", ix), cx))
+                    .child(self.markdown_view(
+                        state,
+                        text,
+                        ("mermaid-install-custom", ix),
+                        (ix, 0),
+                        cx,
+                    ))
                     .into_any_element()
             }),
             CustomBody::Head | CustomBody::Tail => {

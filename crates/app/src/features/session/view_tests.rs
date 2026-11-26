@@ -287,6 +287,140 @@ impl gpui_kit::Render for Selectable {
     }
 }
 
+#[gpui::test]
+fn assistant_code_header_shows_language_and_copy_icon(cx: &mut TestAppContext) {
+    use gpui_kit::AppContext as _;
+
+    cx.update(|cx| {
+        gpui_kit::init(cx);
+        cx.set_reduce_motion(true);
+    });
+    let (root, cx) = cx.add_window_view(|window, cx| {
+        let session = cx.new(|cx| {
+            let mut view = SessionView::new(std::env::temp_dir(), None, window, cx, false);
+            view.backend.started = true;
+            view.transcript
+                .items
+                .push(gentle_core::transcript::Item::Assistant {
+                    blocks: vec![gentle_core::transcript::Block::Text(
+                        "```markdown\nhello\n```".into(),
+                    )],
+                    streaming: false,
+                    error: None,
+                });
+            view.sync_view(cx);
+            view
+        });
+        Selectable(session)
+    });
+    cx.run_until_parked();
+    root.read_with(cx, |root, cx| {
+        let state = root.0.read(cx).list.state();
+        let viewport = state.viewport_bounds();
+        let row = state.bounds_for_item(1);
+        assert!(
+            row.is_some(),
+            "assistant row not laid out: viewport={viewport:?}, scroll={:?}",
+            state.logical_scroll_top()
+        );
+        let row = row.unwrap();
+        assert!(
+            row.bottom() > viewport.top() && row.top() < viewport.bottom(),
+            "assistant row not visible: row={row:?}, viewport={viewport:?}, scroll={:?}",
+            state.logical_scroll_top()
+        );
+    });
+    assert!(drawn(cx, "code-language"));
+    assert!(drawn(cx, "copy-code"));
+
+    for (text, has_card) in [
+        ("intro\n\n```rust\nα", true),
+        ("intro\n\n```rust\nα\n```\n\n[link][ref]", true),
+        (
+            "intro\n\n```rust\nα\n```\n\n[link][ref]\n\n[ref]: /url",
+            false,
+        ),
+        ("replacement\n\n```text\nx\n```", true),
+        ("plain replacement", false),
+    ] {
+        root.update(cx, |root, cx| {
+            root.0.update(cx, |view, cx| {
+                let gentle_core::transcript::Item::Assistant {
+                    blocks, streaming, ..
+                } = view.transcript.items.last_mut().unwrap()
+                else {
+                    panic!("expected assistant")
+                };
+                blocks[0] = gentle_core::transcript::Block::Text(text.into());
+                *streaming = true;
+                view.sync_view(cx);
+                cx.notify();
+            });
+        });
+        assert_eq!(drawn(cx, "code-language"), has_card, "{text:?}");
+    }
+}
+
+#[gpui::test]
+fn incoming_assistant_stream_updates_the_rendered_card(cx: &mut TestAppContext) {
+    use gentle_core::transcript::{Block, Item};
+    use pi_rpc::Incoming;
+
+    let (view, cx) = tab(cx);
+    for (events, text, streaming, has_card) in [
+        (
+            vec![
+                json!({"type": "message_start", "message": {"role": "assistant", "content": []}}),
+                json!({"type": "message_update", "assistantMessageEvent": {"type": "text_start", "contentIndex": 0}}),
+                json!({"type": "message_update", "assistantMessageEvent": {"type": "text_delta", "contentIndex": 0, "delta": "intro\n\n```rust\nα"}}),
+            ],
+            "intro\n\n```rust\nα",
+            true,
+            true,
+        ),
+        (
+            vec![
+                json!({"type": "message_update", "assistantMessageEvent": {"type": "text_delta", "contentIndex": 0, "delta": "\n```\n\n[link][ref]"}}),
+            ],
+            "intro\n\n```rust\nα\n```\n\n[link][ref]",
+            true,
+            true,
+        ),
+        (
+            vec![
+                json!({"type": "message_update", "assistantMessageEvent": {"type": "text_delta", "contentIndex": 0, "delta": "\n\n[ref]: /url"}}),
+            ],
+            "intro\n\n```rust\nα\n```\n\n[link][ref]\n\n[ref]: /url",
+            true,
+            false,
+        ),
+        (
+            vec![
+                json!({"type": "message_end", "message": {"role": "assistant", "stopReason": "stop", "content": [{"type": "text", "text": "final\n\n```text\nx\n```"}]}}),
+            ],
+            "final\n\n```text\nx\n```",
+            false,
+            true,
+        ),
+    ] {
+        view.update_in(cx, |view, window, cx| {
+            view.handle_batch(
+                events.into_iter().map(Incoming::Event).collect(),
+                window,
+                cx,
+            );
+        });
+        view.read_with(cx, |view, _| {
+            assert!(matches!(
+                view.transcript.items.last(),
+                Some(Item::Assistant { blocks, streaming: live, .. })
+                if *live == streaming && matches!(blocks.as_slice(), [Block::Text(actual)] if actual == text)
+            ));
+        });
+        assert_eq!(drawn(cx, "code-language"), has_card, "{text:?}");
+    }
+}
+
 /// A message you sent can be selected with the mouse, like an answer, and
 /// what is selected is its text.
 #[gpui::test]

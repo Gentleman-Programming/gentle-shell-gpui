@@ -480,7 +480,7 @@ impl TranscriptList {
         self.shape.row(ix)
     }
 
-    pub(super) fn state(&self) -> ListState {
+    pub(in crate::features::session) fn state(&self) -> ListState {
         self.state.clone()
     }
 

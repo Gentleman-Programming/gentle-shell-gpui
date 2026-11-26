@@ -357,6 +357,7 @@ impl SessionView {
         state: &Entity<TextViewState>,
         text: &str,
         id: impl Into<ElementId>,
+        segment_key: (usize, usize),
         cx: &Context<Self>,
     ) -> Div {
         let diagrams = self.diagrams.clone();
@@ -365,23 +366,110 @@ impl SessionView {
         } else {
             0
         };
-        v_flex()
-            .gap_2()
-            .child(
-                TextView::new(state)
+        // Mermaid's displayed text can differ from its source. Keep the whole
+        // native view in that case rather than applying source offsets to it.
+        let plan = if has_mermaid(text) {
+            gentle_core::markdown::MarkdownPlan::Native
+        } else {
+            gentle_core::markdown::segment_source(text)
+        };
+        let mut column = v_flex().gap_2();
+        match plan {
+            gentle_core::markdown::MarkdownPlan::Segmented(segments)
+                if segments
+                    .iter()
+                    .any(|s| s.kind == gentle_core::markdown::SegmentKind::Code) =>
+            {
+                for segment in segments {
+                    let code = segment.kind == gentle_core::markdown::SegmentKind::Code;
+                    let source = text[segment.range.clone()].to_string();
+                    let diagrams = diagrams.clone();
+                    let view = TextView::markdown(
+                        SharedString::from(format!(
+                            "answer-segment-{}-{}-{}",
+                            segment_key.0, segment_key.1, segment.range.start
+                        )),
+                        source,
+                    )
                     .selectable(true)
                     .style(ui::prose_style())
                     .list_style(ui::prose_list_style())
-                    .code_block_actions(|block, _, cx| code_block_header(block, cx))
                     .image_source(move |uri| {
                         diagrams.image(uri).unwrap_or_else(|| uri.clone().into())
                     })
                     .plugin(paths::AnswerPaths {
                         lookup: self.paths.clone(),
                         view: cx.entity().downgrade(),
-                    }),
-            )
-            .children(crate::features::files::mermaid_banner(blocks, id, cx))
+                    });
+                    column = if code {
+                        use gpui_kit::base::text::editor_host::{BlockNode, parse_markdown};
+                        let block = parse_markdown(&text[segment.range.clone()], Arc::default())
+                            .ok()
+                            .and_then(|nodes| {
+                                nodes.into_iter().find_map(|node| match node {
+                                    BlockNode::CodeBlock(block) => Some(block),
+                                    _ => None,
+                                })
+                            });
+                        if let Some(block) = block {
+                            column.child(
+                                div()
+                                    .id(SharedString::from(format!(
+                                        "answer-code-card-{}-{}-{}",
+                                        segment_key.0, segment_key.1, segment.range.start
+                                    )))
+                                    .w_full()
+                                    .min_w_0()
+                                    .rounded_lg()
+                                    .p(rems(10. / 16.))
+                                    .bg(ui::raised())
+                                    .child(code_block_header(&block, cx))
+                                    .child(
+                                        view.style(
+                                            ui::prose_style().code_block(
+                                                StyleRefinement::default()
+                                                    .rounded_md()
+                                                    .bg(ui::well())
+                                                    .border_0()
+                                                    .pt(rems(14. / 16.))
+                                                    .line_height(relative(1.7)),
+                                            ),
+                                        )
+                                        .code_block_actions(|_, _, _| div()),
+                                    ),
+                            )
+                        } else {
+                            column.child(
+                                view.code_block_actions(|block, _, cx| {
+                                    native_code_header(block, cx)
+                                }),
+                            )
+                        }
+                    } else {
+                        column.child(
+                            view.code_block_actions(|block, _, cx| native_code_header(block, cx)),
+                        )
+                    };
+                }
+            }
+            _ => {
+                column = column.child(
+                    TextView::new(state)
+                        .selectable(true)
+                        .style(ui::prose_style())
+                        .list_style(ui::prose_list_style())
+                        .code_block_actions(|block, _, cx| native_code_header(block, cx))
+                        .image_source(move |uri| {
+                            diagrams.image(uri).unwrap_or_else(|| uri.clone().into())
+                        })
+                        .plugin(paths::AnswerPaths {
+                            lookup: self.paths.clone(),
+                            view: cx.entity().downgrade(),
+                        }),
+                );
+            }
+        }
+        column.children(crate::features::files::mermaid_banner(blocks, id, cx))
     }
 
     /// Record start/end instants of live items `from..`.
@@ -859,6 +947,7 @@ impl SessionView {
                                             state,
                                             text,
                                             ("mermaid-install", ix * 64 + block_ix),
+                                            (ix, block_ix),
                                             cx,
                                         )),
                                 );
@@ -2752,10 +2841,8 @@ fn notice_card(level: NoticeLevel, text: &str) -> Div {
         )
 }
 
-/// Along the top of a fenced block in an answer, after Tern's: its
-/// language, then Copy, which puts the code on the clipboard and says so.
-/// In the interface's font, not the code's.
-fn code_block_header(block: &gpui_kit::base::text::CodeBlock, cx: &App) -> Div {
+/// The original native header remains in nested blocks and fallback views.
+fn native_code_header(block: &gpui_kit::base::text::CodeBlock, cx: &App) -> Div {
     use gpui_kit::component::WindowExt as _;
     let code = block.code();
     h_flex()
@@ -2780,6 +2867,58 @@ fn code_block_header(block: &gpui_kit::base::text::CodeBlock, cx: &App) -> Div {
                         cx,
                     );
                 }),
+        )
+}
+
+/// Along the top of a fenced block in an answer, after Tern's: its
+/// language, then Copy, which puts the code on the clipboard and says so.
+/// In the interface's font, not the code's.
+fn code_block_header(block: &gpui_kit::base::text::CodeBlock, cx: &App) -> Div {
+    use gpui_kit::component::WindowExt as _;
+    let code = block.code();
+    let language = block.lang().filter(|lang| !lang.is_empty()).map(|lang| {
+        let mut chars = lang.chars();
+        chars.next().unwrap().to_uppercase().collect::<String>() + chars.as_str()
+    });
+    h_flex()
+        .w_full()
+        .justify_between()
+        .items_center()
+        .gap_3()
+        .pl(rems(6. / 16.))
+        .pr(rems(4. / 16.))
+        .pb(rems(8. / 16.))
+        .font_family(cx.theme().font_family.clone())
+        .text_size(rems(12. / 16.))
+        .text_color(ui::muted())
+        .child(
+            div()
+                .id("code-language")
+                .debug_selector(|| "code-language".into())
+                .rounded_full()
+                .px(rems(11. / 16.))
+                .py(rems(3. / 16.))
+                .font_weight(FontWeight::SEMIBOLD)
+                .bg(ui::surface_hover())
+                .children(language),
+        )
+        .child(
+            div().debug_selector(|| "copy-code".into()).child(
+                Button::new("copy-code")
+                    .ghost()
+                    .xsmall()
+                    .icon(Icon::new(IconName::Copy))
+                    .tooltip("Copy")
+                    .on_click(move |_, window, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(code.to_string()));
+                        window.push_notification(
+                            gpui_kit::component::notification::Notification::success(
+                                "Copied to the clipboard.",
+                            ),
+                            cx,
+                        );
+                    }),
+            ),
         )
 }
 
