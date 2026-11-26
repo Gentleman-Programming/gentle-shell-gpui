@@ -25,23 +25,22 @@ use sources::list_branches;
 pub use sources::switch_branch;
 pub(crate) use sources::walk_files;
 
-/// Native command shortcuts for the activity rail. Reuse the palette's
-/// labels, icons and actions; backend slash commands stay in Commands.
+/// Native screen shortcuts for the activity rail. Reuse the palette's
+/// labels, icons and actions; editing/layout commands stay in Commands.
 pub(crate) fn sidebar_commands(
     tab_layout: TabLayout,
 ) -> Vec<(IconName, String, String, PaletteAction)> {
     screen_rows(tab_layout)
         .into_iter()
         .filter(|row| {
-            !matches!(
+            matches!(
                 &row.action,
-                PaletteAction::Setup
-                    | PaletteAction::Welcome
-                    | PaletteAction::Memory
-                    | PaletteAction::Profiles
-                    | PaletteAction::Sessions
-                    | PaletteAction::Providers
-                    | PaletteAction::Settings
+                PaletteAction::Agents
+                    | PaletteAction::Docs
+                    | PaletteAction::History
+                    | PaletteAction::Devices
+                    | PaletteAction::Usage
+                    | PaletteAction::Screen(Screen::Tower)
             )
         })
         .map(|row| (row.icon, row.title, row.detail, row.action))
