@@ -230,7 +230,7 @@ Resume previous conversations for this project or any project; sessions from ano
 
 ### Instances — What agents open, out of your way
 
-What agents open (dev-server pages, `gentle-open`, the design canvas, emulators and simulators they boot) never pops up over your work: a circle in the title bar counts them, its badge colored by the one that most needs a look (red error, gold booting or waiting, green ready).
+What agents start on their own (dev-server pages they mention, the design canvas, emulators and simulators they boot) never pops up over your work: a circle in the title bar counts them, its badge colored by the one that most needs a look (red error, gold booting or waiting, green ready). A page an agent asks to show you (`open_page`, `gentle-open`) shows at once, and is in the tray too.
 
 <details>
 <summary><kbd>More</kbd> <strong>The instance tray</strong></summary>
@@ -600,14 +600,14 @@ The page stays live while you resize, and the card lifts while you drag it. The 
 
 ### Web apps — Dev servers in the in-app browser
 
-The in-app browser is not only for Gentle Design. `gentle-open <url>` is a shim installed at startup on the PATH the agents receive, so the model can open any http(s) page from its shell tool; the app forwards it to the running window through the single-instance server and keeps it in the instance tray.
+The in-app browser is not only for Gentle Design. `gentle-open <url>` is a shim installed at startup on the PATH the agents receive, so the model can open any http(s) page from its shell tool (agents that take the app's tools call `open_page` instead); the app forwards it to the running window through the single-instance server, which shows its card at once (or opens it in your browser when Configuration › Devices › Browser says so).
 
 <details>
 <summary><kbd>More</kbd> <strong><code>gentle-open</code>, loopback URLs and cards</strong></summary>
 
 <br>
 
-A loopback dev-server URL printed by a shell tool (`http://localhost:5173`, `127.0.0.1`, `[::1]`) goes to the tray too. `/web <url>` from the composer shows the card at once. **Each different URL gets its own card**; the same URL reuses it. Web and device cards tile side by side (the hybrid web + mobile case), and the design canvas keeps its own card too. Public URLs need the explicit tool.
+A loopback dev-server URL printed by a shell tool (`http://localhost:5173`, `127.0.0.1`, `[::1]`) waits in the tray instead. `/web <url>` from the composer shows the card at once. **Each different URL gets its own card**; the same URL reuses it. Web and device cards tile side by side (the hybrid web + mobile case), and the design canvas keeps its own card too. Public URLs need the explicit tool.
 
 </details>
 

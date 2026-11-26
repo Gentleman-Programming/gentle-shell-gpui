@@ -39,14 +39,21 @@ use gentle_core::genui::host::Mode;
 
 /// How long the open canvas has to answer, as its `.agent` requests do.
 const CANVAS_ANSWER: Duration = Duration::from_secs(10);
+/// How long the window has to say where a page opened: a server's page
+/// waits for its forward first.
+const PAGE_ANSWER: Duration = Duration::from_secs(60);
 /// How many answered call ids are remembered, so a call the server re-sends
 /// after a reconnect runs once.
 const SEEN: usize = 128;
 
 /// What a call asks of the window.
 pub enum HostToolRequest {
-    /// Show a page as `gentle-open` does.
-    OpenPage(String),
+    /// Show a page as `gentle-open` does; where it opened, or why it
+    /// couldn't, goes to `reply`.
+    OpenPage {
+        url: String,
+        reply: mpsc::Sender<Result<tools::PageOpened, String>>,
+    },
     /// A `gentle-browser` operation; its answer goes to `reply`.
     Browser {
         op: serde_json::Value,
@@ -379,12 +386,20 @@ impl SessionView {
         };
         let work: Box<dyn FnOnce() -> Outcome + Send> = match call {
             Call::OpenPage(url) => {
-                cx.emit(SessionEvent::HostTool(HostToolRequest::OpenPage(
-                    url.clone(),
-                )));
-                let answer = Outcome::text(format!("Opened {url} for the user."));
-                self.answer_host_call(call_id, tool, answer, cx);
-                return;
+                let (reply, answer) = mpsc::channel();
+                cx.emit(SessionEvent::HostTool(HostToolRequest::OpenPage {
+                    url: url.clone(),
+                    reply,
+                }));
+                Box::new(move || match answer.recv_timeout(PAGE_ANSWER) {
+                    Ok(opened) => tools::page_outcome(&url, opened),
+                    Err(mpsc::RecvTimeoutError::Timeout) => Outcome::text(format!(
+                        "Asked the app to open {url} for the user; it is still opening."
+                    )),
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        tools::unavailable("open_page", "no window took the page")
+                    }
+                })
             }
             Call::Browser { op, screenshot } => {
                 let (reply, answer) = mpsc::channel();

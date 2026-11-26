@@ -252,7 +252,7 @@ A server session can't use the app's files, so the tools that need this computer
 
 | Tool | Offered when | Runs | Answers with |
 |---|---|---|---|
-| `open_page` | always | the window's tray, or the user's browser per Devices › Browser; a server-loopback URL through a forward | text |
+| `open_page` | always | a card shown in the window, or the user's browser per Devices › Browser; a server-loopback URL through a forward | text: where it opened, or why it couldn't |
 | `browser` | always | the window's browser driver (`gentle-browser`'s operations) | text, screenshots as images |
 | `screen` | always | `gentle-screen` on this computer (launch, click, type, …) | text, screenshots as images |
 | `canvas_read` / `canvas_edit` / `canvas_shot` | the agent sits beside a canvas | the open canvas, in-process | text, shot as image |
@@ -264,7 +264,7 @@ A server session can't use the app's files, so the tools that need this computer
 All of them need the server's Desktop RPC to advertise `set_host_tools`; without it the session runs with no app tools.
 
 - **Host tools: the app's tools, run here.** A server session gets neither the app's `agent-instructions.md` nor its extensions (they are files on this computer). Instead, when its Gentle Shell advertises `set_host_tools` (Desktop RPC, `gentle-shell.desktop-rpc/v1`), the tab offers the app's tools as host tools once the channel's `capabilities` answer, and again after the stream reconnects or the session switches (`features/session/host_tools.rs`): `set_host_tools { provider: "desktop", tools }` (the server replaces `provider` with this device's id). The tools and their guidance (`features/host_tools.rs`: description plus `guidelines`, which Gentle Shell hands to the model as Pi's tool guidelines while they are registered) are:
-  - `open_page { url }`: what `gentle-open` does — the page opens in the window's tray, or in the user's browser when Configuration › Devices › Browser says so. A URL on the server's loopback opens through a forward (above); the guidelines tell the agent to pass its dev server's `localhost` URL as it is, over plain HTTP.
+  - `open_page { url }`: what `gentle-open` does — the page's card shows at once in the window (and in its tray), or the page opens in the user's browser when Configuration › Devices › Browser says so. A URL on the server's loopback opens through a forward (above). The window answers the call (`HostToolRequest::OpenPage`'s `reply`) once it knows: the result says "in the Gentle Shell app's browser" or "in their own web browser", or is an error with the server's reason, so the agent never tells the user the wrong place. The guidelines tell the agent to pass its dev server's `localhost` URL as it is, over plain HTTP.
   - `browser { op, … }`: `gentle-browser`'s operations (open, tabs, goto, back, forward, reload, state, eval, snapshot, the element actions, wait, screenshot, pick, close, release), run by the window's driver (`Workspace::browser_request`, as the single-instance server runs them for the CLI). A screenshot comes back as an image.
   - `screen { op, … }`: `gentle-screen`'s operations (launch, windows, screenshot, click, type, key, scroll, quit), run in this process (`screen::cli::run_op`) on this computer; its description says so (a `launch` command and `cwd` are this computer's). A screenshot comes back as an image.
   - `canvas_read`, `canvas_edit`, `canvas_shot`: only for an agent opened beside a canvas. The open canvas answers in-process (`CanvasView` subscribes to its agent's `SessionEvent::HostTool`) with the same `gentle_core::canvas::agent` answers the `.agent` folder gets; a shot comes back as an image. The canvas extension's per-turn role section becomes `canvas_read`'s guidelines.
@@ -773,11 +773,11 @@ An MCP server's own UI (a tool with `_meta.ui.resourceUri` pointing at a `ui://`
 
 ## Web apps and the in-app browser
 
-`features/browser/` is a general system web view now, not only Gentle Design's canvas. It shows any `http(s)` page in its own floating card; the design canvas, web apps and device cards all live in the same tileable stage list, and the ones an agent opened wait in the instance tray (see Stages and the instance tray).
+`features/browser/` is a general system web view now, not only Gentle Design's canvas. It shows any `http(s)` page in its own floating card; the design canvas, web apps and device cards all live in the same tileable stage list. A page an agent asked to show (`gentle-open`, `open_page`) shows at once; one it only mentioned (a URL in a tool's output, the design canvas) waits in the instance tray (see Stages and the instance tray).
 
 | Entry point | What happens |
 | --- | --- |
-| `gentle-open <url>` | A generated shim in `<data dir>/gentle-shell-gpui/toolchain/bin` (`.cmd` on Windows), written at startup by `platform/shims.rs` with `gentle-device`. It runs `<app> --open-url <url>`, which forwards an `OpenRequest` with `url` through the single-instance server to the running window. The agent's shell PATH already contains that `toolchain/bin` via `pi_rpc::child_path()`. |
+| `gentle-open <url>` | A generated shim in `<data dir>/gentle-shell-gpui/toolchain/bin` (`.cmd` on Windows), written at startup by `platform/shims.rs` with `gentle-device`. It runs `<app> --open-url <url>`, which forwards an `OpenRequest` with `url` through the single-instance server to the running window, where its card shows at once. The agent's shell PATH already contains that `toolchain/bin` via `pi_rpc::child_path()`. |
 | `/web <url>` | A composer built-in. It emits `SessionEvent::OpenWeb` without sending a prompt to Gentle Shell; the card shows at once. |
 | A shell tool prints a URL | `gentle_core::web::loopback_url` scans the tool's command, result text and extension `notify` messages; only `localhost`, `127.0.0.1` and `[::1]` URLs count (`SessionEvent::AgentWeb`), so a dev server (`Vite`, `Next`, `python -m http.server`, …) appears in the instance tray without asking. Public URLs require the explicit tool. A URL that is already open reuses its card; a new URL adds another one, so the agent can keep a web build and a mobile build visible together. |
 

@@ -599,6 +599,29 @@ pub fn unavailable(tool: &str, why: &str) -> Outcome {
     ))
 }
 
+/// Where the window showed a page `open_page` asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PageOpened {
+    /// In its card in the app, shown.
+    InApp,
+    /// In the user's browser (Configuration › Devices › Browser).
+    InBrowser,
+}
+
+/// What `open_page` of `url` answers: where the page opened, or why it
+/// couldn't.
+pub fn page_outcome(url: &str, opened: Result<PageOpened, String>) -> Outcome {
+    match opened {
+        Ok(PageOpened::InApp) => Outcome::text(format!(
+            "Opened {url} for the user in the Gentle Shell app's browser, where they can see it."
+        )),
+        Ok(PageOpened::InBrowser) => Outcome::text(format!(
+            "Opened {url} for the user in their own web browser."
+        )),
+        Err(why) => Outcome::error(format!("Couldn't open {url} for the user: {why}")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -703,6 +726,31 @@ mod tests {
         let server = text(Place::Server);
         assert!(server.contains("the server's authenticated forward"));
         assert!(server.contains("not the machine you run on"));
+    }
+
+    /// The result says where the page went, so the agent never tells the
+    /// user it opened in their browser when it shows in the app.
+    #[test]
+    fn open_page_says_where_the_page_opened() {
+        let text = |outcome: Outcome| match &outcome.content[..] {
+            [HostToolContent::Text { text }] => (text.clone(), outcome.is_error),
+            other => panic!("{other:?}"),
+        };
+        let (app, error) = text(page_outcome(
+            "http://localhost:5173/",
+            Ok(PageOpened::InApp),
+        ));
+        assert!(!error);
+        assert!(app.contains("in the Gentle Shell app") && !app.contains("their own"));
+        let (browser, error) = text(page_outcome("http://x.dev/", Ok(PageOpened::InBrowser)));
+        assert!(!error);
+        assert!(browser.contains("in their own web browser") && !browser.contains("app"));
+        let (refused, error) = text(page_outcome(
+            "http://localhost:5173/",
+            Err("The session has ended.".into()),
+        ));
+        assert!(error);
+        assert!(refused.ends_with("The session has ended."));
     }
 
     #[test]

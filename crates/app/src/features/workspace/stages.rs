@@ -1,14 +1,16 @@
-//! Floating web pages and the title bar's instance tray. What an agent opens
-//! (a dev server's URL, the design canvas, `gentle-open`) starts hidden in the
-//! tray, so the window never rearranges on its own; the user looks at it from
-//! the tray's circle. What the user opens (`/web`) shows at once. A hidden
-//! page costs nothing: it has no native view. Simulators and emulators have
-//! their own panel (`features::devices`).
+//! Floating web pages and the title bar's instance tray. A page an agent
+//! only mentions (a dev server's URL in a tool's output, the design canvas)
+//! starts hidden in the tray, so the window never rearranges on its own; the
+//! user looks at it from the tray's circle. A page someone asked to show
+//! (`/web`, `open_page`, `gentle-open`) shows at once. A hidden page costs
+//! nothing: it has no native view. Simulators and emulators have their own
+//! panel (`features::devices`).
 
 use super::*;
 use crate::features::browser::{
     BrowserEvent, BrowserPanel, CanvasNotice, card_layout, external, set_card_layout,
 };
+use crate::features::host_tools::PageOpened;
 use crate::shared::floating;
 use gentle_core::browser::CardLayout;
 use gentle_core::web::same_page;
@@ -73,19 +75,27 @@ fn address(url: &str) -> String {
 pub(super) enum PageFrom {
     /// `/web <url>` typed in the tab: shown at once.
     User { url: String },
-    /// `gentle-open` or `open_page`, or (`once`) a URL picked out of a
-    /// tool's output or a notice.
-    Agent { url: String, once: bool },
+    /// `gentle-open` or `open_page`, shown at once; or (`once`) a URL picked
+    /// out of a tool's output or a notice, kept in the tray. `reply` hears
+    /// where it opened, or why it couldn't (`open_page`'s result).
+    Agent {
+        url: String,
+        once: bool,
+        reply: Option<PageReply>,
+    },
     /// Gentle Design's canvas.
     Design(CanvasNotice),
 }
+
+/// Where an agent's page opened, or why it couldn't.
+pub(super) type PageReply = std::sync::mpsc::Sender<Result<PageOpened, String>>;
 
 impl PageFrom {
     /// The same page at `url` (a forward's link to it).
     fn at(self, url: String) -> Self {
         match self {
             Self::User { .. } => Self::User { url },
-            Self::Agent { once, .. } => Self::Agent { url, once },
+            Self::Agent { once, reply, .. } => Self::Agent { url, once, reply },
             Self::Design(CanvasNotice::Open { refreshed, .. }) => {
                 Self::Design(CanvasNotice::Open { url, refreshed })
             }
@@ -112,9 +122,10 @@ impl Workspace {
     }
 
     /// Show a page in its own card. `reveal` is false for pages an agent
-    /// opened (a dev server's URL, `gentle-open`): those wait in the tray. A
-    /// page that is already open (the design canvas too) reuses its card;
-    /// a web page reloads. `source`: the server page `url` forwards to.
+    /// only mentioned (a dev server's URL in a tool's output): those wait in
+    /// the tray. A page that is already open (the design canvas too) reuses
+    /// its card; a web page reloads. `source`: the server page `url`
+    /// forwards to.
     pub(super) fn open_web(
         &mut self,
         url: String,
@@ -144,12 +155,13 @@ impl Workspace {
         self.add_stage(panel, origin, reveal, window, cx);
     }
 
-    /// A page an agent opened (`gentle-open`, a dev server's URL in a tool's
-    /// output): in the tray, or in the browser outside the app when
-    /// Configuration › Devices › Browser says so. `once`: a URL picked out
-    /// of a tool's output or a notice, which only opens outside the first
-    /// time this window sees it. `source`: the server page `url` forwards
-    /// to, which `once` goes by.
+    /// A page an agent opened: in its card, or in the browser outside the
+    /// app when Configuration › Devices › Browser says so. `once`: a URL
+    /// picked out of a tool's output or a notice, which waits hidden in the
+    /// tray, and only opens outside the first time this window sees it;
+    /// otherwise the agent asked to show it (`gentle-open`, `open_page`) and
+    /// its card shows at once. `source`: the server page `url` forwards to,
+    /// which `once` goes by. Says where it went.
     pub(super) fn open_agent_page(
         &mut self,
         url: String,
@@ -158,15 +170,16 @@ impl Workspace {
         once: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
+    ) -> PageOpened {
         if external::agent_pages(cx).outside() {
             let seen = source.unwrap_or_else(|| url.clone());
-            if !self.opened_outside.insert(seen) && once {
-                return;
+            if self.opened_outside.insert(seen) || !once {
+                external::open(&url, cx);
             }
-            external::open(&url, cx);
+            PageOpened::InBrowser
         } else {
-            self.open_web(url, source, origin, false, window, cx);
+            self.open_web(url, source, origin, !once, window, cx);
+            PageOpened::InApp
         }
     }
 
@@ -235,16 +248,19 @@ impl Workspace {
     ) {
         match from {
             PageFrom::User { url } => self.open_web(url, source, Some(origin), true, window, cx),
-            PageFrom::Agent { url, once } => {
-                self.open_agent_page(url, source, Some(origin), once, window, cx)
+            PageFrom::Agent { url, once, reply } => {
+                let opened = self.open_agent_page(url, source, Some(origin), once, window, cx);
+                if let Some(reply) = reply {
+                    let _ = reply.send(Ok(opened));
+                }
             }
             PageFrom::Design(canvas) => self.show_design_canvas(canvas, source, origin, window, cx),
         }
     }
 
     /// The server didn't forward `url`: its card says `why` (in the tray,
-    /// unless the user asked for the page). With agent pages opening
-    /// outside the app, the window's notices do.
+    /// unless someone asked to show the page). With agent pages opening
+    /// outside the app, the window's notices do. An `open_page` hears why.
     fn refuse_page(
         &mut self,
         from: PageFrom,
@@ -256,6 +272,13 @@ impl Workspace {
     ) {
         let design = matches!(from, PageFrom::Design(_));
         let user = matches!(from, PageFrom::User { .. });
+        let asked = user || matches!(from, PageFrom::Agent { once: false, .. });
+        if let PageFrom::Agent {
+            reply: Some(reply), ..
+        } = &from
+        {
+            let _ = reply.send(Err(why.clone()));
+        }
         if !user && external::agent_pages(cx).outside() {
             let source = self.pane_title(origin);
             let message = format!("Couldn't open {url}: {why}");
@@ -283,7 +306,7 @@ impl Workspace {
         let label = design.then(|| "Design canvas".to_string());
         let panel = card.unwrap_or_else(|| {
             let panel = cx.new(|cx| BrowserPanel::new(url.clone(), label, cx));
-            self.add_stage(panel.clone(), Some(origin), user, window, cx);
+            self.add_stage(panel.clone(), Some(origin), asked, window, cx);
             panel
         });
         panel.update(cx, |panel, cx| {
@@ -1185,7 +1208,7 @@ mod tests {
     use gpui_kit::{App, AppContext as _, Entity, Task, TestAppContext, Window, WindowOptions};
 
     use super::super::{DevicePanel, Invisible, Music, Notices, Space, Workspace};
-    use super::PageFrom;
+    use super::{PageFrom, PageOpened};
     use crate::features::browser::CanvasNotice;
     use crate::features::workspaces::TabLayout;
 
@@ -1281,6 +1304,7 @@ mod tests {
                 let from = PageFrom::Agent {
                     url: PAGE.into(),
                     once: false,
+                    reply: None,
                 };
                 w.refuse_page(from, PAGE.into(), WHY.into(), 1, window, cx)
             });
@@ -1301,6 +1325,52 @@ mod tests {
             assert_eq!(panel.refusal(), None);
             assert_eq!(panel.url(), "http://pc:40001/?gs_ticket=b");
             assert_eq!(panel.source(), PAGE);
+        });
+    }
+
+    /// `open_page` shows its card at once and says it opened in the app; a
+    /// URL only picked out of a tool's output waits hidden in the tray. A
+    /// page the server didn't forward tells `open_page` why.
+    #[gpui::test]
+    fn a_page_the_agent_asked_for_shows_at_once(cx: &mut TestAppContext) {
+        with_workspace(cx, |workspace, window, cx| {
+            let (reply, answer) = std::sync::mpsc::channel();
+            workspace.update(cx, |w, cx| {
+                let asked = PageFrom::Agent {
+                    url: "http://pc:40001/?gs_ticket=a".into(),
+                    once: false,
+                    reply: Some(reply.clone()),
+                };
+                w.show_page(asked, Some("http://localhost:5173/".into()), 1, window, cx);
+                let found = PageFrom::Agent {
+                    url: "http://localhost:3000/".into(),
+                    once: true,
+                    reply: None,
+                };
+                w.show_page(found, None, 1, window, cx);
+            });
+            assert_eq!(answer.try_recv(), Ok(Ok(PageOpened::InApp)));
+            let shown: Vec<bool> = workspace
+                .read(cx)
+                .stages
+                .iter()
+                .map(|stage| stage.shown)
+                .collect();
+            assert_eq!(shown, [true, false]);
+
+            workspace.update(cx, |w, cx| {
+                let asked = PageFrom::Agent {
+                    url: "http://localhost:8080/".into(),
+                    once: false,
+                    reply: Some(reply),
+                };
+                let why = "The session has ended.".to_string();
+                w.refuse_page(asked, "http://localhost:8080/".into(), why, 1, window, cx)
+            });
+            assert_eq!(answer.try_recv(), Ok(Err("The session has ended.".into())));
+            let workspace = workspace.read(cx);
+            assert!(workspace.stages[2].shown);
+            assert!(workspace.stages[2].panel.read(cx).refusal().is_some());
         });
     }
 

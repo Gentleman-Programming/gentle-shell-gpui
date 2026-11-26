@@ -242,6 +242,7 @@ impl Workspace {
                 let from = super::stages::PageFrom::Agent {
                     url: url.clone(),
                     once: true,
+                    reply: None,
                 };
                 self.open_session_page(session, from, id, window, cx)
             }
@@ -249,10 +250,11 @@ impl Workspace {
             // `gentle-browser` as the app's own commands run them. The
             // canvas this agent floats over answers its canvas tools.
             SessionEvent::HostTool(request) => match request {
-                crate::features::session::HostToolRequest::OpenPage(url) => {
+                crate::features::session::HostToolRequest::OpenPage { url, reply } => {
                     let from = super::stages::PageFrom::Agent {
                         url: url.clone(),
                         once: false,
+                        reply: Some(reply.clone()),
                     };
                     self.open_session_page(session, from, id, window, cx)
                 }
