@@ -32,6 +32,7 @@ use gpui_kit::*;
 
 use super::{file_icon, human_size, language, mermaid};
 use crate::features::backend;
+use crate::shared::diff_fit::DiffFit;
 use crate::shared::pane::{CloseViewer, ShowInPane};
 use crate::shared::ui;
 
@@ -100,8 +101,8 @@ pub struct FileView {
     focus: FocusHandle,
     /// The header's width in the last frame, for fitting its facts.
     header_width: Rc<Cell<f32>>,
-    /// The diff's size in the last frame (see the canvas beside it).
-    diff_size: Rc<Cell<Size<Pixels>>>,
+    /// Redraws once the diff has measured itself (see [`DiffFit`]).
+    diff_fit: DiffFit,
     /// How a diff shows its two sides (Unified until the header's toggle or
     /// [`Self::set_diff_mode`] picks another).
     diff_mode: DiffMode,
@@ -241,7 +242,7 @@ impl FileView {
             markdown: None,
             focus: cx.focus_handle(),
             header_width: Rc::default(),
-            diff_size: Rc::default(),
+            diff_fit: DiffFit::default(),
             diff_mode: DiffMode::Unified,
             diff_wrap: None,
         };
@@ -450,7 +451,7 @@ impl FileView {
             markdown: None,
             focus: cx.focus_handle(),
             header_width: Rc::default(),
-            diff_size: Rc::default(),
+            diff_fit: DiffFit::default(),
             diff_mode: DiffMode::Unified,
             diff_wrap: None,
         };
@@ -582,7 +583,7 @@ impl FileView {
                 let mode = self.diff_mode;
                 self.body = Body::Diff(cx.new(|cx| DiffState::new([file], cx).with_mode(mode)));
                 // A new diff hasn't measured itself yet.
-                self.diff_size.set(Size::default());
+                self.diff_fit.reset();
             }
             Err(notice) => self.show_notice(notice),
         }
@@ -1432,43 +1433,19 @@ impl Render for FileView {
                     _ => code().into_any_element(),
                 }
             }
-            Body::Diff(state) => {
-                // The diff widens its rows to the size it records while
-                // painting and asks for a frame to apply it, but GPUI
-                // drops a request made mid-frame: rows stayed as wide as
-                // their text until something else redrew. Redraw once
-                // after the diff appears or changes size.
-                let size = self.diff_size.clone();
-                let view = cx.entity_id();
-                div()
-                    .relative()
-                    .size_full()
-                    .child(
-                        Diff::new(state)
-                            .header_visible(false)
-                            .hover_highlight(DiffHoverHighlight::Line)
-                            // Side by side, each side wraps to its half of the pane:
-                            // unwrapped, the widest line sets both columns and pushes
-                            // the new side out of view.
-                            .soft_wrap(self.diff_wraps())
-                            .size_full(),
-                    )
-                    // After the diff in prepaint order, so it has recorded
-                    // this frame's size.
-                    .child(
-                        canvas(
-                            move |bounds, _, cx| {
-                                if size.replace(bounds.size) != bounds.size {
-                                    cx.defer(move |cx| cx.notify(view));
-                                }
-                            },
-                            |_, _, _, _| {},
-                        )
-                        .absolute()
-                        .size_full(),
-                    )
-                    .into_any_element()
-            }
+            Body::Diff(state) => self
+                .diff_fit
+                .fill(
+                    Diff::new(state)
+                        .header_visible(false)
+                        .hover_highlight(DiffHoverHighlight::Line)
+                        // Side by side, each side wraps to its half of the pane:
+                        // unwrapped, the widest line sets both columns and pushes
+                        // the new side out of view.
+                        .soft_wrap(self.diff_wraps()),
+                    cx.entity_id(),
+                )
+                .into_any_element(),
             Body::Notice {
                 icon,
                 title,
