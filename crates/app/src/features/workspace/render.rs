@@ -180,7 +180,7 @@ impl Render for Workspace {
         let vertical_tabs = self.tab_layout == TabLayout::Vertical;
         let left_rail = profile.has(ToolPlacement::Left);
         let right_rail = profile.has(ToolPlacement::Right);
-        let expanded = self.layout_profiles.active == workspaces::LayoutPreset::Expanded;
+        let title_utilities = profile.title_utilities;
         let navigation_visible = self.navigation_visible();
         let window_px_at_100 =
             f32::from(window.viewport_size().width) / (f32::from(window.rem_size()) / 16.);
@@ -309,9 +309,14 @@ impl Render for Workspace {
                                             this.open_empty_area_menu(event.position, window, cx);
                                         }),
                                     )
-                                    .child(self.render_workspace_chip(cx))
-                                    .when(vertical_tabs, |row| {
+                                    .when(tabs_visible || navigation_visible, |row| {
+                                        row.child(self.render_workspace_chip(cx))
+                                    })
+                                    .when(tabs_visible && vertical_tabs, |row| {
                                         row.child(self.new_tab_button("title-new-tab", None, cx))
+                                    })
+                                    .when(!tabs_visible && !navigation_visible, |row| {
+                                        row.child(div().text_sm().text_color(ui::muted()).child("Gentle Shell"))
                                     })
                                     .when(tabs_visible && !vertical_tabs, |row| {
                                         row.child(
@@ -337,7 +342,7 @@ impl Render for Workspace {
                                     // Tern keeps pane layout in the title bar, so
                                     // panes carry no header: one menu acts on the
                                     // focused pane, each entry with its shortcut.
-                                    .when(expanded && self.tab().is_some(), |d| {
+                                    .when(title_utilities && self.tab().is_some(), |d| {
                                         d.child(self.render_layout_menu(cx)).child(
                                             div()
                                                 .w(px(1.))
@@ -367,11 +372,11 @@ impl Render for Workspace {
                                             )
                                         },
                                     )
-                                    .when(expanded, |d| {
+                                    .when(title_utilities, |d| {
                                         d.children(crate::features::music::title_button(&self.music, cx))
                                             .children(self.render_tray(cx))
                                     })
-                                    .when(expanded, |d| d.child({
+                                    .when(title_utilities, |d| d.child({
                                         let weak = cx.entity().downgrade();
                                         div()
                                             .on_mouse_down(MouseButton::Left, |_, _, cx| {
