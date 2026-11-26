@@ -1,9 +1,16 @@
 //! Configuration: everything the user's Gentle Shell is already set up with,
 //! read from the same homes the launcher uses, plus package management
-//! (`gentle-shell install|remove`) and the Claude bridge's plan.
+//! (`gentle-shell install|remove`) and the Claude bridge's plan. It is about
+//! one machine at a time, "Settings for" at its top (this computer, its WSL
+//! distro or command environment, or a paired Gentle Shell server; the
+//! active workspace's first): every page reads and writes that machine's,
+//! its blocking work inside `backend::on` ([`on_machine`]). On a Gentle
+//! Shell server it reads only what that server's Gentle Shell reports over
+//! Desktop RPC, through a control session ([`remote`]).
 
 use std::path::PathBuf;
 
+use gentle_core::backend::Backend;
 use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::*;
 
@@ -30,7 +37,13 @@ mod notifications;
 mod packages;
 mod pages;
 mod reading_desk;
+pub(crate) mod remote;
 mod runs_on;
+pub(crate) use runs_on::{ConnectEvent, ServerConnect};
+mod server_documents;
+mod server_packages;
+mod server_sign_in;
+mod server_upgrade;
 mod services;
 mod shell_config;
 mod shell_status;
@@ -49,8 +62,11 @@ use navigation::SettingsPage;
 use snapshot::Snapshot;
 
 pub struct SettingsView {
+    /// The machine these settings are for ("Settings for").
+    machine: Backend,
+    /// The machines "Settings for" offers.
+    machines: Vec<Backend>,
     cwd: PathBuf,
-    /// Tab placement is owned and persisted by the workspace.
     tab_layout: TabLayout,
     page: SettingsPage,
     body_scroll: ScrollHandle,
@@ -92,9 +108,15 @@ pub struct SettingsView {
     theme_share: theme::ThemeShare,
     /// Fonts: the open picker, its search and cursor.
     fonts: fonts::FontsUi,
-    /// Active agent tab, if available, for the new Desktop RPC update status.
+    /// The session Gentle Shell's own answers come from: the active agent
+    /// tab, or on a server, a dedicated one ([`remote::ControlSession`]).
+    control: remote::ControlSession,
+    /// [`Self::control`]'s session, if any.
     session: Option<Entity<crate::features::session::SessionView>>,
     _session_sub: Option<Subscription>,
+    /// [`SettingsEvent::Reopen`] was sent because the tab asked stopped
+    /// answering: once is enough.
+    reopening: bool,
     /// RPC status and its in-flight ticket; separate from upgrade UI state.
     shell_updates: upgrade::ShellUpdates,
     /// Gentle Shell's settings stores (persona, banner, notifications) as
@@ -107,12 +129,30 @@ pub struct SettingsView {
     sign_ins: sign_ins::SignIns,
     /// Where agents run: this computer, a WSL distro or a command.
     runs_on: runs_on::RunsOn,
+    /// Models › Sign-ins on a server: signing in, keys, removals.
+    server_sign_in: server_sign_in::ServerSignIn,
+    /// Extensions › Packages on a server: the list and the job running.
+    server_packages: server_packages::ServerPackages,
+    /// Updates on a server: whether this device may upgrade it, and how.
+    server_upgrade: server_upgrade::ServerUpgradeUi,
+    /// The control session's model list as last shown (the server's
+    /// default-model menu offers it).
+    server_models_rev: u64,
+    /// Models › Custom models and Integrations › MCP servers on a server:
+    /// the document open in the editor.
+    server_documents: server_documents::ServerDocuments,
 }
 
 impl EventEmitter<SettingsEvent> for SettingsView {}
 
 impl SettingsView {
+    /// Configuration for `machine`, one of `machines` (what "Settings for"
+    /// offers), opened on `cwd` (a folder there) with the agent tab
+    /// `session` the window picked (asked only when it runs on `machine`,
+    /// and on a server only while it answers).
     pub fn new(
+        machine: Backend,
+        machines: Vec<Backend>,
         cwd: PathBuf,
         tab_layout: TabLayout,
         session: Option<Entity<crate::features::session::SessionView>>,
@@ -139,11 +179,16 @@ impl SettingsView {
                 _ => {}
             },
         );
-        let setup = cx.new(crate::features::onboarding::OnboardingView::embedded);
+        let setup =
+            cx.new(|cx| crate::features::onboarding::OnboardingView::embedded(machine.clone(), cx));
+        let control = remote::ControlSession::open(session, &machine, &cwd, window, cx);
+        let session = control.session().cloned();
         let setup_sub = cx.subscribe(&setup, |_, _, event, cx| {
             cx.emit(SettingsEvent::Setup(event.clone()));
         });
         let mut this = Self {
+            machine,
+            machines,
             cwd,
             tab_layout,
             page: SettingsPage::default(),
@@ -174,11 +219,18 @@ impl SettingsView {
                 .as_ref()
                 .map(|session| cx.observe(session, |this, _, cx| this.session_changed(cx))),
             session,
+            reopening: false,
+            control,
             shell_updates: upgrade::ShellUpdates::default(),
             shell_config: shell_config::ShellConfig::default(),
             shell_status: shell_status::ShellStatusRead::default(),
             sign_ins: sign_ins::SignIns::default(),
             runs_on: runs_on::RunsOn::new(window, cx),
+            server_sign_in: server_sign_in::ServerSignIn::new(window, cx),
+            server_packages: server_packages::ServerPackages::default(),
+            server_upgrade: server_upgrade::ServerUpgradeUi::default(),
+            server_models_rev: 0,
+            server_documents: server_documents::ServerDocuments::default(),
         };
         this.reload(cx);
         this.refresh_maestro(cx);
@@ -195,9 +247,22 @@ impl SettingsView {
         self.setup.read(cx).usable()
     }
 
+    /// The session Gentle Shell's answers come from (see
+    /// [`remote::ControlSession`]): where a setting the screen applies with
+    /// a Gentle Shell command runs.
+    pub fn control_session(&self) -> Option<Entity<crate::features::session::SessionView>> {
+        self.session.clone()
+    }
+
     /// Open on the Updates page, where this app's update is installed.
     pub fn show_updates(&mut self, cx: &mut Context<Self>) {
         self.navigate_to(SettingsPage::Updates, cx);
+    }
+
+    /// Open on the Models page, where a server's sign-ins are (the
+    /// Providers screen of a server folder).
+    pub fn show_models(&mut self, cx: &mut Context<Self>) {
+        self.navigate_to(SettingsPage::Models, cx);
     }
 
     /// Reuse a single navigation path for the sidebar, compact picker and search.
@@ -207,6 +272,7 @@ impl SettingsView {
             self.page = page;
             self.body_scroll.scroll_to_item(0);
         }
+        self.login_page_shown(page == SettingsPage::Models, cx);
         cx.notify();
     }
 
@@ -217,11 +283,59 @@ impl SettingsView {
     /// The active agent tab changed: its probe answered, or a Desktop answer
     /// or event arrived.
     fn session_changed(&mut self, cx: &mut Context<Self>) {
+        if self.control.lost(cx) {
+            if !std::mem::replace(&mut self.reopening, true) {
+                cx.emit(SettingsEvent::Reopen(self.machine.clone()));
+            }
+            return;
+        }
         self.update_status_changed(cx);
         self.shell_status_changed(cx);
         self.shell_config_changed(cx);
         self.background_changed(cx);
         self.sign_ins_changed(cx);
+        self.permission_changed(cx);
+        self.server_accounts_changed(cx);
+        self.server_models_changed(cx);
+    }
+
+    /// The server's models came in (or changed): the default-model menu
+    /// shows them.
+    fn server_models_changed(&mut self, cx: &mut Context<Self>) {
+        let Some(session) = self.session.as_ref().filter(|_| self.server().is_some()) else {
+            return;
+        };
+        let rev = session.read(cx).models_rev();
+        if rev != self.server_models_rev {
+            self.server_models_rev = rev;
+            cx.notify();
+        }
+    }
+
+    /// The server agents run on, when they do: what Configuration can't do
+    /// from this computer says where to do it instead.
+    fn server(&self) -> Option<&remote::ServerPlace> {
+        self.control.server()
+    }
+
+    /// On a server, the permission default its Gentle Shell reported
+    /// (`get_permission_mode`); there is no file of it to read here.
+    fn permission_changed(&mut self, cx: &mut Context<Self>) {
+        if self.server().is_none() {
+            return;
+        }
+        let reported = self
+            .session
+            .as_ref()
+            .and_then(|session| session.read(cx).reported_default_mode())
+            .map(|mode| mode.id().to_string());
+        if let Some(snapshot) = self.snapshot.as_mut()
+            && reported.is_some()
+            && snapshot.permission_mode != reported
+        {
+            snapshot.permission_mode = reported;
+            cx.notify();
+        }
     }
 
     /// Show what the active tab's Gentle Shell reported over what the files
@@ -239,6 +353,12 @@ impl SettingsView {
                 .state(pi_rpc::desktop_rpc::ConfigStore::Banner)
             {
                 snapshot.banner = state.value.as_ref().map(snapshot::describe_banner);
+            }
+            if let Some(state) = self
+                .shell_config
+                .state(pi_rpc::desktop_rpc::ConfigStore::Profiles)
+            {
+                (snapshot.active_profile, snapshot.profiles) = shell_config::profiles_of(state);
             }
             if let Some(state) = &self.background.shell {
                 let project_file = snapshot.background_subagents.project_file.clone();
@@ -267,16 +387,56 @@ impl SettingsView {
         self.ask_shell_config(cx);
         self.ask_sign_ins(cx);
         self.ask_background(cx);
-        let cwd = self.cwd.clone();
+        if self.server().is_some() {
+            self.server_packages.forget_list();
+            self.ask_server_packages(cx);
+            self.ask_server_upgrade(cx);
+        }
+        let (cwd, machine) = (self.cwd.clone(), self.machine.clone());
+        let server = self.server().cloned();
         self._load = cx.spawn(async move |this, cx| {
-            let snapshot = cx
-                .background_executor()
-                .spawn(async move { services::snapshot::load(&cwd, shell_updates) })
-                .await;
+            let snapshot = on_machine(cx.background_executor(), &machine, move || {
+                services::snapshot::load(&cwd, shell_updates, server.as_ref())
+            })
+            .await;
             let _ = this.update(cx, |this, cx| {
                 this.snapshot = Some(snapshot);
                 this.adopt_shell(cx);
+                this.permission_changed(cx);
             });
         });
     }
+
+    /// The machine these settings are for.
+    pub fn machine(&self) -> &Backend {
+        &self.machine
+    }
+
+    /// Show the page `previous` (the same screen, for another machine)
+    /// showed.
+    pub fn keep_page(&mut self, previous: &Entity<Self>, cx: &mut Context<Self>) {
+        let page = previous.read(cx).page;
+        self.navigate_to(page, cx);
+    }
+
+    /// "Settings for" picked another machine: the window opens
+    /// Configuration again for it, everything read afresh.
+    fn pick_machine(&mut self, index: usize, cx: &mut Context<Self>) {
+        if let Some(machine) = self.machines.get(index)
+            && !gentle_core::machines::same(machine, &self.machine)
+        {
+            cx.emit(SettingsEvent::Reopen(machine.clone()));
+        }
+    }
+}
+
+/// Run blocking `work` on `executor` acting on `machine` (`backend::on`):
+/// what it reads and runs is that machine's, whatever workspace is shown.
+fn on_machine<R: Send + 'static>(
+    executor: &BackgroundExecutor,
+    machine: &Backend,
+    work: impl FnOnce() -> R + Send + 'static,
+) -> Task<R> {
+    let machine = machine.clone();
+    executor.spawn(async move { crate::features::backend::on(&machine, work) })
 }

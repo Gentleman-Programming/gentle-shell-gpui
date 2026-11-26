@@ -10,6 +10,7 @@ use serde_json::json;
 
 use super::attachments::Kind;
 use super::{SessionEvent, SessionView, attachments, builtins};
+use crate::features::backend;
 use gentle_core::commands::PiBuiltin;
 
 impl SessionView {
@@ -251,7 +252,10 @@ impl SessionView {
         cx.notify();
     }
 
-    /// Read dropped or picked files off the UI thread, then attach them.
+    /// Read dropped or picked files off the UI thread, then attach them. On a
+    /// server tab a file that isn't an image is sent to the server instead
+    /// ([`attachments::upload_path`]) and named in the composer by the path
+    /// the server keeps it at.
     pub(super) fn attach_paths(
         &mut self,
         paths: Vec<PathBuf>,
@@ -261,16 +265,72 @@ impl SessionView {
         if paths.is_empty() {
             return;
         }
-        self.attach_off_thread(
-            move || {
-                paths
-                    .iter()
-                    .map(|path| attachments::load_path(path))
-                    .collect()
-            },
-            window,
-            cx,
-        );
+        let server = self.server();
+        let loading = cx.background_executor().spawn(async move {
+            let mut images = Vec::new();
+            let mut uploads = Vec::new();
+            for path in &paths {
+                match &server {
+                    Some(choice) if !attachments::is_image_file(path) => {
+                        uploads.push(attachments::upload_path(choice, path))
+                    }
+                    _ => images.push(attachments::load_path(path)),
+                }
+            }
+            (images, uploads)
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let (images, uploads) = loading.await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.attach(images, window, cx);
+                this.mention_uploads(uploads, window, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// The server this tab runs on, when it runs on one.
+    fn server(&self) -> Option<gentle_core::backend::Backend> {
+        let choice = self
+            .runs_on
+            .clone()
+            .unwrap_or_else(|| backend::for_tab(self.cwd()));
+        choice.is_server().then_some(choice)
+    }
+
+    /// Name the files sent to the server at the cursor, by their server
+    /// paths, and warn about the ones that weren't sent.
+    fn mention_uploads(
+        &mut self,
+        uploads: Vec<Result<String, String>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut failed = Vec::new();
+        let mut mentions = Vec::new();
+        for upload in uploads {
+            match upload {
+                Ok(path) => mentions.push(attachments::path_mention(&path)),
+                Err(message) => failed.push(message),
+            }
+        }
+        if !mentions.is_empty() {
+            self.composer.update(cx, |state, cx| {
+                let value = state.value();
+                let before = value[..state.cursor().min(value.len())].chars().next_back();
+                let lead = if attachments::needs_lead(before) {
+                    " "
+                } else {
+                    ""
+                };
+                state.insert(format!("{lead}{} ", mentions.join(" ")), window, cx);
+                state.focus(window, cx);
+            });
+        }
+        for message in failed {
+            self.warn(message, window, cx);
+        }
+        cx.notify();
     }
 
     /// Run `load` on the background executor, then attach what it read.
@@ -310,8 +370,9 @@ impl SessionView {
                 _ => {}
             }
         }
-        // Copied files that are not images paste as their names.
-        if !paths.iter().any(|p| attachments::is_image_file(p)) {
+        // Copied files that are not images paste as their names, except on
+        // a server tab, where they are sent to the server.
+        if self.server().is_none() && !paths.iter().any(|p| attachments::is_image_file(p)) {
             paths.clear();
         }
         if images.is_empty() && paths.is_empty() {

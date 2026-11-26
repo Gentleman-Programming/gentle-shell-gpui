@@ -37,6 +37,23 @@ pub(super) struct Backend {
     pub(super) pending_session: Option<PathBuf>,
     /// A new Gentle Shell was installed mid-turn: restart on it once idle.
     pub(super) restart_pending: bool,
+    /// The Gentle Shell server session a restored tab reattaches to when it
+    /// starts (it kept running while the app was closed).
+    pub(super) attach: Option<gentle_core::serve::ServerSession>,
+    /// The Gentle Shell server has no such folder (`invalid_cwd`): its
+    /// user's home folder there, which the failed tab offers to open
+    /// instead.
+    pub(super) server_home: Option<String>,
+    /// The agent takes the app's tools as host tools over Desktop RPC: a
+    /// server's session, or a Gentle Shell here (or in WSL, or through a
+    /// command) new enough to (`backend::takes_host_tools`), started without
+    /// the app's extensions and instructions.
+    pub(super) host_tools: bool,
+    /// On a server that offers it (capability `desktop`), this view asks the
+    /// server's session-less Desktop RPC (`PiProcess::serve_desktop`)
+    /// instead of starting a session of its own: Configuration's control
+    /// session (`settings::remote::ControlSession`).
+    pub(super) server_desktop: bool,
 }
 
 impl Backend {
@@ -49,6 +66,10 @@ impl Backend {
             pending_prompt: prompt,
             pending_session: None,
             restart_pending: false,
+            attach: None,
+            server_home: None,
+            host_tools: false,
+            server_desktop: false,
         }
     }
 
@@ -84,6 +105,22 @@ impl ModelInfo {
                 .as_array()
                 .is_none_or(|input| input.iter().any(|kind| kind == "image")),
         })
+    }
+
+    /// A model `list_available_models` listed, read as Pi's own
+    /// `get_available_models` entry would be.
+    pub(super) fn from_available(model: &pi_rpc::desktop_rpc::AvailableModel) -> Self {
+        Self {
+            provider: model.provider.clone(),
+            id: model.id.clone(),
+            name: model.name.clone().unwrap_or_else(|| model.id.clone()),
+            context_window: model.context_window.unwrap_or(0),
+            reasoning: model.reasoning.unwrap_or(false),
+            images: model
+                .input
+                .as_ref()
+                .is_none_or(|input| input.iter().any(|kind| kind == "image")),
+        }
     }
 }
 
@@ -611,7 +648,22 @@ pub(in crate::features::session) mod desktop {
                     | Some(DesktopMethod::GetProfileBinding)
                     | Some(DesktopMethod::ClearProfileBinding)
                     | Some(DesktopMethod::GetAuthStatus)
-                    | Some(DesktopMethod::ReloadCredentials) => Applied::default(),
+                    | Some(DesktopMethod::ReloadCredentials)
+                    | Some(DesktopMethod::ListAvailableModels)
+                    | Some(DesktopMethod::LoginStart)
+                    | Some(DesktopMethod::LoginComplete)
+                    | Some(DesktopMethod::LoginCancel)
+                    | Some(DesktopMethod::SetApiKey)
+                    | Some(DesktopMethod::RemoveCredentials)
+                    | Some(DesktopMethod::ListPackages)
+                    | Some(DesktopMethod::InstallPackage)
+                    | Some(DesktopMethod::RemovePackage)
+                    // Sent to a server's `/desktop`, never through this slot.
+                    | Some(DesktopMethod::SetHostTools)
+                    | Some(DesktopMethod::HostToolResult)
+                    | Some(DesktopMethod::HostToolProgress)
+                    | Some(DesktopMethod::HostMessage)
+                    | Some(DesktopMethod::SetHostContext) => Applied::default(),
                     None => Applied::default(),
                 },
                 Ok(Some(DesktopRecord::Event(event))) => {

@@ -1,6 +1,9 @@
 //! Packages: `gentle-shell install|remove`, Pi's own package manager
 //! against the resolved home. Update badges come from the active agent
-//! tab's Desktop RPC when available.
+//! tab's Desktop RPC when available. On a Gentle Shell server whose Shell
+//! lists and installs packages, that happens there ([`super::server_packages`]);
+//! on an older one the packages are those its update status lists, and
+//! installing or removing one is done there by hand.
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -56,26 +59,31 @@ impl PackageUiState {
 
 impl SettingsView {
     /// `gentle-shell install|remove <source>`: Pi's own package manager
-    /// against the resolved home.
+    /// against the resolved home. On a server, its Shell installs or
+    /// removes it there ([`Self::run_server_package`]).
     pub(super) fn run_package(
         &mut self,
         verb: &'static str,
         source: String,
         cx: &mut Context<Self>,
     ) {
+        if self.server().is_some() {
+            if matches!(verb, "install" | "remove") {
+                self.run_server_package(verb == "install", source, cx);
+            }
+            return;
+        }
         if self.package.running.is_some() || self.shell_update.blocks_packages() {
             return;
         }
         self.package.running = Some(format!("{verb} {source}"));
         self.package.log.clear();
-        let cwd = self.cwd.clone();
+        let (cwd, machine) = (self.cwd.clone(), self.machine.clone());
         self._job = cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(
-                    async move { crate::features::setup::run_gentle_shell(&cwd, &[verb, &source]) },
-                )
-                .await;
+            let result = super::on_machine(cx.background_executor(), &machine, move || {
+                crate::features::setup::run_gentle_shell(&cwd, &[verb, &source])
+            })
+            .await;
             let _ = this.update(cx, |this, cx| {
                 this.package.running = None;
                 forget_claude_auth();
@@ -104,6 +112,11 @@ impl SettingsView {
 
     /// Installed packages (remove each) and a field to install any source.
     pub(super) fn packages_section(&self, s: &Snapshot, cx: &mut Context<Self>) -> Div {
+        if let Some(server) = self.server() {
+            return self
+                .server_packages_live(server, cx)
+                .unwrap_or_else(|| self.server_packages_section(server));
+        }
         let updates = self.shell_updates.status.as_ref();
         let updating_shell = self.shell_update.blocks_packages();
         let available = updates.map_or(0, crate::features::updates::status::packages_with_updates);
@@ -263,5 +276,49 @@ impl SettingsView {
                     ),
                 )
             })
+    }
+
+    /// A server's packages, read-only: what its update status lists, and
+    /// how to update, install or remove one there.
+    fn server_packages_section(&self, server: &super::remote::ServerPlace) -> Div {
+        use super::remote::{commands, note};
+        let updates = self.shell_updates.status.as_ref();
+        let items = updates.map_or(&[][..], |status| status.packages.items.as_slice());
+        let available = updates.map_or(0, crate::features::updates::status::packages_with_updates);
+        section(IconName::Layers, "Packages")
+            .when(updates.is_none(), |d| {
+                d.child(row("Installed", format!("not reported by {}", server.name)))
+            })
+            .children(items.iter().map(|item| {
+                let update = item.state == pi_rpc::desktop_rpc::PackageUpdateState::UpdateAvailable;
+                h_flex()
+                    .gap_2()
+                    .px_2()
+                    .py_1()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(ui::code_rems(12.))
+                            .font_family(ui::mono())
+                            .text_color(ui::fg())
+                            .child(item.name.clone()),
+                    )
+                    .when_some(item.current.clone(), |d, v| {
+                        d.child(ui::chip(v, ui::info()).flex_shrink_0())
+                    })
+                    .children(
+                        crate::features::updates::status::package_chip(item).map(|text| {
+                            let color = if update { ui::accent() } else { ui::muted() };
+                            ui::chip(text, color).flex_shrink_0()
+                        }),
+                    )
+            }))
+            .when(available > 0, |d| {
+                d.child(note(server.run(commands::UPDATE_PACKAGES)))
+            })
+            .child(note(server.run(commands::INSTALL)))
+            .child(note(server.run(&commands::remove("<source>"))))
     }
 }

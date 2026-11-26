@@ -200,6 +200,7 @@ impl Workspace {
                 }
             }
             SessionEvent::OpenProviders => self.open_providers(window, cx),
+            SessionEvent::OpenServerFolder => self.open_server_folder(window, cx),
             SessionEvent::OpenScreen(screen) => {
                 self.open_screen(*screen, Some(session.clone()), window, cx)
             }
@@ -213,7 +214,8 @@ impl Workspace {
                 }
             }
             SessionEvent::DesignCanvas(canvas) => {
-                self.show_design_canvas(canvas.clone(), id, window, cx)
+                let from = super::stages::PageFrom::Design(canvas.clone());
+                self.open_session_page(session, from, id, window, cx)
             }
             SessionEvent::Device(intent) => {
                 // A device an agent starts itself still shows in the app.
@@ -228,13 +230,42 @@ impl Workspace {
                 self.devices
                     .update(cx, |panel, cx| panel.activity(command, cx));
             }
-            SessionEvent::OpenWeb(url) => self.open_web(url.clone(), Some(id), true, window, cx),
+            // In a server tab, `localhost` is the server's: forwarded too.
+            SessionEvent::OpenWeb(url) => {
+                let from = super::stages::PageFrom::User { url: url.clone() };
+                self.open_session_page(session, from, id, window, cx)
+            }
             SessionEvent::OpenFile { path, line } => {
                 self.open_file_at(path.clone(), *line, window, cx)
             }
             SessionEvent::AgentWeb(url) => {
-                self.open_agent_page(url.clone(), Some(id), true, window, cx)
+                let from = super::stages::PageFrom::Agent {
+                    url: url.clone(),
+                    once: true,
+                    reply: None,
+                };
+                self.open_session_page(session, from, id, window, cx)
             }
+            // A server session's host tools: `gentle-open` and
+            // `gentle-browser` as the app's own commands run them. The
+            // canvas this agent floats over answers its canvas tools.
+            SessionEvent::HostTool(request) => match request {
+                crate::features::session::HostToolRequest::OpenPage { url, reply } => {
+                    let from = super::stages::PageFrom::Agent {
+                        url: url.clone(),
+                        once: false,
+                        reply: Some(reply.clone()),
+                    };
+                    self.open_session_page(session, from, id, window, cx)
+                }
+                crate::features::session::HostToolRequest::Browser { op, reply } => {
+                    self.session_browser_request(session, op.clone(), reply.clone(), window, cx)
+                }
+                crate::features::session::HostToolRequest::Canvas { .. } => {}
+                crate::features::session::HostToolRequest::Device(args) => {
+                    self.device_request(&args.clone(), cx)
+                }
+            },
             SessionEvent::Notice { level, message } => {
                 let source = self.pane_title(id);
                 let (level, message) = (*level, message.clone());
@@ -319,7 +350,8 @@ impl Workspace {
             _ => (target, None),
         };
         // A terminal whose shell exits (`exit`, Ctrl-D) closes its pane; a
-        // double Ctrl+C at its idle prompt closes it as ⌘W does.
+        // double Ctrl+C at its idle prompt closes it as ⌘W does. A server
+        // terminal's id is saved with the pane once it has one.
         let subscriptions = item
             .view
             .clone()
@@ -334,6 +366,8 @@ impl Workspace {
                         match event {
                             TerminalEvent::Exited => this.close_pane_now(id, window, cx),
                             TerminalEvent::CloseRequested => this.close_pane(id, window, cx),
+                            TerminalEvent::Attached => this.schedule_save(cx),
+                            TerminalEvent::Paired => this.follow_pairing(Some(id), window, cx),
                             TerminalEvent::TitleChanged => {}
                         }
                     },
@@ -385,6 +419,35 @@ impl Workspace {
     /// The canvas pane `id` shows, if it is one.
     pub(super) fn canvas_view(&self, id: PaneId) -> Option<Entity<CanvasView>> {
         self.panes.get(&id)?.item.view.clone().downcast().ok()
+    }
+
+    /// The terminal pane `id` shows, if it is one.
+    pub(super) fn terminal_view(
+        &self,
+        id: PaneId,
+    ) -> Option<Entity<crate::features::terminal::TerminalView>> {
+        self.panes.get(&id)?.item.view.clone().downcast().ok()
+    }
+
+    /// Remove pane `id` for good: a terminal on a Gentle Shell server is
+    /// closed there too (quitting the app leaves it running, to reattach),
+    /// as a local shell ends with its pane. Dropping a session drops its
+    /// PiProcess, which shuts the backend down.
+    pub(super) fn discard_pane(&mut self, id: PaneId, cx: &App) {
+        if let Some(view) = self.terminal_view(id) {
+            view.read(cx).close(cx);
+        }
+        self.panes.remove(&id);
+    }
+
+    /// A tab closed without ever being built: the server terminals its
+    /// terminal panes had are closed there, as if they had been shown.
+    pub(super) fn discard_saved_tab(saved: &SavedTab, cx: &App) {
+        for pane in saved.layout.leaves() {
+            if let Some(id) = pane.terminal.clone() {
+                crate::features::terminal::close_on_server(&pane.cwd, id, cx);
+            }
+        }
     }
 
     /// A pane for an already built file view of `path`.
@@ -439,7 +502,9 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> Option<PaneId> {
         let root = self.spaces[space].root.clone();
-        let cwd = if saved.cwd.is_dir() {
+        // A Gentle Shell server's folder is a path there, not on this computer.
+        let on_server = saved.server.is_some() || crate::features::backend::on_server(&saved.cwd);
+        let cwd = if on_server || saved.cwd.is_dir() {
             saved.cwd.clone()
         } else if root.is_dir() {
             root.clone()
@@ -448,16 +513,36 @@ impl Workspace {
         };
         match saved.kind {
             PaneKind::Agent => {
-                let resume = saved.session.clone().filter(|p| p.exists());
+                let resume = saved.session.clone().filter(|p| on_server || p.exists());
                 // Started once its tab is shown (see `start_shown`).
-                Some(self.new_agent_pane(cwd, None, resume, false, window, cx))
+                let id = self.new_agent_pane(cwd, None, resume, false, window, cx);
+                // Its server session kept running while the app was closed.
+                if let Some(server) = saved
+                    .server
+                    .clone()
+                    .map(crate::features::backend::server::with_key)
+                    && let Some(session) = self.panes.get(&id).and_then(|p| p.session.clone())
+                {
+                    session.update(cx, |session, _| session.attach_server_session(server));
+                }
+                Some(id)
             }
             PaneKind::Terminal => {
                 PaneFactories::get(cx).terminal.as_ref()?;
-                self.new_factory_pane_at(PaneKind::Terminal, cwd, &root, window, cx)
+                let id = self.new_factory_pane_at(PaneKind::Terminal, cwd, &root, window, cx)?;
+                // Its server terminal kept running while the app was closed.
+                if let Some(terminal) = saved.terminal.clone()
+                    && let Some(view) = self.terminal_view(id)
+                {
+                    view.update(cx, |view, _| view.resume_server_terminal(terminal));
+                }
+                Some(id)
             }
             PaneKind::File => {
-                let path = saved.path.clone().filter(|p| p.is_file())?;
+                let path = saved
+                    .path
+                    .clone()
+                    .filter(|p| crate::features::backend::fs::is_file(p))?;
                 PaneFactories::get(cx).file.as_ref()?;
                 self.new_factory_pane_at(PaneKind::File, path, &root, window, cx)
             }
@@ -474,17 +559,26 @@ impl Workspace {
                 PaneFactories::get(cx).canvas.as_ref()?;
                 let id = self.new_factory_pane_at(PaneKind::Canvas, path, &root, window, cx)?;
                 // Its agent works in the folder it had and picks up its
-                // conversation the next time it opens.
-                let resume = saved.session.clone().filter(|p| p.exists());
+                // conversation the next time it opens (on a server, a path
+                // there); a server session that kept running is reattached
+                // to now, the agent hidden.
+                let resume = saved.session.clone().filter(|p| on_server || p.exists());
                 if let Some(pane) = self.panes.get_mut(&id) {
                     pane.cwd = cwd.clone();
                     pane.session_file = resume.clone();
                 }
                 if let Some(canvas) = self.canvas_view(id) {
-                    canvas.update(cx, |canvas, _| {
+                    let server = saved
+                        .server
+                        .clone()
+                        .map(crate::features::backend::server::with_key);
+                    canvas.update(cx, |canvas, cx| {
                         canvas.set_cwd(cwd);
                         if let Some(resume) = resume {
                             canvas.resume_agent(resume);
+                        }
+                        if let Some(server) = server {
+                            canvas.reattach_agent(server, window, cx);
                         }
                     });
                 }
@@ -586,10 +680,13 @@ impl Workspace {
         }
     }
 
-    /// Focus the active tab's focused pane.
+    /// Focus the shown workspace's focused pane; with none (a workspace
+    /// with no tabs), the workspace itself takes the keyboard, so a focus
+    /// left on a hidden pane or a closed overlay can't swallow its keys.
     pub(super) fn focus_active(&self, window: &mut Window, cx: &mut App) {
-        if let Some(pane) = self.focused_pane().and_then(|id| self.panes.get(&id)) {
-            pane.item.focus.focus(window, cx);
+        match self.focused_pane().and_then(|id| self.panes.get(&id)) {
+            Some(pane) => pane.item.focus.focus(window, cx),
+            None => self.focus.focus(window, cx),
         }
     }
 
@@ -701,7 +798,10 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let cwd = self.active_cwd(cx);
+        let cwd = match kind {
+            PaneKind::Agent => self.new_agent_cwd(cx),
+            _ => self.active_cwd(cx),
+        };
         self.tile(Some((kind, cwd)), window, cx);
     }
 
@@ -876,8 +976,7 @@ impl Workspace {
         {
             tab.state.set_focused(next);
         }
-        // Dropping a session drops its PiProcess, which shuts the backend down.
-        self.panes.remove(&pane);
+        self.discard_pane(pane, cx);
         if active {
             self.focus_active(window, cx);
         }
@@ -943,6 +1042,7 @@ impl Workspace {
             (saved, id, pinned)
         };
         let Some(saved) = saved else { return };
+        Self::discard_saved_tab(&saved, cx);
         let title = saved
             .layout
             .leaves()
@@ -986,7 +1086,7 @@ impl Workspace {
         self.remember_close(space, index, &leaves, cx);
         let tab = self.spaces[space].tabs.remove(index);
         for pane in tab.leaves() {
-            self.panes.remove(&pane);
+            self.discard_pane(pane, cx);
         }
         self.finish_tab_close(space, index, window, cx);
     }

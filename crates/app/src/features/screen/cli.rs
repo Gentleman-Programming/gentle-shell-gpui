@@ -22,13 +22,19 @@ pub fn run(args: Vec<String>) -> i32 {
             return 2;
         }
     };
-    let answer = answer(op).unwrap_or_else(|e| e);
+    let answer = run_op(op);
     println!("{answer}");
     match answer["error"]["kind"].as_str() {
         None => 0,
         Some("timeout") => 124,
         Some(_) => 1,
     }
+}
+
+/// Run one op here (the `screen` host tool too): its `{ok}` or `{error}`
+/// answer. Blocking.
+pub fn run_op(op: Op) -> Value {
+    answer(op).unwrap_or_else(|e| e)
 }
 
 fn answer(op: Op) -> Result<Value, Value> {

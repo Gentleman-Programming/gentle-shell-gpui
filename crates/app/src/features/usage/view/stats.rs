@@ -30,6 +30,14 @@ impl UsageView {
                     .child("Reading session history…")
                     .into_any_element();
             }
+            StatsState::Elsewhere(line) => {
+                return ui::card()
+                    .p_4()
+                    .gap_2()
+                    .child(ui::section_label("Local stats"))
+                    .child(crate::features::settings::remote::note(line.clone()))
+                    .into_any_element();
+            }
             StatsState::Loaded { source, summary } => (source, summary),
         };
         let range_button = |id: &'static str, label: &'static str, range: StatsRange| {

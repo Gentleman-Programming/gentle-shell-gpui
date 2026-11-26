@@ -1,14 +1,15 @@
 //! A file pane: an editable, syntax-highlighted source buffer that saves with
 //! ⌘S and follows outside writes, or a file's read-only working-tree diff
 //! against HEAD. Markdown files also render: in place of the buffer, or
-//! beside it, live as you type.
+//! beside it, live as you type. A Gentle Shell server's file is read and
+//! saved through its API, a save guarded by the content's tag so it never
+//! overwrites a change made there meanwhile.
 
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -30,6 +31,8 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::{file_icon, human_size, language, mermaid};
+use crate::features::backend;
+use crate::shared::diff_fit::DiffFit;
 use crate::shared::pane::{CloseViewer, ShowInPane};
 use crate::shared::ui;
 
@@ -78,6 +81,9 @@ struct Meta {
 
 pub struct FileView {
     path: PathBuf,
+    /// The file is a Gentle Shell server's: read and saved through its API,
+    /// never opened with this computer's apps.
+    server: bool,
     /// Breadcrumb: muted prefix, bold leaf.
     crumbs: (String, String),
     diff: bool,
@@ -95,6 +101,8 @@ pub struct FileView {
     focus: FocusHandle,
     /// The header's width in the last frame, for fitting its facts.
     header_width: Rc<Cell<f32>>,
+    /// Redraws once the diff has measured itself (see [`DiffFit`]).
+    diff_fit: DiffFit,
     /// How a diff shows its two sides (Unified until the header's toggle or
     /// [`Self::set_diff_mode`] picks another).
     diff_mode: DiffMode,
@@ -153,6 +161,9 @@ struct Markdown {
     preview: Entity<TextViewState>,
     /// The file's directory: relative links and images resolve against it.
     dir: Arc<Path>,
+    /// The file is a Gentle Shell server's: its relative images are read
+    /// there, and its links never open this computer's apps.
+    server: bool,
     images: Arc<EmbeddedImages>,
     /// Mermaid blocks drawn as images.
     diagrams: Arc<mermaid::Diagrams>,
@@ -184,6 +195,9 @@ struct Editing {
     /// The file's metadata when `saved` was read or written; `None` once
     /// the file is gone.
     stamp: Option<Stamp>,
+    /// Read past the soft size limit, as the user asked: outside writes are
+    /// read past it too.
+    asked: bool,
     saving: bool,
     /// Briefly set after a save lands, for the header's "Saved".
     just_saved: bool,
@@ -208,8 +222,10 @@ impl FileView {
     /// ⌘S saves it; outside writes reload a clean buffer and ask before
     /// replacing unsaved edits. Markdown opens in the mode last picked this
     /// session, rendered until one is. A file over its soft size limit
-    /// shows a notice that loads it anyway, off the UI thread.
+    /// shows a notice that loads it anyway, off the UI thread; a server's
+    /// file always loads off it.
     pub fn open(path: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let server = backend::on_server(&path);
         let mut this = Self {
             crumbs: ui::split_path(&path),
             meta: Meta {
@@ -217,6 +233,7 @@ impl FileView {
                 ..Meta::default()
             },
             path,
+            server,
             diff: false,
             patch: None,
             commit: None,
@@ -225,9 +242,14 @@ impl FileView {
             markdown: None,
             focus: cx.focus_handle(),
             header_width: Rc::default(),
+            diff_fit: DiffFit::default(),
             diff_mode: DiffMode::Unified,
             diff_wrap: None,
         };
+        if server {
+            this.load_file(false, window, cx);
+            return this;
+        }
         // Stat before reading: a write in between shows up as a change.
         let stamp = stamp_of(&this.path);
         match read_text(&this.path, false) {
@@ -237,19 +259,20 @@ impl FileView {
         this
     }
 
-    /// The file past its soft size limit: read off the UI thread, then shown.
-    fn load_file_anyway(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// The file read off the UI thread, then shown; `asked` past its soft
+    /// size limit.
+    fn load_file(&mut self, asked: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.body = Body::Loading;
         let path = self.path.clone();
         cx.spawn_in(window, async move |this, cx| {
             let (stamp, read) = cx
                 .background_executor()
-                .spawn(async move { (stamp_of(&path), read_text(&path, true)) })
+                .spawn(async move { (stamp_of(&path), read_text(&path, asked)) })
                 .await;
             let _ = this.update_in(cx, |this, window, cx| {
                 let focused = this.focus.contains_focused(window, cx);
                 match read {
-                    Ok((text, size)) => this.show_text(text, size, stamp, true, window, cx),
+                    Ok((text, size)) => this.show_text(text, size, stamp, asked, window, cx),
                     Err(notice) => this.show_notice(notice),
                 }
                 this.refocus(focused, window, cx);
@@ -314,6 +337,7 @@ impl FileView {
             saved: editor.read(cx).text().clone(),
             dirty: stamp.is_none(),
             stamp,
+            asked,
             saving: false,
             just_saved: false,
             banner: None,
@@ -330,6 +354,7 @@ impl FileView {
             mode: MdMode::last(),
             preview,
             dir: path.parent().unwrap_or(Path::new("")).into(),
+            server: self.server,
             images: Arc::default(),
             diagrams,
             mdx: path
@@ -405,13 +430,14 @@ impl FileView {
         let short = commit
             .as_ref()
             .map(|(hash, _)| hash.get(..7).unwrap_or(hash).to_string());
+        let server = backend::on_server(&abs);
         let mut this = Self {
             meta: Meta {
                 language: language(&abs).1,
-                size: std::fs::metadata(&abs).ok().map(|m| m.len()),
                 ..Meta::default()
             },
             path: abs,
+            server,
             crumbs,
             diff: true,
             patch: Some(PatchSource {
@@ -425,6 +451,7 @@ impl FileView {
             markdown: None,
             focus: cx.focus_handle(),
             header_width: Rc::default(),
+            diff_fit: DiffFit::default(),
             diff_mode: DiffMode::Unified,
             diff_wrap: None,
         };
@@ -432,8 +459,9 @@ impl FileView {
         this
     }
 
-    /// Run git and parse its patch off the UI thread, then show it; `asked`
-    /// once the user chose to load it past its soft size limit.
+    /// Run git and parse its patch off the UI thread, then show it with the
+    /// file's size; `asked` once the user chose to load it past its soft
+    /// size limit.
     fn load_diff(&mut self, asked: bool, window: &mut Window, cx: &mut Context<Self>) {
         let Some(source) = self.patch.clone() else {
             return;
@@ -441,21 +469,26 @@ impl FileView {
         let abs = self.path.clone();
         self.body = Body::Loading;
         cx.spawn_in(window, async move |this, cx| {
-            let loaded = cx
+            let (size, loaded) = cx
                 .background_executor()
                 .spawn(async move {
+                    let size = backend::fs::metadata(&abs).ok().map(|meta| meta.len);
                     let PatchSource { root, rel, commit } = source;
-                    let patch = match commit {
-                        Some((hash, parent)) => {
-                            load_commit_patch(&root, &abs, &hash, parent.as_deref(), asked)
-                        }
-                        None => load_patch(&root, &abs, &rel, asked),
-                    }?;
-                    Ok((parse_patch(&patch)?, patch.len() as u64))
+                    let loaded: Result<(DiffFile, u64), Notice> = (|| {
+                        let patch = match commit {
+                            Some((hash, parent)) => {
+                                load_commit_patch(&root, &abs, &hash, parent.as_deref(), asked)
+                            }
+                            None => load_patch(&root, &abs, &rel, asked),
+                        }?;
+                        Ok((parse_patch(&patch)?, patch.len() as u64))
+                    })();
+                    (size, loaded)
                 })
                 .await;
             let _ = this.update_in(cx, |this, window, cx| {
                 let focused = this.focus.contains_focused(window, cx);
+                this.meta.size = size;
                 this.install_patch(loaded, cx);
                 if asked {
                     this.refocus(focused, window, cx);
@@ -470,7 +503,7 @@ impl FileView {
         if self.diff {
             self.load_diff(true, window, cx);
         } else {
-            self.load_file_anyway(window, cx);
+            self.load_file(true, window, cx);
         }
         cx.notify();
     }
@@ -549,6 +582,8 @@ impl FileView {
                 };
                 let mode = self.diff_mode;
                 self.body = Body::Diff(cx.new(|cx| DiffState::new([file], cx).with_mode(mode)));
+                // A new diff hasn't measured itself yet.
+                self.diff_fit.reset();
             }
             Err(notice) => self.show_notice(notice),
         }
@@ -556,9 +591,10 @@ impl FileView {
     }
 
     /// Check the file for outside writes while the window is in front: a
-    /// cheap stat off the UI thread, and a read only when it changed. Panes
-    /// without focus (maybe not even on screen) are checked less often.
-    /// `asked` reads past the soft size limit, as the file was first loaded.
+    /// cheap stat off the UI thread (a server's `stat`), and a read only
+    /// when it changed. Panes without focus (maybe not even on screen) are
+    /// checked less often. `asked` reads past the soft size limit, as the
+    /// file was first loaded.
     fn watch(path: PathBuf, asked: bool, window: &mut Window, cx: &mut Context<Self>) -> Task<()> {
         cx.spawn_in(window, async move |this, cx| {
             let mut checked = Instant::now();
@@ -597,9 +633,10 @@ impl FileView {
                     continue;
                 }
                 let job_path = path.clone();
+                let there = stamp.is_some();
                 let disk = cx
                     .background_executor()
-                    .spawn(async move { stamp.map(|_| read_text(&job_path, asked)) })
+                    .spawn(async move { there.then(|| read_text(&job_path, asked)) })
                     .await;
                 if this
                     .update_in(cx, |this, window, cx| {
@@ -665,8 +702,9 @@ impl FileView {
         cx.notify();
     }
 
-    /// Write the buffer to disk off the UI thread.
-    fn save(&mut self, _: &Save, _: &mut Window, cx: &mut Context<Self>) {
+    /// Write the buffer to disk off the UI thread; on a server only over the
+    /// content it was read as (or last saved as).
+    fn save(&mut self, _: &Save, window: &mut Window, cx: &mut Context<Self>) {
         let (Body::Code(editor), Some(edit)) = (&self.body, self.edit.as_mut()) else {
             return;
         };
@@ -678,13 +716,16 @@ impl FileView {
         edit.saving = true;
         let text = editor.read(cx).text().clone();
         let path = self.path.clone();
-        cx.spawn(async move |this, cx| {
+        let expected = edit.stamp.clone();
+        cx.spawn_in(window, async move |this, cx| {
             let job_text = text.clone();
             let result = cx
                 .background_executor()
-                .spawn(async move { save_rope(&path, &job_text) })
+                .spawn(async move { save_rope(&path, &job_text, expected.as_ref()) })
                 .await;
-            let _ = this.update(cx, |this, cx| this.finish_save(text, result, cx));
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.finish_save(text, result, window, cx)
+            });
         })
         .detach();
         cx.notify();
@@ -693,7 +734,8 @@ impl FileView {
     fn finish_save(
         &mut self,
         text: Rope,
-        result: io::Result<Option<Stamp>>,
+        result: Result<Option<Stamp>, SaveError>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(edit) = self.edit.as_mut() else {
@@ -716,7 +758,28 @@ impl FileView {
                     });
                 });
             }
-            Err(err) => {
+            // Someone changed the server's file since it was read: what is
+            // there now decides (a conflict to resolve, as for any outside
+            // write), never this save.
+            Err(SaveError::Changed) => {
+                edit.just_saved = false;
+                let (path, asked) = (self.path.clone(), edit.asked);
+                cx.spawn_in(window, async move |this, cx| {
+                    let (stamp, disk) = cx
+                        .background_executor()
+                        .spawn(async move {
+                            let stamp = stamp_of(&path);
+                            let disk = stamp.is_some().then(|| read_text(&path, asked));
+                            (stamp, disk)
+                        })
+                        .await;
+                    let _ = this.update_in(cx, |this, window, cx| {
+                        this.on_disk_change(stamp, disk, window, cx)
+                    });
+                })
+                .detach();
+            }
+            Err(SaveError::Failed(err)) => {
                 edit.just_saved = false;
                 edit.banner = Some(Banner::SaveFailed(err.to_string().into()));
             }
@@ -882,6 +945,7 @@ impl FileView {
         let images = md.images.clone();
         let diagrams = md.diagrams.clone();
         let link_dir = md.dir.clone();
+        let server = md.server;
         // Front matter (title, owner, sources…) shows as a small description
         // list instead of a run-on paragraph.
         let view = TextView::new(&md.preview)
@@ -893,11 +957,13 @@ impl FileView {
             .image_source(move |uri| {
                 diagrams
                     .image(uri)
-                    .unwrap_or_else(|| image_source(&image_dir, &images, uri))
+                    .unwrap_or_else(|| image_source(&image_dir, server, &images, uri))
             })
             .on_link_click({
                 let (focus, pane) = pane.clone();
-                move |url, _, window, cx| open_link(&link_dir, url, &focus, pane, window, cx)
+                move |url, _, window, cx| {
+                    open_link(&link_dir, server, url, &focus, pane, window, cx)
+                }
             });
         let view = if md.mdx { view.markdown_mdx() } else { view };
         div()
@@ -1187,14 +1253,17 @@ impl FileView {
                         .on_click(cx.listener(|this, _, window, cx| this.save(&Save, window, cx))),
                 )
             })
-            .child(
-                Button::new("file-view-reveal")
-                    .ghost()
-                    .xsmall()
-                    .icon(Icon::new(IconName::ExternalLink))
-                    .tooltip("Open with default app")
-                    .on_click(cx.listener(move |_, _, _, cx| cx.open_with_system(&path))),
-            )
+            // A server's file has no app here to open it.
+            .when(!self.server, |d| {
+                d.child(
+                    Button::new("file-view-reveal")
+                        .ghost()
+                        .xsmall()
+                        .icon(Icon::new(IconName::ExternalLink))
+                        .tooltip("Open with default app")
+                        .on_click(cx.listener(move |_, _, _, cx| cx.open_with_system(&path))),
+                )
+            })
             .child({
                 let view = cx.entity_id();
                 Button::new("file-view-close")
@@ -1209,7 +1278,7 @@ impl FileView {
     }
 
     /// The outside-write or save-error notice above the buffer, tinted, with
-    /// its answers.
+    /// its answers (a server's file changes "on the server").
     fn render_banner(&self, cx: &mut Context<Self>) -> Option<Div> {
         let banner = self.edit.as_ref()?.banner.as_ref()?;
         let action = |id: &'static str, label: &'static str, tooltip: &'static str| {
@@ -1219,35 +1288,44 @@ impl FileView {
                 .label(label)
                 .tooltip(tooltip)
         };
+        let (changed, reload, keep, deleted) = if self.server {
+            (
+                "Changed on the server",
+                "Discard your edits and load the file from the server",
+                "Keep your edits; saving overwrites the file on the server",
+                "Deleted on the server",
+            )
+        } else {
+            (
+                "Changed on disk",
+                "Discard your edits and load the file from disk",
+                "Keep your edits; saving overwrites the file on disk",
+                "Deleted on disk",
+            )
+        };
         let (tint, icon, title, detail, actions): (_, _, _, SharedString, Vec<Button>) =
             match banner {
                 Banner::Conflict(_) => (
                     ui::warning(),
                     IconName::TriangleAlert,
-                    "Changed on disk",
+                    changed,
                     "This file was changed outside the editor while you had unsaved edits.".into(),
                     vec![
-                        action(
-                            "file-view-reload",
-                            "Reload",
-                            "Discard your edits and load the file from disk",
-                        )
-                        .icon(Icon::new(IconName::RefreshCw))
-                        .on_click(
-                            cx.listener(|this, _, window, cx| this.reload_from_disk(window, cx)),
-                        ),
-                        action(
-                            "file-view-keep",
-                            "Keep mine",
-                            "Keep your edits; saving overwrites the file on disk",
-                        )
-                        .on_click(cx.listener(|this, _, _, cx| this.keep_mine(cx))),
+                        action("file-view-reload", "Reload", reload)
+                            .icon(Icon::new(IconName::RefreshCw))
+                            .on_click(
+                                cx.listener(|this, _, window, cx| {
+                                    this.reload_from_disk(window, cx)
+                                }),
+                            ),
+                        action("file-view-keep", "Keep mine", keep)
+                            .on_click(cx.listener(|this, _, _, cx| this.keep_mine(cx))),
                     ],
                 ),
                 Banner::Deleted => (
                     ui::warning(),
                     IconName::TriangleAlert,
-                    "Deleted on disk",
+                    deleted,
                     format!("Save ({SAVE_HINT}) to write it back.").into(),
                     vec![
                         action("file-view-dismiss", "Dismiss", "Hide this notice")
@@ -1326,12 +1404,21 @@ impl Render for FileView {
                 .child(Spinner::new().small().color(ui::muted()))
                 .into_any_element(),
             Body::Code(editor) => {
+                // On the pane's opaque ground, the same as the editor's
+                // gutter: in glass, text scrolled sideways never shows
+                // through the line numbers, and the two read as one.
                 let code = || {
-                    Editor::new(editor)
-                        .appearance(false)
-                        .font_family(ui::mono())
-                        .text_size(ui::code_rems(12.5))
+                    div()
                         .size_full()
+                        .rounded_b_xl()
+                        .bg(ui::pane_ground())
+                        .child(
+                            Editor::new(editor)
+                                .appearance(false)
+                                .font_family(ui::mono())
+                                .text_size(ui::code_rems(12.5))
+                                .size_full(),
+                        )
                 };
                 match self.markdown.as_ref() {
                     Some(md) if md.mode == MdMode::Preview => {
@@ -1355,14 +1442,18 @@ impl Render for FileView {
                     _ => code().into_any_element(),
                 }
             }
-            Body::Diff(state) => Diff::new(state)
-                .header_visible(false)
-                .hover_highlight(DiffHoverHighlight::Line)
-                // Side by side, each side wraps to its half of the pane:
-                // unwrapped, the widest line sets both columns and pushes
-                // the new side out of view.
-                .soft_wrap(self.diff_wraps())
-                .size_full()
+            Body::Diff(state) => self
+                .diff_fit
+                .fill(
+                    Diff::new(state)
+                        .header_visible(false)
+                        .hover_highlight(DiffHoverHighlight::Line)
+                        // Side by side, each side wraps to its half of the pane:
+                        // unwrapped, the widest line sets both columns and pushes
+                        // the new side out of view.
+                        .soft_wrap(self.diff_wraps()),
+                    cx.entity_id(),
+                )
                 .into_any_element(),
             Body::Notice {
                 icon,
@@ -1485,40 +1576,47 @@ impl Notice {
 }
 
 /// The file as text with its size, or the reason it cannot be previewed;
-/// `asked` reads it past its soft size limit.
+/// `asked` reads it past its soft size limit. A server's file is read there.
 fn read_text(path: &Path, asked: bool) -> Result<(String, u64), Notice> {
     let unreadable = |e: std::io::Error| {
+        if backend::fs::files_refused(&e) {
+            return files_refused(&e);
+        }
         Notice::new(IconName::CircleAlert, "Can't read this file", e.to_string())
     };
-    let meta = std::fs::metadata(path).map_err(unreadable)?;
-    if meta.is_dir() {
+    let meta = backend::fs::metadata(path).map_err(unreadable)?;
+    if meta.is_dir {
         return Err(Notice::new(
             IconName::FolderOpen,
             "This is a folder",
             path.display().to_string(),
         ));
     }
-    let fit = preview::FILE.fit(meta.len(), asked);
+    let fit = preview::FILE.fit(meta.len, asked);
     if fit != Fit::Load {
         return Err(Notice {
-            size: Some(meta.len()),
+            size: Some(meta.len),
             ..Notice::too_large(
                 "Too large to preview",
                 "preview",
-                meta.len(),
+                meta.len,
                 preview::FILE,
                 fit,
             )
         });
     }
-    let bytes = std::fs::read(path).map_err(unreadable)?;
+    let bytes = backend::fs::read(path).map_err(unreadable)?;
     let size = bytes.len() as u64;
     let binary = || Notice {
         size: Some(size),
         ..Notice::new(
             IconName::File,
             "Binary file",
-            "This file isn't text. Open it with its default app instead.",
+            if backend::on_server(path) {
+                "This file isn't text."
+            } else {
+                "This file isn't text. Open it with its default app instead."
+            },
         )
     };
     if looks_binary(&bytes) {
@@ -1582,16 +1680,68 @@ fn restore_scroll(restore: &Cell<Option<(ListOffset, usize)>>, list: &ListState)
 pub type EmbeddedImages = Mutex<HashMap<SharedUri, Option<Arc<Image>>>>;
 
 /// Where a preview image loads from: relative paths against the file's
-/// directory, `data:` URLs decoded, anything else as the URL it is.
-fn image_source(dir: &Path, embedded: &EmbeddedImages, uri: &SharedUri) -> ImageSource {
+/// directory (a server's file: read there, [`ServerImage`]), `data:` URLs
+/// decoded, anything else as the URL it is.
+fn image_source(
+    dir: &Path,
+    server: bool,
+    embedded: &EmbeddedImages,
+    uri: &SharedUri,
+) -> ImageSource {
     let url: &str = uri;
     if url.starts_with("data:") {
         return embedded_image(embedded, uri).unwrap_or_else(|| uri.clone().into());
     }
     match local_target(dir, url) {
+        Some(path) if server => ImageSource::Custom(Arc::new(move |window, cx| match window
+            .use_asset::<ServerImage>(
+            &path, cx,
+        )? {
+            Some(image) => image.use_render_image(window, cx).map(Ok),
+            None => Some(Err(ImageCacheError::Asset(
+                format!("Can't show {} from the server", path.display()).into(),
+            ))),
+        })),
         Some(path) => path.into(),
         None => uri.clone().into(),
     }
+}
+
+/// An image file on a Gentle Shell server, read through its API off the UI
+/// thread; the preview draws again once it is in. `None` when it can't be
+/// read or isn't an image format GPUI draws.
+enum ServerImage {}
+
+impl Asset for ServerImage {
+    type Source = PathBuf;
+    type Output = Option<Arc<Image>>;
+
+    // An `async fn` would borrow the `App` into the future, which must be
+    // `'static`.
+    #[allow(clippy::manual_async_fn)]
+    fn load(path: PathBuf, _: &mut App) -> impl Future<Output = Self::Output> + Send + 'static {
+        async move {
+            let format = image_format(&path)?;
+            let bytes = backend::fs::read(&path).ok()?;
+            Some(Arc::new(Image::from_bytes(format, bytes)))
+        }
+    }
+}
+
+/// The image format a file's extension names.
+fn image_format(path: &Path) -> Option<ImageFormat> {
+    let ext = path.extension()?.to_string_lossy().to_lowercase();
+    Some(match ext.as_str() {
+        "png" => ImageFormat::Png,
+        "jpg" | "jpeg" => ImageFormat::Jpeg,
+        "webp" => ImageFormat::Webp,
+        "gif" => ImageFormat::Gif,
+        "svg" => ImageFormat::Svg,
+        "bmp" => ImageFormat::Bmp,
+        "tif" | "tiff" => ImageFormat::Tiff,
+        "ico" => ImageFormat::Ico,
+        _ => return None,
+    })
 }
 
 /// The image a `data:` URL carries, decoded the first time it is asked for.
@@ -1638,9 +1788,12 @@ fn data_image(url: &str) -> Option<Arc<Image>> {
 
 /// A clicked preview link: URLs in the browser, another Markdown file in
 /// this pane (`pane`), other local files (relative to the Markdown file) in
-/// their default app, in-page anchors nowhere.
+/// their default app, in-page anchors nowhere. On a server (`server`) a
+/// Markdown file opens in the pane (it says so when it isn't there) and
+/// other files nowhere: no app here can open them.
 fn open_link(
     dir: &Path,
+    server: bool,
     url: &str,
     focus: &FocusHandle,
     pane: EntityId,
@@ -1652,11 +1805,11 @@ fn open_link(
         return;
     }
     match local_target(dir, url) {
-        Some(path) if path.is_file() && is_markdown(&path) => {
+        Some(path) if is_markdown(&path) && (server || path.is_file()) => {
             window.focus(focus, cx);
             window.dispatch_action(Box::new(ShowInPane { pane, path }), cx);
         }
-        Some(path) if path.exists() => cx.open_with_system(&path),
+        Some(path) if !server && path.exists() => cx.open_with_system(&path),
         Some(_) => {}
         None => cx.open_url(url),
     }
@@ -1714,18 +1867,36 @@ fn percent_decode(text: &str) -> String {
     String::from_utf8(out).unwrap_or_else(|_| text.to_string())
 }
 
-/// What a file's metadata says about its content: a change in either means
-/// someone wrote it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Stamp {
-    modified: Option<SystemTime>,
-    len: u64,
+/// What a file's metadata says about its content: a change means someone
+/// wrote it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Stamp {
+    /// This computer's file: its modified time and length.
+    Disk {
+        modified: Option<SystemTime>,
+        len: u64,
+    },
+    /// A server's file: its content tag (from its size and modified time
+    /// there), which also guards a save over it.
+    Server(String),
 }
 
 /// `path`'s stamp, `None` when it is gone or unreadable.
 fn stamp_of(path: &Path) -> Option<Stamp> {
+    match backend::fs::at(path).ok()? {
+        backend::fs::Fs::Local => disk_stamp(path),
+        backend::fs::Fs::Server(client) => client
+            .fs_stat(&backend::fs::server_path(path))
+            .ok()?
+            .etag
+            .map(Stamp::Server),
+    }
+}
+
+/// [`stamp_of`] on this computer.
+fn disk_stamp(path: &Path) -> Option<Stamp> {
     let meta = fs::metadata(path).ok()?;
-    Some(Stamp {
+    Some(Stamp::Disk {
         modified: meta.modified().ok(),
         len: meta.len(),
     })
@@ -1774,13 +1945,49 @@ fn replace_buffer(editor: &Entity<EditorState>, text: String, window: &mut Windo
     });
 }
 
-/// Save `text` to `path` and return the file's new stamp.
-fn save_rope(path: &Path, text: &Rope) -> io::Result<Option<Stamp>> {
+/// Why a save didn't land.
+#[derive(Debug)]
+enum SaveError {
+    /// The server's file changed since it was read or last saved
+    /// (`412 changed`): nothing was written.
+    Changed,
+    Failed(io::Error),
+}
+
+/// Save `text` to `path` and return the file's new stamp. A server's file
+/// is written there in one step, only while it still is what `expected`
+/// stamped (a file that is gone is written back).
+fn save_rope(
+    path: &Path,
+    text: &Rope,
+    expected: Option<&Stamp>,
+) -> Result<Option<Stamp>, SaveError> {
+    let client = match backend::fs::at(path).map_err(SaveError::Failed)? {
+        backend::fs::Fs::Local => return save_local(path, text).map_err(SaveError::Failed),
+        backend::fs::Fs::Server(client) => client,
+    };
+    let tag = match expected {
+        Some(Stamp::Server(tag)) => Some(tag.as_str()),
+        _ => None,
+    };
+    let mut bytes = Vec::with_capacity(text.len());
+    for chunk in text.chunks() {
+        bytes.extend_from_slice(chunk.as_bytes());
+    }
+    match client.fs_write(&backend::fs::server_path(path), &bytes, tag, false) {
+        Ok(written) => Ok(Some(Stamp::Server(written.etag.unwrap_or_default()))),
+        Err(error) if error.status == Some(412) => Err(SaveError::Changed),
+        Err(error) => Err(SaveError::Failed(backend::fs::io_error(error))),
+    }
+}
+
+/// [`save_rope`] on this computer.
+fn save_local(path: &Path, text: &Rope) -> io::Result<Option<Stamp>> {
     atomic_write(path, |out| {
         text.chunks()
             .try_for_each(|chunk| out.write_all(chunk.as_bytes()))
     })?;
-    Ok(stamp_of(path))
+    Ok(disk_stamp(path))
 }
 
 /// Replace the file at `path` with what `write` produces. The bytes go to a
@@ -1862,7 +2069,7 @@ fn load_commit_patch(
         None => vec!["show", "--format=", "--no-color", "--no-ext-diff", commit],
     };
     args.extend(["--", target.as_ref()]);
-    let Some(patch) = git(root, &args) else {
+    let Some(patch) = git(root, &args)? else {
         return Err(Notice::new(
             IconName::GitBranch,
             "Commit not found",
@@ -1886,11 +2093,13 @@ fn load_patch(root: &Path, abs: &Path, rel: &str, asked: bool) -> Result<String,
         git(root, &args)
     };
     // A repository without commits has no HEAD: staged, else unstaged.
-    let tracked = diff(&["HEAD"]).or_else(|| {
-        diff(&["--cached"])
-            .filter(|p| !p.trim().is_empty())
-            .or_else(|| diff(&[]))
-    });
+    let tracked = match diff(&["HEAD"])? {
+        Some(patch) => Some(patch),
+        None => match diff(&["--cached"])?.filter(|p| !p.trim().is_empty()) {
+            Some(patch) => Some(patch),
+            None => diff(&[])?,
+        },
+    };
     let Some(patch) = tracked else {
         return Err(Notice::new(
             IconName::GitBranch,
@@ -1912,7 +2121,7 @@ fn load_patch(root: &Path, abs: &Path, rel: &str, asked: bool) -> Result<String,
             "--",
             target.as_ref(),
         ],
-    )
+    )?
     .is_some_and(|s| s.starts_with("??"));
     if !untracked {
         return Err(Notice::new(
@@ -1922,7 +2131,7 @@ fn load_patch(root: &Path, abs: &Path, rel: &str, asked: bool) -> Result<String,
         ));
     }
     // Its patch is the file plus a byte a line: the file's size decides.
-    patch_fits(fs::metadata(abs).map_or(0, |m| m.len()), asked)?;
+    patch_fits(backend::fs::metadata(abs).map_or(0, |m| m.len), asked)?;
     let (text, _) = read_text(abs, true)?;
     Ok(untracked_patch(rel, &text))
 }
@@ -1935,7 +2144,11 @@ fn untracked_patch(path: &str, text: &str) -> String {
     if text.is_empty() {
         return patch;
     }
-    let lines: Vec<&str> = text.lines().collect();
+    // Each line keeps a CR before its LF, as git's own patches do.
+    let lines: Vec<&str> = text
+        .split_inclusive('\n')
+        .map(|line| line.strip_suffix('\n').unwrap_or(line))
+        .collect();
     patch.push_str(&format!("@@ -0,0 +1,{} @@\n", lines.len()));
     for line in &lines {
         patch.push('+');
@@ -2009,16 +2222,25 @@ fn status_tint(label: &str) -> Hsla {
     }
 }
 
-fn git(cwd: &Path, args: &[&str]) -> Option<String> {
-    let out = crate::features::backend::git(cwd, &[])
-        .args(args)
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    out.status
-        .success()
-        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+/// git's output when it succeeds; `None` when it fails or can't run. A
+/// read-only pairing refused the contents on a server is its notice.
+fn git(cwd: &Path, args: &[&str]) -> Result<Option<String>, Notice> {
+    match crate::features::backend::git(cwd, &[]).args(args).output() {
+        Ok(out) => Ok(out
+            .success
+            .then(|| String::from_utf8_lossy(&out.stdout).into_owned())),
+        Err(error) if backend::fs::files_refused(&error) => Err(files_refused(&error)),
+        Err(_) => Ok(None),
+    }
+}
+
+/// What shows instead of a server's file a read-only pairing can't read.
+fn files_refused(error: &std::io::Error) -> Notice {
+    Notice::new(
+        IconName::Lock,
+        "Files need operate access",
+        error.to_string(),
+    )
 }
 
 #[cfg(test)]
@@ -2030,9 +2252,10 @@ mod tests {
     use gpui_kit::{ImageSource, Resource, SharedUri};
 
     use super::{
-        EmbeddedImages, Outside, Rope, atomic_write, data_image, has_scheme, is_markdown,
-        local_target, looks_binary, offline_image, outside_write, parse_patch, percent_decode,
-        read_text, rope_lines, save_rope, scroll_share, status_label, untracked_patch,
+        EmbeddedImages, Outside, Rope, atomic_write, data_image, has_scheme, image_format,
+        is_markdown, local_target, looks_binary, offline_image, outside_write, parse_patch,
+        percent_decode, read_text, rope_lines, save_local, scroll_share, status_label,
+        untracked_patch,
     };
 
     fn temp_dir(tag: &str) -> PathBuf {
@@ -2084,6 +2307,34 @@ index 3b18e51..a1c2d3e 100644
         assert_eq!(file.path().as_ref(), "notes/todo.md");
         assert_eq!((file.additions(), file.deletions()), (3, 0));
         assert_eq!(status_label(file.status()), "Added");
+    }
+
+    /// A line added after an unterminated last line, as `git diff` prints it
+    /// (a server's `POST /api/git` returns the same bytes): each marker
+    /// ends its side's source rather than being a line of its own.
+    #[test]
+    fn newline_markers_end_their_side() {
+        let patch = "diff --git a/hello.txt b/hello.txt
+index 0a1b2c3..4d5e6f7 100644
+--- a/hello.txt
++++ b/hello.txt
+@@ -1 +1,2 @@
+-hello from mac
+\\ No newline at end of file
++hello from mac
++second line
+\\ No newline at end of file
+";
+        let file = parse_patch(patch).expect("parses");
+        assert_eq!((file.additions(), file.deletions()), (2, 1));
+    }
+
+    #[test]
+    fn untracked_file_keeps_its_line_endings() {
+        let patch = untracked_patch("dos.txt", "one\r\ntwo\r\n");
+        assert!(patch.ends_with("@@ -0,0 +1,2 @@\n+one\r\n+two\r\n"));
+        let file = parse_patch(&patch).expect("parses");
+        assert_eq!((file.additions(), file.deletions()), (2, 0));
     }
 
     #[test]
@@ -2151,12 +2402,12 @@ Binary files a/logo.png and b/logo.png differ
         fs::write(&path, "old").unwrap();
         // Large enough to span many rope chunks; CRLF, tabs, no final newline.
         let text = "línea\tuno ✓\r\n".repeat(20_000) + "end";
-        save_rope(&path, &Rope::from(text.as_str())).unwrap();
+        save_local(&path, &Rope::from(text.as_str())).unwrap();
         assert_eq!(fs::read(&path).unwrap(), text.as_bytes());
         assert_eq!(entries(&dir), ["notes.md"]);
         // A file that is gone is written back.
         fs::remove_file(&path).unwrap();
-        save_rope(&path, &Rope::from("back")).unwrap();
+        save_local(&path, &Rope::from("back")).unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), "back");
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -2186,7 +2437,7 @@ Binary files a/logo.png and b/logo.png differ
         fs::set_permissions(&script, fs::Permissions::from_mode(0o750)).unwrap();
         let link = dir.join("link.sh");
         symlink(&script, &link).unwrap();
-        save_rope(&link, &Rope::from("echo bye\n")).unwrap();
+        save_local(&link, &Rope::from("echo bye\n")).unwrap();
         assert!(
             fs::symlink_metadata(&link)
                 .unwrap()
@@ -2199,7 +2450,7 @@ Binary files a/logo.png and b/logo.png differ
 
         // Read-only files are refused, not replaced.
         fs::set_permissions(&script, fs::Permissions::from_mode(0o444)).unwrap();
-        let err = save_rope(&script, &Rope::from("nope")).unwrap_err();
+        let err = save_local(&script, &Rope::from("nope")).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
         assert_eq!(fs::read_to_string(&script).unwrap(), "echo bye\n");
         fs::set_permissions(&script, fs::Permissions::from_mode(0o644)).unwrap();
@@ -2226,6 +2477,17 @@ Binary files a/logo.png and b/logo.png differ
         for name in ["README", "main.rs", "md"] {
             assert!(!is_markdown(std::path::Path::new(name)), "{name}");
         }
+    }
+
+    #[test]
+    fn server_images_by_extension() {
+        use gpui_kit::ImageFormat;
+        let format = |name: &str| image_format(std::path::Path::new(name));
+        assert_eq!(format("docs/shot.PNG"), Some(ImageFormat::Png));
+        assert_eq!(format("a.jpeg"), Some(ImageFormat::Jpeg));
+        assert_eq!(format("logo.svg"), Some(ImageFormat::Svg));
+        assert_eq!(format("notes.md"), None);
+        assert_eq!(format("Makefile"), None);
     }
 
     #[test]

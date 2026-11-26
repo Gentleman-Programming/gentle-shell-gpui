@@ -88,6 +88,10 @@ impl OnboardingView {
     fn step_of(&self, check: &Check, next: bool) -> Step {
         if self.installing == Some(check.id) {
             Step::Installing
+        } else if matches!(check.status, Status::Unchecked(_)) {
+            // Nothing to do from here, and nothing known either: neither
+            // a done step nor the next one.
+            Step::Waiting { next: false }
         } else if is_ok(check) {
             Step::Done
         } else if matches!(check.status, Status::Failed(_))
@@ -322,6 +326,7 @@ fn step_color(check: &Check, step: Step) -> Hsla {
         Step::Waiting { next: false } => ui::faint(),
         _ => match tone(check) {
             Tone::Good => ui::success(),
+            Tone::Neutral => ui::faint(),
             Tone::Warn => ui::warning(),
             Tone::Bad => ui::danger(),
         },

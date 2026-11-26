@@ -269,11 +269,12 @@ pub(super) fn orchestrator_route(orchestrator: &DefaultOrchestrator) -> Option<R
 /// that says where each agent came from lists every root `/gentle:profiles`
 /// does, so it is the whole list; an older Shell's (no `source`) is joined
 /// with the agents of the roots its read does not cover, read from `env`.
-pub(super) fn reported_names(definitions: &AgentDefinitions, env: &Env) -> Vec<String> {
-    let uncovered = if definitions.lists_every_root() {
-        Vec::new()
-    } else {
-        uncovered_agents(env)
+/// Without `env` (a Gentle Shell server, whose roots are not folders of this
+/// computer's) the list is what it reported.
+pub(super) fn reported_names(definitions: &AgentDefinitions, env: Option<&Env>) -> Vec<String> {
+    let uncovered = match env {
+        Some(env) if !definitions.lists_every_root() => uncovered_agents(env),
+        _ => Vec::new(),
     };
     let reported: Vec<String> = definitions
         .agents

@@ -8,8 +8,9 @@ use crate::features::setup::{Check, CheckId, Fix, Need, Status};
 /// Install output kept per run (the failure view shows the tail).
 const LOG_KEEP: usize = 200;
 
+/// Done, or nothing to do from here: an unchecked row holds nothing up.
 pub(super) fn is_ok(check: &Check) -> bool {
-    matches!(check.status, Status::Ok(_))
+    matches!(check.status, Status::Ok(_) | Status::Unchecked(_))
 }
 
 /// A Required check that holds up Continue. Signing in to a provider is
@@ -54,15 +55,19 @@ pub(super) fn install_plan(checks: &[Check]) -> VecDeque<CheckId> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Tone {
     Good,
+    /// Not checked from here: neither good nor bad.
+    Neutral,
     Warn,
     Bad,
 }
 
 /// Green when done; red for a missing requirement or a failure; amber for
-/// anything outdated or missing that can wait.
+/// anything outdated or missing that can wait; neutral for what wasn't
+/// checked.
 pub(super) fn tone(check: &Check) -> Tone {
     match &check.status {
         Status::Ok(_) => Tone::Good,
+        Status::Unchecked(_) => Tone::Neutral,
         Status::Failed(_) => Tone::Bad,
         Status::Missing(_) if blocks(check) => Tone::Bad,
         Status::Missing(_) | Status::Outdated(_) => Tone::Warn,
@@ -71,7 +76,11 @@ pub(super) fn tone(check: &Check) -> Tone {
 
 pub(super) fn status_text(status: &Status) -> &str {
     match status {
-        Status::Ok(s) | Status::Missing(s) | Status::Outdated(s) | Status::Failed(s) => s,
+        Status::Ok(s)
+        | Status::Missing(s)
+        | Status::Outdated(s)
+        | Status::Failed(s)
+        | Status::Unchecked(s) => s,
     }
 }
 
@@ -111,14 +120,49 @@ pub(super) fn with_registry(checks: &mut [Check], answer: &Result<String, String
     }
 }
 
+/// Gentle Shell's setup just finished on the server `name` (`Run setup on
+/// <server>`) and the server doesn't report its checks (no `checks`
+/// capability): its companion setup is done there, which this computer
+/// can't check otherwise. A server with `checks` already says so.
+pub(super) fn with_server_setup(checks: &mut [Check], name: &str) {
+    for check in checks
+        .iter_mut()
+        .filter(|c| c.id == CheckId::Setup && matches!(c.status, Status::Unchecked(_)))
+    {
+        check.status = Status::Ok(format!("Setup finished on {name}"));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
 
     use super::{
         Check, CheckId, Fix, LOG_KEEP, Need, Status, Tone, all_set, install_plan, push_lines,
-        required_ok, tone, usable, with_registry,
+        required_ok, status_text, tone, usable, with_registry, with_server_setup,
     };
+
+    #[test]
+    fn a_finished_server_setup_marks_only_the_companion_setup() {
+        let unchecked = |id| {
+            check(
+                id,
+                Need::Required,
+                Status::Unchecked("On pc: not checked from here".into()),
+                Fix::None,
+            )
+        };
+        let mut checks = vec![
+            unchecked(CheckId::Node),
+            ok(CheckId::GentleShell, Need::Required),
+            unchecked(CheckId::Setup),
+            unchecked(CheckId::Engram),
+        ];
+        with_server_setup(&mut checks, "pc");
+        assert_eq!(checks[2].status, Status::Ok("Setup finished on pc".into()));
+        assert!(matches!(checks[0].status, Status::Unchecked(_)));
+        assert!(matches!(checks[3].status, Status::Unchecked(_)));
+    }
 
     /// The registry's answer replaces the files' guess for the provider
     /// check only.
@@ -306,5 +350,37 @@ mod tests {
         }
         assert_eq!(log.len(), LOG_KEEP);
         assert_eq!(log.last().map(String::as_str), Some("199"));
+    }
+
+    /// On a server only the server is checked: the rest says "Not checked"
+    /// in a neutral tone, never "Ready", and holds nothing up.
+    #[test]
+    fn what_isnt_checked_from_here_is_neutral_and_holds_nothing_up() {
+        let unchecked = |id, need| {
+            check(
+                id,
+                need,
+                Status::Unchecked("On pc: not checked from here".into()),
+                Fix::None,
+            )
+        };
+        let checks = vec![
+            unchecked(CheckId::Node, Need::Required),
+            ok(CheckId::GentleShell, Need::Required),
+            unchecked(CheckId::Setup, Need::Required),
+            unchecked(CheckId::Git, Need::Recommended),
+        ];
+        assert!(required_ok(&checks) && all_set(&checks) && usable(&checks));
+        assert!(install_plan(&checks).is_empty());
+        assert_eq!(tone(&checks[0]), Tone::Neutral);
+        assert_eq!(tone(&checks[1]), Tone::Good);
+        assert_eq!(
+            super::super::view::status_label(&checks[0].status, false),
+            "Not checked"
+        );
+        assert_eq!(
+            status_text(&checks[0].status),
+            "On pc: not checked from here"
+        );
     }
 }

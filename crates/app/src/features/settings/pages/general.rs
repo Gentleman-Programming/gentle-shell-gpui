@@ -6,13 +6,15 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::{Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::*;
 
+use gentle_core::backend::Backend;
 use pi_rpc::desktop_rpc::ShellStatus;
 
 use super::super::{
     SettingsView,
     layout::{row, section},
+    remote::note,
     shell_status::{status_rows, warns},
-    snapshot::Snapshot,
+    snapshot::{ServerFacts, Snapshot},
 };
 use crate::shared::ui;
 
@@ -24,6 +26,7 @@ pub(super) fn render(
     v_flex()
         .gap_3()
         .child(gentle_shell_section(
+            &view.machine,
             snapshot,
             view.shell_status.status.as_ref(),
         ))
@@ -32,10 +35,20 @@ pub(super) fn render(
         .child(section(IconName::CircleCheck, "Setup & requirements").child(view.setup.clone()))
 }
 
-/// The homes and launcher, then, when the active agent tab's Shell offers
-/// `get_status`, what `/gentle:status` reports and whether it warns.
-fn gentle_shell_section(snapshot: &Snapshot, status: Option<&ShellStatus>) -> Div {
+/// Where it runs, the homes, version and launcher, then, when the active
+/// agent tab's Shell offers `get_status`, what `/gentle:status` reports and
+/// whether it warns. On a server, its home folder and version as it says
+/// them instead: none of this computer's homes or launcher is read for it.
+fn gentle_shell_section(
+    machine: &Backend,
+    snapshot: &Snapshot,
+    status: Option<&ShellStatus>,
+) -> Div {
+    if let Some(server) = &snapshot.server {
+        return server_section(server, status);
+    }
     section(IconName::SquareTerminal, "Gentle Shell")
+        .child(row("Runs on", gentle_core::machines::name(machine)))
         .child(row(
             "Home",
             if snapshot.home_mode.is_empty() {
@@ -43,6 +56,12 @@ fn gentle_shell_section(snapshot: &Snapshot, status: Option<&ShellStatus>) -> Di
             } else {
                 snapshot.home_mode.clone()
             },
+        ))
+        .child(row(
+            "Version",
+            gentle_core::version::current_from_versions(&snapshot.versions)
+                .unwrap_or("—")
+                .to_string(),
         ))
         .child(row("Agent dir", snapshot.agent.display().to_string()))
         .child(row("Config dir", snapshot.config.display().to_string()))
@@ -79,6 +98,26 @@ fn gentle_shell_section(snapshot: &Snapshot, status: Option<&ShellStatus>) -> Di
                         .on_click(move |_, _, cx| cx.open_url(&format!("file://{}", dir.display())))
                 }),
         )
+}
+
+/// General › Gentle Shell on a server: where it runs, its home folder and
+/// version (`GET /api/server`), then its `get_status`.
+fn server_section(server: &ServerFacts, status: Option<&ShellStatus>) -> Div {
+    section(IconName::SquareTerminal, "Gentle Shell")
+        .child(row("Runs on", server.name.clone()))
+        .child(row(
+            "Home",
+            server
+                .home
+                .clone()
+                .unwrap_or_else(|| format!("not reported by {}", server.name)),
+        ))
+        .child(row(
+            "Version",
+            server.version.clone().unwrap_or_else(|| "—".into()),
+        ))
+        .children(status.map(status_block))
+        .children(server.error.clone().map(note))
 }
 
 /// `/gentle:status`'s facts: a chip with its severity, then one row each.

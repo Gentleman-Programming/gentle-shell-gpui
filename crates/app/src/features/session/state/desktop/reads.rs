@@ -5,8 +5,10 @@
 //! orchestrator and the model pickers' default model
 //! (`list_agent_definitions`), Gentle Shell's own status (`get_status`),
 //! background-subagents policy (`get_background_subagents`,
-//! `set_background_subagents`) and sign-ins (`get_auth_status`), and the
-//! tab's own credentials reload (`reload_credentials`). Each method is used
+//! `/gentle:background-subagents`) and sign-ins (`get_auth_status`), the
+//! models Pi can use (`list_available_models`, for a tab without Pi RPC:
+//! a server's session-less Desktop RPC), and the tab's own credentials
+//! reload (`reload_credentials`). Each method is used
 //! only when `capabilities` advertises it; otherwise the caller keeps its own
 //! path (session files, the stats file scan, the npm registry, the agent
 //! files and Pi's `settings.json`, no status, the policy files and
@@ -17,16 +19,24 @@
 //! is answered once, as an outcome for its ticket that the screen takes.
 //! A `session_switching` answer means a switch was in flight: nothing was
 //! done, so screen requests are queued again (a few times) instead of failing.
-//! The default-model read never retries. These methods emit no event of their own.
+//! The default-model read never retries.
+//!
+//! Configuration on a server also sends its sign-in, API key and package
+//! requests here (`login_*`, `set_api_key`, `remove_credentials`,
+//! `list_packages`, `install_package`, `remove_package`), only when the
+//! peer's `capabilities` list them. Their events (`login_prompt`,
+//! `login_finished`, `package_progress`, `package_finished`) are not this
+//! slice's: `session/accounts.rs` keeps them for the screen. The other
+//! methods emit no event of their own.
 
 use std::collections::VecDeque;
 
 use pi_rpc::desktop_rpc::{
-    AgentDefinitions, AuthStatus, BackgroundPolicy, BackgroundSubagents, Capabilities,
-    DesktopErrorCode, DesktopMethod, DesktopRecord, DesktopResponse, DesktopRpcError,
-    DesktopSession, ListSessionsQuery, ReloadCredentials, SessionList, SessionsScope,
-    SetBackgroundSubagentsResult, ShellStatus, StatsRange, StatsScope, SwitchSessionResult,
-    UpdateStatus, UsageStats,
+    AgentDefinitions, AuthStatus, AvailableModels, BackgroundPolicy, BackgroundSubagents,
+    Capabilities, DesktopErrorCode, DesktopMethod, DesktopRecord, DesktopResponse, DesktopRpcError,
+    DesktopSession, InstalledPackage, ListSessionsQuery, ReloadCredentials, SessionList,
+    SessionsScope, SetBackgroundSubagentsResult, ShellStatus, StatsRange, StatsScope,
+    SwitchSessionResult, UpdateStatus, UsageStats,
 };
 
 use super::Send;
@@ -89,6 +99,36 @@ pub(crate) enum ReadRequest {
     AuthStatus,
     /// Make this session pick up credentials added or removed elsewhere.
     ReloadCredentials,
+    /// The models Pi can use now, the current one and its thinking levels.
+    AvailableModels,
+    /// Sign in to `provider` on the Shell's side; its steps arrive as
+    /// [`crate::features::session::AccountEvent`]s.
+    LoginStart {
+        provider: String,
+    },
+    /// Answer a sign-in's prompt: a code, an answer, or the redirect URL
+    /// the app's browser caught.
+    LoginComplete {
+        login_id: String,
+        value: Secret,
+    },
+    LoginCancel {
+        login_id: String,
+    },
+    SetApiKey {
+        provider: String,
+        key: Secret,
+    },
+    RemoveCredentials {
+        provider: String,
+    },
+    ListPackages,
+    /// Install (`install`) or remove `source`; its output arrives as
+    /// [`crate::features::session::AccountEvent`]s.
+    PackageJob {
+        install: bool,
+        source: String,
+    },
 }
 
 impl ReadRequest {
@@ -105,13 +145,26 @@ impl ReadRequest {
             Self::SetBackgroundSubagents { .. } => DesktopMethod::SetBackgroundSubagents,
             Self::AuthStatus => DesktopMethod::GetAuthStatus,
             Self::ReloadCredentials => DesktopMethod::ReloadCredentials,
+            Self::AvailableModels => DesktopMethod::ListAvailableModels,
+            Self::LoginStart { .. } => DesktopMethod::LoginStart,
+            Self::LoginComplete { .. } => DesktopMethod::LoginComplete,
+            Self::LoginCancel { .. } => DesktopMethod::LoginCancel,
+            Self::SetApiKey { .. } => DesktopMethod::SetApiKey,
+            Self::RemoveCredentials { .. } => DesktopMethod::RemoveCredentials,
+            Self::ListPackages => DesktopMethod::ListPackages,
+            Self::PackageJob { install: true, .. } => DesktopMethod::InstallPackage,
+            Self::PackageJob { install: false, .. } => DesktopMethod::RemovePackage,
         }
     }
 
+    /// The request on `session`. The sign-in and package methods are only
+    /// built when `capabilities` list them.
     fn issue(
         &self,
         session: &mut DesktopSession,
+        capabilities: Option<&Capabilities>,
     ) -> Result<pi_rpc::desktop_rpc::DesktopRequest, DesktopRpcError> {
+        let gated = || capabilities.ok_or(DesktopRpcError::NotAdvertised(self.method()));
         match self {
             Self::ListSessions(query) => session.issue_list_sessions(query),
             Self::SwitchSession { id, scope } => session.issue_switch_session(id, *scope),
@@ -131,7 +184,34 @@ impl ReadRequest {
             } => session.issue_set_background_subagents(*policy, confirmation_token.as_deref()),
             Self::AuthStatus => session.issue(DesktopMethod::GetAuthStatus),
             Self::ReloadCredentials => session.issue(DesktopMethod::ReloadCredentials),
+            Self::AvailableModels => session.issue(DesktopMethod::ListAvailableModels),
+            Self::LoginStart { provider } => session.issue_login_start(gated()?, provider),
+            Self::LoginComplete { login_id, value } => {
+                session.issue_login_complete(gated()?, login_id, &value.0)
+            }
+            Self::LoginCancel { login_id } => session.issue_login_cancel(gated()?, login_id),
+            Self::SetApiKey { provider, key } => {
+                session.issue_set_api_key(gated()?, provider, &key.0)
+            }
+            Self::RemoveCredentials { provider } => {
+                session.issue_remove_credentials(gated()?, provider)
+            }
+            Self::ListPackages => session.issue_list_packages(gated()?),
+            Self::PackageJob { install, source } => {
+                session.issue_package_job(gated()?, *install, source, None)
+            }
         }
+    }
+}
+
+/// A value a request carries that is never printed: a key, a pasted code
+/// or a redirect URL with one.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct Secret(pub(crate) String);
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("<redacted>")
     }
 }
 
@@ -194,6 +274,14 @@ pub(crate) enum ReadOutcome {
     BackgroundSubagentsSet(SetBackgroundSubagentsResult),
     AuthStatus(AuthStatus),
     CredentialsReloaded(ReloadCredentials),
+    AvailableModels(AvailableModels),
+    LoginStarted(String),
+    /// `login_complete` or `login_cancel` was taken.
+    LoginAcknowledged,
+    ApiKeySaved(bool),
+    CredentialsRemoved(bool),
+    Packages(Vec<InstalledPackage>),
+    PackageJobStarted(String),
     Failed(ReadFailure),
 }
 
@@ -272,7 +360,7 @@ impl Reads {
             let Some(queued) = self.queue.pop_front() else {
                 break;
             };
-            match queued.request.issue(session) {
+            match queued.request.issue(session, self.capabilities.as_ref()) {
                 Ok(request) => {
                     self.in_flight = Some(queued);
                     self.generation += 1;
@@ -423,6 +511,27 @@ impl Reads {
             ReadRequest::ReloadCredentials => response
                 .reload_credentials()
                 .map(ReadOutcome::CredentialsReloaded),
+            ReadRequest::AvailableModels => response
+                .available_models()
+                .map(ReadOutcome::AvailableModels),
+            ReadRequest::LoginStart { .. } => response
+                .login_started()
+                .map(|started| ReadOutcome::LoginStarted(started.login_id)),
+            ReadRequest::LoginComplete { .. } | ReadRequest::LoginCancel { .. } => response
+                .login_acknowledged()
+                .map(|()| ReadOutcome::LoginAcknowledged),
+            ReadRequest::SetApiKey { .. } => response
+                .api_key_saved()
+                .map(|saved| ReadOutcome::ApiKeySaved(saved.saved)),
+            ReadRequest::RemoveCredentials { .. } => response
+                .credentials_removed()
+                .map(|removed| ReadOutcome::CredentialsRemoved(removed.removed)),
+            ReadRequest::ListPackages => response
+                .packages()
+                .map(|list| ReadOutcome::Packages(list.packages)),
+            ReadRequest::PackageJob { .. } => response
+                .package_job()
+                .map(|job| ReadOutcome::PackageJobStarted(job.job_id)),
         };
         let outcome = match decoded {
             Ok(outcome) => outcome,
@@ -483,6 +592,15 @@ pub(in crate::features::session) fn is_read(method: DesktopMethod) -> bool {
             | DesktopMethod::SetBackgroundSubagents
             | DesktopMethod::GetAuthStatus
             | DesktopMethod::ReloadCredentials
+            | DesktopMethod::ListAvailableModels
+            | DesktopMethod::LoginStart
+            | DesktopMethod::LoginComplete
+            | DesktopMethod::LoginCancel
+            | DesktopMethod::SetApiKey
+            | DesktopMethod::RemoveCredentials
+            | DesktopMethod::ListPackages
+            | DesktopMethod::InstallPackage
+            | DesktopMethod::RemovePackage
     )
 }
 
@@ -1147,6 +1265,96 @@ mod tests {
                     _ => None,
                 }),
             Some(DesktopErrorCode::StatusUnavailable)
+        );
+    }
+
+    #[test]
+    fn sign_in_and_package_requests_go_only_to_a_shell_that_offers_them() {
+        use super::Secret;
+
+        let mut older = main_shell();
+        assert_eq!(
+            older.reads_enqueue(ReadRequest::LoginStart {
+                provider: "anthropic".into()
+            }),
+            Err(ReadFailure::NotOffered)
+        );
+        assert!(older.session().pending().is_none());
+
+        let mut methods = RELEASE_METHODS.to_vec();
+        methods.extend([
+            "login_start",
+            "login_complete",
+            "set_api_key",
+            "install_package",
+        ]);
+        let mut desktop = probed(&methods);
+        let ticket = desktop
+            .reads_enqueue(ReadRequest::LoginStart {
+                provider: "anthropic".into(),
+            })
+            .unwrap();
+        let (id, payload) = sent(&desktop.reads_pump().sends);
+        assert_eq!(payload["method"], "login_start");
+        assert_eq!(payload["params"], json!({ "provider": "anthropic" }));
+        let _ = desktop.reads_apply(&ok(&id, json!({ "loginId": "l1" })));
+        assert_eq!(
+            desktop.reads_take(ticket),
+            Some(ReadOutcome::LoginStarted("l1".into()))
+        );
+
+        // The redirect the browser card caught goes back whole; a secret
+        // never shows in the request's Debug.
+        let answer = ReadRequest::LoginComplete {
+            login_id: "l1".into(),
+            value: Secret("http://localhost:1455/cb?code=secret-code".into()),
+        };
+        assert!(!format!("{answer:?}").contains("secret-code"));
+        let ticket = desktop.reads_enqueue(answer).unwrap();
+        let (id, payload) = sent(&desktop.reads_pump().sends);
+        assert_eq!(
+            payload["params"],
+            json!({ "loginId": "l1", "value": "http://localhost:1455/cb?code=secret-code" })
+        );
+        let _ = desktop.reads_apply(&ok(&id, json!({ "accepted": true })));
+        assert_eq!(
+            desktop.reads_take(ticket),
+            Some(ReadOutcome::LoginAcknowledged)
+        );
+
+        let ticket = desktop
+            .reads_enqueue(ReadRequest::SetApiKey {
+                provider: "groq".into(),
+                key: Secret("gsk-1".into()),
+            })
+            .unwrap();
+        let (id, _) = sent(&desktop.reads_pump().sends);
+        let _ = desktop.reads_apply(&ok(&id, json!({ "saved": true })));
+        assert_eq!(
+            desktop.reads_take(ticket),
+            Some(ReadOutcome::ApiKeySaved(true))
+        );
+
+        let ticket = desktop
+            .reads_enqueue(ReadRequest::PackageJob {
+                install: true,
+                source: "npm:pi-btw".into(),
+            })
+            .unwrap();
+        let (id, payload) = sent(&desktop.reads_pump().sends);
+        assert_eq!(payload["method"], "install_package");
+        let _ = desktop.reads_apply(&ok(&id, json!({ "jobId": "j1" })));
+        assert_eq!(
+            desktop.reads_take(ticket),
+            Some(ReadOutcome::PackageJobStarted("j1".into()))
+        );
+        // Removing is not offered by this Shell.
+        assert_eq!(
+            desktop.reads_enqueue(ReadRequest::PackageJob {
+                install: false,
+                source: "npm:pi-btw".into(),
+            }),
+            Err(ReadFailure::NotOffered)
         );
     }
 }

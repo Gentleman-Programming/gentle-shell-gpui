@@ -60,11 +60,32 @@ impl SessionView {
                 }
                 self.backend.stderr.push_back(line);
             }
+            // A server's stream reconnected past what it still keeps: the
+            // conversation is read again, as after opening a session.
+            Incoming::Resync => {
+                self.reset_conversation();
+                self.reset_desktop_channel();
+                self.refresh_state(cx);
+            }
+            Incoming::DialogResolved { id, refused } => {
+                self.dialog_resolved(&id, refused, window, cx);
+            }
             Incoming::Exited(code) => {
+                // A server session this tab lost hold of (its pairing was
+                // replaced or revoked) may still run there: Start again picks
+                // it up when it does.
+                if self
+                    .runs_on
+                    .as_ref()
+                    .is_some_and(|runs_on| runs_on.is_server())
+                {
+                    self.backend.attach = self.server_session();
+                }
                 self.backend.status = BackendStatus::Exited(code);
                 self.usage.compacting = false;
                 self.transcript.interrupt();
                 self.extension.dialogs.clear();
+                self.host.reset();
                 // Nothing the dead backend said or numbered applies any more.
                 self.desktop.reset();
                 self.permission.reset(self.desktop.session());
@@ -111,6 +132,8 @@ impl SessionView {
                 }
                 self.refresh_stats(cx);
             }
+            // The context html pages shared went with this run.
+            Some("agent_start") => self.host_genui_turn_started(cx),
             Some("session_info_changed") => {
                 self.session_name = event["name"].as_str().map(str::to_string);
             }
@@ -329,6 +352,21 @@ impl SessionView {
     /// channel (probe, sequencing, resync, and every benign foreign record).
     fn handle_desktop_ui(&mut self, request: &UiRequest, cx: &mut Context<Self>) {
         let decoded = decode_widget(request);
+        // A host tool's call or cancel is this tab's to run, whichever
+        // request is pending.
+        if let Ok(Some(DesktopRecord::Event(event))) = &decoded
+            && super::host_tools::is_host_event(event)
+        {
+            self.handle_host_event(request, event, cx);
+            return;
+        }
+        // A sign-in's or package job's step is the screen's that started it.
+        if let Ok(Some(DesktopRecord::Event(event))) = &decoded
+            && super::accounts::is_account_event(event)
+        {
+            self.handle_account_event(request, event, cx);
+            return;
+        }
         // An unrelated delta leaves the merged context untouched; it is not
         // fresh context data and must not replace a compaction estimate.
         let context_changed = match &decoded {
@@ -504,6 +542,8 @@ impl SessionView {
                 self.sync_design(cx);
                 self.sync_config(cx);
                 self.sync_output(cx);
+                // The probe answered: a server session takes the app's tools.
+                self.sync_host_tools(cx);
             }
         }
         self.sync_review(cx);
@@ -616,6 +656,35 @@ impl SessionView {
                 .notice(NoticeLevel::Error, format!("{error:#}"));
         }
         self.prepare_dialog(window, cx);
+        self.sync_chrome(cx);
+        cx.notify();
+    }
+
+    /// Another device following this server session answered the dialog
+    /// `id`: it closes here with a quiet note. `refused`: this tab's own
+    /// answer arrived second and the server kept the other one.
+    pub(super) fn dialog_resolved(
+        &mut self,
+        id: &str,
+        refused: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let front = self.extension.dialogs.front().is_some_and(|d| d.id == id);
+        let shown = self.extension.dialogs.len();
+        self.extension.dialogs.retain(|d| d.id != id);
+        let note = if self.extension.dialogs.len() < shown {
+            "Answered on another device."
+        } else if refused {
+            "Another device answered this first; the answer here wasn't used."
+        } else {
+            // This tab's own answer, or one it never showed.
+            return;
+        };
+        self.transcript.notice(NoticeLevel::Info, note.into());
+        if front {
+            self.prepare_dialog(window, cx);
+        }
         self.sync_chrome(cx);
         cx.notify();
     }

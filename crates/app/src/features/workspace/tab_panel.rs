@@ -493,9 +493,12 @@ impl Workspace {
         let indices: Vec<usize> = removals.iter().map(|(i, _)| *i).collect();
         for idx in gentle_core::workspaces::close_stack_order(&indices) {
             let tab = self.spaces[space].tabs.remove(idx);
-            if tab.is_built() {
-                for pane in tab.leaves() {
-                    self.panes.remove(&pane);
+            match tab.state.unbuilt() {
+                Some(saved) => Self::discard_saved_tab(saved, cx),
+                None => {
+                    for pane in tab.leaves() {
+                        self.discard_pane(pane, cx);
+                    }
                 }
             }
         }
@@ -739,6 +742,8 @@ mod tests {
                     cwd: PathBuf::from("/x"),
                     path: None,
                     session: None,
+                    server: None,
+                    terminal: None,
                 }),
                 pinned,
                 focused: 0,
@@ -976,6 +981,7 @@ mod tests {
                         _lifecycle: Vec::new(),
                         notices: cx.new(|_| Notices::default()),
                         renaming: None,
+                        tab_strip: Default::default(),
                         surge: None,
                         surge_runs: 0,
                         _surge_end: None,
@@ -990,6 +996,7 @@ mod tests {
                         closed: Vec::new(),
                         music: cx.new(|cx| Music::new(window, cx)),
                         devices: cx.new(DevicePanel::new),
+                        focus: cx.focus_handle(),
                     });
                     workspace.update(cx, |workspace, cx| body(workspace, window, cx));
                 })

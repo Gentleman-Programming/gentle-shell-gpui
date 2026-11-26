@@ -1,6 +1,8 @@
 //! UI testing: Maestro, set up and managed from one place. Install (Java when
 //! missing, the CLI, the agent's tools), test the connection, disconnect, or
-//! remove what the app installed. The work itself is `setup::maestro`.
+//! remove what the app installed. For agents on a Gentle Shell server it is
+//! this computer's Maestro, which the app runs for them (the `maestro` host
+//! tool), with nothing to connect. The work itself is `setup::maestro`.
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -10,7 +12,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::layout::{row, section};
-use super::{SettingsEvent, SettingsView};
+use super::{SettingsEvent, SettingsView, on_machine};
 use crate::features::setup::maestro::{self, MaestroStatus};
 use crate::shared::ui;
 
@@ -35,11 +37,9 @@ type Work = fn(&(dyn Fn(String) + Send + Sync)) -> Result<(), String>;
 impl SettingsView {
     /// Look at the machine again (CLI, Java, the agent's `mcp.json`).
     pub(super) fn refresh_maestro(&mut self, cx: &mut Context<Self>) {
+        let machine = self.machine.clone();
         self.maestro.task = Some(cx.spawn(async move |this, cx| {
-            let status = cx
-                .background_executor()
-                .spawn(async { maestro::status() })
-                .await;
+            let status = on_machine(cx.background_executor(), &machine, maestro::status).await;
             let _ = this.update(cx, |this, cx| {
                 this.maestro.status = Some(status);
                 cx.notify();
@@ -63,8 +63,9 @@ impl SettingsView {
         self.maestro.log.clear();
         self.maestro.note = None;
         let (tx, rx) = async_channel::unbounded::<String>();
+        let machine = self.machine.clone();
         self.maestro.task = Some(cx.spawn(async move |this, cx| {
-            let done = cx.background_executor().spawn(async move {
+            let done = on_machine(cx.background_executor(), &machine, move || {
                 let log = move |line: String| {
                     let _ = tx.send_blocking(line);
                 };
@@ -90,10 +91,7 @@ impl SettingsView {
                 }
             }
             let result = done.await;
-            let status = cx
-                .background_executor()
-                .spawn(async { maestro::status() })
-                .await;
+            let status = on_machine(cx.background_executor(), &machine, maestro::status).await;
             let _ = this.update(cx, |this, cx| {
                 this.maestro.job = None;
                 this.maestro.status = Some(status);
@@ -116,11 +114,10 @@ impl SettingsView {
         }
         self.maestro.job = Some("Testing the connection");
         self.maestro.note = None;
+        let machine = self.machine.clone();
         self.maestro.task = Some(cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async { maestro::test_connection() })
-                .await;
+            let result =
+                on_machine(cx.background_executor(), &machine, maestro::test_connection).await;
             let _ = this.update(cx, |this, cx| {
                 this.maestro.job = None;
                 this.maestro.note = Some(match result {
@@ -156,11 +153,16 @@ impl SettingsView {
         };
         let busy = self.maestro.job.is_some();
         let (state, color) = match (status.cli.is_some(), status.connected) {
+            (true, _) if status.host_tool => {
+                ("Ready: the app runs it for its agents", ui::success())
+            }
+            (false, _) if status.host_tool => ("Not installed on this computer", ui::faint()),
             (true, true) => ("Ready: the agent has the maestro tools", ui::success()),
             (true, false) => ("Installed, not connected to the agent", ui::warning()),
             (false, true) => ("Connected, but the CLI is missing", ui::danger()),
             (false, false) => ("Not installed", ui::faint()),
         };
+        let host_tool = status.host_tool;
         let action = |id: &'static str, icon: IconName, label: &'static str| {
             Button::new(id)
                 .small()
@@ -191,7 +193,10 @@ impl SettingsView {
             ))
             .child(row(
                 "Agent tools",
-                if status.connected {
+                if host_tool {
+                    "The app's maestro tool: agents run flows on the device panel's \
+                     simulators here (with Devices on), no MCP server"
+                } else if status.connected {
                     "Connected (open tabs reload when idle)"
                 } else {
                     "Not connected"
@@ -202,23 +207,33 @@ impl SettingsView {
                     .pt_3()
                     .gap_2()
                     .flex_wrap()
-                    .when(!status.connected || status.cli.is_none(), |d| {
-                        d.child(
-                            Button::new("maestro-install")
-                                .small()
-                                .primary()
-                                .icon(Icon::new(IconName::ArrowDown))
-                                .label(if status.cli.is_some() {
-                                    "Connect to the agent"
-                                } else {
-                                    "Install Maestro"
-                                })
-                                .disabled(busy)
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.run_maestro("Install", maestro::install, true, cx)
-                                })),
-                        )
-                    })
+                    .when(
+                        status.cli.is_none() || !(status.connected || host_tool),
+                        |d| {
+                            d.child(
+                                Button::new("maestro-install")
+                                    .small()
+                                    .primary()
+                                    .icon(Icon::new(IconName::ArrowDown))
+                                    .label(if status.cli.is_some() {
+                                        "Connect to the agent"
+                                    } else {
+                                        "Install Maestro"
+                                    })
+                                    .disabled(busy)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        // Agents with host tools need no restart:
+                                        // the tool is offered with the app's others.
+                                        this.run_maestro(
+                                            "Install",
+                                            maestro::install,
+                                            !host_tool,
+                                            cx,
+                                        )
+                                    })),
+                            )
+                        },
+                    )
                     .when(status.connected, |d| {
                         d.child(
                             action("maestro-test", IconName::CircleCheck, "Test connection")

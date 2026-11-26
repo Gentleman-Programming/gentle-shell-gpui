@@ -18,7 +18,9 @@
 //! [`DesktopSession::abandon`] for a request that will never be answered (a
 //! transport timeout, or a disposition other than `handled`), and
 //! [`DesktopSession::reset`] / [`DesktopSession::resync_from_snapshot`] for a
-//! backend restart or a lost event sequence.
+//! backend restart or a lost event sequence. A server that names its event
+//! numbering with an `epoch` also says when that numbering restarted (a
+//! reload or a switch on its side), so the session follows it on its own.
 //!
 //! The server validates the domain: the client keeps only the rules the
 //! contract documents. It checks input before sending only where the server
@@ -37,7 +39,7 @@
 
 use crate::record::{Response as PiResponse, UiMethod, UiRequest};
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use std::fmt;
 
 /// A closed wire vocabulary: the enum, its wire names, parsing (an unknown
@@ -106,15 +108,21 @@ mod background;
 mod binding;
 mod changes;
 mod definitions;
+mod host_tools;
 mod output;
+mod packages;
 mod review;
 mod session_state;
 mod sessions;
+mod sign_in;
 mod stats;
 mod status;
 mod updates;
 
-pub use auth::{AuthSource, AuthStatus, AuthType, ProviderAuth, ReloadCredentials};
+pub use auth::{
+    AuthSource, AuthStatus, AuthType, AvailableModel, AvailableModels, CurrentModel, LoginKind,
+    ProviderAuth, ReloadCredentials,
+};
 pub use background::{
     BackgroundCapability, BackgroundConfirmation, BackgroundPolicy, BackgroundSource,
     BackgroundSubagents, PolicyFile, SetBackgroundSubagentsOutcome, SetBackgroundSubagentsResult,
@@ -128,7 +136,20 @@ pub use definitions::{
     AgentDefinition, AgentDefinitionProblems, AgentDefinitionScope, AgentDefinitionSource,
     AgentDefinitions, DefaultOrchestrator, OrchestratorStatus, SubagentDefaults,
 };
+pub use host_tools::{
+    HOST_TOOL_CALL, HOST_TOOL_CANCEL, HOST_TOOL_PROGRESS_EVERY, HostDelivery, HostMessage,
+    HostMessageAck, HostTool, HostToolCall, HostToolCancel, HostToolContent, HostToolProgressAck,
+    HostToolResultAck, MAX_DESCRIPTION_CHARS, MAX_DETAILS_BYTES, MAX_GUIDELINE_CHARS,
+    MAX_GUIDELINES, MAX_HOST_MESSAGE_BYTES, MAX_HOST_TOOL_RESULT_BYTES, MAX_HOST_TOOLS,
+    MAX_LABEL_CHARS, MAX_MESSAGE_CONTENT_BYTES, MAX_PARAMETERS_BYTES, MAX_PROVIDER_CHARS,
+    MAX_RESULT_CONTENT_BYTES, MAX_SET_HOST_TOOLS_BYTES, RejectedHostTool, SetHostContextAck,
+    SetHostToolsResult, valid_custom_type, valid_tool_name,
+};
 pub use output::{JobOutput, SubagentThread, ThreadItem};
+pub use packages::{
+    InstalledPackage, PACKAGE_FINISHED, PACKAGE_PROGRESS, PackageFinished, PackageJob, PackageList,
+    PackageProgress,
+};
 pub use review::{
     ReviewConfirmation, ReviewEffective, ReviewMode, ReviewModeChanged, ReviewScope, ReviewScopes,
     ReviewSetting, ReviewSource, SetReviewModeOutcome, SetReviewModeResult,
@@ -147,6 +168,10 @@ pub use session_state::{
 pub use sessions::{
     ListSessionsQuery, MAX_SESSION_ID_UNITS, MAX_SESSIONS_LIMIT, SessionEntry, SessionList,
     SessionsScope, SwitchSessionResult,
+};
+pub use sign_in::{
+    ApiKeySaved, CredentialsRemoved, LOGIN_FINISHED, LOGIN_PROMPT, LoginFinished, LoginOption,
+    LoginPrompt, LoginPromptKind, LoginStarted,
 };
 pub use stats::{
     StatsRange, StatsScope, UsageStats, UsageStatsDay, UsageStatsModel, UsageStatsProject,
@@ -209,13 +234,27 @@ pub enum DesktopMethod {
     ClearProfileBinding,
     GetAuthStatus,
     ReloadCredentials,
+    ListAvailableModels,
+    SetHostTools,
+    HostToolResult,
+    HostToolProgress,
+    HostMessage,
+    SetHostContext,
+    LoginStart,
+    LoginComplete,
+    LoginCancel,
+    SetApiKey,
+    RemoveCredentials,
+    ListPackages,
+    InstallPackage,
+    RemovePackage,
 }
 
 impl DesktopMethod {
     /// Every method this client knows, in the order `capabilities` lists
     /// them on Gentle Shell 5.0.0. Which ones a peer offers is only what its
     /// `capabilities` say: Gentle Shell 4.8.0 offers fourteen of them.
-    pub const ALL: [Self; 32] = [
+    pub const ALL: [Self; 46] = [
         Self::Capabilities,
         Self::GetSnapshot,
         Self::GetConfig,
@@ -248,6 +287,20 @@ impl DesktopMethod {
         Self::ClearProfileBinding,
         Self::GetAuthStatus,
         Self::ReloadCredentials,
+        Self::ListAvailableModels,
+        Self::SetHostTools,
+        Self::HostToolResult,
+        Self::HostToolProgress,
+        Self::HostMessage,
+        Self::SetHostContext,
+        Self::LoginStart,
+        Self::LoginComplete,
+        Self::LoginCancel,
+        Self::SetApiKey,
+        Self::RemoveCredentials,
+        Self::ListPackages,
+        Self::InstallPackage,
+        Self::RemovePackage,
     ];
 
     /// The wire name of the method.
@@ -285,6 +338,32 @@ impl DesktopMethod {
             Self::ClearProfileBinding => "clear_profile_binding",
             Self::GetAuthStatus => "get_auth_status",
             Self::ReloadCredentials => "reload_credentials",
+            Self::ListAvailableModels => "list_available_models",
+            Self::SetHostTools => "set_host_tools",
+            Self::HostToolResult => "host_tool_result",
+            Self::HostToolProgress => "host_tool_progress",
+            Self::HostMessage => "host_message",
+            Self::SetHostContext => "set_host_context",
+            Self::LoginStart => "login_start",
+            Self::LoginComplete => "login_complete",
+            Self::LoginCancel => "login_cancel",
+            Self::SetApiKey => "set_api_key",
+            Self::RemoveCredentials => "remove_credentials",
+            Self::ListPackages => "list_packages",
+            Self::InstallPackage => "install_package",
+            Self::RemovePackage => "remove_package",
+        }
+    }
+
+    /// The largest inner request of this method, in bytes: host tool
+    /// results carry screenshots, registrations schemas, and host messages
+    /// and contexts `details`.
+    pub fn max_request_bytes(self) -> usize {
+        match self {
+            Self::HostToolResult => MAX_HOST_TOOL_RESULT_BYTES,
+            Self::SetHostTools => MAX_SET_HOST_TOOLS_BYTES,
+            Self::HostMessage | Self::SetHostContext => MAX_HOST_MESSAGE_BYTES,
+            _ => MAX_REQUEST_BYTES,
         }
     }
 
@@ -306,6 +385,19 @@ impl DesktopMethod {
                 | Self::GetChangeDiff
                 | Self::SetReviewMode
                 | Self::SetBackgroundSubagents
+                | Self::SetHostTools
+                | Self::HostToolResult
+                | Self::HostToolProgress
+                | Self::HostMessage
+                | Self::SetHostContext
+                | Self::LoginStart
+                | Self::LoginComplete
+                | Self::LoginCancel
+                | Self::SetApiKey
+                | Self::RemoveCredentials
+                | Self::ListPackages
+                | Self::InstallPackage
+                | Self::RemovePackage
         )
     }
 
@@ -344,6 +436,20 @@ impl DesktopMethod {
             "clear_profile_binding" => Ok(Self::ClearProfileBinding),
             "get_auth_status" => Ok(Self::GetAuthStatus),
             "reload_credentials" => Ok(Self::ReloadCredentials),
+            "list_available_models" => Ok(Self::ListAvailableModels),
+            "set_host_tools" => Ok(Self::SetHostTools),
+            "host_tool_result" => Ok(Self::HostToolResult),
+            "host_tool_progress" => Ok(Self::HostToolProgress),
+            "host_message" => Ok(Self::HostMessage),
+            "set_host_context" => Ok(Self::SetHostContext),
+            "login_start" => Ok(Self::LoginStart),
+            "login_complete" => Ok(Self::LoginComplete),
+            "login_cancel" => Ok(Self::LoginCancel),
+            "set_api_key" => Ok(Self::SetApiKey),
+            "remove_credentials" => Ok(Self::RemoveCredentials),
+            "list_packages" => Ok(Self::ListPackages),
+            "install_package" => Ok(Self::InstallPackage),
+            "remove_package" => Ok(Self::RemovePackage),
             other => Err(DesktopRpcError::UnsupportedMethod(other.to_string())),
         }
     }
@@ -510,12 +616,32 @@ impl fmt::Display for DesktopAgentStep {
     }
 }
 
-/// One validated inner request, ready to be sent as a prompt.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// One validated inner request, ready to be sent as a prompt. Its `Debug`
+/// leaves out the payload of a request that carries a secret (a key, a
+/// pasted code or redirect URL).
+#[derive(Clone, PartialEq, Eq)]
 pub struct DesktopRequest {
     request_id: String,
     method: DesktopMethod,
     payload: String,
+}
+
+impl fmt::Debug for DesktopRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let secret = matches!(
+            self.method,
+            DesktopMethod::SetApiKey | DesktopMethod::LoginComplete
+        );
+        formatter
+            .debug_struct("DesktopRequest")
+            .field("request_id", &self.request_id)
+            .field("method", &self.method)
+            .field(
+                "payload",
+                &if secret { "<redacted>" } else { &self.payload },
+            )
+            .finish()
+    }
 }
 
 #[derive(serde::Serialize)]
@@ -925,6 +1051,206 @@ impl DesktopRequest {
         )
     }
 
+    /// The `set_host_tools` request: `provider`'s whole set of host tools
+    /// (an empty list unregisters it), each validated against the
+    /// contract's limits. A Gentle Shell server overwrites `provider` with
+    /// the calling device's id.
+    pub fn set_host_tools(
+        request_id: impl Into<String>,
+        provider: &str,
+        tools: &[HostTool],
+    ) -> Result<Self, DesktopRpcError> {
+        Self::build(
+            request_id,
+            DesktopMethod::SetHostTools,
+            host_tools::set_host_tools_params(provider, tools)?,
+        )
+    }
+
+    /// The `host_tool_result` request answering `call_id`; `is_error` is sent
+    /// only when true, `details` (the Pi tool result's) only when given.
+    /// Content over [`MAX_RESULT_CONTENT_BYTES`] or details over
+    /// [`MAX_DETAILS_BYTES`] are refused.
+    pub fn host_tool_result(
+        request_id: impl Into<String>,
+        call_id: &str,
+        content: &[HostToolContent],
+        is_error: bool,
+        details: Option<&Map<String, Value>>,
+    ) -> Result<Self, DesktopRpcError> {
+        Self::build(
+            request_id,
+            DesktopMethod::HostToolResult,
+            host_tools::host_tool_result_params(call_id, content, is_error, details)?,
+        )
+    }
+
+    /// The `host_tool_progress` request for `call_id`: this client still
+    /// works on it, so the server restarts its no-result deadline. Refused
+    /// before anything is sent when the peer's `capabilities` don't list it
+    /// (an older server fails the call after its deadline whatever comes).
+    pub fn host_tool_progress(
+        request_id: impl Into<String>,
+        capabilities: &Capabilities,
+        call_id: &str,
+    ) -> Result<Self, DesktopRpcError> {
+        capabilities.require(DesktopMethod::HostToolProgress)?;
+        Self::build(
+            request_id,
+            DesktopMethod::HostToolProgress,
+            host_tools::host_tool_progress_params(call_id)?,
+        )
+    }
+
+    /// The `host_message` request: a custom message in the conversation.
+    /// Through a server, it goes to `/desktop`.
+    pub fn host_message(
+        request_id: impl Into<String>,
+        message: &HostMessage,
+    ) -> Result<Self, DesktopRpcError> {
+        Self::build(
+            request_id,
+            DesktopMethod::HostMessage,
+            host_tools::host_message_params(message)?,
+        )
+    }
+
+    /// The `set_host_context` request: `provider`'s hidden context before
+    /// each agent run (an empty `content` clears it). A Gentle Shell server
+    /// overwrites `provider` with the calling device's id.
+    pub fn set_host_context(
+        request_id: impl Into<String>,
+        provider: &str,
+        content: &str,
+        details: Option<&Map<String, Value>>,
+    ) -> Result<Self, DesktopRpcError> {
+        Self::build(
+            request_id,
+            DesktopMethod::SetHostContext,
+            host_tools::set_host_context_params(provider, content, details)?,
+        )
+    }
+
+    /// The `login_start` request: `{ provider }`. Like every sign-in and
+    /// package method, refused before anything is built when the peer's
+    /// `capabilities` don't list it.
+    pub fn login_start(
+        request_id: impl Into<String>,
+        capabilities: &Capabilities,
+        provider: &str,
+    ) -> Result<Self, DesktopRpcError> {
+        let params = sign_in::provider_params(provider)?;
+        Self::gated(request_id, capabilities, DesktopMethod::LoginStart, params)
+    }
+
+    /// The `login_complete` request: `{ loginId, value }`, a pasted code, an
+    /// answer, or the full redirect URL the client intercepted.
+    pub fn login_complete(
+        request_id: impl Into<String>,
+        capabilities: &Capabilities,
+        login_id: &str,
+        value: &str,
+    ) -> Result<Self, DesktopRpcError> {
+        let params = sign_in::login_complete_params(login_id, value)?;
+        Self::gated(
+            request_id,
+            capabilities,
+            DesktopMethod::LoginComplete,
+            params,
+        )
+    }
+
+    /// The `login_cancel` request: `{ loginId }`.
+    pub fn login_cancel(
+        request_id: impl Into<String>,
+        capabilities: &Capabilities,
+        login_id: &str,
+    ) -> Result<Self, DesktopRpcError> {
+        let params = sign_in::login_cancel_params(login_id)?;
+        Self::gated(request_id, capabilities, DesktopMethod::LoginCancel, params)
+    }
+
+    /// The `set_api_key` request: `{ provider, key }`.
+    pub fn set_api_key(
+        request_id: impl Into<String>,
+        capabilities: &Capabilities,
+        provider: &str,
+        key: &str,
+    ) -> Result<Self, DesktopRpcError> {
+        let params = sign_in::set_api_key_params(provider, key)?;
+        Self::gated(request_id, capabilities, DesktopMethod::SetApiKey, params)
+    }
+
+    /// The `remove_credentials` request: `{ provider }`.
+    pub fn remove_credentials(
+        request_id: impl Into<String>,
+        capabilities: &Capabilities,
+        provider: &str,
+    ) -> Result<Self, DesktopRpcError> {
+        let params = sign_in::provider_params(provider)?;
+        Self::gated(
+            request_id,
+            capabilities,
+            DesktopMethod::RemoveCredentials,
+            params,
+        )
+    }
+
+    /// The `list_packages` request. It takes no params.
+    pub fn list_packages(
+        request_id: impl Into<String>,
+        capabilities: &Capabilities,
+    ) -> Result<Self, DesktopRpcError> {
+        Self::gated(
+            request_id,
+            capabilities,
+            DesktopMethod::ListPackages,
+            json!({}),
+        )
+    }
+
+    /// The `install_package` request: `{ source }`, plus `scope` when given.
+    pub fn install_package(
+        request_id: impl Into<String>,
+        capabilities: &Capabilities,
+        source: &str,
+        scope: Option<PackageScope>,
+    ) -> Result<Self, DesktopRpcError> {
+        let params = packages::package_params(source, scope)?;
+        Self::gated(
+            request_id,
+            capabilities,
+            DesktopMethod::InstallPackage,
+            params,
+        )
+    }
+
+    /// The `remove_package` request: `{ source }`, plus `scope` when given.
+    pub fn remove_package(
+        request_id: impl Into<String>,
+        capabilities: &Capabilities,
+        source: &str,
+        scope: Option<PackageScope>,
+    ) -> Result<Self, DesktopRpcError> {
+        let params = packages::package_params(source, scope)?;
+        Self::gated(
+            request_id,
+            capabilities,
+            DesktopMethod::RemovePackage,
+            params,
+        )
+    }
+
+    fn gated(
+        request_id: impl Into<String>,
+        capabilities: &Capabilities,
+        method: DesktopMethod,
+        params: Value,
+    ) -> Result<Self, DesktopRpcError> {
+        capabilities.require(method)?;
+        Self::build(request_id, method, params)
+    }
+
     /// A request for a known method, validated against the id and size limits
     /// before anything reaches the transport. The config methods are refused
     /// here: their params come only from [`Self::get_config`] and
@@ -961,10 +1287,11 @@ impl DesktopRequest {
             params: &params,
         })
         .map_err(|error| DesktopRpcError::MalformedPayload(error.to_string()))?;
-        if payload.len() > MAX_REQUEST_BYTES {
+        let limit = method.max_request_bytes();
+        if payload.len() > limit {
             return Err(DesktopRpcError::RequestTooLarge {
                 bytes: payload.len(),
-                limit: MAX_REQUEST_BYTES,
+                limit,
             });
         }
         Ok(Self {
@@ -1271,6 +1598,73 @@ impl DesktopResponse {
         ReloadCredentials::from_data(self.data()?)
     }
 
+    /// The response to `list_available_models`.
+    pub fn available_models(&self) -> Result<AvailableModels, DesktopRpcError> {
+        AvailableModels::from_data(self.data()?)
+    }
+
+    /// The response to `set_host_tools`.
+    pub fn set_host_tools(&self) -> Result<SetHostToolsResult, DesktopRpcError> {
+        SetHostToolsResult::from_data(self.data()?)
+    }
+
+    /// The response to `host_tool_result`.
+    pub fn host_tool_result(&self) -> Result<HostToolResultAck, DesktopRpcError> {
+        HostToolResultAck::from_data(self.data()?)
+    }
+
+    /// The response to `host_tool_progress`.
+    pub fn host_tool_progress(&self) -> Result<HostToolProgressAck, DesktopRpcError> {
+        HostToolProgressAck::from_data(self.data()?)
+    }
+
+    /// The response to `host_message`.
+    pub fn host_message(&self) -> Result<HostMessageAck, DesktopRpcError> {
+        HostMessageAck::from_data(self.data()?)
+    }
+
+    /// The response to `set_host_context`.
+    pub fn set_host_context(&self) -> Result<SetHostContextAck, DesktopRpcError> {
+        SetHostContextAck::from_data(self.data()?)
+    }
+
+    /// The response to `login_start`: the login its events name.
+    pub fn login_started(&self) -> Result<LoginStarted, DesktopRpcError> {
+        LoginStarted::from_data(self.data()?)
+    }
+
+    /// The response to `login_complete` or `login_cancel`: accepted.
+    pub fn login_acknowledged(&self) -> Result<(), DesktopRpcError> {
+        if self.data()?.is_object() {
+            Ok(())
+        } else {
+            Err(DesktopRpcError::MalformedPayload(
+                "a login answer must be an object".into(),
+            ))
+        }
+    }
+
+    /// The response to `set_api_key`.
+    pub fn api_key_saved(&self) -> Result<ApiKeySaved, DesktopRpcError> {
+        decode_data(self.data()?)
+    }
+
+    /// The response to `remove_credentials`.
+    pub fn credentials_removed(&self) -> Result<CredentialsRemoved, DesktopRpcError> {
+        decode_data(self.data()?)
+    }
+
+    /// The response to `list_packages`.
+    pub fn packages(&self) -> Result<PackageList, DesktopRpcError> {
+        PackageList::from_data(self.data()?)
+    }
+
+    /// The response to `install_package` or `remove_package`: the job its
+    /// events name.
+    pub fn package_job(&self) -> Result<PackageJob, DesktopRpcError> {
+        packages::job_record(self.data()?, |job: &PackageJob| &job.job_id)
+    }
+
     fn data(&self) -> Result<&Value, DesktopRpcError> {
         self.result
             .as_ref()
@@ -1278,10 +1672,15 @@ impl DesktopResponse {
     }
 }
 
-/// One inner event. `seq` is session-scoped and advances by one.
+/// One inner event. `seq` is session-scoped and advances by one within its
+/// `epoch`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DesktopEvent {
     pub seq: u64,
+    /// The numbering `seq` belongs to: a new one each time the server's
+    /// channel starts again (a reload, a switch, a restart) and `seq` restarts
+    /// at 1. `None` from a server older than epochs.
+    pub epoch: Option<String>,
     pub event: String,
     pub data: Value,
 }
@@ -1357,6 +1756,48 @@ impl DesktopEvent {
     pub fn profile_binding_changed(&self) -> Result<ProfileBindingChanged, DesktopRpcError> {
         expect_event(self, "profile_binding_changed")?;
         ProfileBindingChanged::from_data(&self.data)
+    }
+
+    /// Decode the data of a `host_tool_call` event, verifying the exact event
+    /// name before the shape, exactly like [`Self::agents_update`].
+    pub fn host_tool_call(&self) -> Result<HostToolCall, DesktopRpcError> {
+        expect_event(self, HOST_TOOL_CALL)?;
+        HostToolCall::from_data(&self.data)
+    }
+
+    /// Decode the data of a `host_tool_cancel` event, verifying the exact
+    /// event name before the shape.
+    pub fn host_tool_cancel(&self) -> Result<HostToolCancel, DesktopRpcError> {
+        expect_event(self, HOST_TOOL_CANCEL)?;
+        HostToolCancel::from_data(&self.data)
+    }
+
+    /// Decode the data of a `login_prompt` event, verifying the exact event
+    /// name before the shape.
+    pub fn login_prompt(&self) -> Result<LoginPrompt, DesktopRpcError> {
+        expect_event(self, LOGIN_PROMPT)?;
+        LoginPrompt::from_data(&self.data)
+    }
+
+    /// Decode the data of a `login_finished` event, verifying the exact
+    /// event name before the shape.
+    pub fn login_finished(&self) -> Result<LoginFinished, DesktopRpcError> {
+        expect_event(self, LOGIN_FINISHED)?;
+        LoginFinished::from_data(&self.data)
+    }
+
+    /// Decode the data of a `package_progress` event, verifying the exact
+    /// event name before the shape.
+    pub fn package_progress(&self) -> Result<PackageProgress, DesktopRpcError> {
+        expect_event(self, PACKAGE_PROGRESS)?;
+        packages::job_record(&self.data, |progress: &PackageProgress| &progress.job_id)
+    }
+
+    /// Decode the data of a `package_finished` event, verifying the exact
+    /// event name before the shape.
+    pub fn package_finished(&self) -> Result<PackageFinished, DesktopRpcError> {
+        expect_event(self, PACKAGE_FINISHED)?;
+        packages::job_record(&self.data, |finished: &PackageFinished| &finished.job_id)
     }
 }
 
@@ -1671,6 +2112,8 @@ fn expect_event(event: &DesktopEvent, expected: &'static str) -> Result<(), Desk
 #[derive(Debug, Clone, PartialEq)]
 pub struct Snapshot {
     pub sequence: u64,
+    /// The numbering `sequence` counts in, as [`DesktopEvent::epoch`].
+    pub epoch: Option<String>,
     pub state: Value,
     pub session: Option<SessionSections>,
 }
@@ -1683,6 +2126,7 @@ impl Snapshot {
             .get("sequence")
             .and_then(Value::as_u64)
             .ok_or_else(|| DesktopRpcError::MalformedPayload("snapshot has no sequence".into()))?;
+        let epoch = epoch_field(data, "snapshot")?;
         let state = data
             .get("state")
             .filter(|state| state.is_object())
@@ -1696,9 +2140,22 @@ impl Snapshot {
             .transpose()?;
         Ok(Self {
             sequence,
+            epoch,
             state,
             session,
         })
+    }
+}
+
+/// The `epoch` an event or a snapshot names its numbering with: absent from
+/// a server older than epochs, otherwise a non-empty string.
+fn epoch_field(record: &Value, what: &str) -> Result<Option<String>, DesktopRpcError> {
+    match record.get("epoch") {
+        None => Ok(None),
+        Some(Value::String(epoch)) if !epoch.is_empty() => Ok(Some(epoch.clone())),
+        Some(_) => Err(DesktopRpcError::MalformedPayload(format!(
+            "{what} epoch must be a non-empty string"
+        ))),
     }
 }
 
@@ -2557,10 +3014,15 @@ impl DesignCanvasEvent {
     }
 }
 
-/// The nine configuration stores the protocol names. A store is an
+/// The thirteen configuration stores the protocol names. A store is an
 /// identifier, never a path; anything else is refused. Gentle Shell 4.9.0
 /// knows only the first six: it answers `unknown_store` for the settings
-/// stores (`persona`, `banner`, `notifications`).
+/// stores (`persona`, `banner`, `notifications`), and a Shell older than
+/// the last four answers it for those: `mcp` (Pi's `mcp.json`, global and
+/// project, with the servers Pi loads from them), `pi_settings` (Pi's
+/// merged `settings.json` view; its four model keys are writable),
+/// `claude_bridge` (the plan of `pi-claude-bridge`, read-only) and
+/// `custom_models` (Pi's `models.json`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ConfigStore {
     Profiles,
@@ -2572,11 +3034,15 @@ pub enum ConfigStore {
     Persona,
     Banner,
     Notifications,
+    Mcp,
+    PiSettings,
+    ClaudeBridge,
+    CustomModels,
 }
 
 impl ConfigStore {
     /// Every store the protocol speaks, in wire order.
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 13] = [
         Self::Profiles,
         Self::Models,
         Self::ProfileFallbacks,
@@ -2586,6 +3052,10 @@ impl ConfigStore {
         Self::Persona,
         Self::Banner,
         Self::Notifications,
+        Self::Mcp,
+        Self::PiSettings,
+        Self::ClaudeBridge,
+        Self::CustomModels,
     ];
 
     /// The wire name of the store.
@@ -2600,6 +3070,10 @@ impl ConfigStore {
             Self::Persona => "persona",
             Self::Banner => "banner",
             Self::Notifications => "notifications",
+            Self::Mcp => "mcp",
+            Self::PiSettings => "pi_settings",
+            Self::ClaudeBridge => "claude_bridge",
+            Self::CustomModels => "custom_models",
         }
     }
 
@@ -2610,30 +3084,37 @@ impl ConfigStore {
             | Self::ProfileFallbacks
             | Self::ManagedAssets
             | Self::Banner
-            | Self::Notifications => ConfigScope::Global,
-            Self::Models | Self::Subagents | Self::Persona => ConfigScope::GlobalProject,
+            | Self::Notifications
+            | Self::ClaudeBridge
+            | Self::CustomModels => ConfigScope::Global,
+            Self::Models | Self::Subagents | Self::Persona | Self::Mcp | Self::PiSettings => {
+                ConfigScope::GlobalProject
+            }
             Self::Pins => ConfigScope::LocalRepo,
         }
     }
 
-    /// Whether the store is derived or installer-owned, so `set_config` can
-    /// never target it.
+    /// Whether the store is derived, installer-owned or display-only, so
+    /// `set_config` can never target it.
     pub fn is_read_only(self) -> bool {
         self.write_targets().is_empty()
     }
 
     /// The files a write to this store may replace; empty when read-only.
     /// `persona`'s `global` target also covers the project file when that
-    /// one already exists.
+    /// one already exists; `pi_settings` writes only the global file.
     pub fn write_targets(self) -> &'static [ConfigWriteTarget] {
         match self {
             Self::Profiles
             | Self::ProfileFallbacks
             | Self::Persona
             | Self::Banner
-            | Self::Notifications => &[ConfigWriteTarget::Global],
+            | Self::Notifications
+            | Self::PiSettings
+            | Self::CustomModels => &[ConfigWriteTarget::Global],
+            Self::Mcp => &[ConfigWriteTarget::Global, ConfigWriteTarget::Project],
             Self::Pins => &[ConfigWriteTarget::Local, ConfigWriteTarget::Repo],
-            Self::Models | Self::Subagents | Self::ManagedAssets => &[],
+            Self::Models | Self::Subagents | Self::ManagedAssets | Self::ClaudeBridge => &[],
         }
     }
 }
@@ -2778,18 +3259,20 @@ impl fmt::Display for ConfigLayerSource {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ConfigWriteTarget {
     Global,
+    Project,
     Local,
     Repo,
 }
 
 impl ConfigWriteTarget {
     /// Every write target the protocol speaks, in wire order.
-    pub const ALL: [Self; 3] = [Self::Global, Self::Local, Self::Repo];
+    pub const ALL: [Self; 4] = [Self::Global, Self::Project, Self::Local, Self::Repo];
 
     /// The wire name of the write target.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Global => "global",
+            Self::Project => "project",
             Self::Local => "local",
             Self::Repo => "repo",
         }
@@ -2941,6 +3424,104 @@ impl NotificationsData {
     }
 }
 
+/// A `pi_settings` write: a patch of Pi's four model keys
+/// (`defaultProvider`, `defaultModel`, `defaultThinkingLevel`,
+/// `enabledModels`) in the agent home's `settings.json`. A key set to
+/// `null` is removed, an omitted key is kept, and no other key may be sent.
+/// The server's owner validates the values (`invalid_data`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PiSettingsPatch(Value);
+
+impl PiSettingsPatch {
+    /// The keys a patch may name.
+    pub const KEYS: [&'static str; 4] = [
+        "defaultProvider",
+        "defaultModel",
+        "defaultThinkingLevel",
+        "enabledModels",
+    ];
+
+    pub fn new(data: Value) -> Result<Self, DesktopRpcError> {
+        store_document(&data, "pi_settings")?;
+        if let Some(key) = data
+            .as_object()
+            .and_then(|patch| patch.keys().find(|key| !Self::KEYS.contains(&key.as_str())))
+        {
+            return Err(DesktopRpcError::InvalidConfigData(format!(
+                "pi_settings data may not name {key}"
+            )));
+        }
+        Ok(Self(data))
+    }
+
+    pub fn as_value(&self) -> &Value {
+        &self.0
+    }
+}
+
+/// The complete `custom_models` store content: Pi's whole `models.json`
+/// (`providers` required), secrets as the `"•••"` marker where they were
+/// read (sent back in place, a marker keeps that secret). Only the JSON
+/// object shape is checked here; the server validates it with Pi's own
+/// schema (`invalid_data`, its message saying where).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CustomModelsData(Value);
+
+impl CustomModelsData {
+    pub fn new(data: Value) -> Result<Self, DesktopRpcError> {
+        store_document(&data, "custom_models")?;
+        Ok(Self(data))
+    }
+
+    pub fn as_value(&self) -> &Value {
+        &self.0
+    }
+}
+
+/// Which `mcp.json` an `mcp` write replaces: the agent home's, or the
+/// session folder's `.pi/mcp.json` (read by Pi only in a trusted project;
+/// otherwise the write answers `project_untrusted`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum McpLayer {
+    Global,
+    Project,
+}
+
+impl McpLayer {
+    /// The wire name of the layer (`source`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Global => "global",
+            Self::Project => "project",
+        }
+    }
+
+    /// The write target whose revision guards a write of this layer.
+    pub fn write_target(self) -> ConfigWriteTarget {
+        match self {
+            Self::Global => ConfigWriteTarget::Global,
+            Self::Project => ConfigWriteTarget::Project,
+        }
+    }
+}
+
+/// One complete `mcp.json` document (`{ mcpServers, … }`), secrets as the
+/// `"•••"` marker where they were read. Only the JSON object shape is
+/// checked here; the server validates every server with Pi's own rules.
+#[derive(Debug, Clone, PartialEq)]
+pub struct McpDocumentData(Value);
+
+impl McpDocumentData {
+    pub fn new(data: Value) -> Result<Self, DesktopRpcError> {
+        store_document(&data, "mcp")?;
+        Ok(Self(data))
+    }
+
+    pub fn as_value(&self) -> &Value {
+        &self.0
+    }
+}
+
 /// One `set_config` write. Only the writable stores exist here, so a
 /// read-only store cannot be targeted through the typed API.
 #[derive(Debug, Clone, PartialEq)]
@@ -2962,6 +3543,15 @@ pub enum ConfigWrite {
     Banner(BannerData),
     /// Replace the whole `notifications` store.
     Notifications(NotificationsData),
+    /// Patch Pi's model keys (`pi_settings`).
+    PiSettings(PiSettingsPatch),
+    /// Replace Pi's whole `models.json` (`custom_models`).
+    CustomModels(CustomModelsData),
+    /// Replace one whole `mcp.json` (`mcp`), sent as `{ source, document }`.
+    Mcp {
+        layer: McpLayer,
+        document: McpDocumentData,
+    },
 }
 
 impl ConfigWrite {
@@ -2990,6 +3580,9 @@ impl ConfigWrite {
             Self::Persona(_) => ConfigStore::Persona,
             Self::Banner(_) => ConfigStore::Banner,
             Self::Notifications(_) => ConfigStore::Notifications,
+            Self::PiSettings(_) => ConfigStore::PiSettings,
+            Self::CustomModels(_) => ConfigStore::CustomModels,
+            Self::Mcp { .. } => ConfigStore::Mcp,
         }
     }
 
@@ -2997,11 +3590,14 @@ impl ConfigWrite {
     pub fn write_target(&self) -> ConfigWriteTarget {
         match self {
             Self::Pin { source, .. } => source.write_target(),
+            Self::Mcp { layer, .. } => layer.write_target(),
             Self::Profiles(_)
             | Self::ProfileFallbacks(_)
             | Self::Persona(_)
             | Self::Banner(_)
-            | Self::Notifications(_) => ConfigWriteTarget::Global,
+            | Self::Notifications(_)
+            | Self::PiSettings(_)
+            | Self::CustomModels(_) => ConfigWriteTarget::Global,
         }
     }
 }
@@ -3033,6 +3629,11 @@ fn set_config_params(
         ConfigWrite::Persona(mode) => json!({ "mode": mode.as_str() }),
         ConfigWrite::Banner(data) => data.as_value().clone(),
         ConfigWrite::Notifications(data) => data.as_value().clone(),
+        ConfigWrite::PiSettings(patch) => patch.as_value().clone(),
+        ConfigWrite::CustomModels(data) => data.as_value().clone(),
+        ConfigWrite::Mcp { layer, document } => {
+            json!({ "source": layer.as_str(), "document": document.as_value() })
+        }
     };
     Ok(json!({
         "store": write.store().as_str(),
@@ -3045,11 +3646,13 @@ fn set_config_params(
 /// (`invalid_request`, `internal_error`) are not config-specific.
 /// `profile_apply_busy` is also an `apply_profile` failure: `set_config` for
 /// `profiles`, `profile_fallbacks` or `pins` answers it while an apply runs,
-/// and writes nothing.
+/// and writes nothing. `project_untrusted` refuses an `mcp` write of the
+/// project layer while the session does not trust the project.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ConfigErrorCode {
     UnknownStore,
     ReadOnly,
+    ProjectUntrusted,
     InvalidData,
     RevisionConflict,
     WriteFailed,
@@ -3059,9 +3662,10 @@ pub enum ConfigErrorCode {
 
 impl ConfigErrorCode {
     /// Every config failure code, in documented order.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::UnknownStore,
         Self::ReadOnly,
+        Self::ProjectUntrusted,
         Self::InvalidData,
         Self::RevisionConflict,
         Self::WriteFailed,
@@ -3074,6 +3678,7 @@ impl ConfigErrorCode {
         match self {
             Self::UnknownStore => "unknown_store",
             Self::ReadOnly => "read_only",
+            Self::ProjectUntrusted => "project_untrusted",
             Self::InvalidData => "invalid_data",
             Self::RevisionConflict => "revision_conflict",
             Self::WriteFailed => "write_failed",
@@ -3684,6 +4289,9 @@ pub struct DesktopSession {
     next_request_id: u64,
     pending: Option<Pending>,
     last_seq: Option<u64>,
+    /// The epoch `last_seq` counts in; `None` before a baseline or from a
+    /// server older than epochs.
+    epoch: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3705,6 +4313,7 @@ impl DesktopSession {
             next_request_id: 1,
             pending: None,
             last_seq: None,
+            epoch: None,
         }
     }
 
@@ -3954,6 +4563,95 @@ impl DesktopSession {
         )
     }
 
+    /// Issue `login_start` with `{ provider }`, when `capabilities` list it.
+    pub fn issue_login_start(
+        &mut self,
+        capabilities: &Capabilities,
+        provider: &str,
+    ) -> Result<DesktopRequest, DesktopRpcError> {
+        let params = sign_in::provider_params(provider)?;
+        self.issue_gated(capabilities, DesktopMethod::LoginStart, params)
+    }
+
+    /// Issue `login_complete` with `{ loginId, value }`.
+    pub fn issue_login_complete(
+        &mut self,
+        capabilities: &Capabilities,
+        login_id: &str,
+        value: &str,
+    ) -> Result<DesktopRequest, DesktopRpcError> {
+        let params = sign_in::login_complete_params(login_id, value)?;
+        self.issue_gated(capabilities, DesktopMethod::LoginComplete, params)
+    }
+
+    /// Issue `login_cancel` with `{ loginId }`.
+    pub fn issue_login_cancel(
+        &mut self,
+        capabilities: &Capabilities,
+        login_id: &str,
+    ) -> Result<DesktopRequest, DesktopRpcError> {
+        let params = sign_in::login_cancel_params(login_id)?;
+        self.issue_gated(capabilities, DesktopMethod::LoginCancel, params)
+    }
+
+    /// Issue `set_api_key` with `{ provider, key }`.
+    pub fn issue_set_api_key(
+        &mut self,
+        capabilities: &Capabilities,
+        provider: &str,
+        key: &str,
+    ) -> Result<DesktopRequest, DesktopRpcError> {
+        let params = sign_in::set_api_key_params(provider, key)?;
+        self.issue_gated(capabilities, DesktopMethod::SetApiKey, params)
+    }
+
+    /// Issue `remove_credentials` with `{ provider }`.
+    pub fn issue_remove_credentials(
+        &mut self,
+        capabilities: &Capabilities,
+        provider: &str,
+    ) -> Result<DesktopRequest, DesktopRpcError> {
+        let params = sign_in::provider_params(provider)?;
+        self.issue_gated(capabilities, DesktopMethod::RemoveCredentials, params)
+    }
+
+    /// Issue `list_packages`.
+    pub fn issue_list_packages(
+        &mut self,
+        capabilities: &Capabilities,
+    ) -> Result<DesktopRequest, DesktopRpcError> {
+        self.issue_gated(capabilities, DesktopMethod::ListPackages, json!({}))
+    }
+
+    /// Issue `install_package` (`install`) or `remove_package` with
+    /// `{ source }` and `scope` when given.
+    pub fn issue_package_job(
+        &mut self,
+        capabilities: &Capabilities,
+        install: bool,
+        source: &str,
+        scope: Option<PackageScope>,
+    ) -> Result<DesktopRequest, DesktopRpcError> {
+        let method = if install {
+            DesktopMethod::InstallPackage
+        } else {
+            DesktopMethod::RemovePackage
+        };
+        let params = packages::package_params(source, scope)?;
+        self.issue_gated(capabilities, method, params)
+    }
+
+    /// [`Self::issue_with`] for a method only `capabilities` may allow.
+    fn issue_gated(
+        &mut self,
+        capabilities: &Capabilities,
+        method: DesktopMethod,
+        params: Value,
+    ) -> Result<DesktopRequest, DesktopRpcError> {
+        capabilities.require(method)?;
+        self.issue_with(method, params)
+    }
+
     /// A new request with a fresh id; `params` is built by the typed callers
     /// above, never from app-supplied JSON.
     fn issue_with(
@@ -3990,22 +4688,32 @@ impl DesktopSession {
     /// backend can never match a new request.
     pub fn reset(&mut self) {
         self.pending = None;
-        self.last_seq = None;
+        self.forget_baseline();
     }
 
     /// Adopt a snapshot's sequence as the event baseline, the documented
-    /// recovery after an [`DesktopRpcError::OutOfOrderSequence`] gap. A
-    /// snapshot older than the last accepted event is refused, so a stale one
-    /// cannot rewind the session into replays.
+    /// recovery after an [`DesktopRpcError::OutOfOrderSequence`] gap. Within
+    /// one epoch a snapshot older than the last accepted event is refused, so
+    /// a stale one cannot rewind the session into replays; a snapshot of
+    /// another epoch counts a numbering that started again, so its sequence
+    /// is taken whatever it is.
     pub fn resync_from_snapshot(&mut self, snapshot: &Snapshot) -> Result<(), DesktopRpcError> {
-        if let Some(last) = self.last_seq.filter(|last| snapshot.sequence < *last) {
+        if snapshot.epoch == self.epoch
+            && let Some(last) = self.last_seq.filter(|last| snapshot.sequence < *last)
+        {
             return Err(DesktopRpcError::StaleSnapshot {
                 last,
                 sequence: snapshot.sequence,
             });
         }
         self.last_seq = Some(snapshot.sequence);
+        self.epoch = snapshot.epoch.clone();
         Ok(())
+    }
+
+    fn forget_baseline(&mut self) {
+        self.last_seq = None;
+        self.epoch = None;
     }
 
     /// Decode and correlate an `extension_ui_request`: `Ok(None)` when it is
@@ -4050,29 +4758,46 @@ impl DesktopSession {
                 }
                 if switching {
                     // The new session numbers its events from 1 again.
-                    self.last_seq = None;
+                    self.forget_baseline();
                 }
             }
-            DesktopRecord::Event(event) => match self.last_seq {
-                // During a switch either session may speak, and the new one
-                // restarts at 1: each event is a new baseline.
-                _ if switching => self.last_seq = Some(event.seq),
-                Some(last) if event.seq <= last => {
-                    return Err(DesktopRpcError::DuplicateSequence {
-                        last,
-                        got: event.seq,
-                    });
+            DesktopRecord::Event(event) => {
+                let last = if switching {
+                    // During a switch either session may speak, and the new
+                    // one restarts at 1: each event is a new baseline.
+                    None
+                } else if self.last_seq.is_some() && event.epoch != self.epoch {
+                    // Another epoch is a channel that started again (a
+                    // reload, a switch, a restart) numbering from 1: none of
+                    // its events is a replay, and a first one other than 1
+                    // means events were lost.
+                    self.last_seq = Some(0);
+                    self.epoch = event.epoch.clone();
+                    Some(0)
+                } else {
+                    self.last_seq
+                };
+                match last {
+                    Some(last) if event.seq <= last => {
+                        return Err(DesktopRpcError::DuplicateSequence {
+                            last,
+                            got: event.seq,
+                        });
+                    }
+                    Some(last) if event.seq != last + 1 => {
+                        return Err(DesktopRpcError::OutOfOrderSequence {
+                            expected: last + 1,
+                            got: event.seq,
+                        });
+                    }
+                    // The first event seen sets the baseline: the session
+                    // does not know how many events preceded its subscription.
+                    _ => {
+                        self.last_seq = Some(event.seq);
+                        self.epoch = event.epoch.clone();
+                    }
                 }
-                Some(last) if event.seq != last + 1 => {
-                    return Err(DesktopRpcError::OutOfOrderSequence {
-                        expected: last + 1,
-                        got: event.seq,
-                    });
-                }
-                // The first event seen sets the baseline: the session does not
-                // know how many events preceded its subscription.
-                _ => self.last_seq = Some(event.seq),
-            },
+            }
         }
         Ok(Some(record))
     }
@@ -4082,6 +4807,12 @@ impl DesktopSession {
 pub fn decode_payload(payload: &str) -> Result<DesktopRecord, DesktopRpcError> {
     let value: Value = serde_json::from_str(payload)
         .map_err(|error| DesktopRpcError::MalformedPayload(error.to_string()))?;
+    decode_value(value)
+}
+
+/// Decode one inner record already parsed as JSON (the body a Gentle Shell
+/// server's `/desktop` endpoint answers with).
+pub fn decode_value(value: Value) -> Result<DesktopRecord, DesktopRpcError> {
     if !value.is_object() {
         return Err(DesktopRpcError::MalformedPayload(
             "record must be a JSON object".into(),
@@ -4186,6 +4917,7 @@ fn decode_response(value: Value) -> Result<DesktopRecord, DesktopRpcError> {
 }
 
 fn decode_event(value: Value) -> Result<DesktopRecord, DesktopRpcError> {
+    let epoch = epoch_field(&value, "event")?;
     let raw: RawEvent = serde_json::from_value(value)
         .map_err(|error| DesktopRpcError::MalformedPayload(error.to_string()))?;
     let seq = raw
@@ -4198,7 +4930,12 @@ fn decode_event(value: Value) -> Result<DesktopRecord, DesktopRpcError> {
     let data = raw
         .data
         .ok_or_else(|| DesktopRpcError::MalformedPayload("event has no data".into()))?;
-    Ok(DesktopRecord::Event(DesktopEvent { seq, event, data }))
+    Ok(DesktopRecord::Event(DesktopEvent {
+        seq,
+        epoch,
+        event,
+        data,
+    }))
 }
 
 /// Everything that can go wrong before, while and after a request: request

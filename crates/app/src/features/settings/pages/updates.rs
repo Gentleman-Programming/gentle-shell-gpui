@@ -36,6 +36,8 @@ fn backend_updates_section(
         status.and_then(|status| main_update_target(&status.gentle_shell, snapshot.managed)),
     );
     let pi = status.is_some_and(|status| pi_update_available(status, snapshot.managed));
+    let offer = view.update_offer(snapshot);
+    let offered = offer.is_some() || main.is_some();
     section(IconName::RefreshCw, "Gentle Shell and Engram")
         .child(row("Versions", snapshot.versions.join(" · ")))
         .children(
@@ -64,12 +66,13 @@ fn backend_updates_section(
                 ),
             )
         })
-        .when_some(view.update_offer(snapshot), |card, offer| {
+        .when_some(offer, |card, offer| {
             card.child(view.render_update(offer, cx))
         })
         .when_some(main, |card, commit| {
             card.child(view.render_main_update(commit, cx))
         })
+        .children(view.render_server_upgrade(offered, cx))
         .children(
             view.shell_update
                 .result

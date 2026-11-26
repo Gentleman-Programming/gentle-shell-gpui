@@ -145,7 +145,7 @@ pub fn add_worktree(toplevel: &Path, branch: &str, new: bool) -> Result<PathBuf,
             || toplevel.to_path_buf(),
             |main| backend::host_path(toplevel, &main.path.to_string_lossy()),
         );
-    let path = worktree_path(&main, branch, |p| p.exists());
+    let path = worktree_path(&main, branch, backend::fs::entry_exists);
     let folder = backend::there(toplevel, &path);
     let args: Vec<&str> = if new {
         vec!["worktree", "add", "-b", branch, "--", &folder]

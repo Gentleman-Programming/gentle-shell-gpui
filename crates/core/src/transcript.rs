@@ -662,8 +662,16 @@ impl Transcript {
         if text.trim().is_empty() {
             return;
         }
+        // The app's own `gentle_ui` (a server session's host tool) sends its
+        // events as `host.gentle-ui.event`: drawn as the extension's.
+        let kind = str_field(message, "customType");
+        let kind = if crate::genui::host::is_event_message(&kind) {
+            crate::genui::EVENT_MESSAGE.to_string()
+        } else {
+            kind
+        };
         self.push(Item::Custom {
-            kind: str_field(message, "customType"),
+            kind,
             text,
             details: message["details"].clone(),
         });

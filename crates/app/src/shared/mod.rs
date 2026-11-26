@@ -5,6 +5,7 @@ pub mod backdrop;
 pub mod banner;
 pub mod data_dir;
 pub mod diagnostics;
+pub mod diff_fit;
 pub mod floating;
 pub mod gentle_state;
 pub mod kisses;

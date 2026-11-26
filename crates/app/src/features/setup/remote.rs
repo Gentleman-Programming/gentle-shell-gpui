@@ -1,19 +1,98 @@
 //! Setup's checks when agents run in a backend (a WSL distro, a VM, a
 //! container): Node.js, Gentle Shell, its setup, a provider, git and the
 //! optional pieces are looked for there, never on this computer. Fixes are
-//! commands for a terminal, which opens in the backend too.
+//! commands for a terminal, which opens in the backend too. A Gentle Shell
+//! server runs nothing of the app's: Setup checks it answers and, when it
+//! offers `checks`, shows what it found of Node.js, Git, Engram and the
+//! companion setup there (an admin device may run Gentle Shell's own setup
+//! there, see `onboarding::server_setup`).
 
 use gentle_core::backend::Backend;
+use gentle_core::server_checks::{Readiness, ServerCheck, readiness};
 use serde_json::Value;
 
 use super::gentle::{self, BRIDGE, Marker};
 use super::probe::{parse_version, show_version};
-use super::{Check, CheckId, Fix, Log, MIN_NODE, Status, extras, fetch, meta};
+use super::{Check, CheckId, Fix, Log, MIN_ENGRAM, MIN_NODE, Status, extras, fetch, meta};
 use crate::features::backend;
 
-/// The backend agents run in, when they don't run on this computer.
+/// The machine Setup acts on ([`backend::current`]), when it isn't this
+/// computer.
 pub(super) fn backend() -> Option<Backend> {
-    Some(backend::saved()).filter(|choice| *choice != Backend::Local)
+    Some(backend::current()).filter(|choice| *choice != Backend::Local)
+}
+
+/// Installs and fixes can't reach a Gentle Shell server: the error to show
+/// instead of running them anywhere (never on this computer).
+pub(super) fn refuse_server() -> Result<(), String> {
+    match backend() {
+        Some(choice) if choice.is_server() => Err(backend::server::NOT_ON_SERVER.to_string()),
+        _ => Ok(()),
+    }
+}
+
+/// Blocking: Setup's checks for a Gentle Shell server. Gentle Shell is the
+/// server answering this device's token. A server that offers `checks`
+/// says what it found of Node.js, Git, Engram and the companion setup
+/// (`GET /api/checks`); otherwise, and for the rest, nothing is checked
+/// from here and the row says so ([`Status::Unchecked`]), never "Ready".
+pub(super) fn server_checks(choice: &Backend) -> Vec<Check> {
+    let label = choice.label();
+    let info = backend::server::info(choice);
+    let found = match &info {
+        Ok(info) if info.has("checks") => backend::server::client(choice)
+            .ok()
+            .and_then(|client| client.checks().ok())
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    };
+    let shell = match info {
+        Ok(info) => Status::Ok(match info.version {
+            Some(version) => format!("Gentle Shell {version} on {label}"),
+            None => format!("Answering on {label}"),
+        }),
+        Err(error) => Status::Failed(error),
+    };
+    super::check_order(std::env::consts::OS)
+        .into_iter()
+        .map(|id| {
+            let status = match id {
+                CheckId::GentleShell => shell.clone(),
+                CheckId::Go => Status::Unchecked("Not needed".into()),
+                _ => server_row(id, &found, &label).unwrap_or_else(|| {
+                    Status::Unchecked(format!("On {label}: not checked from here"))
+                }),
+            };
+            let (title, summary, need) = meta(id);
+            Check {
+                id,
+                title,
+                summary,
+                need,
+                status,
+                fix: Fix::None,
+            }
+        })
+        .collect()
+}
+
+/// The checklist row `id` from what the server `label` found, with this
+/// computer's own minimum versions; `None` for a row it doesn't report.
+fn server_row(id: CheckId, found: &[ServerCheck], label: &str) -> Option<Status> {
+    let (key, name, min) = match id {
+        CheckId::Node => ("node", "Node", Some(MIN_NODE)),
+        CheckId::Git => ("git", "Git", None),
+        CheckId::Engram => ("engram", "Engram", Some(MIN_ENGRAM)),
+        CheckId::Setup => ("companion", "Companion setup", None),
+        _ => return None,
+    };
+    let check = found.iter().find(|check| check.id == key)?;
+    Some(match readiness(check, name, min, label) {
+        Readiness::Ready(text) => Status::Ok(text),
+        Readiness::Missing(text) => Status::Missing(text),
+        Readiness::Outdated(text) => Status::Outdated(text),
+        Readiness::Failed(text) => Status::Failed(text),
+    })
 }
 
 /// What `engram version` prints in `choice`.

@@ -102,6 +102,7 @@ impl OnboardingView {
         let tone = tone(check);
         let color = match tone {
             Tone::Good => ui::success(),
+            Tone::Neutral => ui::faint(),
             Tone::Warn => ui::warning(),
             Tone::Bad => ui::danger(),
         };
@@ -110,6 +111,7 @@ impl OnboardingView {
         } else {
             Icon::new(match tone {
                 Tone::Good => IconName::CircleCheck,
+                Tone::Neutral => IconName::Circle,
                 Tone::Warn => IconName::TriangleAlert,
                 Tone::Bad => IconName::CircleX,
             })
@@ -413,12 +415,80 @@ impl OnboardingView {
                 )
             })
     }
+
+    /// The other way in: agents on a Gentle Shell server (connect with the
+    /// code `gentle-shell serve share` shows), or, once on one, what that
+    /// means here and the way back to setting up this computer.
+    pub(super) fn render_runs_on(&self, cx: &mut Context<Self>) -> Option<Div> {
+        let (connect, _) = self.connect.as_ref()?;
+        let heading = |title: String| {
+            h_flex()
+                .gap_2()
+                .child(Icon::new(IconName::Server).small().text_color(ui::petal()))
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(ui::fg())
+                        .child(title),
+                )
+        };
+        let note = |text: String| {
+            div()
+                .text_xs()
+                .text_color(ui::muted())
+                .whitespace_normal()
+                .child(text)
+        };
+        let card = ui::card().w_full().p_4().gap_2();
+        Some(match self.server() {
+            Some(name) => card
+                .child(heading(format!("Agents run on {name}")))
+                .child(note(format!(
+                    "Nothing needs installing on this computer: Setup only checks that {name} \
+                     answers. Change it any time in Configuration › General › Where agents run."
+                )))
+                .child(
+                    h_flex().pt_1().child(
+                        Button::new("onboarding-run-here")
+                            .small()
+                            .ghost()
+                            .icon(Icon::new(IconName::Laptop))
+                            .label("Set up this computer instead")
+                            .disabled(self.busy())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.choose_runs_on(gentle_core::backend::Backend::Local, cx)
+                            })),
+                    ),
+                ),
+            None => card
+                .child(heading("Connect to a Gentle Shell server".into()))
+                .child(note(
+                    "Run agents on another computer instead, with nothing installed here: on \
+                     it, run gentle-shell serve share and enter the code it shows."
+                        .into(),
+                ))
+                .child(connect.clone()),
+        })
+    }
 }
 
 impl Render for OnboardingView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.mode == Mode::Sequence {
-            return self.render_sequence(cx).into_any_element();
+            let runs_on = self
+                .render_runs_on(cx)
+                .map(|card| ui::appear_after("sequence-runs-on", self.entrance, 8., card));
+            return v_flex()
+                .w_full()
+                .gap_6()
+                .children(runs_on)
+                .children(
+                    self.render_server_setup(cx)
+                        .map(|setup| ui::card().w_full().p_4().child(setup)),
+                )
+                .child(self.render_sequence(cx))
+                .into_any_element();
         }
         let body: AnyElement = match &self.checks {
             None => h_flex()
@@ -437,6 +507,10 @@ impl Render for OnboardingView {
             return v_flex()
                 .w_full()
                 .child(self.render_embedded_bar(cx))
+                .children(
+                    self.render_server_setup(cx)
+                        .map(|setup| div().pb_3().child(setup)),
+                )
                 .child(body)
                 .into_any_element();
         }
@@ -456,6 +530,16 @@ impl Render for OnboardingView {
                             .min_h_0()
                             .overflow_y_scroll()
                             .child(self.render_hero())
+                            .children(
+                                self.render_runs_on(cx)
+                                    .map(|card| div().px_6().pb_4().child(card)),
+                            )
+                            .children(self.render_server_setup(cx).map(|setup| {
+                                div()
+                                    .px_6()
+                                    .pb_4()
+                                    .child(ui::card().w_full().p_4().child(setup))
+                            }))
                             .child(body),
                     )
                     .child(self.render_footer(cx))
@@ -484,5 +568,6 @@ pub(super) fn status_label(status: &Status, installing: bool) -> &'static str {
         (Status::Missing(_), _) => "Missing",
         (Status::Outdated(_), _) => "Outdated",
         (Status::Failed(_), _) => "Failed",
+        (Status::Unchecked(_), _) => "Not checked",
     }
 }

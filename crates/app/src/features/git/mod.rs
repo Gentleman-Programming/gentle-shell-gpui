@@ -8,7 +8,6 @@
 //! reads the commits for the Git pane, and `ops` runs the Git pane's actions.
 
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 
 mod changes;
 mod log;
@@ -33,14 +32,11 @@ pub use refs::{
 pub use snapshot::snapshot;
 
 fn git(cwd: &Path, args: &[&str]) -> Option<String> {
-    let mut command = crate::features::backend::git(cwd, &[]);
-    command
+    let out = crate::features::backend::git(cwd, &[])
         .args(args)
-        .stdin(Stdio::null())
-        .stderr(Stdio::null());
-    let out = command.output().ok()?;
-    out.status
-        .success()
+        .output()
+        .ok()?;
+    out.success
         .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
@@ -66,7 +62,7 @@ pub fn activity(toplevel: &Path) -> Vec<i64> {
 
 /// A git setting as the repository sees it (`user.email`, `github.user`).
 pub fn config(toplevel: &Path, key: &str) -> Option<String> {
-    git(toplevel, &["config", key])
+    git(toplevel, &["config", "--get", key])
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
 }
@@ -74,8 +70,19 @@ pub fn config(toplevel: &Path, key: &str) -> Option<String> {
 /// The shortened path of the repository when `root` is a folder inside a
 /// larger one (its top level is above it); `None` when `root` is the top level.
 pub fn repository_path(root: &Path, toplevel: &Path) -> Option<String> {
-    let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-    let home = dirs::home_dir();
+    use crate::features::backend;
+    // A server's folders and home are paths there.
+    let (root, home) = if backend::on_server(root) {
+        (
+            root.to_path_buf(),
+            backend::server::known_home_of(root).map(PathBuf::from),
+        )
+    } else {
+        (
+            std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf()),
+            dirs::home_dir(),
+        )
+    };
     gentle_core::git::repo::nested_repository(
         &root.to_string_lossy(),
         &toplevel.to_string_lossy(),
@@ -87,10 +94,11 @@ pub fn repository_path(root: &Path, toplevel: &Path) -> Option<String> {
 /// Run `git` for its effect. The error is git's own message; credentials
 /// are never prompted for (there is no terminal to answer).
 pub fn run(cwd: &Path, args: &[&str]) -> Result<String, String> {
-    let mut command = crate::features::backend::git(cwd, &[("GIT_TERMINAL_PROMPT", "0")]);
-    command.args(args).stdin(Stdio::null());
-    let out = command.output().map_err(|e| format!("git: {e}"))?;
-    if out.status.success() {
+    let out = crate::features::backend::git(cwd, &[("GIT_TERMINAL_PROMPT", "0")])
+        .args(args)
+        .output()
+        .map_err(|e| format!("git: {e}"))?;
+    if out.success {
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     } else {
         let stderr = String::from_utf8_lossy(&out.stderr);

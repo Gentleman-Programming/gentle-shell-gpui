@@ -15,7 +15,9 @@ impl Workspace {
             Command::Create { name, root } => {
                 self.check_workspace_name(&name, None)?;
                 let root = command_root(root)?;
-                self.create_workspace(Some(name.clone()), root, window, cx);
+                // A new workspace goes where new ones do.
+                let machine = crate::features::backend::default_machine();
+                self.create_workspace(Some(name.clone()), root, &machine, window, cx);
                 window.activate_window();
                 format!("Created workspace '{name}'")
             }
@@ -37,6 +39,7 @@ impl Workspace {
                 if index == self.current {
                     self.set_root(root.clone(), cx);
                 } else {
+                    // It keeps its machine: the folder is one of its.
                     self.spaces[index].root = root.clone();
                     self.schedule_save(cx);
                     cx.notify();
@@ -105,12 +108,17 @@ impl Workspace {
     }
 }
 
+/// `root` as a workspace folder: absolute, an existing folder (on the Gentle
+/// Shell server agents run on, when they do: there every path is the
+/// server's), with every link resolved. Blocking: a server answers over the
+/// network.
 fn command_root(root: PathBuf) -> Result<PathBuf, String> {
-    if !root.is_absolute() || !root.is_dir() {
+    use crate::features::backend::fs;
+    if !root.is_absolute() || !fs::is_dir(&root) {
         return Err(format!(
             "Not an existing absolute directory: {}",
             root.display()
         ));
     }
-    dunce::canonicalize(&root).map_err(|error| format!("Cannot open {}: {error}", root.display()))
+    fs::canonicalize(&root).map_err(|error| format!("Cannot open {}: {error}", root.display()))
 }

@@ -11,6 +11,7 @@ pub mod edits;
 pub mod erd;
 pub mod export;
 pub mod form;
+pub mod host;
 pub mod html;
 pub mod kanban;
 pub mod layout;

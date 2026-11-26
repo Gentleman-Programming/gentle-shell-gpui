@@ -29,7 +29,7 @@ mod tests;
 use paint::GeoCache;
 use pointer::Gesture;
 
-pub use agent::{AGENT_ENV, install_extension};
+pub use agent::{AGENT_ENV, install_extension, shot_png};
 
 pub const CONTEXT: &str = "GentleCanvas";
 
@@ -189,12 +189,14 @@ impl CanvasView {
             ),
         };
         // A change made in the last half second is still waiting to be saved.
+        // The agent's server session keeps running for the next launch, as an
+        // agent tab's does; a local one stops.
         let quit = cx.on_app_quit(|this, cx| {
             if let Some(job) = this.save_job() {
                 job();
             }
             if let Some(agent) = &this.agent {
-                agent.session.read(cx).shutdown_backend();
+                agent.session.read(cx).quit_backend();
             }
             async {}
         });

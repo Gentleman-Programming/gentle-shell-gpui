@@ -7,6 +7,7 @@ mod listing;
 mod mermaid;
 mod ops;
 mod refs;
+mod transfer;
 mod tree;
 mod viewer;
 

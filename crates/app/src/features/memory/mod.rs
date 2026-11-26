@@ -1,5 +1,7 @@
 //! Memory: browse and search Engram, Gentle Shell's persistent memory, over
-//! its local HTTP API (`gentle-engram` talks to the same server). Read-only:
+//! its HTTP API (`gentle-engram` talks to the same server); for a folder on
+//! a Gentle Shell server, the server's Engram through a forward, never this
+//! computer's. Read-only:
 //! the agent owns writes through `mem_save` / `mem_update`.
 //!
 //! `client` talks HTTP to Engram, `view` renders; the protocol model and
@@ -82,8 +84,8 @@ impl MemoryView {
                 .spawn(async move {
                     let project = known.or_else(|| client::current_project(&cwd));
                     let items = match (all, project.as_deref()) {
-                        (true, _) => client::load(None, &query),
-                        (false, Some(project)) => client::load(Some(project), &query),
+                        (true, _) => client::load(&cwd, None, &query),
+                        (false, Some(project)) => client::load(&cwd, Some(project), &query),
                         // Engram has no project for this folder, so it has
                         // no memories of its own: "This project" stays empty
                         // rather than falling back to every project's.
@@ -94,7 +96,7 @@ impl MemoryView {
                     let items = items.map(|mut items| {
                         if let Some(id) = focus
                             && !items.iter().any(|o| o.id == id)
-                            && let Some(observation) = client::observation(id)
+                            && let Some(observation) = client::observation(&cwd, id)
                         {
                             items.insert(0, observation);
                         }

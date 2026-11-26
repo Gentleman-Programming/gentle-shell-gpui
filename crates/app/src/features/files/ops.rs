@@ -1,9 +1,11 @@
 //! The file operations behind the tree's context menu. The path helpers are
-//! pure; the rest is blocking I/O: call off the UI thread.
+//! pure; the rest is blocking I/O through [`fs`] (this computer's files, or
+//! a Gentle Shell server's): call off the UI thread.
 
-use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
+
+use crate::features::backend::fs;
 
 /// What a paste does with the clipboard entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,54 +127,18 @@ pub fn create(path: &Path, is_dir: bool) -> io::Result<()> {
     if is_dir {
         fs::create_dir(path)
     } else {
-        fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path)
-            .map(drop)
+        fs::create_new(path)
     }
-}
-
-/// Rename in place, refusing to replace another entry. A case-only rename on
-/// a case-insensitive disk is allowed: both names are the same entry.
-pub fn rename(from: &Path, to: &Path) -> io::Result<()> {
-    if to != from && fs::symlink_metadata(to).is_ok() && !same_entry(from, to) {
-        return Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            "an entry with that name already exists",
-        ));
-    }
-    fs::rename(from, to)
 }
 
 /// Move `from` to `to` (which must not exist), copying across disks.
 pub fn move_entry(from: &Path, to: &Path) -> io::Result<()> {
     match fs::rename(from, to) {
         Err(e) if e.kind() == io::ErrorKind::CrossesDevices => {
-            copy_all(from, to)?;
-            remove_all(from)
+            fs::copy_all(from, to)?;
+            fs::remove_all(from)
         }
         other => other,
-    }
-}
-
-/// Copy a file, or a folder with everything in it, to `to`. Symlinks are
-/// copied as links on Unix.
-pub fn copy_all(from: &Path, to: &Path) -> io::Result<()> {
-    let meta = fs::symlink_metadata(from)?;
-    #[cfg(unix)]
-    if meta.file_type().is_symlink() {
-        return std::os::unix::fs::symlink(fs::read_link(from)?, to);
-    }
-    if meta.is_dir() {
-        fs::create_dir(to)?;
-        for entry in fs::read_dir(from)? {
-            let entry = entry?;
-            copy_all(&entry.path(), &to.join(entry.file_name()))?;
-        }
-        Ok(())
-    } else {
-        fs::copy(from, to).map(drop)
     }
 }
 
@@ -188,28 +154,6 @@ pub fn trash(path: &Path) -> Result<(), String> {
         trash::macos::DeleteMethod::NsFileManager,
     );
     context.delete(path).map_err(|e| e.to_string())
-}
-
-fn remove_all(path: &Path) -> io::Result<()> {
-    if fs::symlink_metadata(path)?.is_dir() {
-        fs::remove_dir_all(path)
-    } else {
-        fs::remove_file(path)
-    }
-}
-
-#[cfg(unix)]
-fn same_entry(a: &Path, b: &Path) -> bool {
-    use std::os::unix::fs::MetadataExt as _;
-    match (fs::symlink_metadata(a), fs::symlink_metadata(b)) {
-        (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
-        _ => false,
-    }
-}
-
-#[cfg(not(unix))]
-fn same_entry(a: &Path, b: &Path) -> bool {
-    a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase()
 }
 
 #[cfg(test)]
@@ -383,25 +327,25 @@ mod tests {
     #[test]
     fn copies_folders_and_refuses_to_rename_over_entries() {
         let dir = std::env::temp_dir().join(format!("gentle-ops-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(dir.join("src/inner")).unwrap();
-        fs::write(dir.join("src/inner/a.rs"), "a").unwrap();
-        fs::write(dir.join("b.rs"), "b").unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src/inner")).unwrap();
+        std::fs::write(dir.join("src/inner/a.rs"), "a").unwrap();
+        std::fs::write(dir.join("b.rs"), "b").unwrap();
 
-        copy_all(&dir.join("src"), &dir.join("src copy")).unwrap();
+        fs::copy_all(&dir.join("src"), &dir.join("src copy")).unwrap();
         assert_eq!(
-            fs::read_to_string(dir.join("src copy/inner/a.rs")).unwrap(),
+            std::fs::read_to_string(dir.join("src copy/inner/a.rs")).unwrap(),
             "a"
         );
 
-        assert!(rename(&dir.join("b.rs"), &dir.join("src")).is_err());
-        rename(&dir.join("b.rs"), &dir.join("c.rs")).unwrap();
+        assert!(fs::rename(&dir.join("b.rs"), &dir.join("src")).is_err());
+        fs::rename(&dir.join("b.rs"), &dir.join("c.rs")).unwrap();
         assert!(dir.join("c.rs").is_file());
 
         create(&dir.join("new/deep.rs"), false).unwrap();
         assert!(create(&dir.join("new/deep.rs"), false).is_err());
         move_entry(&dir.join("new"), &dir.join("src/new")).unwrap();
         assert!(dir.join("src/new/deep.rs").is_file());
-        fs::remove_dir_all(&dir).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

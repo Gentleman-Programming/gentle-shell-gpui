@@ -147,187 +147,93 @@ impl Workspace {
             )
     }
 
-    pub(super) fn render_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(super) fn render_tabs(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let space = self.space();
         let weak = cx.entity().downgrade();
+        let rem = window.rem_size();
+        // When the tabs don't fit, the active one scrolls into view as it
+        // is picked, opened or shown with another workspace, and as the
+        // strip's room changes (the window resized). Before the strip's
+        // first layout its handle can't scroll yet: it asks again on the
+        // next frame.
+        let strip = &self.tab_strip;
+        let room = strip.scroll.bounds().size;
+        let shown = space
+            .tabs
+            .get(space.active)
+            .map(|tab| (self.current, tab.id, room.width));
+        if shown.is_some() && strip.shown.get() != shown {
+            strip.scroll.scroll_to_item(space.active);
+            if room.height > px(0.) {
+                strip.shown.set(shown);
+            } else {
+                window.request_animation_frame();
+            }
+        }
         h_flex()
             .id("horizontal-tab-strip")
             .gap(px(2.))
+            .flex_1()
             .min_w_0()
-            .children(space.tabs.iter().enumerate().map(|(i, tab)| {
-                let active = i == space.active;
-                let running = self.tab_running(tab);
-                let focused = tab.focused();
-                let saved = tab.state.saved_focused();
-                let kind = match (&focused, &saved) {
-                    (Some(id), _) => self.panes.get(id).map(|p| p.item.kind),
-                    (None, Some(saved)) => Some(saved.kind),
-                    _ => None,
-                }
-                .unwrap_or(PaneKind::Agent);
-                let count = tab.state.len();
-                let title = match (&focused, &saved) {
-                    (Some(id), _) => self.pane_title(*id),
-                    (None, Some(saved)) => sidebars::saved_title(saved),
-                    _ => SharedString::default(),
-                };
-                let icon_color = if active { ui::petal() } else { ui::faint() };
-                let is_tab_selected = self.is_tab_selected(self.current, tab.id);
-                let drag = TabDrag {
-                    tab: tab.id,
-                    title: title.clone(),
-                };
-                let tab_menu = TabMenu {
-                    space: self.current,
-                    id: tab.id,
-                    can_rename: kind == PaneKind::Agent && tab.is_built(),
-                    pinned: tab.pinned,
-                    can_up: false,
-                    can_down: false,
-                    compact: true,
-                };
-                let item = h_flex()
+            .child(
+                h_flex()
+                    .id("horizontal-tabs")
+                    .gap(px(2.))
                     .min_w_0()
-                    .overflow_hidden()
-                    .id(("tab", tab.id))
-                    .group("tab")
-                    .h(rems(TITLE_ITEM / 16.))
-                    .pl(rems(10. / 16.))
-                    .pr(rems(4. / 16.))
-                    .gap(rems(7. / 16.))
-                    .rounded(rems(8. / 16.))
-                    .text_size(rems(12.5 / 16.))
-                    .cursor_pointer()
-                    .relative()
-                    // The fill marks the active tab, like Tern; the petal icon
-                    // carries the accent. The fill is the opaque popover layer
-                    // with a hairline, so it reads over a see-through window
-                    // and a busy backdrop alike; every tab keeps the border's
-                    // width so none shifts when another is picked. A selected
-                    // tab, the active one included, is ringed in petal.
-                    .border_1()
-                    .when(active, |this| {
-                        this.bg(ui::popover_bg().opacity(0.92))
-                            .border_color(ui::border())
-                            .shadow_sm()
-                            .text_color(ui::fg())
-                    })
-                    .when(!active && is_tab_selected, |this| {
-                        this.bg(ui::raised()).text_color(ui::fg())
-                    })
-                    .when(!active && !is_tab_selected, |this| {
-                        this.border_color(gpui_kit::transparent_black())
-                            .text_color(ui::muted())
-                            .hover(|s| s.bg(ui::surface_hover().opacity(0.6)).text_color(ui::fg()))
-                    })
-                    .when(is_tab_selected, |this| {
-                        this.border_color(ui::petal().opacity(0.45))
-                    })
-                    // Keep clicks on tabs from turning into window drags (see the
-                    // workspace chip).
-                    .occlude()
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .on_mouse_down(
-                        MouseButton::Right,
-                        cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                            cx.stop_propagation();
-                            this.open_tab_menu(tab_menu, event.position, window, cx);
-                        }),
-                    )
-                    // A double-click on an agent tab renames its session.
-                    .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
-                        this.on_tab_click(i, event, None, window, cx);
-                    }))
-                    // Drag a tab onto another to put it there.
-                    .on_drag(drag, |drag, _, _, cx| {
-                        cx.new(|_| DragChip(drag.title.clone()))
-                    })
-                    .drag_over::<TabDrag>(|style, _, _, _| style.bg(ui::petal().opacity(0.18)))
-                    .on_drop(cx.listener(move |this, drag: &TabDrag, _, cx| {
-                        this.move_tab(drag.tab, i, cx)
-                    }))
-                    .child(
-                        div()
-                            .size(rems(14. / 16.))
-                            .flex_none()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .child(if running {
-                                ui::pulse(
-                                    div().size(rems(7. / 16.)).rounded_full().bg(ui::accent()),
-                                )
-                                .into_any_element()
-                            } else if kind == PaneKind::Agent {
-                                div()
-                                    .text_size(rems(13. / 16.))
-                                    .line_height(relative(1.))
-                                    .text_color(icon_color)
-                                    .child("❀")
-                                    .into_any_element()
-                            } else {
-                                Icon::new(kind.icon())
-                                    .small()
-                                    .text_color(icon_color)
-                                    .into_any_element()
-                            }),
-                    )
-                    .child(
-                        match self.renaming.as_ref().filter(|r| Some(r.pane) == focused) {
-                            Some(rename) => div()
-                                .w(rems(160. / 16.))
-                                .h(rems(20. / 16.))
-                                .px_1()
-                                .flex()
-                                .items_center()
-                                .rounded(rems(5. / 16.))
-                                .bg(ui::well())
-                                // Clicks in the field edit it rather than the tab.
-                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                                .on_action(cx.listener(Self::cancel_tab_rename))
-                                .child(Input::new(&rename.input).appearance(false).xsmall())
-                                .into_any_element(),
-                            None => {
-                                let title = title.clone();
-                                div()
-                                    .id(("tab-title", tab.id))
-                                    .min_w_0()
-                                    .max_w(rems(180. / 16.))
-                                    .overflow_hidden()
-                                    .text_ellipsis()
-                                    .whitespace_nowrap()
-                                    .when(active, |d| d.font_weight(FontWeight::MEDIUM))
-                                    .when(!self.popups_open(), |d| {
-                                        let title = title.clone();
-                                        d.tooltip(move |window, cx| {
-                                            Tooltip::new(title.clone()).build(window, cx)
-                                        })
-                                    })
-                                    .child(title)
-                                    .into_any_element()
-                            }
-                        },
-                    )
-                    .when(count > 1, |d| {
-                        d.child(
-                            div()
-                                .h(rems(1.))
-                                .min_w(rems(1.))
-                                .px(rems(4. / 16.))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .rounded(rems(5. / 16.))
-                                .bg(ui::surface_hover().opacity(0.7))
-                                .text_size(rems(10. / 16.))
-                                .line_height(relative(1.))
-                                .text_color(ui::muted())
-                                .child(count.to_string()),
-                        )
-                    })
-                    .child(
-                        div()
+                    .overflow_x_scroll()
+                    .track_scroll(&self.tab_strip.scroll)
+                    .children(space.tabs.iter().enumerate().map(|(i, tab)| {
+                        let active = i == space.active;
+                        let running = self.tab_running(tab);
+                        let focused = tab.focused();
+                        let saved = tab.state.saved_focused();
+                        let kind = match (&focused, &saved) {
+                            (Some(id), _) => self.panes.get(id).map(|p| p.item.kind),
+                            (None, Some(saved)) => Some(saved.kind),
+                            _ => None,
+                        }
+                        .unwrap_or(PaneKind::Agent);
+                        let count = tab.state.len();
+                        let title = match (&focused, &saved) {
+                            (Some(id), _) => self.pane_title(*id),
+                            (None, Some(saved)) => sidebars::saved_title(saved),
+                            _ => SharedString::default(),
+                        };
+                        let icon_color = if active { ui::petal() } else { ui::faint() };
+                        let is_tab_selected = self.is_tab_selected(self.current, tab.id);
+                        let drag = TabDrag {
+                            tab: tab.id,
+                            title: title.clone(),
+                        };
+                        let tab_menu = TabMenu {
+                            space: self.current,
+                            id: tab.id,
+                            can_rename: kind == PaneKind::Agent && tab.is_built(),
+                            pinned: tab.pinned,
+                            can_up: false,
+                            can_down: false,
+                            compact: true,
+                        };
+                        // A tab never gets narrower than its own parts (padding,
+                        // border, icon, pane count) and the first letters of its
+                        // title; the room left grows the tabs evenly up to their
+                        // whole titles, and tabs that still don't fit scroll. The
+                        // close button floats over the tab's end while the pointer
+                        // is on it, so no tab keeps an empty slot for it.
+                        let renaming = self
+                            .renaming
+                            .as_ref()
+                            .is_some_and(|r| Some(r.pane) == focused);
+                        let span = if renaming {
+                            let field = rems(160. / 16.).to_pixels(rem);
+                            tab_span(rem, field, field, count)
+                        } else {
+                            let (whole, floor) = tab_title_widths(&title, active, window, cx);
+                            tab_span(rem, whole, floor, count)
+                        };
+                        let close = div()
                             .id(("close-tab", tab.id))
+                            .flex_none()
                             .size(rems(18. / 16.))
                             .flex()
                             .items_center()
@@ -341,12 +247,180 @@ impl Workspace {
                                 cx.stop_propagation();
                                 this.close_tab(i, window, cx);
                             }))
-                            .child(Icon::new(IconName::X).xsmall()),
-                    );
-                // Tabs shrink (titles end in …) so the title bar's buttons
-                // keep their place in a narrow window.
-                ui::appear(("tab-in", tab.id), div().flex().min_w_0().child(item))
-            }))
+                            .child(Icon::new(IconName::X).xsmall());
+                        let item = h_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .id(("tab", tab.id))
+                            .group("tab")
+                            .h(rems(TITLE_ITEM / 16.))
+                            .pl(rems(10. / 16.))
+                            .pr(rems(4. / 16.))
+                            .gap(rems(7. / 16.))
+                            .rounded(rems(8. / 16.))
+                            .text_size(rems(12.5 / 16.))
+                            .cursor_pointer()
+                            .relative()
+                            // The fill marks the active tab, like Tern; the petal icon
+                            // carries the accent. The fill is the opaque popover layer
+                            // with a hairline, so it reads over a see-through window
+                            // and a busy backdrop alike; every tab keeps the border's
+                            // width so none shifts when another is picked. A selected
+                            // tab, the active one included, is ringed in petal.
+                            .border_1()
+                            .when(active, |this| {
+                                this.bg(ui::popover_bg().opacity(0.92))
+                                    .border_color(ui::border())
+                                    .shadow_sm()
+                                    .text_color(ui::fg())
+                            })
+                            .when(!active && is_tab_selected, |this| {
+                                this.bg(ui::raised()).text_color(ui::fg())
+                            })
+                            .when(!active && !is_tab_selected, |this| {
+                                this.border_color(gpui_kit::transparent_black())
+                                    .text_color(ui::muted())
+                                    .hover(|s| {
+                                        s.bg(ui::surface_hover().opacity(0.6)).text_color(ui::fg())
+                                    })
+                            })
+                            .when(is_tab_selected, |this| {
+                                this.border_color(ui::petal().opacity(0.45))
+                            })
+                            // Keep clicks on tabs from turning into window drags (see the
+                            // workspace chip); the wheel still scrolls the strip.
+                            .block_mouse_except_scroll()
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .on_mouse_down(
+                                MouseButton::Right,
+                                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                                    cx.stop_propagation();
+                                    this.open_tab_menu(tab_menu, event.position, window, cx);
+                                }),
+                            )
+                            // A double-click on an agent tab renames its session.
+                            .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                                this.on_tab_click(i, event, None, window, cx);
+                            }))
+                            // Drag a tab onto another to put it there.
+                            .on_drag(drag, |drag, _, _, cx| {
+                                cx.new(|_| DragChip(drag.title.clone()))
+                            })
+                            .drag_over::<TabDrag>(|style, _, _, _| {
+                                style.bg(ui::petal().opacity(0.18))
+                            })
+                            .on_drop(cx.listener(move |this, drag: &TabDrag, _, cx| {
+                                this.move_tab(drag.tab, i, cx)
+                            }))
+                            .child(
+                                div()
+                                    .size(rems(14. / 16.))
+                                    .flex_none()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .child(if running {
+                                        ui::pulse(
+                                            div()
+                                                .size(rems(7. / 16.))
+                                                .rounded_full()
+                                                .bg(ui::accent()),
+                                        )
+                                        .into_any_element()
+                                    } else if kind == PaneKind::Agent {
+                                        div()
+                                            .text_size(rems(13. / 16.))
+                                            .line_height(relative(1.))
+                                            .text_color(icon_color)
+                                            .child("❀")
+                                            .into_any_element()
+                                    } else {
+                                        Icon::new(kind.icon())
+                                            .small()
+                                            .text_color(icon_color)
+                                            .into_any_element()
+                                    }),
+                            )
+                            .child(
+                                match self.renaming.as_ref().filter(|r| Some(r.pane) == focused) {
+                                    Some(rename) => div()
+                                        .w(rems(160. / 16.))
+                                        .h(rems(20. / 16.))
+                                        .px_1()
+                                        .flex()
+                                        .items_center()
+                                        .rounded(rems(5. / 16.))
+                                        .bg(ui::well())
+                                        // Clicks in the field edit it rather than the tab.
+                                        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                            cx.stop_propagation()
+                                        })
+                                        .on_action(cx.listener(Self::cancel_tab_rename))
+                                        .child(Input::new(&rename.input).appearance(false).xsmall())
+                                        .into_any_element(),
+                                    None => {
+                                        let title = title.clone();
+                                        div()
+                                            .id(("tab-title", tab.id))
+                                            .min_w_0()
+                                            .max_w(rems(TAB_TITLE_MAX / 16.))
+                                            .overflow_hidden()
+                                            .text_ellipsis()
+                                            .whitespace_nowrap()
+                                            .when(active, |d| d.font_weight(FontWeight::MEDIUM))
+                                            .when(!self.popups_open(), |d| {
+                                                let title = title.clone();
+                                                d.tooltip(move |window, cx| {
+                                                    Tooltip::new(title.clone()).build(window, cx)
+                                                })
+                                            })
+                                            .child(title)
+                                            .into_any_element()
+                                    }
+                                },
+                            )
+                            .when(count > 1, |d| {
+                                d.child(
+                                    div()
+                                        .flex_none()
+                                        .h(rems(1.))
+                                        .min_w(rems(1.))
+                                        .px(rems(4. / 16.))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded(rems(5. / 16.))
+                                        .bg(ui::surface_hover().opacity(0.7))
+                                        .text_size(rems(10. / 16.))
+                                        .line_height(relative(1.))
+                                        .text_color(ui::muted())
+                                        .child(count.to_string()),
+                                )
+                            })
+                            .child(
+                                div()
+                                    .absolute()
+                                    .top_0()
+                                    .bottom_0()
+                                    .right(rems(4. / 16.))
+                                    .flex()
+                                    .items_center()
+                                    .child(close.bg(ui::popover_bg())),
+                            );
+                        ui::appear(
+                            ("tab-in", tab.id),
+                            div()
+                                .flex()
+                                .flex_grow(1.)
+                                .flex_shrink_0()
+                                .flex_basis(span.min)
+                                .min_w(span.min)
+                                .max_w(span.max)
+                                .child(item),
+                        )
+                    })),
+            )
             .child(
                 div()
                     .flex_none()
@@ -846,6 +920,104 @@ impl Workspace {
     }
 }
 
+/// The horizontal tabs' scroll, and the tab it last brought into view
+/// (workspace, tab id) at the strip's width then.
+#[derive(Default)]
+pub(super) struct TabStrip {
+    scroll: ScrollHandle,
+    shown: std::cell::Cell<Option<(usize, usize, Pixels)>>,
+}
+
+/// Letters of a horizontal tab's title that show however many tabs share
+/// the title bar: the tabs that don't fit scroll instead.
+const TAB_TITLE_FLOOR: usize = 8;
+
+/// Widest a horizontal tab's title draws (px at 100 % interface size).
+const TAB_TITLE_MAX: f32 = 180.;
+
+/// How narrow and how wide a horizontal tab gets.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct TabSpan {
+    min: Pixels,
+    max: Pixels,
+}
+
+/// A horizontal tab's span at the window's `rem`: its own parts (padding,
+/// border, icon and, past one pane, the pane count) with the `floor` of its
+/// title at the least, its `whole` title (up to [`TAB_TITLE_MAX`]) at the
+/// most. Its close button floats over its end, so it adds nothing.
+fn tab_span(rem: Pixels, whole: Pixels, floor: Pixels, panes: usize) -> TabSpan {
+    let at = |size: f32| rems(size / 16.).to_pixels(rem);
+    let count = if panes > 1 {
+        let digits = panes.to_string().len() as f32;
+        at(7.) + at(16.).max(at(8.) + at(6.5) * digits)
+    } else {
+        px(0.)
+    };
+    let parts = at(10. + 14. + 7. + 4.) + px(2.) + count;
+    let whole = whole.min(at(TAB_TITLE_MAX));
+    // A pixel past the measure, so the ellipsis never takes a letter the
+    // measure fitted.
+    TabSpan {
+        min: parts + floor.min(whole) + px(1.),
+        max: parts + whole + px(1.),
+    }
+}
+
+/// What of a one-line `title` a horizontal tab always shows: its first
+/// [`TAB_TITLE_FLOOR`] letters and an ellipsis. `None` when that is all of
+/// it.
+fn title_floor(title: &str) -> Option<String> {
+    let (end, _) = title.char_indices().nth(TAB_TITLE_FLOOR)?;
+    Some(format!("{}…", &title[..end]))
+}
+
+/// How wide a horizontal tab's `title` draws, whole and its
+/// [`title_floor`]: the interface font at the tab's size, medium on the
+/// active tab.
+fn tab_title_widths(
+    title: &SharedString,
+    active: bool,
+    window: &Window,
+    cx: &App,
+) -> (Pixels, Pixels) {
+    if title.is_empty() {
+        return (px(0.), px(0.));
+    }
+    let mut font = gpui_kit::font(
+        gpui_kit::component::ActiveTheme::theme(cx)
+            .font_family
+            .clone(),
+    );
+    if active {
+        font.weight = FontWeight::MEDIUM;
+    }
+    let size = rems(12.5 / 16.).to_pixels(window.rem_size());
+    let width = |text: SharedString| {
+        let run = TextRun {
+            len: text.len(),
+            font: font.clone(),
+            color: ui::fg(),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        window
+            .text_system()
+            .shape_line(text, size, &[run], None)
+            .width
+    };
+    // One line: a title never wraps.
+    let line: SharedString = if title.contains(['\n', '\r']) {
+        title.replace(['\n', '\r'], " ").into()
+    } else {
+        title.clone()
+    };
+    let floor = title_floor(&line);
+    let whole = width(line);
+    (whole, floor.map_or(whole, |floor| width(floor.into())))
+}
+
 /// Height of the title bar's pills, tabs and buttons.
 pub(super) const TITLE_ITEM: f32 = 28.;
 
@@ -970,4 +1142,54 @@ fn drop_overlay(zone: DropZone) -> impl IntoElement {
         DropZone::Center => area.inset_0(),
     };
     ui::popover_in(("pane-drop", zone as usize), area)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TabSpan, tab_span, title_floor};
+    use gpui_kit::px;
+
+    /// A tab is never narrower than its parts and the first letters of its
+    /// title, and grows to at most its whole title; the active tab keeps no
+    /// slot for its close button, so it spans what the others do.
+    #[test]
+    fn a_tab_spans_its_title_floor_to_its_whole_title() {
+        let rem = px(16.);
+        // Padding 10 + 4, icon 14, gap 7, border 2, and a pixel of slack.
+        let parts = 10. + 4. + 14. + 7. + 2. + 1.;
+        assert_eq!(
+            tab_span(rem, px(120.), px(52.), 1),
+            TabSpan {
+                min: px(parts + 52.),
+                max: px(parts + 120.),
+            }
+        );
+        // A long title ends in … past 180; a short one never shrinks.
+        assert_eq!(tab_span(rem, px(400.), px(52.), 1).max, px(parts + 180.));
+        let short = tab_span(rem, px(30.), px(30.), 1);
+        assert_eq!(short.min, short.max);
+        // The pane count (gap 7, pill 16) adds to both ends alike.
+        let two = tab_span(rem, px(120.), px(52.), 2);
+        assert_eq!(two.min, px(parts + 7. + 16. + 52.));
+        assert_eq!(two.max, px(parts + 7. + 16. + 120.));
+        // At a larger interface size the parts grow with it.
+        assert!(tab_span(px(20.), px(120.), px(52.), 1).min > px(parts + 52.));
+    }
+
+    /// However many tabs share the title bar, each shows its first eight
+    /// letters (the tabs that don't fit scroll).
+    #[test]
+    fn long_titles_keep_their_first_letters() {
+        assert_eq!(
+            title_floor("ismaelo@ismael:~/gs-remote-test").as_deref(),
+            Some("ismaelo@…")
+        );
+        assert_eq!(
+            title_floor("Terminal · gs-remote-test").as_deref(),
+            Some("Terminal…")
+        );
+        assert_eq!(title_floor("ñandú·café·té").as_deref(), Some("ñandú·ca…"));
+        assert_eq!(title_floor("12345678"), None);
+        assert_eq!(title_floor("zsh"), None);
+    }
 }

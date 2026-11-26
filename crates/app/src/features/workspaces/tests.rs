@@ -13,18 +13,28 @@ fn sample() -> SavedState {
         cwd: PathBuf::from("/tmp/project"),
         path: None,
         session: Some(PathBuf::from("/tmp/sessions/a.jsonl")),
+        server: Some(gentle_core::serve::ServerSession {
+            url: "http://127.0.0.1:8787".into(),
+            id: "ses_1".into(),
+            server_id: "srv_1".into(),
+        }),
+        terminal: None,
     };
     let terminal = SavedPane {
         kind: PaneKind::Terminal,
         cwd: PathBuf::from("/tmp/project"),
         path: None,
         session: None,
+        server: None,
+        terminal: Some("t_abc123".into()),
     };
     let file = SavedPane {
         kind: PaneKind::File,
         cwd: PathBuf::from("/tmp/project"),
         path: Some(PathBuf::from("/tmp/project/README.md")),
         session: None,
+        server: None,
+        terminal: None,
     };
     SavedState {
         version: VERSION,
@@ -33,6 +43,8 @@ fn sample() -> SavedState {
             SavedWorkspace {
                 name: "Default".into(),
                 root: PathBuf::from("/tmp"),
+                server: None,
+                backend: Some(serde_json::json!({"kind": "command", "prefix": ["orb", "--"]})),
                 tabs: vec![SavedTab {
                     layout: PaneTree::Leaf(agent.clone()),
                     pinned: true,
@@ -46,6 +58,8 @@ fn sample() -> SavedState {
             SavedWorkspace {
                 name: "project".into(),
                 root: PathBuf::from("/tmp/project"),
+                server: Some("http://pc:8787".into()),
+                backend: None,
                 tabs: vec![SavedTab {
                     pinned: false,
                     layout: PaneTree::Split {
@@ -147,6 +161,25 @@ fn json_round_trip() {
     assert_eq!(old.tabs_sidebar_width, 260.);
     assert_eq!(old.files_sidebar_width, 260.);
     assert_eq!(SavedState::default().sidebar, minimal.sidebar);
+}
+
+/// A server terminal pane keeps its terminal's id; a pane saved before
+/// terminals ran on servers (no `terminal` key) loads without one, and a pane
+/// without one writes none.
+#[test]
+fn terminal_panes_keep_their_server_terminal() {
+    let json = serde_json::to_value(sample()).unwrap();
+    let terminal =
+        &json["workspaces"][1]["tabs"][0]["layout"]["split"]["second"]["split"]["first"]["leaf"];
+    assert_eq!(terminal["terminal"], "t_abc123");
+    let agent = &json["workspaces"][0]["tabs"][0]["layout"]["leaf"];
+    assert_eq!(agent["kind"], "agent");
+    assert!(agent.get("terminal").is_none());
+    let old: SavedPane =
+        serde_json::from_str(r#"{"kind":"terminal","cwd":"/home/ana/proj"}"#).unwrap();
+    assert_eq!(old.terminal, None);
+    let back: SavedPane = serde_json::from_value(terminal.clone()).unwrap();
+    assert_eq!(back.terminal.as_deref(), Some("t_abc123"));
 }
 
 /// The tabs sidebar's width saved as `sidebar_width` (before the Files
@@ -251,13 +284,13 @@ fn a_folder_reached_another_way_keys_the_same_workspace() {
     let canonical = dunce::canonicalize(base.join("a")).unwrap();
     // The explorer builds `dir.join(name)`; `gsd` passes a canonical path.
     assert_eq!(
-        super::root_key(base.join("a").join("..").join("a")),
+        super::root_key(base.join("a").join("..").join("a"), false),
         canonical
     );
-    assert_eq!(super::root_key(canonical.clone()), canonical);
+    assert_eq!(super::root_key(canonical.clone(), false), canonical);
     // A folder that can't be resolved keeps its path.
     let missing = base.join("missing");
-    assert_eq!(super::root_key(missing.clone()), missing);
+    assert_eq!(super::root_key(missing.clone(), false), missing);
     std::fs::remove_dir_all(&base).unwrap();
 }
 
@@ -268,8 +301,64 @@ fn a_workspace_saved_with_a_non_canonical_root_is_still_found() {
     std::fs::create_dir_all(base.join("b")).unwrap();
     // Saved before roots were canonical: `a/../a`.
     let roots = [base.join("b"), base.join("a").join("..").join("a")];
+    let spaces = || roots.iter().map(|root| (root, None::<&str>));
     let canonical = dunce::canonicalize(base.join("a")).unwrap();
-    assert_eq!(super::find_root(roots.iter(), &canonical), Some(1));
-    assert_eq!(super::find_root(roots.iter(), &base.join("missing")), None);
+    assert_eq!(super::find_root(spaces(), &canonical, None, false), Some(1));
+    assert_eq!(
+        super::find_root(spaces(), &base.join("missing"), None, false),
+        None
+    );
     std::fs::remove_dir_all(&base).unwrap();
+}
+
+/// A server's folder names the server's file system: a link of the same
+/// name on this computer must not rewrite it.
+#[cfg(unix)]
+#[test]
+fn a_server_folder_is_never_resolved_on_this_computer() {
+    let base = std::env::temp_dir().join(format!("ws-server-key-test-{}", std::process::id()));
+    std::fs::create_dir_all(base.join("real")).unwrap();
+    std::os::unix::fs::symlink(base.join("real"), base.join("link")).unwrap();
+    let link = base.join("link");
+    assert_eq!(
+        super::root_key(link.join(".").join("x").join(".."), true),
+        link
+    );
+    assert_ne!(super::root_key(link.clone(), false), link);
+    let roots = [base.join("real"), base.join("link").join(".")];
+    let spaces = roots.iter().map(|root| (root, Some(SERVER)));
+    assert_eq!(super::find_root(spaces, &link, Some(SERVER), true), Some(1));
+    std::fs::remove_dir_all(&base).unwrap();
+}
+
+const SERVER: &str = "http://127.0.0.1:8787";
+
+/// A folder typed or browsed on a server shows the workspace that server
+/// already has there, however the path is written; the same path on this
+/// computer or on another server is another workspace.
+#[test]
+fn a_server_folder_finds_only_that_servers_workspace() {
+    let root = PathBuf::from("/home/me/project");
+    let other = "http://10.0.0.2:8787";
+    let spaces = [
+        (root.clone(), None),
+        (root.clone(), Some(other)),
+        (PathBuf::from("/home/me"), Some(SERVER)),
+        (PathBuf::from("/home/me/project/"), Some(SERVER)),
+    ];
+    let find = |folder: &str, server: Option<&str>| {
+        let folder = super::root_key(folder.into(), server.is_some());
+        super::find_root(
+            spaces.iter().map(|(r, s)| (r, *s)),
+            &folder,
+            server,
+            server.is_some(),
+        )
+    };
+    assert_eq!(find("/home/me/project", Some(SERVER)), Some(3));
+    assert_eq!(find("/home/me/./project/src/..", Some(SERVER)), Some(3));
+    assert_eq!(find("/home/me/project", Some(other)), Some(1));
+    assert_eq!(find("/home/me/project", None), Some(0));
+    assert_eq!(find("/home/me/other", Some(SERVER)), None);
+    assert_eq!(find("/home/me/project", Some("http://10.0.0.3:8787")), None);
 }

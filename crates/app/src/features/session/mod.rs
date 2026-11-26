@@ -14,10 +14,13 @@ use pi_rpc::{UiAnswer, UiMethod};
 use crate::shared::ui;
 use gentle_core::transcript::{NoticeLevel, Transcript};
 
+mod accounts;
 mod agents;
 mod attachments;
 mod builtins;
 mod events;
+mod host_genui;
+mod host_tools;
 pub mod input_style;
 mod lifecycle;
 mod reads;
@@ -28,10 +31,12 @@ mod view;
 #[cfg(test)]
 mod view_tests;
 
+pub(crate) use accounts::AccountEvent;
 pub use agents::{AgentsPanel, AgentsTab};
+pub use host_tools::{CanvasAnswer, HostToolRequest};
 pub(crate) use reads::READ_DECIDE_WAIT;
 pub(crate) use state::desktop::reads::{
-    ReadFailure, ReadOutcome, ReadRequest, ReadSupport, ReadTicket,
+    ReadFailure, ReadOutcome, ReadRequest, ReadSupport, ReadTicket, Secret,
 };
 
 actions!(session, [Abort, Stop, ToggleAgents, NewSession]);
@@ -85,6 +90,13 @@ pub enum SessionEvent {
         path: std::path::PathBuf,
         line: Option<u32>,
     },
+    /// The agent (on a Gentle Shell server) called one of the app's host
+    /// tools that the window runs: show a page, drive a browser card, or
+    /// use the canvas this agent floats over.
+    HostTool(HostToolRequest),
+    /// The tab's folder doesn't exist on its Gentle Shell server: the
+    /// window asks for one there (⌘K, typed as the server sees it).
+    OpenServerFolder,
 }
 
 /// What the window reads from a tab, to emit [`SessionEvent::ChromeChanged`]
@@ -110,6 +122,12 @@ pub struct SessionView {
     /// A `reload_credentials` sent after a sign-in, until it answers: a
     /// failure falls back to restarting the tab.
     credentials_reload: Option<ReadTicket>,
+    /// A `list_available_models` read in flight: how a tab without Pi RPC
+    /// (a server's session-less Desktop RPC), or one whose Shell advertises
+    /// it, learns the models it can offer.
+    models_read: Option<ReadTicket>,
+    /// The models are owed until the Desktop probe says how to read them.
+    models_owed: bool,
     transcript: Transcript,
     /// Rendered Markdown per (item, block): the state, the byte length of
     /// the shown text already pushed and how many Mermaid diagrams it showed
@@ -217,6 +235,16 @@ pub struct SessionView {
     /// it had nothing to show: the chip is hidden without data, so it can't
     /// wait for its card to open (at most once per `PLAN_SEED_EVERY`).
     plan_seed_asked: std::cell::Cell<Option<std::time::Instant>>,
+    /// The app's tools offered to a server session, and its calls running.
+    host: host_tools::HostCalls,
+    /// `gentle_ui` run by the app for a server session (`host_genui`):
+    /// the conversation's surfaces, rebuilt from it.
+    host_genui: gentle_core::genui::host::Engine,
+    /// Sign-in and package events waiting for the screen that started them.
+    accounts: accounts::AccountEvents,
+    /// The host messages sent, for the tests (a test tab has no server).
+    #[cfg(test)]
+    host_messages: Vec<pi_rpc::desktop_rpc::HostMessage>,
 }
 
 impl EventEmitter<SessionEvent> for SessionView {}
@@ -232,6 +260,7 @@ impl SessionView {
         cx: &mut Context<Self>,
         start_now: bool,
     ) -> Self {
+        let on_server = crate::features::backend::on_server(&cwd);
         let composer = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .auto_grow(1, 10)
@@ -356,9 +385,13 @@ impl SessionView {
             activity: state::TurnActivity::default(),
             agents_panel: AgentsPanel::default(),
             mode: None,
-            default_mode: crate::shared::gentle_state::read_default_mode(
-                &pi_rpc::resolve_homes().config,
-            ),
+            // A server's tab reads no Gentle Shell home of this computer:
+            // its default mode comes from the server (`get_permission_mode`).
+            default_mode: (!on_server)
+                .then(|| {
+                    crate::shared::gentle_state::read_default_mode(&pi_rpc::resolve_homes().config)
+                })
+                .flatten(),
             _agents_ticker: Task::ready(()),
             job_output: agents::JobOutputView::default(),
             todo: state::TodoIsland::default(),
@@ -374,7 +407,13 @@ impl SessionView {
             title: None,
             active_shell: None,
             credentials_reload: None,
-            banner: crate::shared::banner::read_config(&pi_rpc::resolve_homes().config),
+            models_read: None,
+            models_owed: false,
+            banner: if on_server {
+                crate::shared::banner::BannerConfig::default()
+            } else {
+                crate::shared::banner::read_config(&pi_rpc::resolve_homes().config)
+            },
             banner_reveal: 0.0,
             _banner_anim: Task::ready(()),
             list: view::TranscriptList::new(),
@@ -391,6 +430,13 @@ impl SessionView {
             window_handle: window.window_handle(),
             local_offset: std::cell::OnceCell::new(),
             plan_seed_asked: std::cell::Cell::new(None),
+            host: host_tools::HostCalls::default(),
+            host_genui: gentle_core::genui::host::Engine::new(crate::features::genui::mode::mode(
+                cx,
+            )),
+            accounts: accounts::AccountEvents::default(),
+            #[cfg(test)]
+            host_messages: Vec::new(),
         };
         if start_now {
             this.ensure_started(window, cx);
@@ -417,6 +463,25 @@ impl SessionView {
 
     pub fn cwd(&self) -> &PathBuf {
         &self.cwd
+    }
+
+    /// Where this tab's agent runs: the backend it started on, else where a
+    /// tab in its folder starts.
+    pub fn runs_on(&self) -> gentle_core::backend::Backend {
+        self.runs_on
+            .clone()
+            .unwrap_or_else(|| crate::features::backend::for_tab(&self.cwd))
+    }
+
+    /// The default permission mode for new sessions as this tab's Gentle
+    /// Shell reported it (`get_permission_mode`); `None` until it says.
+    pub(crate) fn reported_default_mode(
+        &self,
+    ) -> Option<gentle_core::gentle_state::PermissionMode> {
+        self.permission
+            .confirmed()
+            .default_mode
+            .map(from_desktop_mode)
     }
 
     /// Pairs this agent with a canvas; set before its backend starts.
@@ -510,6 +575,11 @@ impl SessionView {
             default,
         );
         models
+    }
+
+    /// Bumped whenever [`Self::model_choices`] may have changed.
+    pub fn models_rev(&self) -> u64 {
+        self.models.rev
     }
 
     pub fn model_choices(&self) -> Vec<(String, String, String, bool)> {

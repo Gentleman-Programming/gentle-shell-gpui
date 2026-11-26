@@ -29,12 +29,13 @@ flowchart TD
 | --- | --- |
 | `crates/app` | Binary, composition, feature state, GPUI views, and the effects (files, processes, sound) of the logic that lives in `core`. |
 | `crates/core` (`gentle-core`) | Pure logic with no GPUI or IO: transcript and subagent activity models, tool summaries, permission mode, jobs and ODD phase, `/` command routing, `notifications.json` policy, usage and statistics models, and the profile and model routing model. |
-| `crates/pi-rpc` | Backend resolution and launch, JSONL transport, authentication and protocol types. |
+| `crates/pi-rpc` | Backend resolution and launch, JSONL transport (a child's stdio, or a Gentle Shell server's HTTP and event stream), authentication and protocol types, and the client of a Gentle Shell server's API (files, git, uploads, forwards, services, terminals). |
+| `crates/term-host` (`gentle-term-host`) | A separate binary, not linked into the app: the terminal host a Gentle Shell server (`gentle-shell serve`) runs to keep its devices' terminals alive across clients (PTYs, ConPTY on Windows, a headless alacritty emulator for reattach snapshots, JSON Lines over a Unix socket, or loopback TCP with a token on Windows). The app installs its own build on a server of the same kind, a file the user picks, or says how to build it there; it never downloads one. Releases also publish it per platform (`gentle-term-host-<os>-<arch>[.exe]`), for picking by hand. |
 | `packaging` | Packaging and distribution integration per operating system. |
 
 `crates/pi-rpc` is a stable boundary: it knows nothing about GPUI, windows, tabs or visual components. `crates/app` depends on it, never the other way around.
 
-`crates/core` depends on nothing in the project (neither `app` nor `pi-rpc`) and not on GPUI; its only dependencies are `serde`, `serde_json` and `regex`. It compiles the same on macOS, Windows and Linux: it contains no platform-specific code except the syntax of the policy's `file:` paths, chosen with `cfg!(windows)` at compile time. When a module mixed pure logic and effects, the pure part lives in `core`, and the effectful part stays in `app` and calls it:
+`crates/core` depends on nothing in the project (neither `app` nor `pi-rpc`) and not on GPUI; its only dependencies are `serde`, `serde_json`, `regex`, `markdown` and `base64` (a server's connection code). It compiles the same on macOS, Windows and Linux: it contains no platform-specific code except the syntax of the policy's `file:` paths, chosen with `cfg!(windows)` at compile time. When a module mixed pure logic and effects, the pure part lives in `core`, and the effectful part stays in `app` and calls it:
 
 | `core` | Stays in `app` |
 | --- | --- |
@@ -56,7 +57,7 @@ flowchart TD
 | `docs`: the skill's `docs-check` report, each document's standing and front-matter title | `docs/`: the Architecture docs screen, installing the skill (`gentle-shell install`), running `docs-check` with Node, listing `docs/`. |
 | `fuzzy`: fuzzy scoring and file ranking | `palette/`: walking files, reading branches with git. |
 | `prompt_history`: the composer's sent prompts and where ↑/↓ are in them (draft kept, seeded from a resumed conversation) | `session/submit.rs`: recording at send, the ↑/↓ keystrokes (first and last line, `/` menu first) and putting a prompt in the composer. |
-| `backend`: where agents, terminals, git and Setup run (this computer, a WSL distro, a command), its `settings.json` value, the WSL distro a folder implies, host ↔ backend paths both ways, the launch and terminal argv, the login PATH probe and `wsl.exe --list --verbose` | `backend/`: reading and saving the choice, probing the backend, staging the app's files there, `git` and `gentle-shell` commands through it, the backend's homes, listing WSL's distros; `setup/remote.rs`: Setup's checks there; `settings/runs_on.rs`: the Configuration section. |
+| `backend`: where agents, terminals, git and Setup run (this computer, a WSL distro, a command, a Gentle Shell server), its `settings.json` value, the WSL distro a folder implies, host ↔ backend paths both ways, the launch and terminal argv, the login PATH probe and `wsl.exe --list --verbose`; `serve`: a Gentle Shell server's address rules, error wording, SSE framing, stream cursor and response dedupe | `backend/`: reading and saving the choice, probing the backend, staging the app's files there, `git` and `gentle-shell` commands through it, the backend's homes, listing WSL's distros, pairing with a server and its device token (`backend/server.rs`); `setup/remote.rs`: Setup's checks there; `settings/runs_on.rs`: the Configuration section. |
 | `ides`: code editors and IDEs (VS Code and its forks, Zed, Sublime Text, Xcode, Visual Studio, Android Studio, JetBrains, …), where each installs per OS, versioned-folder matching and the launch command | `platform/ides.rs`: probing those folders and the PATH, launching the editor; `files/tree.rs` and `history/view.rs`: the ⋯ menus' "Open in …". |
 | `web_browsers`: where agents' pages open (`agentPages` in the app's `settings.json`: inside the app, the default, or in the user's browser) and which browser (`externalBrowser`: the system's default or a catalogued one — Safari, Chrome, Chromium, Arc, Dia, Firefox, Zen, LibreWolf, Brave, Edge, Opera, Vivaldi, Orion, …), where each installs per OS, which choice applies, the http(s)-only URL check and the launch command (`open -a <App> <url>` on macOS, the browser's program with the URL elsewhere, never a shell) | `platform/browsers.rs`: probing those folders, the PATH and Flatpak exports (with `platform::ides`' lookup), starting the browser; `browser/external.rs`: the saved choices and opening a page outside the app (the card's ↗; falls back to the system's default when the chosen browser is gone); `workspace/stages.rs`: routing agents' pages (`gentle-open`, dev-server URLs, the design canvas; each picked-out URL opens outside once per window); `settings/browser.rs`: Configuration › Devices › Browser. |
 | `sessions`: session summary, folder name from cwd, ordering, ISO dates and relative time | `sessions/`: finding and reading `.jsonl` files (line scanning is tied to reading), cache. |
@@ -68,6 +69,34 @@ flowchart TD
 | `canvas`: canvas tabs' whiteboard model after Tern's canvas blocks (shapes, Tern's 16-color palette, fill, pen types and sizes, which of them show on each kind of shape (`Kind::controls`, `Style::adopt`), the file format), perfect-freehand ink outlines (`freehand`), geometry, hit testing, lasso and box selection, the camera, copy and paste, the undo history, and what its agent reads, edits and sees of it (`agent`: the flat shape form, ops applied all or nothing, the SVG of an area) | `canvas/`: the view (`CanvasView`: tools, gestures, keys, saving the file), painting (shapes tessellated once in page units, only moved onto the screen each frame), the tool bar, zoom pill, style panel (only the controls the current tool and the selection show) and minimap, and the agent floating over it (`agent.rs`: a `SessionView` in a card, started with the `gentle-canvas.ts` extension it installs; answering its requests, rasterizing shots). The workspace handles that agent's events as an agent pane's (`on_session_event`) and saves its conversation with the canvas pane. |
 | `commands`: `/gentle:tower` routes to the Tower tab (`Screen::Tower`); `tower`: the URL from `gentle-shell tower`'s `--json` line or its older `Gentle Tower: <url>` text, and whether a Shell refused `--json` | `tower/`: Gentle Tower in a tab (`TowerView`): runs `gentle-shell tower --no-open --json` (again without `--json` on a Shell older than 5.0.0 that refuses it), shows its page in a `WebSurface`, shown or hidden by the workspace's `sync_web_views` like agents' web views. |
 | `commands`: `/gentle:changes` routes to the review screen (`Screen::Changes`) | `review/`: the review screen (`ReviewView`), a modal over the window (`Overlay::Review`, Esc closes it like the other screens): a `files::FileView` diff (Split · Unified) beside its own `files::ChangesView`, which polls while the review is open; the composer's `±` and `/gentle:changes` open it (`workspace/overlays.rs` `open_review`). |
+
+### The Gentle Shell server boundary
+
+When agents run on a Gentle Shell server (`gentle-shell serve`), the app is a thin client: the server owns sessions, folders, git and terminals. Three choke points in `app` decide, per folder, whether an effect runs here or there, so no view branches on the backend itself:
+
+| Choke point | Local / WSL / command | Gentle Shell server |
+| --- | --- | --- |
+| `features/backend/fs.rs` (`backend::fs::at(path)` → `Fs::Local` or `Fs::Server`) | `std::fs` | `pi_rpc::serve` `/api/fs/*` (list, read, write with `If-Match`, stat, mkdir, rename, remove, search, watch) |
+| `features/backend/mod.rs` (`backend::git`, `Git::output`) | `git` through the backend's argv | `POST /api/git { cwd, args, env }` |
+| `features/terminal/remote.rs` | a local PTY (alacritty) | a persistent terminal of the server's `gentle-term-host`, `/api/terminals/*` |
+
+`crates/pi-rpc/src/serve.rs` is the client of the server's API (`ServeClient`: pairing, discovery, `/api/server`, sessions, the event stream, Desktop requests, forwards, Tower), with `serve/files.rs`, `serve/services.rs` (Engram through a forward) and `serve/terminals.rs`. A server session is a `PiProcess` like a child's (`PiProcess::serve`), so the session view doesn't know which transport it has. The protocol's pure rules (codes, addresses, SSE framing, stream cursor, URL classification, folder keys) live in `gentle_core::serve`. `features/backend/server.rs` keeps the pairing, the device token (`server-tokens.json`, `0600`) and the server's advertised capabilities; host tools (`features/host_tools.rs`, `features/session/host_tools.rs`) answer the server's calls for the app's own tools.
+
+```mermaid
+flowchart TD
+    Views["Files, editor, Changes, Branches, Git pane, terminal panes"] --> Fs["backend::fs"]
+    Views --> Git["backend::git"]
+    Views --> Term["terminal/remote.rs"]
+    Session["SessionView → PiProcess"] --> Serve
+    Fs --> Serve["pi_rpc::serve (ServeClient)"]
+    Git --> Serve
+    Term --> Serve
+    Serve --> Core["gentle_core::serve (pure rules)"]
+    Serve -- "HTTP + SSE" --> Server["gentle-shell serve"]
+    Server --> Host["gentle-term-host (crates/term-host)"]
+```
+
+`crates/term-host` is built and shipped beside the app (`packaging/macos/bundle.sh` copies it into the bundle) only so the app can offer to install it on a server of the same platform; the app never runs it. Its protocol is tested end to end in `crates/term-host/tests/protocol.rs`.
 
 ## Layout
 
@@ -86,7 +115,8 @@ crates/
 │       └── shared/              # pieces used by several features, with no logic of their own:
 │                                # ui, overlay (live indicators' layer), floating, themes, backdrop (theme scenes), assets, banner, surge, pane, gentle_state
 ├── core/                        # shared pure logic (gentle-core)
-└── pi-rpc/
+├── pi-rpc/
+└── term-host/                   # gentle-term-host: a Gentle Shell server's terminal host (its own binary)
 ```
 
 Paths follow the folder: `crate::features::session`, `crate::shared::ui`, `crate::platform::instance`. Each feature is a `features/<name>/` folder: `mod.rs` keeps its public types and API, and child modules add `impl` blocks and mark what they share as `pub(super)`. A new feature goes in `features/` as a folder even if it starts as a single file; something moves to `shared/` only when more than one feature uses it and it has no product logic.
@@ -272,7 +302,7 @@ Effects must not hide state changes. Results return to the feature so it decides
 
 ## Dependency rules
 
-1. `pi-rpc` **does not depend** on `app` or GPUI.
+1. `pi-rpc` **does not depend** on `app` or GPUI; it may use `core`'s pure rules (a server's protocol, `core::serve`).
 2. `app` may depend on `pi-rpc` and `core`; the reverse direction is forbidden.
 3. `core` **does not depend** on anything in the project (`app`, `pi-rpc`), nor on GPUI, the filesystem, processes, the clock or system APIs.
 4. A feature consumes another through its public API; it does not access its private modules.

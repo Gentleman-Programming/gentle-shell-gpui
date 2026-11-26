@@ -1,9 +1,17 @@
 //! One directory level of the project tree, honoring `.gitignore` unless
-//! ignored entries are asked for.
+//! ignored entries are asked for: this computer's folders, or a Gentle Shell
+//! server's (through its API).
 //! Blocking I/O: call off the UI thread.
 
 use std::cmp::Ordering;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+
+use crate::features::backend;
+
+/// The most names one `git check-ignore` is asked about: a server takes at
+/// most 256 arguments.
+const CHECK_BATCH: usize = 250;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
@@ -21,8 +29,20 @@ pub struct Entry {
 /// ignore files in parent directories), `.git/info/exclude`, the global git
 /// excludes and `.ignore` are left out unless `show_ignored`, which lists
 /// them marked [`Entry::ignored`]. The `.git` folder never is. Hidden files
-/// are listed.
+/// are listed. On a Gentle Shell server git there decides what is ignored
+/// (so outside a repository nothing is).
 pub fn list_dir(dir: &Path, show_ignored: bool) -> Vec<Entry> {
+    let mut entries = if backend::on_server(dir) {
+        list_server_dir(dir, show_ignored)
+    } else {
+        list_local_dir(dir, show_ignored)
+    };
+    entries.sort_by(compare);
+    entries
+}
+
+/// [`list_dir`] on this computer, unsorted.
+fn list_local_dir(dir: &Path, show_ignored: bool) -> Vec<Entry> {
     let walker = ignore::WalkBuilder::new(dir)
         .max_depth(Some(1))
         .hidden(false)
@@ -44,8 +64,8 @@ pub fn list_dir(dir: &Path, show_ignored: bool) -> Vec<Entry> {
                 || (e.path_is_symlink() && e.path().is_dir());
             (e.into_path(), is_dir)
         });
-    let mut entries: Vec<Entry> = if show_ignored {
-        let kept: std::collections::HashSet<PathBuf> = kept.map(|(path, _)| path).collect();
+    if show_ignored {
+        let kept: HashSet<PathBuf> = kept.map(|(path, _)| path).collect();
         std::fs::read_dir(dir)
             .into_iter()
             .flatten()
@@ -62,9 +82,105 @@ pub fn list_dir(dir: &Path, show_ignored: bool) -> Vec<Entry> {
     } else {
         kept.filter_map(|(path, is_dir)| entry(path, is_dir, false))
             .collect()
+    }
+}
+
+/// [`list_dir`] on a Gentle Shell server, unsorted: its listing, with what
+/// `git check-ignore` there ignores.
+fn list_server_dir(dir: &Path, show_ignored: bool) -> Vec<Entry> {
+    let Ok(listed) = backend::fs::read_dir(dir) else {
+        return Vec::new();
     };
-    entries.sort_by(compare);
-    entries
+    let listed: Vec<backend::fs::DirEntry> =
+        listed.into_iter().filter(|e| e.name != ".git").collect();
+    let ignored = ignored_names(dir, &listed);
+    listed
+        .into_iter()
+        .filter_map(|e| {
+            let ignored = ignored.contains(&e.name);
+            if ignored && !show_ignored {
+                return None;
+            }
+            entry(e.path, e.is_dir, ignored)
+        })
+        .collect()
+}
+
+/// The names among `listed` (entries of `dir`) that git ignores, asked in
+/// batches of [`CHECK_BATCH`]. Nothing outside a repository, or when git
+/// can't be asked.
+fn ignored_names(dir: &Path, listed: &[backend::fs::DirEntry]) -> HashSet<String> {
+    let names: Vec<&str> = listed.iter().map(|e| e.name.as_str()).collect();
+    let mut ignored = HashSet::new();
+    for batch in names.chunks(CHECK_BATCH) {
+        // Names are paths, never pathspec magic (`:(glob)…`).
+        let Ok(out) = backend::git(dir, &[("GIT_LITERAL_PATHSPECS", "1")])
+            .args(["check-ignore", "--"])
+            .args(batch)
+            .output()
+        else {
+            break;
+        };
+        // It fails quietly when none of these is ignored, and says why
+        // when it can't tell (not a repository): the next batch can't either.
+        if !out.success && !out.stderr.is_empty() {
+            break;
+        }
+        ignored.extend(check_ignore_paths(&String::from_utf8_lossy(&out.stdout)));
+    }
+    ignored
+}
+
+/// The paths `git check-ignore` printed, one a line, unquoted where git
+/// quoted them (C-style, for unusual characters).
+fn check_ignore_paths(printed: &str) -> impl Iterator<Item = String> + '_ {
+    printed.lines().filter(|line| !line.is_empty()).map(|line| {
+        line.strip_prefix('"')
+            .and_then(|quoted| quoted.strip_suffix('"'))
+            .map_or_else(|| line.to_string(), unquote)
+    })
+}
+
+/// A path git quoted C-style (its inside, without the quotes): `\\`, `\"`,
+/// the control escapes and `\ooo` octal bytes.
+fn unquote(quoted: &str) -> String {
+    let mut bytes = Vec::with_capacity(quoted.len());
+    let mut rest = quoted.as_bytes();
+    while let Some((&byte, tail)) = rest.split_first() {
+        rest = tail;
+        if byte != b'\\' {
+            bytes.push(byte);
+            continue;
+        }
+        let Some((&escaped, tail)) = rest.split_first() else {
+            bytes.push(byte);
+            break;
+        };
+        rest = tail;
+        bytes.push(match escaped {
+            b'a' => 0x07,
+            b'b' => 0x08,
+            b'f' => 0x0c,
+            b'n' => b'\n',
+            b'r' => b'\r',
+            b't' => b'\t',
+            b'v' => 0x0b,
+            b'0'..=b'7' => {
+                let used = rest
+                    .iter()
+                    .take(2)
+                    .take_while(|d| (b'0'..=b'7').contains(*d))
+                    .count();
+                let value = std::iter::once(&escaped)
+                    .chain(&rest[..used])
+                    .fold(0u32, |value, digit| value * 8 + u32::from(digit - b'0'));
+                rest = &rest[used..];
+                value as u8
+            }
+            other => other,
+        });
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 fn entry(path: PathBuf, is_dir: bool, ignored: bool) -> Option<Entry> {
@@ -90,7 +206,7 @@ fn compare(a: &Entry, b: &Entry) -> Ordering {
 
 #[cfg(test)]
 mod tests {
-    use super::list_dir;
+    use super::{check_ignore_paths, list_dir};
     use std::fs;
 
     fn temp_dir(tag: &str) -> std::path::PathBuf {
@@ -182,5 +298,14 @@ mod tests {
             ]
         );
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn check_ignore_output_unquotes_what_git_quoted() {
+        let printed = "target\na.log\n\"\\303\\261.log\"\n\"q\\\"x\\\\y\\t.log\"\n\n";
+        assert_eq!(
+            check_ignore_paths(printed).collect::<Vec<_>>(),
+            vec!["target", "a.log", "ñ.log", "q\"x\\y\t.log"]
+        );
     }
 }

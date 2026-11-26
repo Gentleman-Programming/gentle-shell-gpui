@@ -67,14 +67,17 @@ impl Render for ProvidersView {
         let listing = self.flow.is_none() && !(self.error.is_some() && self.helper.is_none());
         let body: AnyElement = if let Some((cwd, label)) = &self.remote {
             let (cwd, label) = (cwd.clone(), label.clone());
+            // A Gentle Shell server's folder never gets here: its sign-ins
+            // are Configuration's (`Workspace::open_providers`).
             v_flex()
                 .gap_3()
                 .child(notice(
                     IconName::SquareTerminal,
                     ui::accent(),
                     format!(
-                        "Agents here run on {label}, so they sign in there: open Gentle Shell \
-                         in a terminal on {label} and run /login. Credentials go to its auth.json."
+                        "Agents here run on {label}, so they sign in there: open Gentle \
+                         Shell in a terminal on {label} and run /login. Credentials go to \
+                         its auth.json."
                     ),
                 ))
                 .child(

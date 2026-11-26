@@ -51,6 +51,14 @@ impl SessionView {
         self.animate_banner(cx);
     }
 
+    /// Before it starts: on a server that offers it (capability
+    /// `desktop`), ask the server's session-less Desktop RPC instead of
+    /// starting a session there (Configuration's control session). An older
+    /// server gets a session of its own, as before.
+    pub fn use_server_desktop(&mut self) {
+        self.backend.server_desktop = true;
+    }
+
     /// Bloom the rose and write the wordmark in over
     /// [`crate::shared::banner::WRITE`]; the banner paces it.
     fn animate_banner(&mut self, cx: &mut Context<Self>) {
@@ -137,14 +145,19 @@ impl SessionView {
     /// or broken, then fixed by onboarding). Running and unstarted tabs are
     /// left alone; a backend that exited before any conversation counts.
     pub fn retry_start(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.never_ran() {
+            self.start(window, cx);
+        }
+    }
+
+    /// Started, but its backend never came up.
+    fn never_ran(&self) -> bool {
         let never_ran = match &self.backend.status {
             BackendStatus::Failed(_) => true,
             BackendStatus::Exited(_) => self.transcript.items.is_empty(),
             BackendStatus::Starting | BackendStatus::Ready(_) => false,
         };
-        if self.backend.started && never_ran {
-            self.start(window, cx);
-        }
+        self.backend.started && never_ran
     }
 
     /// Restart the backend in another folder; the conversation starts fresh.
@@ -153,6 +166,7 @@ impl SessionView {
         self.cwd = cwd;
         // A conversation still waiting to be resumed belongs to the old folder.
         self.backend.pending_session = None;
+        self.backend.attach = None;
         if self.backend.started {
             self.start(window, cx);
         } else {
@@ -164,8 +178,9 @@ impl SessionView {
     /// keeping its conversation (the session file is resumed on the new
     /// backend). A tab in the middle of a turn switches when the turn ends.
     pub fn restart_for_update(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // A tab not started yet starts on the new version anyway.
-        if !self.backend.started {
+        // A tab not started yet starts on the new version anyway; a server's
+        // tab doesn't run this computer's Gentle Shell.
+        if !self.backend.started || self.runs_on.as_ref().is_some_and(|b| b.is_server()) {
             return;
         }
         self.restart_when_idle(
@@ -311,13 +326,121 @@ impl SessionView {
     }
 
     /// Ask the backend to stop, without waiting for it; whether one was
-    /// running. The app quits with this, before any tab is released.
+    /// running. A server's session is stopped there too.
     pub fn shutdown_backend(&self) -> bool {
         let BackendStatus::Ready(process) = &self.backend.status else {
             return false;
         };
         process.shutdown(Duration::from_secs(3));
         true
+    }
+
+    /// The app is quitting, before any tab is released: a local backend is
+    /// asked to stop; a Gentle Shell server's session keeps running, and the
+    /// next launch reattaches to it. Whether a local one was signalled.
+    pub fn quit_backend(&self) -> bool {
+        let BackendStatus::Ready(process) = &self.backend.status else {
+            return false;
+        };
+        if process.detach() {
+            return false;
+        }
+        process.shutdown(Duration::from_secs(3));
+        true
+    }
+
+    /// Reattach to `session` on a Gentle Shell server when this tab starts:
+    /// a restored tab whose session kept running there.
+    pub fn attach_server_session(&mut self, session: gentle_core::serve::ServerSession) {
+        self.backend.attach = Some(session);
+    }
+
+    /// The Gentle Shell server session this tab follows (or will reattach
+    /// to), saved with the tab so the next launch picks it up.
+    pub fn server_session(&self) -> Option<gentle_core::serve::ServerSession> {
+        if let Some(attach) = &self.backend.attach {
+            return Some(attach.clone());
+        }
+        let Some(runs_on @ gentle_core::backend::Backend::Server { url, .. }) = &self.runs_on
+        else {
+            return None;
+        };
+        let id = self.process()?.server_session()?.to_string();
+        Some(gentle_core::serve::ServerSession {
+            url: url.clone(),
+            id,
+            server_id: crate::features::backend::server::key(runs_on)
+                .filter(|key| key != url)
+                .unwrap_or_default(),
+        })
+    }
+
+    /// This device was unpaired from `server` (named `name`), which this
+    /// tab's session runs on: the tab lets go of the session, which keeps
+    /// running there as when the app quits, and says so. Paired again with
+    /// that server, Start again picks it up. `addresses`: every address the
+    /// server was paired or reached at.
+    pub fn server_unpaired(
+        &mut self,
+        server: &str,
+        addresses: &[String],
+        name: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(gentle_core::backend::Backend::Server { url, .. }) = &self.runs_on else {
+            return;
+        };
+        if !addresses.contains(url) {
+            return;
+        }
+        let mut attach = self.server_session();
+        if let Some(attach) = &mut attach
+            && attach.server_id.is_empty()
+        {
+            attach.server_id = server.to_string();
+        }
+        if let BackendStatus::Ready(process) = &self.backend.status {
+            process.detach();
+        }
+        // What the session still sends isn't read any more.
+        self._io = Task::ready(());
+        self.backend.attach = attach;
+        self.backend.status = BackendStatus::Failed(format!(
+            "This computer was unpaired from {name}. The session keeps running there: pair with \
+             {name} again in Configuration › General › Where agents run, then Start again \
+             picks it up."
+        ));
+        self.sync_chrome(cx);
+        cx.notify();
+    }
+
+    /// The server `server` names was paired again: this device's earlier
+    /// pairing with it, whose token this tab used, is gone (the server
+    /// revoked it). A tab whose session runs there follows it through the
+    /// new pairing; one that lost hold of it there (unpaired, or its token
+    /// revoked) picks it up again.
+    pub fn follow_pairing(&mut self, server: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(runs_on @ gentle_core::backend::Backend::Server { .. }) = &self.runs_on else {
+            return;
+        };
+        let on_it = crate::features::backend::server::key(runs_on).as_deref() == Some(server)
+            || self.backend.attach.as_ref().is_some_and(|attach| {
+                crate::features::backend::server::key_of(attach.server()) == server
+            });
+        if !on_it {
+            return;
+        }
+        match &self.backend.status {
+            BackendStatus::Ready(process) => {
+                let attach = self.server_session();
+                process.detach();
+                self.backend.attach = attach;
+            }
+            BackendStatus::Failed(_) | BackendStatus::Exited(_)
+                if self.backend.attach.is_some() => {}
+            _ => return,
+        }
+        self.restart_backend(window, cx);
     }
 
     fn start(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -329,6 +452,7 @@ impl SessionView {
         // Desktop answers and event numbering are gone.
         self.desktop.reset();
         self.permission.reset(self.desktop.session());
+        self.host.reset();
         self.transcript = Transcript::default();
         self.markdown.clear();
         self.expanded.clear();
@@ -370,14 +494,72 @@ impl SessionView {
             .collect();
         let canvas = self.canvas.clone();
         // The backend chosen when the tab first started: a restart resumes
-        // its conversation there, wherever new tabs go now.
-        let runs_on = self.runs_on.clone();
+        // its conversation there, wherever new tabs go now; its server, paired
+        // again since (elsewhere, or after an unpair), as it is saved now.
+        let runs_on = crate::features::backend::server::paired_again(
+            self.runs_on.clone(),
+            self.backend.attach.as_ref(),
+        );
+        // A server session the restored tab reattaches to (it kept running),
+        // kept until the tab is up: a start that fails tries it again.
+        let attach = self.backend.attach.clone();
+        let server_desktop = self.backend.server_desktop;
+        self.backend.server_home = None;
+        // Where a server would be asked for its home folder, should it have
+        // no such folder as this tab's.
+        let choice = runs_on
+            .clone()
+            .unwrap_or_else(|| crate::features::backend::for_tab(&cwd));
         self._io = cx.spawn_in(window, async move |this, cx| {
             let spawned = cx
                 .background_executor()
                 .spawn(async move {
                     let runs_on =
                         runs_on.unwrap_or_else(|| crate::features::backend::for_tab(&cwd));
+                    if let gentle_core::backend::Backend::Server { url, .. } = &runs_on {
+                        // The server starts the session itself, in the folder
+                        // as it sees it; a conversation resumes by its Pi id.
+                        let client = crate::features::backend::server::client(&runs_on)?;
+                        let info = crate::features::backend::server::info(&runs_on).ok();
+                        let version = info.as_ref().and_then(|info| info.version.clone());
+                        // Configuration's control session: the server's own
+                        // Desktop RPC when it has it, no session started.
+                        if crate::features::settings::remote::uses_server_desktop(
+                            server_desktop,
+                            info.as_ref(),
+                        ) {
+                            let (process, rx) = PiProcess::serve_desktop(client)?;
+                            return anyhow::Ok((
+                                process,
+                                rx,
+                                VersionFrom::Known(version),
+                                runs_on,
+                                false,
+                            ));
+                        }
+                        let attach = attach
+                            .filter(|s| {
+                                s.url == *url
+                                    || crate::features::backend::server::same(s.server(), &runs_on)
+                            })
+                            .map(|s| s.id);
+                        let pi_session = resume.as_deref().and_then(|path| {
+                            gentle_core::serve::pi_session_id(&path.to_string_lossy())
+                        });
+                        let (process, rx) = PiProcess::serve(
+                            client,
+                            &cwd.to_string_lossy(),
+                            attach.as_deref(),
+                            pi_session.as_deref(),
+                        )?;
+                        return anyhow::Ok((
+                            process,
+                            rx,
+                            VersionFrom::Known(version),
+                            runs_on,
+                            true,
+                        ));
+                    }
                     // The canvas this agent works on: its extension's tools.
                     let files: Vec<(String, &std::path::Path)> = canvas
                         .as_deref()
@@ -386,6 +568,13 @@ impl SessionView {
                         .collect();
                     let mut spec =
                         crate::features::backend::launch_spec(&runs_on, &cwd, &env, &files)?;
+                    // A Gentle Shell with host tools gets the app's tools
+                    // that way, with their guidance, instead of its
+                    // extensions and instructions.
+                    let host_tools = crate::features::backend::takes_host_tools(&runs_on, &spec);
+                    if host_tools {
+                        spec.without_app_tools();
+                    }
                     if let Some(path) = &resume {
                         // A conversation listed from this computer's view of the
                         // backend's home reads there as the backend's path.
@@ -395,21 +584,31 @@ impl SessionView {
                             .push(runs_on.path(&path).unwrap_or_else(|| path.into_owned()));
                     }
                     let (process, rx) = PiProcess::spawn(&spec)?;
-                    anyhow::Ok((process, rx, spec, runs_on))
+                    anyhow::Ok((process, rx, VersionFrom::Probe(spec), runs_on, host_tools))
                 })
                 .await;
             let (rx, probe) = match spawned {
-                Ok((process, rx, spec, runs_on)) => {
-                    // The version is only shown: asked while the backend
-                    // boots, not before (`--version` is a cold Node start).
-                    let probe = {
-                        let runs_on = runs_on.clone();
-                        cx.background_executor().spawn(async move {
-                            crate::features::backend::shell_version(&runs_on, &spec)
-                        })
+                Ok((process, rx, version, runs_on, host_tools)) => {
+                    // A server tells its version with the start; a launcher's
+                    // is only shown, so it is asked while the backend boots,
+                    // not before (`--version` is a cold Node start).
+                    let (known, probe) = match version {
+                        VersionFrom::Known(version) => (Some(version), None),
+                        VersionFrom::Probe(spec) => {
+                            let runs_on = runs_on.clone();
+                            let probe = cx.background_executor().spawn(async move {
+                                crate::features::backend::shell_version(&runs_on, &spec)
+                            });
+                            (None, Some(probe))
+                        }
                     };
                     let ok = this.update(cx, |this, cx| {
                         this.backend.status = BackendStatus::Ready(process);
+                        this.backend.attach = None;
+                        if let Some(version) = known {
+                            this.backend.version = version;
+                        }
+                        this.backend.host_tools = host_tools;
                         this.runs_on = Some(runs_on);
                         this.genui_mode = genui_mode;
                         this.sync_genui_mode(cx);
@@ -433,10 +632,25 @@ impl SessionView {
                     (rx, probe)
                 }
                 Err(error) => {
+                    // No such folder on the server: the tab offers the
+                    // server's home instead.
+                    let missing = error
+                        .downcast_ref::<pi_rpc::serve::ServeError>()
+                        .is_some_and(|e| e.error.as_deref() == Some("invalid_cwd"));
                     let _ = this.update(cx, |this, cx| {
                         this.backend.status = BackendStatus::Failed(format!("{error:#}"));
                         cx.notify();
                     });
+                    if missing {
+                        let home = cx
+                            .background_executor()
+                            .spawn(async move { crate::features::backend::server::home(&choice) })
+                            .await;
+                        let _ = this.update(cx, |this, cx| {
+                            this.backend.server_home = home;
+                            cx.notify();
+                        });
+                    }
                     return;
                 }
             };
@@ -445,6 +659,9 @@ impl SessionView {
             let version = {
                 let (this, mut cx) = (this.clone(), cx.clone());
                 async move {
+                    let Some(probe) = probe else {
+                        return;
+                    };
                     let version = probe.await;
                     let _ = this.update(&mut cx, |this, cx| {
                         this.backend.version = version;
@@ -493,6 +710,14 @@ impl SessionView {
         self.capture = None;
         self.usage.context_latch.rearm();
     }
+}
+
+/// Where a starting tab's backend version comes from.
+enum VersionFrom {
+    /// A server's, told with the start.
+    Known(Option<String>),
+    /// Asked of the launcher alongside the start.
+    Probe(pi_rpc::LaunchSpec),
 }
 
 /// `first` plus every message already queued behind it, in arrival order.
@@ -808,7 +1033,7 @@ mod tests {
             let BackendStatus::Ready(process) = &view.backend.status else {
                 panic!("the first backend is not running");
             };
-            process.pid()
+            process.pid().expect("a local backend has a process id")
         });
 
         // `/reload`'s restart, onto the second launcher.

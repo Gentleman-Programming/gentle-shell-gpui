@@ -51,7 +51,7 @@ impl NativeView {
         script: Option<&str>,
         sandbox: Option<&super::Sandbox>,
         profile: &Profile,
-        popups: Option<super::Popups>,
+        steering: super::Steering,
     ) -> Result<Self, String> {
         use wry::WebViewBuilderExtDarwin as _;
         let builder = wry::WebViewBuilder::new()
@@ -69,7 +69,7 @@ impl NativeView {
         } else {
             builder.with_data_store_identifier(profile.store_id())
         };
-        let builder = super::follow_popups(builder, popups);
+        let builder = super::steer(builder, steering);
         let webview = match sandbox {
             Some(sandbox) => super::isolate(builder, sandbox),
             None => builder,

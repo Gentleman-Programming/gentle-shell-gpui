@@ -116,7 +116,11 @@ pub fn parse_record(line: &[u8]) -> Result<Record> {
     if line.iter().all(u8::is_ascii_whitespace) {
         return Ok(Record::Empty);
     }
-    let value: Value = serde_json::from_slice(line)?;
+    record_from(serde_json::from_slice(line)?)
+}
+
+/// A record already parsed as JSON (a server's event stream carries them).
+pub(crate) fn record_from(value: Value) -> Result<Record> {
     Ok(match value.get("type").and_then(Value::as_str) {
         Some("response") => Record::Response(serde_json::from_value(value)?),
         Some("extension_ui_request") => Record::Ui(serde_json::from_value(value)?),

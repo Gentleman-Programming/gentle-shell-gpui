@@ -1,9 +1,22 @@
-//! Where agents run (`gentle_core::backend`): the choice saved in the app's
-//! `settings.json`, the WSL distro a project folder implies, that
-//! environment's login PATH and Gentle Shell homes, the WSL distros on this
-//! computer, and what runs through it: `gentle-shell` (agent tabs and its
-//! commands), terminals and `git`.
+//! Where agents run (`gentle_core::backend`): the default machine saved in
+//! the app's `settings.json` (where a new workspace goes), the machine each
+//! open workspace runs on ([`set_workspaces`]), the WSL distro a project
+//! folder implies, that environment's login PATH and Gentle Shell homes, the
+//! WSL distros on this computer, and what runs through it: `gentle-shell`
+//! (agent tabs and its commands), terminals, files ([`fs`]) and `git`. On a
+//! Gentle Shell server ([`server`]) sessions, files, git and terminals go
+//! through its API; what a server doesn't offer answers
+//! [`server::UNAVAILABLE`].
+//!
+//! Work is found its machine by its folder ([`for_tab`]): the workspace
+//! whose folder holds it ([`gentle_core::machines::owner`]). A screen that
+//! acts on a machine it chose (Configuration's "Settings for", Open folder)
+//! runs its work inside [`on`], which wins over any folder.
 
+pub mod fs;
+pub mod server;
+
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -19,45 +32,126 @@ use serde_json::Value;
 /// or VM boots first.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// The saved choice, read once: `git` asks for it on every refresh.
-static SAVED: RwLock<Option<Backend>> = RwLock::new(None);
+/// The default machine, read once: where a new workspace goes.
+static DEFAULT: RwLock<Option<Backend>> = RwLock::new(None);
 
-/// Read the backend's homes, if agents run in one, in the background.
+/// The open workspaces' folders and machines, the shown one's first, then
+/// the homes of the servers they run on ([`set_workspaces`]).
+static ROOTS: RwLock<Vec<(PathBuf, Backend)>> = RwLock::new(Vec::new());
+
+/// The shown workspace's machine, once a window shows one.
+static SHOWN: RwLock<Option<Backend>> = RwLock::new(None);
+
+thread_local! {
+    /// The machine work on this thread acts on, inside [`on`].
+    static ON: RefCell<Option<Backend>> = const { RefCell::new(None) };
+}
+
+/// Read the shown machine's homes, if it is an environment of its own, in
+/// the background; a server's name kept from before servers were listed
+/// is kept beside its pairing ([`server::remember_name`]).
 pub fn init(cx: &mut App) {
     cx.background_executor()
-        .spawn(async { sync_homes() })
+        .spawn(async {
+            server::remember_name(&default_machine());
+            sync_homes();
+        })
         .detach();
 }
 
-/// The backend new agent tabs use; [`Backend::Local`] when none is saved.
-pub fn saved() -> Backend {
-    if let Some(known) = SAVED.read().ok().and_then(|saved| saved.clone()) {
+/// Where a new workspace goes ("Agents run on"); [`Backend::Local`] when
+/// none is saved. Open workspaces keep their own machine.
+pub fn default_machine() -> Backend {
+    if let Some(known) = DEFAULT.read().ok().and_then(|saved| saved.clone()) {
         return known;
     }
     let choice = crate::shared::themes::store_path()
         .and_then(|path| crate::shared::themes::read_key(&path, backend::KEY))
         .map_or_else(Backend::default, |value| Backend::from_json(&value));
-    if let Ok(mut saved) = SAVED.write() {
+    if let Ok(mut saved) = DEFAULT.write() {
         *saved = Some(choice.clone());
     }
     choice
 }
 
-/// Save the backend new agent tabs use (`null` for this computer).
-pub fn save(choice: &Backend) -> std::io::Result<()> {
+/// Save where new workspaces go (`null` for this computer). Choosing this
+/// computer forgets no server: pairings stay listed ([`server::paired`]).
+pub fn save_default(choice: &Backend) -> std::io::Result<()> {
     let path = crate::shared::themes::store_path()
         .ok_or_else(|| std::io::Error::other("no data folder"))?;
     crate::shared::themes::write_key(&path, backend::KEY, choice.to_json().unwrap_or(Value::Null))?;
-    if let Ok(mut saved) = SAVED.write() {
+    if let Ok(mut saved) = DEFAULT.write() {
         *saved = Some(choice.clone());
     }
     Ok(())
 }
 
-/// Where work rooted at `cwd` runs: the distro of a folder under
-/// `\\wsl.localhost\<distro>\`, else the saved choice.
+/// The open workspaces' folders and machines, the shown workspace's first:
+/// work in one of those folders runs on its machine ([`for_tab`]). A
+/// server's home holds what its workspaces' folders don't (a tab started
+/// there), after them.
+pub fn set_workspaces(roots: Vec<(PathBuf, Backend)>, active: Backend) {
+    let mut all = roots;
+    let homes: Vec<(PathBuf, Backend)> = all
+        .iter()
+        .filter_map(|(_, machine)| match machine {
+            Backend::Server { url, .. } => {
+                server::known_home(url).map(|home| (PathBuf::from(home), machine.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    all.extend(homes);
+    if let Ok(mut roots) = ROOTS.write() {
+        *roots = all;
+    }
+    if let Ok(mut shown) = SHOWN.write() {
+        *shown = Some(active);
+    }
+}
+
+/// Run `work` acting on `machine`: every folder it reaches is that
+/// machine's ([`for_tab`]), and so is [`current`]. For screens that act on
+/// a machine the user chose; blocking work runs inside it on its own
+/// thread.
+pub fn on<R>(machine: &Backend, work: impl FnOnce() -> R) -> R {
+    let before = ON.with(|on| on.replace(Some(machine.clone())));
+    let out = work();
+    ON.with(|on| *on.borrow_mut() = before);
+    out
+}
+
+/// The machine whole-machine work acts on (Setup, Gentle Shell's own
+/// commands, its homes): the one [`on`] names, else the shown workspace's,
+/// else the default.
+pub fn current() -> Backend {
+    ON.with(|on| on.borrow().clone())
+        .or_else(|| SHOWN.read().ok().and_then(|shown| shown.clone()))
+        .unwrap_or_else(default_machine)
+}
+
+/// Where work rooted at `cwd` runs: the machine [`on`] names; else the
+/// distro of a folder under `\\wsl.localhost\<distro>\`; else the machine
+/// of the workspace whose folder holds it; else the shown workspace's.
 pub fn for_tab(cwd: &Path) -> Backend {
-    Backend::for_folder(&cwd.to_string_lossy()).unwrap_or_else(saved)
+    if let Some(machine) = ON.with(|on| on.borrow().clone()) {
+        return machine;
+    }
+    if let Some(distro) = Backend::for_folder(&cwd.to_string_lossy()) {
+        return distro;
+    }
+    ROOTS
+        .read()
+        .ok()
+        .and_then(|roots| gentle_core::machines::owner(cwd, &roots).cloned())
+        .unwrap_or_else(current)
+}
+
+/// Whether work rooted at `cwd` runs on a Gentle Shell server, where its
+/// files, git and terminals are the server's (through its API), never this
+/// computer's.
+pub fn on_server(cwd: &Path) -> bool {
+    for_tab(cwd).is_server()
 }
 
 /// How `choice` reads `path`, a path on this computer, or why it can't.
@@ -81,6 +175,10 @@ pub fn launch_spec(
     env: &[(String, String)],
     files: &[(String, &Path)],
 ) -> Result<pi_rpc::LaunchSpec> {
+    // A server starts its sessions itself (`PiProcess::serve`).
+    if choice.is_server() {
+        return Err(anyhow!(server::NOT_ON_SERVER));
+    }
     let folder = reach(choice, cwd)?;
     let Some(launch) = choice.launch(&folder) else {
         let mut spec = pi_rpc::resolve_backend(cwd)?;
@@ -169,8 +267,8 @@ pub fn put_file(
     let mode = if executable { "chmod 755" } else { "true" };
     let script =
         format!(r#"mkdir -p "${{1%/*}}" && cat > "$1.$$" && {mode} "$1.$$" && mv -f "$1.$$" "$1""#);
-    let mut command = in_root(choice, &["sh", "-c", &script, "sh", there])
-        .ok_or("Agents run on this computer.")?;
+    let mut command =
+        in_root(choice, &["sh", "-c", &script, "sh", there]).ok_or_else(|| no_runner(choice))?;
     command
         .stdin(std::fs::File::open(file).map_err(|e| format!("{}: {e}", file.display()))?)
         .stderr(std::process::Stdio::null());
@@ -190,8 +288,8 @@ pub fn put_file(
 /// caller marks what must run. Blocking.
 pub fn put_dir(choice: &Backend, dir: &Path, there: &str) -> Result<(), String> {
     let script = r#"rm -rf "$1.part" && mkdir -p "$1.part" && tar -xf - --no-same-owner -C "$1.part" && rm -rf "$1" && mv "$1.part" "$1""#;
-    let mut command = in_root(choice, &["sh", "-c", script, "sh", there])
-        .ok_or("Agents run on this computer.")?;
+    let mut command =
+        in_root(choice, &["sh", "-c", script, "sh", there]).ok_or_else(|| no_runner(choice))?;
     let mut child = command
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
@@ -218,6 +316,15 @@ pub fn put_dir(choice: &Backend, dir: &Path, there: &str) -> Result<(), String> 
             choice.label(),
             String::from_utf8_lossy(&out.stderr).trim()
         )),
+    }
+}
+
+/// Why `choice` can't run something there: it is this computer, or a server.
+fn no_runner(choice: &Backend) -> String {
+    if choice.is_server() {
+        server::NOT_ON_SERVER.to_string()
+    } else {
+        "Agents run on this computer.".to_string()
     }
 }
 
@@ -295,12 +402,13 @@ pub fn shell_spec(cwd: &Path) -> Result<pi_rpc::LaunchSpec> {
     launch_spec(&for_tab(cwd), cwd, &[], &[])
 }
 
-/// `gentle-shell` where new agent tabs run, for commands about the
-/// installation (`--version`, `setup`, `install`): from the user's home
-/// here, or the backend's root, which every backend has (a container may not
-/// see this computer's home). Blocking, like [`launch_spec`].
+/// `gentle-shell` on the machine whole-machine work acts on ([`current`]),
+/// for commands about the installation (`--version`, `setup`, `install`):
+/// from the user's home here, or the backend's root, which every backend
+/// has (a container may not see this computer's home). Blocking, like
+/// [`launch_spec`].
 pub fn home_shell_spec() -> Result<pi_rpc::LaunchSpec> {
-    match saved() {
+    match current() {
         Backend::Local => {
             pi_rpc::resolve_backend(&dirs::home_dir().unwrap_or_else(std::env::temp_dir))
         }
@@ -309,29 +417,147 @@ pub fn home_shell_spec() -> Result<pi_rpc::LaunchSpec> {
 }
 
 /// `git` for the repository at `cwd`, run where `cwd`'s agents run (in a
-/// WSL distro instead of over `\\wsl.localhost`, which is slow), with `env`
-/// set; the caller adds the arguments. A folder the backend can't reach
-/// runs on this computer, the only place that can read it.
-pub fn git(cwd: &Path, env: &[(&str, &str)]) -> Command {
-    let choice = for_tab(cwd);
-    let launch = reach(&choice, cwd)
-        .ok()
-        .and_then(|folder| choice.launch(&folder));
-    match launch.as_deref() {
-        Some([program, args @ ..]) => {
-            let mut command = pi_rpc::command(program);
-            command
-                .args(args)
-                .arg("env")
-                .args(env.iter().map(|(key, value)| format!("{key}={value}")))
-                .arg("git");
-            command
+/// WSL distro instead of over `\\wsl.localhost`, which is slow; on a Gentle
+/// Shell server through `POST /api/git`), with `env` set; the caller adds
+/// the arguments and runs it ([`Git::output`]). A folder the backend can't
+/// reach runs on this computer, the only place that can read it.
+pub fn git(cwd: &Path, env: &[(&str, &str)]) -> Git {
+    Git {
+        cwd: cwd.to_path_buf(),
+        env: env
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+        args: Vec::new(),
+        clean: false,
+    }
+}
+
+/// One `git` command, built by [`git`].
+pub struct Git {
+    cwd: PathBuf,
+    env: Vec<(String, String)>,
+    args: Vec<String>,
+    /// Leave out the `GIT_DIR`-style variables this app inherited.
+    clean: bool,
+}
+
+/// What a `git` command printed, and whether it succeeded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitOutput {
+    pub success: bool,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+}
+
+/// The variables a server lets a client set for git; it sets
+/// `GIT_TERMINAL_PROMPT=0` itself.
+const SERVER_GIT_ENV: [&str; 18] = [
+    "GIT_AUTHOR_NAME",
+    "GIT_AUTHOR_EMAIL",
+    "GIT_AUTHOR_DATE",
+    "GIT_COMMITTER_NAME",
+    "GIT_COMMITTER_EMAIL",
+    "GIT_COMMITTER_DATE",
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_NAMESPACE",
+    "GIT_LITERAL_PATHSPECS",
+    "GIT_GLOB_PATHSPECS",
+    "GIT_NOGLOB_PATHSPECS",
+    "GIT_ICASE_PATHSPECS",
+    "GIT_REFLOG_ACTION",
+    "GIT_MERGE_AUTOEDIT",
+    "GIT_MERGE_VERBOSITY",
+    "GIT_OPTIONAL_LOCKS",
+];
+
+impl Git {
+    pub fn args<I, S>(&mut self, args: I) -> &mut Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        self.args
+            .extend(args.into_iter().map(|a| a.as_ref().to_string()));
+        self
+    }
+
+    /// Without the `GIT_DIR`, `GIT_WORK_TREE`, `GIT_COMMON_DIR` and
+    /// `GIT_INDEX_FILE` this app may have inherited (a server never passes
+    /// its own on).
+    pub fn clean_env(&mut self) -> &mut Self {
+        self.clean = true;
+        self
+    }
+
+    /// Run it, without input, to its end. On a server a failure to reach
+    /// it is the error, in words.
+    pub fn output(&self) -> std::io::Result<GitOutput> {
+        let choice = for_tab(&self.cwd);
+        if choice.is_server() {
+            if !server::offers(&choice, "git") {
+                return Err(std::io::Error::other(server::UNAVAILABLE));
+            }
+            let client = server::client(&choice).map_err(std::io::Error::other)?;
+            let env: Vec<(String, String)> = self
+                .env
+                .iter()
+                .filter(|(k, _)| SERVER_GIT_ENV.contains(&k.as_str()))
+                .cloned()
+                .collect();
+            let out = client
+                .git(&self.cwd.to_string_lossy(), &self.args, &env, None)
+                .map_err(|error| fs::content_error(error, &self.cwd))?;
+            return Ok(GitOutput {
+                success: out.success(),
+                stdout: out.stdout,
+                stderr: out.stderr,
+            });
         }
-        _ => {
-            let mut command = pi_rpc::command("git");
-            command.current_dir(cwd).envs(env.iter().copied());
-            command
+        let launch = reach(&choice, &self.cwd)
+            .ok()
+            .and_then(|folder| choice.launch(&folder));
+        let mut command = match launch.as_deref() {
+            Some([program, args @ ..]) => {
+                let mut command = pi_rpc::command(program);
+                command
+                    .args(args)
+                    .arg("env")
+                    .args(self.env.iter().map(|(key, value)| format!("{key}={value}")))
+                    .arg("git");
+                command
+            }
+            _ => {
+                let mut command = pi_rpc::command("git");
+                command
+                    .current_dir(&self.cwd)
+                    .envs(self.env.iter().map(|(k, v)| (k, v)));
+                command
+            }
+        };
+        if self.clean {
+            for name in [
+                "GIT_DIR",
+                "GIT_WORK_TREE",
+                "GIT_COMMON_DIR",
+                "GIT_INDEX_FILE",
+            ] {
+                command.env_remove(name);
+            }
         }
+        let out = command
+            .args(&self.args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()?;
+        Ok(GitOutput {
+            success: out.status.success(),
+            stdout: out.stdout,
+            stderr: out.stderr,
+        })
     }
 }
 
@@ -380,6 +606,7 @@ pub fn read(choice: &Backend, path: &str) -> Option<String> {
         Backend::Command { .. } => run_in(choice, &["cat".to_string(), path.to_string()])
             .filter(|(ok, _)| *ok)
             .map(|(_, text)| text),
+        Backend::Server { .. } => None,
     }
 }
 
@@ -396,10 +623,11 @@ pub fn run(choice: &Backend, program: &str, args: &[&str]) -> Option<(bool, Stri
 /// The backend whose homes the app last pointed at ([`sync_homes`]).
 static SYNCED: Mutex<Option<Backend>> = Mutex::new(None);
 
-/// Point the app at the saved backend's Gentle Shell homes ([`use_home`]).
-/// Blocking: it asks `gentle-shell --version` there.
+/// Point the app at the Gentle Shell homes of the machine whole-machine
+/// work acts on ([`current`], [`use_home`]). Blocking: it asks
+/// `gentle-shell --version` there.
 pub fn sync_homes() {
-    let choice = saved();
+    let choice = current();
     let home = match choice {
         Backend::Local => None,
         _ => crate::features::setup::launcher_home(),
@@ -410,12 +638,12 @@ pub fn sync_homes() {
     }
 }
 
-/// [`sync_homes`] unless the app already reads the saved backend's homes,
-/// so a screen that reads them never shows this computer's by mistake.
+/// [`sync_homes`] unless the app already reads [`current`]'s homes, so a
+/// screen that reads them never shows another machine's by mistake.
 /// Blocking.
 pub fn ensure_homes() {
-    let current = SYNCED.lock().ok().and_then(|synced| synced.clone());
-    if current.as_ref() != Some(&saved()) {
+    let synced = SYNCED.lock().ok().and_then(|synced| synced.clone());
+    if synced.as_ref() != Some(&current()) {
         sync_homes();
     }
 }
@@ -449,6 +677,9 @@ pub fn forget_paths() {
     if let Ok(mut versions) = VERSIONS.lock() {
         versions.clear();
     }
+    if let Ok(mut takes) = HOST_TOOLS.lock() {
+        takes.clear();
+    }
 }
 
 /// Each backend's `gentle-shell` version, asked once: every `--version`
@@ -470,6 +701,31 @@ pub fn shell_version(choice: &Backend, spec: &pi_rpc::LaunchSpec) -> Option<Stri
         .ok()?
         .insert(choice.clone(), version.clone());
     version
+}
+
+/// Whether each backend's `gentle-shell` takes the app's tools as host
+/// tools, asked once: every `serve --help` there starts Node in the backend.
+static HOST_TOOLS: LazyLock<Mutex<HashMap<Backend, bool>>> = LazyLock::new(Mutex::default);
+
+/// Whether the `gentle-shell` `spec` runs on `choice` takes the app's tools
+/// as host tools over Desktop RPC (`pi_rpc::probe_host_tools`): cached per
+/// launcher build here, per backend there. A server's sessions always do,
+/// through the server.
+pub fn takes_host_tools(choice: &Backend, spec: &pi_rpc::LaunchSpec) -> bool {
+    match choice {
+        Backend::Local => pi_rpc::takes_host_tools(spec),
+        Backend::Server { .. } => true,
+        _ => {
+            if let Some(known) = HOST_TOOLS.lock().ok().and_then(|t| t.get(choice).copied()) {
+                return known;
+            }
+            let takes = pi_rpc::probe_host_tools(spec);
+            if let Ok(mut known) = HOST_TOOLS.lock() {
+                known.insert(choice.clone(), takes);
+            }
+            takes
+        }
+    }
 }
 
 /// The backend's login PATH, asked once per backend and kept.

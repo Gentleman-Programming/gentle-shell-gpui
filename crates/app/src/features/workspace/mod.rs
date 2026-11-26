@@ -27,7 +27,7 @@ use crate::features::onboarding::{OnboardingEvent, OnboardingView, Probe};
 use crate::features::palette::{
     Activity, Category, PaletteAction, PaletteEvent, PaletteInput, PaletteView, WorkspaceRow,
 };
-use crate::features::profiles::{ModelChoice, ProfilesEvent, ProfilesView};
+use crate::features::profiles::{ProfilesEvent, ProfilesView};
 use crate::features::providers::{ProvidersEvent, ProvidersView};
 use crate::features::review::{ReviewEvent, ReviewView};
 use crate::features::session::{AgentsTab, SessionEvent, SessionView};
@@ -274,10 +274,17 @@ impl Tab {
     }
 }
 
-/// One named workspace.
+/// One named workspace, on the machine it was opened on: its tabs,
+/// terminals, files and git run there, whatever the default.
 struct Space {
     name: String,
     root: PathBuf,
+    /// The Gentle Shell server (its server id, or address) whose folder
+    /// `root` is; `None` for a folder of this computer's.
+    server: Option<String>,
+    /// What runs it when it isn't a server's: this computer, a WSL distro
+    /// or a command.
+    backend: gentle_core::backend::Backend,
     last_active: u64,
     tabs: Vec<Tab>,
     active: usize,
@@ -288,16 +295,39 @@ struct Space {
 }
 
 impl Space {
+    /// A workspace at `root` on this computer ([`Self::set_machine`] moves
+    /// it elsewhere before it holds anything).
     fn new(name: String, root: PathBuf) -> Self {
         Self {
             name,
             root,
+            server: None,
+            backend: gentle_core::backend::Backend::Local,
             last_active: workspaces::now(),
             tabs: Vec::new(),
             active: 0,
             badge: Badge::default(),
             sidebar_expanded: true,
         }
+    }
+
+    /// The machine it runs on: its server's pairing (one this device isn't
+    /// paired with any more says so when asked), else its own.
+    fn machine(&self) -> gentle_core::backend::Backend {
+        match &self.server {
+            Some(server) => crate::features::backend::server::by_key(server),
+            None => self.backend.clone(),
+        }
+    }
+
+    /// Run on `machine` from now on (a server by what names it for good).
+    fn set_machine(&mut self, machine: &gentle_core::backend::Backend) {
+        self.server = crate::features::backend::server::key(machine);
+        self.backend = if machine.is_server() {
+            gentle_core::backend::Backend::Local
+        } else {
+            machine.clone()
+        };
     }
 }
 
@@ -445,6 +475,8 @@ pub struct Workspace {
     /// The bell's notification center, shared by every tab.
     notices: Entity<Notices>,
     renaming: Option<TabRename>,
+    /// The horizontal tabs' scroll when they don't fit the title bar.
+    tab_strip: view::TabStrip,
     /// The max-effort surge playing over the window (its run number and when
     /// it started), and the timer that clears it.
     surge: Option<(u64, std::time::Instant, crate::shared::surge::Level)>,
@@ -479,6 +511,10 @@ pub struct Workspace {
     music: Entity<Music>,
     /// Simulators and emulators, docked at the right or floating.
     devices: Entity<DevicePanel>,
+    /// The window's keyboard focus when nothing in it has one (no tab, a
+    /// pane just closed): keys reach the workspace's actions (⌘O, ⌘K, …)
+    /// only along the focus path.
+    focus: FocusHandle,
 }
 
 impl EventEmitter<WorkspaceEvent> for Workspace {}
@@ -495,15 +531,39 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> Self {
         let saved = workspaces::load();
+        let default = crate::features::backend::default_machine();
         let mut restored = Vec::new();
         let spaces: Vec<Space> = saved
             .workspaces
             .into_iter()
             .map(|w| {
+                // Before workspaces named their server, one whose agents
+                // followed a server's sessions was opened there. A server
+                // saved by address (before ids were kept) is named by its id
+                // once a pairing knows it, so pairing it again elsewhere
+                // keeps its workspaces.
+                let server = w
+                    .server
+                    .or_else(|| {
+                        w.tabs
+                            .iter()
+                            .flat_map(|tab| tab.layout.leaves())
+                            .find_map(|pane| pane.server.as_ref().map(|s| s.server().to_string()))
+                    })
+                    .map(|server| crate::features::backend::server::key_of(&server));
+                // Saved before each workspace kept its machine: where the
+                // default ran its agents then.
+                let backend = gentle_core::machines::saved_machine(
+                    saved.version,
+                    w.backend.as_ref(),
+                    &default,
+                );
                 restored.push((w.tabs, w.active_tab));
                 Space {
                     name: w.name,
                     root: w.root,
+                    server,
+                    backend,
                     last_active: w.last_active,
                     tabs: Vec::new(),
                     active: 0,
@@ -522,9 +582,11 @@ impl Workspace {
                 // The app exits before any tab is released: ask every backend
                 // to stop now. A moment's wait lets the launchers pass SIGTERM
                 // on to Pi before the exit closes its stdin (GPUI caps it).
+                // Sessions on a Gentle Shell server keep running for the next
+                // launch to reattach to.
                 let mut signalled = false;
                 for session in this.sessions() {
-                    signalled |= session.read(cx).shutdown_backend();
+                    signalled |= session.read(cx).quit_backend();
                 }
                 let settle =
                     signalled.then(|| cx.background_executor().timer(Duration::from_millis(100)));
@@ -590,6 +652,7 @@ impl Workspace {
             save_task: None,
             notices: cx.new(|_| Notices::default()),
             renaming: None,
+            tab_strip: Default::default(),
             surge: None,
             surge_runs: 0,
             stages: Vec::new(),
@@ -603,6 +666,7 @@ impl Workspace {
             closed: Vec::new(),
             music,
             devices,
+            focus: cx.focus_handle(),
             _surge_end: None,
             _title_poll: cx.spawn(async move |this, cx| {
                 loop {
@@ -631,14 +695,27 @@ impl Workspace {
             space.tabs = tabs;
         }
         let target = match folder {
-            Some(folder) => match this.spaces.iter().position(|s| s.root == folder) {
-                Some(index) => index,
-                None => this.push_space(None, folder),
+            Some(folder) => this.space_for(folder, &default),
+            // The first workspace goes where new ones do: on a Gentle Shell
+            // server, its home folder, not one on this computer.
+            None if this.spaces.is_empty() => match &default {
+                gentle_core::backend::Backend::Server { url, .. } => {
+                    match crate::features::backend::server::known_home(url) {
+                        Some(home) => this.push_space(None, home.into(), &default),
+                        None => this.push_space(
+                            None,
+                            crate::cli::default_cwd(),
+                            &gentle_core::backend::Backend::Local,
+                        ),
+                    }
+                }
+                _ => this.push_space(None, crate::cli::default_cwd(), &default),
             },
-            None if this.spaces.is_empty() => this.push_space(None, crate::cli::default_cwd()),
             None => this.current,
         };
         this.current = target;
+        // Tabs built from here on run on their workspace's machine.
+        this.publish_machines();
         if let Some(prompt) = prompt {
             let root = this.space().root.clone();
             this.open_tab(PaneKind::Agent, root, Some(prompt), None, window, cx);
@@ -647,7 +724,7 @@ impl Workspace {
             this.activate(active, window, cx);
         }
         if let Some(url) = url {
-            this.open_agent_page(url, None, false, window, cx);
+            this.open_agent_page(url, None, None, false, window, cx);
         }
         this.space_mut().last_active = workspaces::now();
         this.schedule_save(cx);
@@ -692,14 +769,16 @@ impl Workspace {
             device,
         } = request;
         if let Some(folder) = folder {
-            self.show_folder(folder, window, cx);
+            // A folder `gsd` names goes where new workspaces do.
+            let machine = crate::features::backend::default_machine();
+            self.show_folder(folder, &machine, window, cx);
         }
         if let Some(prompt) = prompt {
             let root = self.space().root.clone();
             self.open_tab(PaneKind::Agent, root, Some(prompt), None, window, cx);
         }
         if let Some(url) = url {
-            self.open_agent_page(url, None, false, window, cx);
+            self.open_agent_page(url, None, None, false, window, cx);
         }
         if let Some(args) = device {
             self.device_request(&args, cx);
@@ -708,7 +787,7 @@ impl Workspace {
     }
 
     /// `gentle-device`'s request: start the hub, open a device, close one.
-    fn device_request(&mut self, args: &[String], cx: &mut Context<Self>) {
+    pub(crate) fn device_request(&mut self, args: &[String], cx: &mut Context<Self>) {
         use crate::features::devices::cli::{Request, parse};
         let Ok(request) = parse(args) else { return };
         self.devices.update(cx, |panel, cx| match request {

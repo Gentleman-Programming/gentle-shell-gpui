@@ -49,6 +49,10 @@ pub enum Status {
     Missing(String),
     Outdated(String),
     Failed(String),
+    /// Not looked at from here (on a Gentle Shell server, everything but
+    /// the server itself): neither ready nor missing, and it holds nothing
+    /// up.
+    Unchecked(String),
 }
 
 /// `Auto`: `install` does it unattended. `Terminal`: needs the user (sudo or
@@ -217,7 +221,10 @@ fn check_order(os: &str) -> Vec<CheckId> {
 /// Blocking: probes every dependency relevant to this OS.
 pub fn run_checks() -> Vec<Check> {
     apply_toolchain_path();
-    let choice = crate::features::backend::saved();
+    let choice = crate::features::backend::current();
+    if choice.is_server() {
+        return remote::server_checks(&choice);
+    }
     if choice != gentle_core::backend::Backend::Local {
         return remote::run_checks(&choice);
     }
@@ -331,11 +338,13 @@ pub fn engram_latest() -> Result<String, String> {
 /// Blocking: update Engram the way it was installed (Homebrew, or the
 /// release binary in the app's toolchain); the version it runs afterwards.
 pub fn upgrade_engram(log: &(dyn Fn(String) + Send + Sync)) -> Result<String, String> {
+    remote::refuse_server()?;
     extras::upgrade_engram(log)
 }
 
 /// Blocking: installs `id` unattended, streaming progress lines to `log`.
 pub fn install(id: CheckId, log: &(dyn Fn(String) + Send + Sync)) -> Result<(), String> {
+    remote::refuse_server()?;
     let result = match id {
         CheckId::Node => fetch::install_node(log),
         CheckId::Go if cfg!(windows) => extras::install_go(log),

@@ -4,6 +4,7 @@
 //! rename, delete, create), files under the workspace root and git branches.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::input::{InputEvent, InputState};
@@ -22,7 +23,7 @@ mod view;
 
 use commands::{command_row, screen_rows};
 pub use sources::switch_branch;
-use sources::{list_branches, walk_files};
+use sources::{list_branches, search_files, walk_files};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PaletteAction {
@@ -76,6 +77,13 @@ pub enum PaletteAction {
         name: String,
         pick_folder: bool,
     },
+    /// The workspace at `root` on a Gentle Shell server, typed as the
+    /// server names it. The one already open there is shown, else one is
+    /// created.
+    ShowServerFolder(PathBuf, gentle_core::backend::Backend),
+    /// Browse the folders of a paired Gentle Shell server, from its home
+    /// folder.
+    OpenFolderOn(gentle_core::backend::Backend),
     OpenFile(PathBuf),
     /// Asks for confirmation before running `git switch`.
     SwitchBranch(String),
@@ -164,6 +172,10 @@ enum Line {
 }
 
 const MAX_FILES: usize = 20_000;
+/// The most files one server search answers.
+const SEARCHED_FILES: usize = 200;
+/// How long typing pauses before a server folder is searched again.
+const SEARCH_DEBOUNCE: Duration = Duration::from_millis(150);
 
 pub struct PaletteView {
     query: Entity<InputState>,
@@ -173,6 +185,10 @@ pub struct PaletteView {
     workspaces: Vec<WorkspaceRow>,
     root: PathBuf,
     files: Option<Vec<FileEntry>>,
+    /// The root is a Gentle Shell server's folder outside a repository:
+    /// `files` are what searching it by name for the query found
+    /// ([`Self::search_files`]).
+    searched: bool,
     branches: Option<Vec<(String, bool)>>,
     renaming: Option<(usize, Entity<InputState>)>,
     /// The query as last matched.
@@ -184,6 +200,8 @@ pub struct PaletteView {
     scroll: ScrollHandle,
     _subscriptions: Vec<Subscription>,
     _tasks: Vec<Task<()>>,
+    /// The server search running for the query; a newer one replaces it.
+    _search: Task<()>,
 }
 
 impl EventEmitter<PaletteEvent> for PaletteView {}
@@ -197,6 +215,9 @@ impl PaletteView {
             if let InputEvent::Change = event {
                 this.selected = 0;
                 this.scroll.scroll_to_item(0);
+                if this.searched {
+                    this.search_files(cx);
+                }
                 this.refresh_rows(cx);
                 cx.notify();
             }
@@ -210,13 +231,17 @@ impl PaletteView {
                 .background_executor()
                 .spawn(async move {
                     walk_files(&root, MAX_FILES)
-                        .into_iter()
-                        .map(FileEntry::new)
-                        .collect::<Vec<_>>()
+                        .map(|files| files.into_iter().map(FileEntry::new).collect::<Vec<_>>())
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
-                this.files = Some(files);
+                match files {
+                    Some(files) => this.files = Some(files),
+                    None => {
+                        this.searched = true;
+                        this.search_files(cx);
+                    }
+                }
                 this.refresh_rows(cx);
                 cx.notify();
             });
@@ -242,6 +267,7 @@ impl PaletteView {
             workspaces: input.workspaces,
             root: input.root,
             files: None,
+            searched: false,
             branches: None,
             renaming: None,
             needle: Needle::default(),
@@ -250,9 +276,47 @@ impl PaletteView {
             scroll: ScrollHandle::new(),
             _subscriptions: vec![subscription],
             _tasks: vec![files, branches],
+            _search: Task::ready(()),
         };
         this.refresh_rows(cx);
         this
+    }
+
+    /// Search the server folder for files named like the query (its first
+    /// 256 characters, as much as a server takes), once typing pauses;
+    /// nothing is searched for an empty query.
+    fn search_files(&mut self, cx: &mut Context<Self>) {
+        let query: String = self
+            .query
+            .read(cx)
+            .value()
+            .trim()
+            .chars()
+            .take(256)
+            .collect();
+        if query.is_empty() {
+            self.files = Some(Vec::new());
+            self._search = Task::ready(());
+            return;
+        }
+        let root = self.root.clone();
+        self._search = cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(SEARCH_DEBOUNCE).await;
+            let files = cx
+                .background_executor()
+                .spawn(async move {
+                    search_files(&root, &query, SEARCHED_FILES)
+                        .into_iter()
+                        .map(FileEntry::new)
+                        .collect::<Vec<_>>()
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.files = Some(files);
+                this.refresh_rows(cx);
+                cx.notify();
+            });
+        });
     }
 
     pub fn category(&self) -> Category {

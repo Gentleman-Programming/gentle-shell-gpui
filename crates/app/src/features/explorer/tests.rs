@@ -9,7 +9,9 @@ use std::rc::Rc;
 // Not a glob: GPUI exports a `test` attribute that would shadow `#[test]`.
 use gpui_kit::{Entity, TestAppContext, VisualTestContext, point, px, size};
 
-use super::{ExplorerEvent, ExplorerView};
+use gentle_core::backend::Backend;
+
+use super::{ExplorerEvent, ExplorerView, Purpose};
 
 /// A temporary folder, removed when dropped.
 struct Temp(PathBuf);
@@ -47,9 +49,18 @@ fn init(cx: &mut TestAppContext) {
     });
 }
 
+/// The explorer over this computer, opening `dir`.
+fn explorer(
+    dir: PathBuf,
+    window: &mut gpui_kit::Window,
+    cx: &mut gpui_kit::Context<ExplorerView>,
+) -> ExplorerView {
+    ExplorerView::new(Backend::Local, Vec::new(), dir, Purpose::Open, window, cx)
+}
+
 fn open(cx: &mut TestAppContext, dir: PathBuf) -> (Entity<ExplorerView>, &mut VisualTestContext) {
     init(cx);
-    cx.add_window_view(|window, cx| ExplorerView::new(dir, window, cx))
+    cx.add_window_view(|window, cx| explorer(dir, window, cx))
 }
 
 fn load(view: &Entity<ExplorerView>, dir: PathBuf, cx: &mut VisualTestContext) {
@@ -116,7 +127,7 @@ fn the_folder_is_read_off_the_ui_thread_keeping_the_previous_one_shown(cx: &mut 
 fn nothing_opens_before_the_first_folder_is_read(cx: &mut TestAppContext) {
     let root = temp("first");
     init(cx);
-    let window = cx.add_window(|window, cx| ExplorerView::new(root.0.clone(), window, cx));
+    let window = cx.add_window(|window, cx| explorer(root.0.clone(), window, cx));
     let view = window.root(cx).unwrap();
     let opened = Rc::new(RefCell::new(Vec::new()));
     let seen = opened.clone();
@@ -208,10 +219,10 @@ fn a_long_folder_draws_the_rows_in_view_and_follows_the_selection(cx: &mut TestA
     );
     assert!(cx.debug_bounds(row(299)).is_none());
 
-    // ↑ from the first row wraps to the last, scrolled into view.
+    // ↑ with nothing highlighted starts at the last row, scrolled into view.
     cx.simulate_keystrokes("up");
     cx.run_until_parked();
-    assert_eq!(view.read_with(cx, |this, _| this.selected), 299);
+    assert_eq!(view.read_with(cx, |this, _| this.selected), Some(299));
     assert!(cx.debug_bounds(row(299)).is_some());
     assert!(cx.debug_bounds(row(0)).is_none());
 }

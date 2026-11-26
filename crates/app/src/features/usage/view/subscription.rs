@@ -73,6 +73,14 @@ impl UsageView {
                     )
                     .into_any_element();
             }
+            UsageState::Elsewhere(line) => {
+                return ui::card()
+                    .p_4()
+                    .gap_2()
+                    .child(ui::section_label("Subscriptions"))
+                    .child(crate::features::settings::remote::note(line.clone()))
+                    .into_any_element();
+            }
             UsageState::Loaded {
                 cards,
                 others,

@@ -10,7 +10,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::layout::{row, section};
-use super::{SettingsEvent, SettingsView};
+use super::{SettingsEvent, SettingsView, on_machine};
 use crate::features::setup::music::{self, MusicStatus};
 use crate::shared::ui;
 
@@ -30,11 +30,9 @@ type Work = fn(&(dyn Fn(String) + Send + Sync)) -> Result<(), String>;
 
 impl SettingsView {
     pub(super) fn refresh_music(&mut self, cx: &mut Context<Self>) {
+        let machine = self.machine.clone();
         self.music.task = Some(cx.spawn(async move |this, cx| {
-            let status = cx
-                .background_executor()
-                .spawn(async { music::status() })
-                .await;
+            let status = on_machine(cx.background_executor(), &machine, music::status).await;
             let _ = this.update(cx, |this, cx| {
                 this.music.status = Some(status);
                 cx.notify();
@@ -50,8 +48,9 @@ impl SettingsView {
         self.music.log.clear();
         self.music.note = None;
         let (tx, rx) = async_channel::unbounded::<String>();
+        let machine = self.machine.clone();
         self.music.task = Some(cx.spawn(async move |this, cx| {
-            let done = cx.background_executor().spawn(async move {
+            let done = on_machine(cx.background_executor(), &machine, move || {
                 let log = move |line: String| {
                     let _ = tx.send_blocking(line);
                 };
@@ -75,10 +74,7 @@ impl SettingsView {
                 }
             }
             let result = done.await;
-            let status = cx
-                .background_executor()
-                .spawn(async { music::status() })
-                .await;
+            let status = on_machine(cx.background_executor(), &machine, music::status).await;
             let _ = this.update(cx, |this, cx| {
                 this.music.job = None;
                 this.music.status = Some(status);

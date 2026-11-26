@@ -45,7 +45,7 @@ impl Workspace {
     }
 
     pub(super) fn on_new_tab(&mut self, _: &NewTab, window: &mut Window, cx: &mut Context<Self>) {
-        let cwd = self.active_cwd(cx);
+        let cwd = self.new_agent_cwd(cx);
         self.open_tab(PaneKind::Agent, cwd, None, None, window, cx);
     }
 

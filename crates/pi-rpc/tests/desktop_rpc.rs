@@ -10,27 +10,27 @@ use pi_rpc::desktop_rpc::{
     ClearBindingStatus, ClearProfileBindingResult, CommandSource, ConfigChangeOrigin,
     ConfigChanged, ConfigErrorCode, ConfigLayer, ConfigLayerSource, ConfigScope, ConfigState,
     ConfigStatus, ConfigStore, ConfigWrite, ConfigWriteTarget, ConfigWriteTargetState,
-    DesignCanvas, DesignCanvasEvent, DesignEntry, DesignTransition, DesktopAgent, DesktopAgentStep,
-    DesktopAgentUsage, DesktopErrorCode, DesktopErrorInfo, DesktopEvent, DesktopJob, DesktopMethod,
-    DesktopRecord, DesktopRequest, DesktopResponse, DesktopRpcError, DesktopSession, DevBinary,
-    DevBinaryState, Handoff, JobExitCode, JobOutput, ListSessionsQuery, MAX_REQUEST_BYTES,
-    MAX_SESSION_ID_UNITS, MAX_SESSIONS_LIMIT, ModelConfigPresence, NotificationsData,
-    OrchestratorStatus, PROMPT_COMMAND, PackageKind, PackageScope, PackageUpdate,
-    PackageUpdateState, PendingQuestionKind, PermissionMode, PermissionModeChanged,
-    PermissionModeState, PersonaMode, PiUpdate, PinSource, PolicyFile, ProfileApplied,
-    ProfileApplyErrorCode, ProfileApplyMode, ProfileBinding, ProfileBindingChanged,
-    ProfileBindingKind, ProfileBindingOrigin, ProfileConfirmation, ProfileFallbacksData,
-    ProfileNote, ProfileNoteLevel, ProfilesData, ProviderAuth, ProviderUsage, RateLimitEvent,
-    RateLimitSource, ReviewConfirmation, ReviewEffective, ReviewMode, ReviewScope, ReviewScopes,
-    ReviewSetting, ReviewSource, RoutingState, SCHEMA, SessionActivity, SessionChangedFile,
-    SessionChanges, SessionChangesSummary, SessionCommand, SessionEntry, SessionJobs, SessionList,
-    SessionPermission, SessionProject, SessionSection, SessionTodo, SessionTodoItem,
-    SessionTodoProgress, SessionWorktree, SessionsScope, SetBackgroundSubagentsOutcome,
-    SetConfigResult, SetPermissionModeResult, SetReviewModeOutcome, ShellChannel, ShellUpdate,
-    StatsRange, StatsScope, StatusSeverity, SubagentThread, SwitchSessionResult, ThreadItem,
-    UpdateState, UsageLimit, UsageLimitScope, UsageRefresh, UsageResetAt, UsageStatsDay,
-    UsageStatsModel, UsageStatsProvider, UsageStatsTotals, UsageStatsTruncated, UsageStatus,
-    UsageWindow, WIDGET_KEY, decode_payload, decode_widget,
+    CustomModelsData, DesignCanvas, DesignCanvasEvent, DesignEntry, DesignTransition, DesktopAgent,
+    DesktopAgentStep, DesktopAgentUsage, DesktopErrorCode, DesktopErrorInfo, DesktopEvent,
+    DesktopJob, DesktopMethod, DesktopRecord, DesktopRequest, DesktopResponse, DesktopRpcError,
+    DesktopSession, DevBinary, DevBinaryState, Handoff, JobExitCode, JobOutput, ListSessionsQuery,
+    MAX_REQUEST_BYTES, MAX_SESSION_ID_UNITS, MAX_SESSIONS_LIMIT, McpDocumentData, McpLayer,
+    ModelConfigPresence, NotificationsData, OrchestratorStatus, PROMPT_COMMAND, PackageKind,
+    PackageScope, PackageUpdate, PackageUpdateState, PendingQuestionKind, PermissionMode,
+    PermissionModeChanged, PermissionModeState, PersonaMode, PiSettingsPatch, PiUpdate, PinSource,
+    PolicyFile, ProfileApplied, ProfileApplyErrorCode, ProfileApplyMode, ProfileBinding,
+    ProfileBindingChanged, ProfileBindingKind, ProfileBindingOrigin, ProfileConfirmation,
+    ProfileFallbacksData, ProfileNote, ProfileNoteLevel, ProfilesData, ProviderAuth, ProviderUsage,
+    RateLimitEvent, RateLimitSource, ReviewConfirmation, ReviewEffective, ReviewMode, ReviewScope,
+    ReviewScopes, ReviewSetting, ReviewSource, RoutingState, SCHEMA, SessionActivity,
+    SessionChangedFile, SessionChanges, SessionChangesSummary, SessionCommand, SessionEntry,
+    SessionJobs, SessionList, SessionPermission, SessionProject, SessionSection, SessionTodo,
+    SessionTodoItem, SessionTodoProgress, SessionWorktree, SessionsScope,
+    SetBackgroundSubagentsOutcome, SetConfigResult, SetPermissionModeResult, SetReviewModeOutcome,
+    ShellChannel, ShellUpdate, Snapshot, StatsRange, StatsScope, StatusSeverity, SubagentThread,
+    SwitchSessionResult, ThreadItem, UpdateState, UsageLimit, UsageLimitScope, UsageRefresh,
+    UsageResetAt, UsageStatsDay, UsageStatsModel, UsageStatsProvider, UsageStatsTotals,
+    UsageStatsTruncated, UsageStatus, UsageWindow, WIDGET_KEY, decode_payload, decode_widget,
 };
 use pi_rpc::{Response, UiMethod, UiRequest};
 use serde_json::{Value, json};
@@ -104,6 +104,38 @@ fn event_line(seq: u64, event: &str, data: Value) -> String {
         "data": data,
     })
     .to_string()
+}
+
+/// An event of a server that names its numbering with an `epoch`.
+fn epoch_event_line(epoch: &str, seq: u64) -> String {
+    json!({
+        "schema": SCHEMA,
+        "kind": "event",
+        "seq": seq,
+        "epoch": epoch,
+        "event": "jobs_update",
+        "data": { "jobs": [] },
+    })
+    .to_string()
+}
+
+/// A `get_snapshot` answer of `epoch` at `sequence`, accepted for the
+/// session's pending request and decoded.
+fn epoch_snapshot(session: &mut DesktopSession, epoch: &str, sequence: u64) -> Snapshot {
+    let request_id = session
+        .issue(DesktopMethod::GetSnapshot)
+        .unwrap()
+        .request_id()
+        .to_string();
+    let data = json!({ "schema": SCHEMA, "sequence": sequence, "epoch": epoch, "state": {} });
+    record_response(
+        session
+            .accept(&widget(&response_line(&request_id, data)))
+            .unwrap()
+            .unwrap(),
+    )
+    .snapshot()
+    .unwrap()
 }
 
 /// The `DesktopResponse` inside a decoded record.
@@ -854,6 +886,181 @@ fn a_snapshot_resyncs_the_event_sequence_after_a_gap() {
         })
     ));
     assert_eq!(session.last_sequence(), Some(4));
+}
+
+#[test]
+fn events_and_snapshots_decode_their_epoch() {
+    let event = record_event(
+        decode_widget(&widget(&epoch_event_line("e1", 3)))
+            .unwrap()
+            .unwrap(),
+    );
+    assert_eq!((event.seq, event.epoch.as_deref()), (3, Some("e1")));
+    // A server older than epochs sends none.
+    let older = record_event(
+        decode_widget(&widget(&event_line(3, "jobs_update", json!({}))))
+            .unwrap()
+            .unwrap(),
+    );
+    assert_eq!(older.epoch, None);
+
+    let snapshot = |data: Value| {
+        record_response(
+            decode_widget(&widget(&response_line("desktop-1", data)))
+                .unwrap()
+                .unwrap(),
+        )
+        .snapshot()
+    };
+    let named = snapshot(json!({ "schema": SCHEMA, "sequence": 2, "epoch": "e1", "state": {} }));
+    assert_eq!(named.unwrap().epoch.as_deref(), Some("e1"));
+    let unnamed = snapshot(json!({ "schema": SCHEMA, "sequence": 2, "state": {} }));
+    assert_eq!(unnamed.unwrap().epoch, None);
+
+    // An epoch is a non-empty string or nothing.
+    for epoch in [json!(""), json!(7), json!(null)] {
+        let line = json!({
+            "schema": SCHEMA, "kind": "event", "seq": 1, "epoch": epoch,
+            "event": "jobs_update", "data": {},
+        });
+        assert!(matches!(
+            decode_widget(&widget(&line.to_string())),
+            Err(DesktopRpcError::MalformedPayload(_))
+        ));
+        assert!(matches!(
+            snapshot(json!({ "schema": SCHEMA, "sequence": 2, "epoch": epoch, "state": {} })),
+            Err(DesktopRpcError::MalformedPayload(_))
+        ));
+    }
+}
+
+#[test]
+fn a_new_epoch_restarts_the_event_sequence_and_duplicates_within_one_stay_dropped() {
+    let mut session = DesktopSession::new();
+    for seq in 1..=5 {
+        session
+            .accept(&widget(&epoch_event_line("before-reload", seq)))
+            .unwrap()
+            .unwrap();
+    }
+    // Within an epoch a seen sequence is a replay.
+    assert!(matches!(
+        session.accept(&widget(&epoch_event_line("before-reload", 5))),
+        Err(DesktopRpcError::DuplicateSequence { last: 5, got: 5 })
+    ));
+
+    // The server reloaded: its channel numbers from 1 again under a new
+    // epoch, and those events are new, not replays.
+    session
+        .accept(&widget(&epoch_event_line("after-reload", 1)))
+        .unwrap()
+        .unwrap();
+    assert_eq!(session.last_sequence(), Some(1));
+    assert!(matches!(
+        session.accept(&widget(&epoch_event_line("after-reload", 1))),
+        Err(DesktopRpcError::DuplicateSequence { last: 1, got: 1 })
+    ));
+    session
+        .accept(&widget(&epoch_event_line("after-reload", 2)))
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        session.accept(&widget(&epoch_event_line("after-reload", 4))),
+        Err(DesktopRpcError::OutOfOrderSequence {
+            expected: 3,
+            got: 4
+        })
+    ));
+
+    // A new epoch whose first event is not 1 lost the ones before it: the
+    // gap resyncs from a snapshot of that epoch.
+    assert!(matches!(
+        session.accept(&widget(&epoch_event_line("after-switch", 3))),
+        Err(DesktopRpcError::OutOfOrderSequence {
+            expected: 1,
+            got: 3
+        })
+    ));
+    assert_eq!(session.last_sequence(), Some(0));
+    let snapshot = epoch_snapshot(&mut session, "after-switch", 3);
+    session.resync_from_snapshot(&snapshot).unwrap();
+    session
+        .accept(&widget(&epoch_event_line("after-switch", 4)))
+        .unwrap()
+        .unwrap();
+    assert_eq!(session.last_sequence(), Some(4));
+}
+
+#[test]
+fn a_snapshot_of_a_new_epoch_replaces_a_larger_baseline() {
+    let mut session = DesktopSession::new();
+    for seq in 1..=9 {
+        session
+            .accept(&widget(&epoch_event_line("before-reload", seq)))
+            .unwrap();
+    }
+    // Within an epoch a smaller snapshot is stale.
+    let stale = epoch_snapshot(&mut session, "before-reload", 3);
+    assert!(matches!(
+        session.resync_from_snapshot(&stale),
+        Err(DesktopRpcError::StaleSnapshot {
+            last: 9,
+            sequence: 3
+        })
+    ));
+    assert_eq!(session.last_sequence(), Some(9));
+
+    // After a reload it counts a new numbering and is the baseline.
+    let reloaded = epoch_snapshot(&mut session, "after-reload", 2);
+    session.resync_from_snapshot(&reloaded).unwrap();
+    assert_eq!(session.last_sequence(), Some(2));
+    assert!(matches!(
+        session.accept(&widget(&epoch_event_line("after-reload", 2))),
+        Err(DesktopRpcError::DuplicateSequence { last: 2, got: 2 })
+    ));
+    session
+        .accept(&widget(&epoch_event_line("after-reload", 3)))
+        .unwrap()
+        .unwrap();
+    assert_eq!(session.last_sequence(), Some(3));
+}
+
+#[test]
+fn without_an_epoch_a_restarted_sequence_still_reads_as_replays() {
+    // An older server names no epoch: the session keeps today's rules.
+    let mut session = DesktopSession::new();
+    for seq in 1..=3 {
+        session
+            .accept(&widget(&event_line(seq, "jobs_update", json!({}))))
+            .unwrap();
+    }
+    assert!(matches!(
+        session.accept(&widget(&event_line(1, "jobs_update", json!({})))),
+        Err(DesktopRpcError::DuplicateSequence { last: 3, got: 1 })
+    ));
+    let request_id = session
+        .issue(DesktopMethod::GetSnapshot)
+        .unwrap()
+        .request_id()
+        .to_string();
+    let older = record_response(
+        session
+            .accept(&widget(&response_line(
+                &request_id,
+                json!({ "schema": SCHEMA, "sequence": 1, "state": {} }),
+            )))
+            .unwrap()
+            .unwrap(),
+    )
+    .snapshot()
+    .unwrap();
+    assert!(matches!(
+        session.resync_from_snapshot(&older),
+        Err(DesktopRpcError::StaleSnapshot {
+            last: 3,
+            sequence: 1
+        })
+    ));
 }
 
 #[test]
@@ -3113,6 +3320,25 @@ fn config_stores_are_a_closed_vocabulary_with_their_documented_shape() {
             ConfigScope::Global,
             false,
         ),
+        (ConfigStore::Mcp, "mcp", ConfigScope::GlobalProject, false),
+        (
+            ConfigStore::PiSettings,
+            "pi_settings",
+            ConfigScope::GlobalProject,
+            false,
+        ),
+        (
+            ConfigStore::ClaudeBridge,
+            "claude_bridge",
+            ConfigScope::Global,
+            true,
+        ),
+        (
+            ConfigStore::CustomModels,
+            "custom_models",
+            ConfigScope::Global,
+            false,
+        ),
     ];
     assert_eq!(ConfigStore::ALL.len(), expected.len());
     for (store, (want, name, scope, read_only)) in ConfigStore::ALL.into_iter().zip(expected) {
@@ -3168,12 +3394,25 @@ fn config_stores_are_a_closed_vocabulary_with_their_documented_shape() {
     ));
     assert_eq!(
         ConfigWriteTarget::ALL.map(ConfigWriteTarget::as_str),
-        ["global", "local", "repo"]
+        ["global", "project", "local", "repo"]
     );
     assert!(matches!(
-        "project".parse::<ConfigWriteTarget>(),
+        "workspace".parse::<ConfigWriteTarget>(),
         Err(DesktopRpcError::InvalidConfigWriteTarget(_))
     ));
+    assert_eq!(
+        ConfigStore::Mcp.write_targets(),
+        [ConfigWriteTarget::Global, ConfigWriteTarget::Project]
+    );
+    // Pi's settings are merged from both files, but only the global one
+    // is written.
+    assert_eq!(
+        ConfigStore::PiSettings.write_targets(),
+        [ConfigWriteTarget::Global]
+    );
+    for retired in ["mcp_servers", "model_defaults"] {
+        assert!(retired.parse::<ConfigStore>().is_err(), "{retired}");
+    }
     assert_eq!(PinSource::Local.as_str(), "local");
     assert_eq!(PinSource::Repo.as_str(), "repo");
     assert_eq!(PinSource::Local.write_target(), ConfigWriteTarget::Local);
@@ -3548,6 +3787,67 @@ fn set_config_writes_the_settings_stores_through_their_global_target() {
         NotificationsData::new(json!([])),
         Err(DesktopRpcError::InvalidConfigData(_))
     ));
+    // Pi's model keys: a patch, `null` removing a key, an omitted one kept.
+    let patch = json!({ "defaultProvider": "anthropic", "defaultModel": "claude-opus-4-5",
+                        "enabledModels": null });
+    let write = ConfigWrite::PiSettings(PiSettingsPatch::new(patch.clone()).unwrap());
+    assert_eq!(write.store(), ConfigStore::PiSettings);
+    assert_eq!(write.write_target(), ConfigWriteTarget::Global);
+    assert_eq!(
+        DesktopRequest::set_config("desktop-6", write, "r4")
+            .unwrap()
+            .payload(),
+        request_payload(
+            "desktop-6",
+            "set_config",
+            json!({ "store": "pi_settings", "data": patch, "expectedRevision": "r4" }),
+        )
+    );
+    assert!(matches!(
+        PiSettingsPatch::new(json!("gpt")),
+        Err(DesktopRpcError::InvalidConfigData(_))
+    ));
+    // Only the four model keys may be patched.
+    assert!(matches!(
+        PiSettingsPatch::new(json!({ "theme": "dark" })),
+        Err(DesktopRpcError::InvalidConfigData(_))
+    ));
+    assert!(PiSettingsPatch::new(json!({})).is_ok());
+    // Pi's models.json, whole; a secret marker goes back as read.
+    let models = json!({ "providers": { "local": { "baseUrl": "http://localhost:11434/v1",
+                         "apiKey": "•••", "models": [{ "id": "qwen3" }] } } });
+    let write = ConfigWrite::CustomModels(CustomModelsData::new(models.clone()).unwrap());
+    assert_eq!(write.store(), ConfigStore::CustomModels);
+    assert_eq!(
+        DesktopRequest::set_config("desktop-7", write, "r5")
+            .unwrap()
+            .payload(),
+        request_payload(
+            "desktop-7",
+            "set_config",
+            json!({ "store": "custom_models", "data": models, "expectedRevision": "r5" }),
+        )
+    );
+    // One mcp.json, named by its layer, guarded by that file's revision.
+    let mcp = json!({ "mcpServers": { "docs": { "url": "https://docs.example/mcp" } } });
+    let write = ConfigWrite::Mcp {
+        layer: McpLayer::Project,
+        document: McpDocumentData::new(mcp.clone()).unwrap(),
+    };
+    assert_eq!(write.store(), ConfigStore::Mcp);
+    assert_eq!(write.write_target(), ConfigWriteTarget::Project);
+    assert_eq!(
+        DesktopRequest::set_config("desktop-8", write, "r6")
+            .unwrap()
+            .payload(),
+        request_payload(
+            "desktop-8",
+            "set_config",
+            json!({ "store": "mcp", "data": { "source": "project", "document": mcp },
+                    "expectedRevision": "r6" }),
+        )
+    );
+    assert!(McpDocumentData::new(json!(null)).is_err());
     assert_eq!(
         "gentleman".parse::<PersonaMode>().unwrap(),
         PersonaMode::Gentleman
@@ -4048,6 +4348,8 @@ fn config_failures_keep_their_documented_codes() {
     let codes = [
         (ConfigErrorCode::UnknownStore, "unknown_store"),
         (ConfigErrorCode::ReadOnly, "read_only"),
+        // An `mcp` write of the project file Pi doesn't read.
+        (ConfigErrorCode::ProjectUntrusted, "project_untrusted"),
         (ConfigErrorCode::InvalidData, "invalid_data"),
         (ConfigErrorCode::RevisionConflict, "revision_conflict"),
         (ConfigErrorCode::WriteFailed, "write_failed"),
@@ -4866,7 +5168,7 @@ fn capabilities_expose_the_profile_apply_method_and_event() {
 
 /// The `capabilities` methods of Gentle Shell 5.0.0, as the spec and a live
 /// backend list them.
-const MAIN_METHODS: [&str; 32] = [
+const MAIN_METHODS: [&str; 46] = [
     "capabilities",
     "get_snapshot",
     "get_config",
@@ -4899,6 +5201,20 @@ const MAIN_METHODS: [&str; 32] = [
     "clear_profile_binding",
     "get_auth_status",
     "reload_credentials",
+    "list_available_models",
+    "set_host_tools",
+    "host_tool_result",
+    "host_tool_progress",
+    "host_message",
+    "set_host_context",
+    "login_start",
+    "login_complete",
+    "login_cancel",
+    "set_api_key",
+    "remove_credentials",
+    "list_packages",
+    "install_package",
+    "remove_package",
 ];
 const MAIN_EVENTS: [&str; 10] = [
     "config_changed",
@@ -4938,7 +5254,7 @@ const RELEASE_4_8_EVENTS: [&str; 7] = [
     "profile_applied",
     "agents_update",
 ];
-const NEW_METHODS: [DesktopMethod; 18] = [
+const NEW_METHODS: [DesktopMethod; 32] = [
     DesktopMethod::GetJobOutput,
     DesktopMethod::GetSubagentThread,
     DesktopMethod::ListSessions,
@@ -4957,6 +5273,20 @@ const NEW_METHODS: [DesktopMethod; 18] = [
     DesktopMethod::ClearProfileBinding,
     DesktopMethod::GetAuthStatus,
     DesktopMethod::ReloadCredentials,
+    DesktopMethod::ListAvailableModels,
+    DesktopMethod::SetHostTools,
+    DesktopMethod::HostToolResult,
+    DesktopMethod::HostToolProgress,
+    DesktopMethod::HostMessage,
+    DesktopMethod::SetHostContext,
+    DesktopMethod::LoginStart,
+    DesktopMethod::LoginComplete,
+    DesktopMethod::LoginCancel,
+    DesktopMethod::SetApiKey,
+    DesktopMethod::RemoveCredentials,
+    DesktopMethod::ListPackages,
+    DesktopMethod::InstallPackage,
+    DesktopMethod::RemovePackage,
 ];
 
 fn capabilities_of(methods: &[&str], events: &[&str]) -> Capabilities {
@@ -5044,6 +5374,37 @@ fn capabilities_gate_the_new_methods_and_events_per_backend() {
     // Without the feed seam the server omits `session_snapshot`.
     let without_feed = capabilities_of(&MAIN_METHODS, &MAIN_EVENTS[..9]);
     assert!(!without_feed.supports_session_sections());
+}
+
+#[test]
+fn available_models_decode_with_only_provider_and_id_required() {
+    let models = ok_response(json!({
+        "models": [
+            { "provider": "anthropic", "id": "claude-sol", "name": "Claude Sol", "contextWindow": 200000, "reasoning": true, "input": ["text", "image"] },
+            { "provider": "openrouter", "id": "openai/gpt-oss:free" }
+        ],
+        "thinkingLevels": ["off", "low", "high"],
+        "current": { "provider": "anthropic", "id": "claude-sol", "thinkingLevel": "high" },
+        "truncated": false,
+        "futureField": 1
+    }))
+    .available_models()
+    .unwrap();
+    assert_eq!(models.models.len(), 2);
+    assert_eq!(models.models[0].context_window, Some(200000));
+    assert_eq!(models.models[1].name, None);
+    assert_eq!(models.thinking_levels, ["off", "low", "high"]);
+    assert_eq!(models.current.unwrap().thinking_level, "high");
+    let fresh = ok_response(json!({"models": [], "thinkingLevels": ["off"], "truncated": false}))
+        .available_models()
+        .unwrap();
+    assert!(fresh.current.is_none());
+    assert!(
+        ok_response(json!({"models": [{"id": "x"}], "thinkingLevels": [], "truncated": false}))
+            .available_models()
+            .is_err(),
+        "a model without its provider is malformed"
+    );
 }
 
 #[test]
@@ -5293,6 +5654,7 @@ fn get_auth_status_reports_status_never_a_value() {
             configured: true,
             kind: Some(AuthType::OAuth),
             source: Some(AuthSource::Stored),
+            login_kinds: Vec::new(),
         }
     );
     assert_eq!(
@@ -7090,4 +7452,347 @@ fn profile_binding_reads_clears_and_changes_decode_the_spec_shapes() {
             .profile_binding()
             .is_err()
     );
+}
+
+// --- host tools ------------------------------------------------------------
+
+fn host_tool(name: &str) -> pi_rpc::desktop_rpc::HostTool {
+    pi_rpc::desktop_rpc::HostTool {
+        name: name.into(),
+        label: "Open page".into(),
+        description: "Open a page in the app".into(),
+        parameters: json!({"type": "object", "properties": {"url": {"type": "string"}}}),
+        guidelines: vec!["Use it for pages the user should see.".into()],
+    }
+}
+
+#[test]
+fn set_host_tools_encodes_the_provider_and_its_whole_set() {
+    let request =
+        DesktopRequest::set_host_tools("host-1", "desktop", &[host_tool("open_page")]).unwrap();
+    assert_eq!(request.method(), DesktopMethod::SetHostTools);
+    assert_eq!(
+        request.payload(),
+        payload(
+            "host-1",
+            "set_host_tools",
+            r#"{"provider":"desktop","tools":[{"name":"open_page","label":"Open page","description":"Open a page in the app","parameters":{"type":"object","properties":{"url":{"type":"string"}}},"guidelines":["Use it for pages the user should see."]}]}"#
+        )
+    );
+    // An empty set unregisters the provider.
+    let empty = DesktopRequest::set_host_tools("host-2", "desktop", &[]).unwrap();
+    assert!(empty.payload().contains(r#""tools":[]"#));
+    // The typed constructor is the only way in.
+    assert_eq!(
+        DesktopRequest::new("x", DesktopMethod::SetHostTools, json!({})),
+        Err(DesktopRpcError::TypedParamsRequired(
+            DesktopMethod::SetHostTools
+        ))
+    );
+}
+
+#[test]
+fn set_host_tools_refuses_what_the_server_would() {
+    let refused = |tools: &[pi_rpc::desktop_rpc::HostTool]| {
+        DesktopRequest::set_host_tools("host-1", "desktop", tools).is_err()
+    };
+    for name in ["", "Open", "9page", "open-page", &"a".repeat(65)] {
+        assert!(refused(&[host_tool(name)]), "{name:?}");
+    }
+    assert!(!refused(&[host_tool(&"a".repeat(64))]));
+    assert!(refused(&[host_tool("a"), host_tool("a")]));
+    let many: Vec<_> = (0..33).map(|i| host_tool(&format!("t{i}"))).collect();
+    assert!(refused(&many));
+    assert!(!refused(&many[..32]));
+    let mut tool = host_tool("a");
+    tool.label = "l".repeat(65);
+    assert!(refused(&[tool]));
+    let mut tool = host_tool("a");
+    tool.description = "d".repeat(4097);
+    assert!(refused(&[tool]));
+    let mut tool = host_tool("a");
+    tool.parameters = json!("string");
+    assert!(refused(&[tool]));
+    let mut tool = host_tool("a");
+    tool.parameters = json!({"description": "x".repeat(16 * 1024)});
+    assert!(refused(&[tool]));
+    let mut tool = host_tool("a");
+    tool.guidelines = vec!["g".into(); 17];
+    assert!(refused(&[tool]));
+    let mut tool = host_tool("a");
+    tool.guidelines = vec!["g".repeat(513)];
+    assert!(refused(&[tool]));
+    assert!(DesktopRequest::set_host_tools("host-1", "", &[]).is_err());
+    assert!(DesktopRequest::set_host_tools("host-1", &"p".repeat(65), &[]).is_err());
+}
+
+#[test]
+fn host_tool_result_carries_text_and_images_up_to_the_content_cap() {
+    use pi_rpc::desktop_rpc::{HostToolContent, MAX_RESULT_CONTENT_BYTES};
+    let content = [
+        HostToolContent::text("Screenshot"),
+        HostToolContent::Image {
+            data: "iVBORw0=".into(),
+            mime_type: "image/png".into(),
+        },
+    ];
+    let request =
+        DesktopRequest::host_tool_result("host-3", "call-1", &content, false, None).unwrap();
+    assert_eq!(
+        request.payload(),
+        payload(
+            "host-3",
+            "host_tool_result",
+            r#"{"callId":"call-1","content":[{"type":"text","text":"Screenshot"},{"type":"image","data":"iVBORw0=","mimeType":"image/png"}]}"#
+        )
+    );
+    let failed = DesktopRequest::host_tool_result(
+        "host-4",
+        "call-1",
+        &[HostToolContent::text("no")],
+        true,
+        None,
+    )
+    .unwrap();
+    assert!(failed.payload().contains(r#""isError":true"#));
+    assert!(DesktopRequest::host_tool_result("host-5", "", &[], false, None).is_err());
+    // A result far over the 64 KiB of other requests still goes…
+    let big = HostToolContent::Image {
+        data: "A".repeat(MAX_RESULT_CONTENT_BYTES - 10),
+        mime_type: "image/png".into(),
+    };
+    assert!(
+        DesktopRequest::host_tool_result(
+            "host-6",
+            "call-1",
+            std::slice::from_ref(&big),
+            false,
+            None
+        )
+        .is_ok()
+    );
+    // …but not over the content cap.
+    let over = [big, HostToolContent::text("x".repeat(11))];
+    assert!(matches!(
+        DesktopRequest::host_tool_result("host-7", "call-1", &over, false, None),
+        Err(DesktopRpcError::RequestTooLarge { .. })
+    ));
+}
+
+#[test]
+fn host_tool_result_details_and_host_messages_encode_within_their_caps() {
+    use pi_rpc::desktop_rpc::{
+        HostDelivery, HostMessage, HostToolContent, MAX_DETAILS_BYTES, MAX_MESSAGE_CONTENT_BYTES,
+    };
+    let details = json!({"id": "ui-1", "version": 2})
+        .as_object()
+        .cloned()
+        .unwrap();
+    let result = DesktopRequest::host_tool_result(
+        "host-8",
+        "call-1",
+        &[HostToolContent::text("ok")],
+        false,
+        Some(&details),
+    )
+    .unwrap();
+    assert!(
+        result
+            .payload()
+            .ends_with(r#""details":{"id":"ui-1","version":2}}}"#)
+    );
+    let huge = json!({"x": "y".repeat(MAX_DETAILS_BYTES)})
+        .as_object()
+        .cloned()
+        .unwrap();
+    assert!(matches!(
+        DesktopRequest::host_tool_result("host-9", "call-1", &[], false, Some(&huge)),
+        Err(DesktopRpcError::RequestTooLarge { .. })
+    ));
+
+    let message = HostMessage {
+        custom_type: "host.gentle-ui.event".into(),
+        content: "The user edited it".into(),
+        display: true,
+        details: Some(details.clone()),
+        deliver: HostDelivery::Auto,
+        trigger_turn: Some(false),
+    };
+    let request = DesktopRequest::host_message("host-10", &message).unwrap();
+    assert_eq!(request.method(), DesktopMethod::HostMessage);
+    assert_eq!(
+        request.payload(),
+        payload(
+            "host-10",
+            "host_message",
+            r#"{"customType":"host.gentle-ui.event","content":"The user edited it","display":true,"deliver":"auto","details":{"id":"ui-1","version":2},"triggerTurn":false}"#
+        )
+    );
+    for bad in ["gentle-ui.event", "host.", "host.Upper", "host._x"] {
+        let message = HostMessage {
+            custom_type: bad.into(),
+            ..message.clone()
+        };
+        assert!(
+            DesktopRequest::host_message("host-11", &message).is_err(),
+            "{bad}"
+        );
+    }
+    let long = HostMessage {
+        content: "x".repeat(MAX_MESSAGE_CONTENT_BYTES + 1),
+        ..message.clone()
+    };
+    assert!(DesktopRequest::host_message("host-12", &long).is_err());
+
+    let context = DesktopRequest::set_host_context("host-13", "desktop", "shared", None).unwrap();
+    assert_eq!(
+        context.payload(),
+        payload(
+            "host-13",
+            "set_host_context",
+            r#"{"provider":"desktop","content":"shared"}"#
+        )
+    );
+    assert!(DesktopRequest::set_host_context("host-14", "", "", None).is_err());
+    assert!(DesktopRequest::new("x", DesktopMethod::HostMessage, json!({})).is_err());
+
+    assert!(
+        ok_response(json!({"delivered": true}))
+            .host_message()
+            .unwrap()
+            .delivered
+    );
+    assert!(
+        ok_response(json!({"set": true}))
+            .set_host_context()
+            .unwrap()
+            .set
+    );
+}
+
+#[test]
+fn capabilities_with_a_method_this_client_doesnt_know_still_decode() {
+    let mut methods = MAIN_METHODS.to_vec();
+    methods.push("set_host_activity");
+    let capabilities = capabilities_of(&methods, &MAIN_EVENTS);
+    assert!(capabilities.supports(DesktopMethod::HostMessage));
+    assert!(capabilities.supports(DesktopMethod::SetHostContext));
+    assert!(DesktopMethod::parse("set_host_activity").is_err());
+}
+
+#[test]
+fn host_tool_progress_is_sent_only_to_a_server_that_takes_it() {
+    use pi_rpc::desktop_rpc::HostToolProgressAck;
+    let main = capabilities_of(&MAIN_METHODS, &MAIN_EVENTS);
+    let request = DesktopRequest::host_tool_progress("host-20", &main, "call-1").unwrap();
+    assert_eq!(request.method(), DesktopMethod::HostToolProgress);
+    assert_eq!(
+        request.payload(),
+        payload("host-20", "host_tool_progress", r#"{"callId":"call-1"}"#)
+    );
+    assert!(DesktopRequest::host_tool_progress("host-21", &main, "").is_err());
+    // Only through its typed constructor.
+    assert!(
+        DesktopRequest::new(
+            "host-22",
+            DesktopMethod::HostToolProgress,
+            json!({"callId": "call-1"})
+        )
+        .is_err()
+    );
+
+    // A server from before it: refused before anything is built.
+    let older: Vec<&str> = MAIN_METHODS
+        .iter()
+        .copied()
+        .filter(|method| *method != "host_tool_progress")
+        .collect();
+    let older = capabilities_of(&older, &MAIN_EVENTS);
+    assert_eq!(
+        DesktopRequest::host_tool_progress("host-23", &older, "call-1"),
+        Err(DesktopRpcError::NotAdvertised(
+            DesktopMethod::HostToolProgress
+        ))
+    );
+
+    assert_eq!(
+        ok_response(json!({"extended": true, "deadlineMs": 1_764_000_600_000_u64}))
+            .host_tool_progress()
+            .unwrap(),
+        HostToolProgressAck {
+            extended: true,
+            deadline_ms: 1_764_000_600_000,
+        }
+    );
+    assert!(
+        ok_response(json!({"extended": true}))
+            .host_tool_progress()
+            .is_err()
+    );
+}
+
+#[test]
+fn host_tool_answers_and_events_decode() {
+    let registered = ok_response(json!({
+        "registered": ["open_page"],
+        "rejected": [{"name": "bash", "reason": "collides with a built-in tool"}],
+    }))
+    .set_host_tools()
+    .unwrap();
+    assert_eq!(registered.registered, vec!["open_page".to_string()]);
+    assert_eq!(registered.rejected[0].name, "bash");
+    assert!(
+        ok_response(json!({"accepted": true}))
+            .host_tool_result()
+            .unwrap()
+            .accepted
+    );
+    let call = some_event(
+        4,
+        "host_tool_call",
+        json!({"callId": "c1", "provider": "dev_1", "tool": "open_page", "args": {"url": "https://x.dev"}}),
+    )
+    .host_tool_call()
+    .unwrap();
+    assert_eq!(call.call_id, "c1");
+    assert_eq!(call.provider, "dev_1");
+    assert_eq!(call.tool, "open_page");
+    assert_eq!(call.args["url"], "https://x.dev");
+    let cancel = some_event(5, "host_tool_cancel", json!({"callId": "c1"}))
+        .host_tool_cancel()
+        .unwrap();
+    assert_eq!(cancel.call_id, "c1");
+    // The exact event name is required.
+    assert!(
+        some_event(
+            6,
+            "host_tool_cancel",
+            json!({"callId": "c1", "provider": "p", "tool": "t"})
+        )
+        .host_tool_call()
+        .is_err()
+    );
+    assert!(
+        some_event(
+            7,
+            "host_tool_call",
+            json!({"callId": "", "provider": "p", "tool": "t"})
+        )
+        .host_tool_call()
+        .is_err()
+    );
+}
+
+#[test]
+fn a_server_desktop_answer_decodes_from_its_json() {
+    let answer = json!({
+        "schema": SCHEMA, "kind": "response", "requestId": "serve-desktop-3",
+        "ok": false, "error": {"code": "unknown_call", "message": "no such call"},
+    });
+    match pi_rpc::desktop_rpc::decode_value(answer).unwrap() {
+        DesktopRecord::Response(response) => {
+            assert_eq!(response.error().unwrap().code, "unknown_call")
+        }
+        other => panic!("{other:?}"),
+    }
 }

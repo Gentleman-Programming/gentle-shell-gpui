@@ -1743,6 +1743,477 @@ fn change_cwd_drops_a_pending_resume(cx: &mut TestAppContext) {
     });
 }
 
+/// A host tool's call or cancel as the server's stream carries it.
+fn host_event(seq: u64, event: &str, data: Value) -> pi_rpc::Incoming {
+    pi_rpc::Incoming::Ui(widget(json!({
+        "schema": SCHEMA, "kind": "event", "seq": seq, "event": event, "data": data,
+    })))
+}
+
+#[gpui::test]
+fn host_tool_calls_reach_their_handler_once_and_answer_unless_cancelled(cx: &mut TestAppContext) {
+    use super::{CanvasAnswer, HostToolRequest, SessionEvent};
+    use pi_rpc::desktop_rpc::HostToolContent;
+
+    let (view, cx) = tab(cx);
+    view.update(cx, |view, _| {
+        view.set_canvas(std::env::temp_dir().join("board.json"));
+        // This tab runs on a server as device dev_1.
+        view.runs_on = Some(gentle_core::backend::Backend::Server {
+            url: "http://127.0.0.1:8787".into(),
+            device: "dev_1".into(),
+            name: "pc".into(),
+        });
+    });
+    // A fake canvas, as the canvas view answers its agent's requests.
+    let asked = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let seen = asked.clone();
+    cx.update(|_, cx| {
+        cx.subscribe(&view, move |_, event: &SessionEvent, _| {
+            if let SessionEvent::HostTool(HostToolRequest::Canvas { request, reply }) = event {
+                seen.borrow_mut().push(request.clone());
+                let _ = reply.send(CanvasAnswer {
+                    json: json!({"ok": true, "shapes": [], "view": [0, 0, 10, 10]}),
+                    shot: None,
+                });
+            }
+        })
+        .detach();
+    });
+    let call = |seq: u64, id: &str, tool: &str| {
+        host_event(
+            seq,
+            "host_tool_call",
+            json!({"callId": id, "provider": "dev_1", "tool": tool, "args": {}}),
+        )
+    };
+    view.update_in(cx, |view, window, cx| {
+        view.handle_batch(
+            vec![
+                call(1, "c1", "canvas_read"),
+                // Re-sent after a reconnect, with its old sequence: once.
+                call(1, "c1", "canvas_read"),
+                call(2, "c2", "no_such_tool"),
+                call(3, "c3", "canvas_read"),
+                host_event(4, "host_tool_cancel", json!({"callId": "c3"})),
+                // Another device's tool on the same session: not this tab's.
+                host_event(
+                    5,
+                    "host_tool_call",
+                    json!({"callId": "c5", "provider": "dev_2", "tool": "canvas_read", "args": {}}),
+                ),
+            ],
+            window,
+            cx,
+        );
+    });
+    cx.run_until_parked();
+    assert_eq!(asked.borrow().len(), 2, "c1 and c3 reached the canvas");
+    assert_eq!(asked.borrow()[0], json!({"action": "read"}));
+    view.update(cx, |view, _| {
+        let sent = &view.host.sent;
+        let ids: Vec<&str> = sent.iter().map(|(id, ..)| id.as_str()).collect();
+        // c2 answers at once; c1 once the canvas did; c3 was cancelled.
+        assert_eq!(ids, ["c2", "c1"]);
+        assert!(sent[0].1.is_error);
+        let HostToolContent::Text { text } = &sent[1].1.content[0] else {
+            panic!("expected text")
+        };
+        assert!(!sent[1].1.is_error);
+        assert!(text.contains("shapes"), "{text}");
+    });
+}
+
+/// A server tab whose Desktop channel takes host messages and contexts.
+fn genui_server_tab(cx: &mut TestAppContext) -> (Entity<SessionView>, &mut VisualTestContext) {
+    host_tools_tab(
+        cx,
+        gentle_core::backend::Backend::Server {
+            url: "http://127.0.0.1:8787".into(),
+            device: "dev_1".into(),
+            name: "pc".into(),
+        },
+    )
+}
+
+/// A tab on `runs_on` whose agent takes the app's host tools, with a
+/// Desktop channel that takes host messages and contexts.
+fn host_tools_tab(
+    cx: &mut TestAppContext,
+    runs_on: gentle_core::backend::Backend,
+) -> (Entity<SessionView>, &mut VisualTestContext) {
+    host_tools_tab_offering(cx, runs_on, &[])
+}
+
+/// [`host_tools_tab`] whose Gentle Shell offers `more` methods too.
+fn host_tools_tab_offering<'a>(
+    cx: &'a mut TestAppContext,
+    runs_on: gentle_core::backend::Backend,
+    more: &[&str],
+) -> (Entity<SessionView>, &'a mut VisualTestContext) {
+    let (view, cx) = tab(cx);
+    let mut methods = vec![
+        "capabilities",
+        "get_snapshot",
+        "set_host_tools",
+        "host_tool_result",
+        "host_message",
+        "set_host_context",
+        "set_host_activity",
+    ];
+    methods.extend_from_slice(more);
+    view.update(cx, |view, _| {
+        view.runs_on = Some(runs_on);
+        view.backend.host_tools = true;
+        let probe = view.desktop.ready(true).sends.remove(0);
+        view.desktop.ui(&response(
+            probe.request.request_id(),
+            json!({
+                "schema": SCHEMA, "command": PROMPT_COMMAND, "widget": WIDGET_KEY,
+                "methods": methods,
+                "events": ["host_tool_call", "host_tool_cancel"],
+            }),
+        ));
+    });
+    (view, cx)
+}
+
+/// A `gentle_ui` review that waits for decisions, on a server that takes
+/// `host_tool_progress` when `progress`; then `minutes` minute by minute.
+fn waiting_review(
+    cx: &mut TestAppContext,
+    progress: bool,
+    minutes: u64,
+) -> (Entity<SessionView>, &mut VisualTestContext) {
+    let server = gentle_core::backend::Backend::Server {
+        url: "http://127.0.0.1:8787".into(),
+        device: "dev_1".into(),
+        name: "pc".into(),
+    };
+    let more: &[&str] = if progress {
+        &["host_tool_progress"]
+    } else {
+        &[]
+    };
+    let (view, cx) = host_tools_tab_offering(cx, server, more);
+    let spec = json!({"files": [{"path": "src/a.rs", "hunks": [
+        {"id": "h1", "oldStart": 1, "newStart": 1, "lines": ["-a", "+b"]},
+    ]}]});
+    view.update_in(cx, |view, window, cx| {
+        view.handle_batch(
+            vec![host_event(
+                1,
+                "host_tool_call",
+                json!({"callId": "g1", "provider": "dev_1", "tool": "gentle_ui",
+                       "args": {"action": "show", "id": "r", "kind": "review", "spec": spec, "wait": true}}),
+            )],
+            window,
+            cx,
+        );
+    });
+    for _ in 0..minutes {
+        cx.executor()
+            .advance_clock(std::time::Duration::from_secs(60));
+        cx.run_until_parked();
+    }
+    (view, cx)
+}
+
+/// A server that takes `host_tool_progress` hears every minute that the
+/// app still waits for the review's decisions, with no cap, until the call
+/// ends.
+#[gpui::test]
+fn a_waiting_review_keeps_its_call_alive_while_the_server_takes_progress(cx: &mut TestAppContext) {
+    let (view, cx) = waiting_review(cx, true, 12);
+    view.read_with(cx, |view, _| {
+        assert!(view.host.sent.is_empty(), "still waiting past 9 minutes");
+        assert_eq!(view.host.beats, vec!["g1".to_string(); 12]);
+    });
+    view.update_in(cx, |view, window, cx| {
+        view.handle_batch(
+            vec![host_event(2, "host_tool_cancel", json!({"callId": "g1"}))],
+            window,
+            cx,
+        );
+    });
+    cx.executor()
+        .advance_clock(std::time::Duration::from_secs(180));
+    cx.run_until_parked();
+    view.read_with(cx, |view, _| {
+        assert_eq!(view.host.beats.len(), 12, "a cancelled call goes quiet");
+        assert!(view.host.sent.is_empty());
+    });
+}
+
+/// A server without `host_tool_progress` fails the call after 10 minutes:
+/// the review answers first, after 9, and nothing beats.
+#[gpui::test]
+fn a_waiting_review_gives_up_first_on_a_server_without_progress(cx: &mut TestAppContext) {
+    let (view, cx) = waiting_review(cx, false, 9);
+    view.read_with(cx, |view, _| {
+        assert!(view.host.beats.is_empty());
+        let (id, outcome, _) = &view.host.sent[0];
+        assert_eq!(id, "g1");
+        let pi_rpc::desktop_rpc::HostToolContent::Text { text } = &outcome.content[0] else {
+            panic!("expected text")
+        };
+        assert!(text.contains("No decisions after 9 minutes."), "{text}");
+    });
+}
+
+/// A Gentle Shell here with host tools: the app runs `gentle_ui` itself and
+/// answers the calls made to its own provider, `desktop`, as it does for a
+/// server's session.
+#[gpui::test]
+fn a_local_tab_with_host_tools_runs_the_apps_tools(cx: &mut TestAppContext) {
+    use gentle_core::genui::host::Mode;
+
+    let (view, cx) = host_tools_tab(cx, gentle_core::backend::Backend::Local);
+    view.read_with(cx, |view, _| {
+        assert_eq!(view.host_genui_mode(), Some(Mode::Proactive));
+    });
+    let call = |seq: u64, id: &str, provider: &str| {
+        host_event(
+            seq,
+            "host_tool_call",
+            json!({"callId": id, "provider": provider, "tool": "no_such_tool", "args": {}}),
+        )
+    };
+    view.update_in(cx, |view, window, cx| {
+        view.handle_batch(
+            vec![call(1, "c1", "desktop"), call(2, "c2", "dev_1")],
+            window,
+            cx,
+        );
+    });
+    cx.run_until_parked();
+    view.read_with(cx, |view, _| {
+        let ids: Vec<&str> = view.host.sent.iter().map(|(id, ..)| id.as_str()).collect();
+        assert_eq!(ids, ["c1"]);
+        assert!(view.host.sent[0].1.is_error);
+    });
+}
+
+#[gpui::test]
+fn a_server_tab_runs_gentle_ui_itself_and_sends_edits_as_host_messages(cx: &mut TestAppContext) {
+    use gentle_core::genui::host::{HOST_EVENT_MESSAGE, Mode};
+    use gentle_core::transcript::Item;
+
+    let (view, cx) = genui_server_tab(cx);
+    view.read_with(cx, |view, _| {
+        assert_eq!(view.host_genui_mode(), Some(Mode::Proactive));
+    });
+    let args = json!({"action": "show", "id": "plan", "kind": "checklist",
+                      "spec": {"items": [{"id": "a", "label": "Back up"}]}});
+    view.update_in(cx, |view, window, cx| {
+        view.handle_batch(
+            vec![host_event(
+                1,
+                "host_tool_call",
+                json!({"callId": "g1", "provider": "dev_1", "tool": "gentle_ui", "args": args}),
+            )],
+            window,
+            cx,
+        );
+    });
+    cx.run_until_parked();
+    let details = view.read_with(cx, |view, _| {
+        let (id, outcome, details) = &view.host.sent[0];
+        assert_eq!(id, "g1");
+        assert!(!outcome.is_error);
+        let pi_rpc::desktop_rpc::HostToolContent::Text { text } = &outcome.content[0] else {
+            panic!("expected text")
+        };
+        assert!(
+            text.starts_with(
+                "Checklist \"Checklist\" (plan, v1) is shown to the user (0 of 1 done)."
+            ),
+            "{text}"
+        );
+        Value::Object(details.clone().expect("details"))
+    });
+    assert_eq!(details["kind"], "checklist");
+    assert_eq!(details["spec"]["items"][0]["done"], false);
+
+    // The server's Pi records the call with those details: the surface
+    // draws from them, as from the extension's result.
+    view.update_in(cx, |view, window, cx| {
+        view.handle_batch(
+            vec![
+                pi_rpc::Incoming::Event(json!({
+                    "type": "tool_execution_start", "toolCallId": "t1", "toolName": "gentle_ui", "args": args,
+                })),
+                pi_rpc::Incoming::Event(json!({
+                    "type": "tool_execution_end", "toolCallId": "t1", "toolName": "gentle_ui",
+                    "result": {"content": [{"type": "text", "text": "shown"}], "details": details},
+                })),
+            ],
+            window,
+            cx,
+        );
+    });
+    // The user checks the item: the edit goes as a host message.
+    let mut spec = details["spec"].clone();
+    spec["items"][0]["done"] = json!(true);
+    let command = gentle_core::genui::event_command_json(
+        "plan",
+        1,
+        &[json!({"op": "check", "item": "a", "done": true})],
+        &["checked Back up".to_string()],
+        &spec,
+        None,
+    );
+    let ran = std::rc::Rc::new(std::cell::Cell::new(None));
+    let seen = ran.clone();
+    view.update(cx, |view, cx| {
+        view.run_extension_command(command, cx, move |result, _| seen.set(Some(result)));
+    });
+    cx.run_until_parked();
+    assert_eq!(ran.take(), Some(Ok(())));
+    let message = view.read_with(cx, |view, _| view.host_messages[0].clone());
+    assert_eq!(message.custom_type, HOST_EVENT_MESSAGE);
+    assert_eq!(message.trigger_turn, Some(true));
+    assert!(message.content.starts_with(
+        "The user edited the checklist \"Checklist\" (plan, now v2) in the app:\n- checked Back up"
+    ));
+    let event_details = Value::Object(message.details.clone().unwrap());
+    assert_eq!(event_details["version"], 2);
+
+    // The message comes back in the conversation: drawn as the extension's
+    // event, and the next call builds on version 2.
+    view.update_in(cx, |view, window, cx| {
+        view.handle_batch(
+            vec![pi_rpc::Incoming::Event(json!({
+                "type": "message_end",
+                "message": {"role": "custom", "customType": HOST_EVENT_MESSAGE, "content": message.content,
+                            "display": true, "details": event_details},
+            }))],
+            window,
+            cx,
+        );
+        assert!(view.transcript.items.iter().any(|item| matches!(
+            item,
+            Item::Custom { kind, .. } if kind == gentle_core::genui::EVENT_MESSAGE
+        )));
+        view.handle_batch(
+            vec![host_event(
+                2,
+                "host_tool_call",
+                json!({"callId": "g2", "provider": "dev_1", "tool": "gentle_ui",
+                       "args": {"action": "update", "id": "plan", "patch": {"items": [{"id": "b", "label": "Migrate"}]}}}),
+            )],
+            window,
+            cx,
+        );
+    });
+    cx.run_until_parked();
+    view.read_with(cx, |view, _| {
+        let (_, outcome, details) = &view.host.sent[1];
+        assert!(!outcome.is_error);
+        assert_eq!(details.as_ref().unwrap()["version"], 3);
+    });
+
+    // Agent UI off: the tool's offer is withdrawn and the Off rule becomes
+    // the host context.
+    view.update(cx, |view, cx| {
+        view.run_extension_command(Mode::Off.command(), cx, |_, _| {});
+        assert_eq!(view.host_genui_mode(), Some(Mode::Off));
+        assert_eq!(
+            view.host.context.as_deref(),
+            Some(gentle_core::genui::host::guide::OFF_RULE)
+        );
+    });
+}
+
+#[gpui::test]
+fn a_local_tab_keeps_sending_gentle_ui_events_to_the_extension(cx: &mut TestAppContext) {
+    let (view, cx) = tab(cx);
+    let ran = std::rc::Rc::new(std::cell::Cell::new(None));
+    let seen = ran.clone();
+    view.update(cx, |view, cx| {
+        assert_eq!(view.host_genui_mode(), None);
+        let command = gentle_core::genui::host::Mode::Off.command();
+        view.run_extension_command(command, cx, move |result, _| seen.set(Some(result)));
+        assert!(view.host_messages.is_empty());
+    });
+    // Not handled here: it went to the (missing) backend.
+    assert!(matches!(ran.take(), Some(Err(_))));
+}
+
+#[gpui::test]
+fn a_dialog_another_device_answered_closes_with_a_note(cx: &mut TestAppContext) {
+    use gentle_core::transcript::Item;
+    let (view, cx) = tab(cx);
+    let dialog = |id: &str| UiRequest {
+        id: id.into(),
+        timeout: None,
+        method: UiMethod::Confirm {
+            title: "Deploy?".into(),
+            message: String::new(),
+        },
+    };
+    view.update_in(cx, |view, window, cx| {
+        view.handle_batch(
+            vec![
+                pi_rpc::Incoming::Ui(dialog("d1")),
+                pi_rpc::Incoming::Ui(dialog("d2")),
+            ],
+            window,
+            cx,
+        );
+    });
+    let notes = |view: &SessionView| {
+        view.transcript
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Notice { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    view.update_in(cx, |view, window, cx| {
+        // The front one, answered on another device: the next one shows.
+        view.handle_batch(
+            vec![pi_rpc::Incoming::DialogResolved {
+                id: "d1".into(),
+                refused: false,
+            }],
+            window,
+            cx,
+        );
+        assert_eq!(view.extension.dialogs.len(), 1);
+        assert_eq!(view.extension.dialogs[0].id, "d2");
+        assert_eq!(notes(view), ["Answered on another device."]);
+
+        // This tab's own answer comes back as resolved too: nothing to say.
+        view.handle_batch(
+            vec![pi_rpc::Incoming::DialogResolved {
+                id: "d0".into(),
+                refused: false,
+            }],
+            window,
+            cx,
+        );
+        assert_eq!(notes(view).len(), 1);
+
+        // Answered here after another device did: the server kept theirs.
+        view.extension.dialogs.clear();
+        view.handle_batch(
+            vec![pi_rpc::Incoming::DialogResolved {
+                id: "d2".into(),
+                refused: true,
+            }],
+            window,
+            cx,
+        );
+        assert_eq!(
+            notes(view).last().map(String::as_str),
+            Some("Another device answered this first; the answer here wasn't used.")
+        );
+    });
+}
+
 /// A stand-in for `gentle-shell --mode rpc`: it appends every command it
 /// reads to the file named by its first argument and answers each with
 /// success; `get_messages` returns a conversation of one user message.

@@ -234,6 +234,7 @@ impl SessionView {
             self.genui.set_root(&self.cwd, cx);
             self.genui
                 .sync(&self.transcript.items, from, dirty.reset, cx);
+            self.sync_host_genui(from, dirty.reset, cx);
             let session = self.session_file();
             self.genui.restore_pins(session.as_deref(), cx);
         }
@@ -724,8 +725,15 @@ impl SessionView {
             })
     }
 
-    fn render_backend_state(&self) -> Option<AnyElement> {
-        let (title, body): (&str, String) = match &self.backend.status {
+    fn render_backend_state(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        // A server's session ends there (stopped by another client, or the
+        // server stopped): say so, and offer a new one on this conversation.
+        let server = self
+            .runs_on
+            .as_ref()
+            .filter(|backend| backend.is_server())
+            .map(|backend| backend.label());
+        let (title, body): (String, String) = match &self.backend.status {
             BackendStatus::Starting => {
                 return Some(
                     h_flex()
@@ -744,29 +752,48 @@ impl SessionView {
                 );
             }
             BackendStatus::Ready(_) => return None,
-            BackendStatus::Failed(error) => ("Could not start gentle-shell", error.clone()),
-            BackendStatus::Exited(code) => (
-                "gentle-shell stopped",
-                format!(
-                    "Exit code {}.\n{}",
-                    code.map_or("unknown".into(), |c| c.to_string()),
-                    self.backend
-                        .stderr
-                        .iter()
-                        .rev()
-                        .take(12)
-                        .rev()
-                        .cloned()
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                ),
-            ),
+            BackendStatus::Failed(error) => ("Could not start gentle-shell".into(), error.clone()),
+            BackendStatus::Exited(code) => {
+                let code = code.map_or("unknown".into(), |c| c.to_string());
+                let lead = match &server {
+                    Some(_) => format!(
+                        "The session was stopped on the server, or the server stopped (exit code {code}). Start again opens a new session there on this conversation."
+                    ),
+                    None => format!("Exit code {code}."),
+                };
+                let title = match &server {
+                    Some(server) => format!("Disconnected from {server}"),
+                    None => "gentle-shell stopped".into(),
+                };
+                (
+                    title,
+                    format!(
+                        "{lead}\n{}",
+                        self.backend
+                            .stderr
+                            .iter()
+                            .rev()
+                            .take(12)
+                            .rev()
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    ),
+                )
+            }
         };
+        // Also after a failed start: the server may answer again later.
+        let restart = server.is_some()
+            && matches!(
+                self.backend.status,
+                BackendStatus::Exited(_) | BackendStatus::Failed(_)
+            );
         Some(
             ui::card()
                 .mt_6()
                 .mx_auto()
-                .w(rems(560. / 16.))
+                .w_full()
+                .max_w(rems(560. / 16.))
                 .p_4()
                 .gap_3()
                 .border_color(ui::danger().opacity(0.4))
@@ -793,6 +820,49 @@ impl SessionView {
                         .whitespace_normal()
                         .child(body),
                 )
+                .when(restart, |this| {
+                    let home = self.backend.server_home.clone();
+                    let server = server.clone().unwrap_or_default();
+                    this.child(
+                        h_flex()
+                            .gap_2()
+                            .flex_wrap()
+                            // The server has no such folder: its home, or
+                            // another folder typed as the server sees it.
+                            .when_some(home, |row, home| {
+                                row.child(
+                                    Button::new("backend-server-home")
+                                        .small()
+                                        .primary()
+                                        .icon(Icon::new(IconName::House))
+                                        .label(format!("Open in your home on {server}"))
+                                        .tooltip(home.clone())
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.change_cwd(home.clone().into(), window, cx)
+                                        })),
+                                )
+                                .child(
+                                    Button::new("backend-server-folder")
+                                        .small()
+                                        .ghost()
+                                        .icon(Icon::new(IconName::FolderOpen))
+                                        .label(format!("Open another folder on {server}…"))
+                                        .on_click(cx.listener(|_, _, _, cx| {
+                                            cx.emit(super::SessionEvent::OpenServerFolder)
+                                        })),
+                                )
+                            })
+                            .child(
+                                Button::new("backend-start-again")
+                                    .small()
+                                    .icon(Icon::new(IconName::RefreshCw))
+                                    .label("Start again")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.restart_backend(window, cx)
+                                    })),
+                            ),
+                    )
+                })
                 .into_any_element(),
         )
     }
@@ -1816,7 +1886,7 @@ impl SessionView {
                     .w_full()
                     .gap_4()
                     .when(hero, |this| this.child(self.render_hero(cx)))
-                    .children(self.render_backend_state())
+                    .children(self.render_backend_state(cx))
                     .into_any_element()
             }
             Row::Item(i) => {

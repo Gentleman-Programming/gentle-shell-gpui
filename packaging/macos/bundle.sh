@@ -7,7 +7,11 @@
 #   packaging/macos/bundle.sh aarch64-apple-darwin 0.1.0
 #
 # Set GENTLE_BIN=<path> to bundle an already-built binary instead of running
-# `cargo build --profile dist --target <target-triple>` (the shipping profile).
+# `cargo build --profile dist --target <target-triple>` (the shipping profile);
+# the terminal host is then GENTLE_TERM_HOST_BIN, else `gentle-term-host`
+# beside it, and left out when neither is there. The bundled
+# `gentle-term-host` is what the app offers to install on a Gentle Shell
+# server of the same platform and architecture.
 set -euo pipefail
 
 if [[ $# -ne 2 ]]; then
@@ -28,10 +32,12 @@ min_macos=11.0
 
 if [[ -n "${GENTLE_BIN:-}" ]]; then
   binary="$GENTLE_BIN"
+  term_host="${GENTLE_TERM_HOST_BIN:-$(dirname "$binary")/gentle-term-host}"
 else
   MACOSX_DEPLOYMENT_TARGET="$min_macos" \
-    cargo build --profile dist --locked -p gentle-shell-gpui --target "$target"
+    cargo build --profile dist --locked -p gentle-shell-gpui -p gentle-term-host --target "$target"
   binary="target/$target/dist/gentle-shell-gpui"
+  term_host="target/$target/dist/gentle-term-host"
 fi
 [[ -x "$binary" ]] || { echo "missing binary: $binary" >&2; exit 1; }
 
@@ -39,6 +45,9 @@ app="dist/Gentle Shell.app"
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp "$binary" "$app/Contents/MacOS/gentle-shell-gpui"
+if [[ -x "$term_host" ]]; then
+  cp "$term_host" "$app/Contents/MacOS/gentle-term-host"
+fi
 cp packaging/icons/AppIcon.icns "$app/Contents/Resources/AppIcon.icns"
 sed -e "s/@VERSION@/$version/g" -e "s/@MIN_MACOS@/$min_macos/g" \
   packaging/macos/Info.plist > "$app/Contents/Info.plist"

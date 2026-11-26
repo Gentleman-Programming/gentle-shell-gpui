@@ -5,7 +5,9 @@
 //! that Shell lists the sessions (newest first, a page at a time) and opens
 //! one by id in the same tab, so the app reads no session file. Otherwise —
 //! no agent tab, an older Shell, a tab in another folder — the app reads the
-//! files itself:
+//! files itself, except for a folder on a Gentle Shell server, whose files
+//! are on the server: then only its agent tab's Shell lists, and the screen
+//! says so instead:
 //!
 //! Pi stores one JSONL file per session under `<agent>/sessions/--<cwd>--/`
 //! (`<timestamp>_<id>.jsonl`), unless `settings.json` sets `sessionDir`, in

@@ -377,7 +377,8 @@ impl SettingsView {
     /// the launcher the app resolves now which version it runs: that's the
     /// result shown.
     fn run_upgrade(&mut self, target: UpgradeTarget, cx: &mut Context<Self>) {
-        if self.shell_job_running() {
+        // A server's Gentle Shell is upgraded there, not by this computer's.
+        if self.shell_job_running() || self.server().is_some() {
             return;
         }
         let channel = target.channel();
@@ -385,12 +386,12 @@ impl SettingsView {
         self.shell_update.upgrading = Some(target);
         self.shell_update.result = None;
         self.start_clock(cx);
-        let cwd = self.cwd.clone();
+        let (cwd, machine) = (self.cwd.clone(), self.machine.clone());
         self._job = cx.spawn(async move |this, cx| {
-            let upgrade = cx
-                .background_executor()
-                .spawn(async move { super::services::updates::upgrade_shell(&cwd, channel.args()) })
-                .await;
+            let upgrade = super::on_machine(cx.background_executor(), &machine, move || {
+                super::services::updates::upgrade_shell(&cwd, channel.args())
+            })
+            .await;
             let _ = this.update(cx, |this, cx| {
                 let target = target_version;
                 this.shell_update.upgrading = None;
@@ -439,6 +440,19 @@ impl SettingsView {
         offer: UpdateOffer,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
+        if let Some(server) = self.server() {
+            return update_card_body(
+                format!("Gentle Shell {} is available", offer.latest),
+                Some(&offer.current),
+                "Open agent tabs keep running on the server's current version until it restarts them.",
+            )
+            .child(
+                match self.server_upgrade_button("server-update", None, cx) {
+                    Some(button) => h_flex().child(button),
+                    None => super::remote::note(server.run(super::remote::commands::UPGRADE)),
+                },
+            );
+        }
         let target = offer.clone();
         let skipped = offer.latest.clone();
         let upgrading = self.shell_update.upgrading.is_some();
@@ -462,6 +476,21 @@ impl SettingsView {
     }
 
     pub(super) fn render_main_update(&self, commit: &str, cx: &mut Context<Self>) -> Div {
+        if let Some(server) = self.server() {
+            return update_card_body(
+                format!("Gentle Shell main has a newer commit {commit}"),
+                None,
+                "Open agent tabs keep running on the server's current build until it restarts them.",
+            )
+            .child(
+                match self.server_upgrade_button("server-update-main", Some("main"), cx) {
+                    Some(button) => h_flex().child(button),
+                    None => {
+                        super::remote::note(server.run(super::remote::commands::UPGRADE_MAIN))
+                    }
+                },
+            );
+        }
         let target = commit.to_string();
         let busy = self.upgrading_on(UpgradeChannel::Main);
         let running = busy.is_some();
@@ -483,18 +512,18 @@ impl SettingsView {
     }
 
     fn run_pi_update(&mut self, cx: &mut Context<Self>) {
-        if self.shell_job_running() {
+        if self.shell_job_running() || self.server().is_some() {
             return;
         }
         self.shell_update.pi_running = true;
         self.shell_update.pi_result = None;
         self.start_clock(cx);
-        let cwd = self.cwd.clone();
+        let (cwd, machine) = (self.cwd.clone(), self.machine.clone());
         self._job = cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move { crate::features::setup::run_gentle_shell(&cwd, &["update"]) })
-                .await;
+            let result = super::on_machine(cx.background_executor(), &machine, move || {
+                crate::features::setup::run_gentle_shell(&cwd, &["update"])
+            })
+            .await;
             let _ = this.update(cx, |this, cx| {
                 let (text, failed) = match result {
                     Ok(text) => (text, false),
@@ -519,6 +548,10 @@ impl SettingsView {
     }
 
     pub(super) fn render_pi_update(&self, available: bool, cx: &mut Context<Self>) -> Option<Div> {
+        if let Some(server) = self.server() {
+            return available
+                .then(|| super::remote::note(server.run(super::remote::commands::UPDATE_PI)));
+        }
         let running = self.shell_update.pi_running;
         let show_button = available || running;
         let output = self.shell_update.pi_result.as_ref();
@@ -566,11 +599,14 @@ impl SettingsView {
         }
         self.engram.upgrading = true;
         self.engram.result = None;
+        let machine = self.machine.clone();
         self.engram._job = cx.spawn(async move |this, cx| {
-            let (result, lines) = cx
-                .background_executor()
-                .spawn(async move { super::services::updates::upgrade_engram() })
-                .await;
+            let (result, lines) = super::on_machine(
+                cx.background_executor(),
+                &machine,
+                super::services::updates::upgrade_engram,
+            )
+            .await;
             let _ = this.update(cx, |this, cx| {
                 this.engram.upgrading = false;
                 let mut shown = lines[lines.len().saturating_sub(8)..].to_vec();

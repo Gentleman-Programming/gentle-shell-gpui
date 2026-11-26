@@ -127,6 +127,40 @@ fn follow_popups<'a>(
     })
 }
 
+/// A login's loopback callback (`prefix`) a page must not load: a
+/// navigation there goes to `caught`, whole, instead (see
+/// [`gentle_core::sign_in`]).
+#[derive(Clone)]
+struct Redirects {
+    prefix: String,
+    caught: async_channel::Sender<String>,
+}
+
+/// Where a page's navigations may go instead of loading: new windows into
+/// the page itself ([`follow_popups`]), a login's callback to the app
+/// ([`Redirects`]).
+#[derive(Clone, Default)]
+struct Steering {
+    popups: Option<Popups>,
+    redirects: Option<Redirects>,
+}
+
+/// `builder` steered as `steering` says.
+fn steer(builder: wry::WebViewBuilder<'_>, steering: Steering) -> wry::WebViewBuilder<'_> {
+    let builder = follow_popups(builder, steering.popups);
+    let Some(redirects) = steering.redirects else {
+        return builder;
+    };
+    builder.with_navigation_handler(move |url| {
+        if gentle_core::sign_in::is_login_redirect(&redirects.prefix, &url) {
+            let _ = redirects.caught.try_send(url);
+            false
+        } else {
+            true
+        }
+    })
+}
+
 /// `builder` locked down for `sandbox` (see [`Sandbox`]).
 fn isolate<'a>(builder: wry::WebViewBuilder<'a>, sandbox: &Sandbox) -> wry::WebViewBuilder<'a> {
     let serve = sandbox.serve.clone();
@@ -443,6 +477,13 @@ fn add_named_profile(name: &str, cx: &mut App) {
 
 pub struct BrowserPanel {
     url: String,
+    /// The page as a server session named it, on the server's own loopback,
+    /// when the card shows it through a forward ([`Self::url`] is the
+    /// forward's): one card per page, whichever forward link opened it.
+    source: Option<String>,
+    /// Why the page can't show (the server refused its forward), drawn in
+    /// its place; no native view runs meanwhile.
+    refused: Option<String>,
     /// What the header calls this page. `None` derives it from the URL (the
     /// host), so any web app can use the card, not only Gentle Design.
     label: Option<String>,
@@ -475,6 +516,8 @@ impl BrowserPanel {
         });
         Self {
             url,
+            source: None,
+            refused: None,
             label,
             name: None,
             driven: false,
@@ -493,6 +536,30 @@ impl BrowserPanel {
 
     pub fn url(&self) -> &str {
         &self.url
+    }
+
+    /// The page this card shows, as whoever opened it named it: the server's
+    /// loopback URL for a forwarded page, else [`Self::url`].
+    pub fn source(&self) -> &str {
+        self.source.as_deref().unwrap_or(&self.url)
+    }
+
+    pub fn set_source(&mut self, source: Option<String>) {
+        self.source = source;
+    }
+
+    /// The page can't show: `why` (the server's words) in its place, the
+    /// address it was asked for in the header, until the next
+    /// [`Self::navigate`].
+    pub fn refuse(&mut self, url: String, why: String, cx: &mut Context<Self>) {
+        self.surface.update(cx, |surface, cx| surface.hide(cx));
+        self.url = url;
+        self.refused = Some(why);
+        cx.notify();
+    }
+
+    pub fn refusal(&self) -> Option<&str> {
+        self.refused.as_deref()
     }
 
     pub fn mode(&self) -> Mode {
@@ -578,8 +645,13 @@ impl BrowserPanel {
     /// Show `url`, or reload when it is already showing (the canvas was
     /// refreshed).
     pub fn navigate(&mut self, url: String, label: Option<String>, cx: &mut Context<Self>) {
-        self.surface
-            .update(cx, |surface, cx| surface.navigate(url.clone(), cx));
+        let refused = self.refused.take().is_some();
+        self.surface.update(cx, |surface, cx| {
+            if refused {
+                surface.show(cx);
+            }
+            surface.navigate(url.clone(), cx)
+        });
         self.url = url;
         self.label = label;
         cx.notify();
@@ -673,6 +745,17 @@ impl BrowserPanel {
         }
     }
 
+    /// The page's address as the header and the tray show it: without its
+    /// scheme, and without the single-use ticket a forwarded page's link
+    /// carries (its forward trades it for a cookie, answering with the
+    /// address without it).
+    pub fn address(&self) -> String {
+        let url = gentle_core::serve::without_ticket(&self.url);
+        url.trim_start_matches("http://")
+            .trim_start_matches("https://")
+            .to_string()
+    }
+
     fn reload(&mut self, cx: &mut Context<Self>) {
         self.surface.update(cx, |surface, cx| surface.reload(cx));
     }
@@ -717,11 +800,7 @@ impl BrowserPanel {
         } else {
             IconName::Globe
         };
-        let address = self
-            .url
-            .trim_start_matches("http://")
-            .trim_start_matches("https://")
-            .to_string();
+        let address = self.address();
         let url = self.url.clone();
         let maximized = self.card.maximized();
         let docked = self.mode == Mode::Docked;
@@ -867,9 +946,29 @@ impl BrowserPanel {
             .rounded(px(floating::BODY_RADIUS))
             .bg(ui::well())
             .overflow_hidden()
-            .map(|body| match &self.choosing {
-                Some(choosing) => body.child(self.chooser(choosing, cx)),
-                None => body.child(self.surface.clone()),
+            .map(|body| match (&self.choosing, &self.refused) {
+                (Some(choosing), _) => body.child(self.chooser(choosing, cx)),
+                (None, Some(why)) => body.child(
+                    v_flex()
+                        .size_full()
+                        .items_center()
+                        .justify_center()
+                        .gap_1()
+                        .p_4()
+                        .child(
+                            div()
+                                .text_size(rems(13. / 16.))
+                                .text_color(ui::fg())
+                                .child("This page didn't open"),
+                        )
+                        .child(
+                            div()
+                                .text_size(rems(12. / 16.))
+                                .text_color(ui::muted())
+                                .child(why.clone()),
+                        ),
+                ),
+                (None, None) => body.child(self.surface.clone()),
             })
     }
 

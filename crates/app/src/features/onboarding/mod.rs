@@ -2,17 +2,24 @@
 //! It shows what this machine has for Gentle Shell (`crate::features::setup` checks),
 //! installs what can be installed unattended with a live log, hands anything
 //! that needs a password or an interactive login to a terminal tab, and sends
-//! provider sign-in to the Providers screen.
+//! provider sign-in to the Providers screen. The other way in is connecting
+//! to a Gentle Shell server (`gentle-shell serve share`'s code): agents then
+//! run there, nothing is installed on this computer, only the server is
+//! checked, and an admin device may run Gentle Shell's own setup there
+//! ([`server_setup`]).
 
 use std::collections::VecDeque;
 
+use gentle_core::backend::Backend;
 use gpui_kit::*;
 
+use crate::features::settings::{ConnectEvent, ServerConnect};
 use crate::features::setup::{self, Check, CheckId};
 
 mod checks;
 mod install;
 mod sequence;
+mod server_setup;
 mod view;
 
 use checks::{install_plan, required_ok, usable, with_registry};
@@ -38,10 +45,11 @@ pub struct Probe {
 }
 
 impl Probe {
-    /// BLOCKING: runs every check; call it on the background executor.
+    /// BLOCKING: runs every check; call it on the background executor
+    /// (inside `backend::on` for a machine of its own).
     pub fn run() -> Self {
         // The checks run where agents do: the badge says so.
-        let platform = match crate::features::backend::saved() {
+        let platform = match crate::features::backend::current() {
             gentle_core::backend::Backend::Local => setup::platform_label(),
             choice => format!("Agents on {}", choice.label()),
         };
@@ -70,6 +78,10 @@ pub enum OnboardingEvent {
     /// Open a terminal tab with this command typed (needs the user: a
     /// password, an interactive login).
     Terminal(String),
+    /// Where agents run changed here: a Gentle Shell server was paired
+    /// (nothing needs installing on this computer then), or this computer
+    /// was chosen again.
+    RunsOnChanged,
 }
 
 pub struct OnboardingView {
@@ -94,6 +106,15 @@ pub struct OnboardingView {
     /// The provider check as the active agent tab's Gentle Shell answered
     /// it (`get_auth_status`), applied over every look at the machine.
     registry_sign_in: Option<Result<String, String>>,
+    /// Connecting to a Gentle Shell server instead of setting up this
+    /// computer (the first-run paths; Configuration has its own).
+    connect: Option<(Entity<ServerConnect>, Subscription)>,
+    /// Gentle Shell's setup run on the server agents run on.
+    server_setup: server_setup::ServerSetup,
+    /// The machine set up: Configuration's "Settings for", or a server
+    /// just paired here; `None` for the shown workspace's
+    /// (`backend::current`).
+    machine: Option<Backend>,
     _probe: Task<()>,
     _job: Task<()>,
 }
@@ -102,7 +123,23 @@ impl EventEmitter<OnboardingEvent> for OnboardingView {}
 
 impl OnboardingView {
     /// `probe` is a look already taken (the startup check); `None` looks now.
-    pub fn new(probe: Option<Probe>, cx: &mut Context<Self>) -> Self {
+    /// Offers connecting to a Gentle Shell server as the other way in.
+    pub fn new(probe: Option<Probe>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let mut this = Self::build(probe, None, cx);
+        let url = match crate::features::backend::default_machine() {
+            Backend::Server { url, .. } => url,
+            _ => String::new(),
+        };
+        let connect = cx.new(|cx| ServerConnect::new(url, window, cx));
+        let paired = cx.subscribe(&connect, |this, _, event: &ConnectEvent, cx| {
+            let ConnectEvent::Paired(choice, _) = event;
+            this.choose_runs_on(choice.clone(), cx);
+        });
+        this.connect = Some((connect, paired));
+        this
+    }
+
+    fn build(probe: Option<Probe>, machine: Option<Backend>, cx: &mut Context<Self>) -> Self {
         let mut this = Self {
             mode: Mode::Screen,
             entrance: std::time::Duration::ZERO,
@@ -117,6 +154,9 @@ impl OnboardingView {
             failure: None,
             announce: false,
             registry_sign_in: None,
+            connect: None,
+            server_setup: server_setup::ServerSetup::default(),
+            machine,
             _probe: Task::ready(()),
             _job: Task::ready(()),
         };
@@ -127,12 +167,49 @@ impl OnboardingView {
         this
     }
 
-    /// The checklist for Configuration → Setup & requirements: looks at the
-    /// machine now, installs and hands off actions like the screen does.
-    pub fn embedded(cx: &mut Context<Self>) -> Self {
-        let mut this = Self::new(None, cx);
+    /// The checklist for Configuration → Setup & requirements of `machine`
+    /// (its "Settings for"): looks at it now, installs and hands off actions
+    /// like the screen does. Where agents run is Configuration's own section
+    /// there.
+    pub fn embedded(machine: Backend, cx: &mut Context<Self>) -> Self {
+        let mut this = Self::build(None, Some(machine), cx);
         this.mode = Mode::Embedded;
         this
+    }
+
+    /// Look at `machine` from now on.
+    fn set_machine(&mut self, machine: Backend, cx: &mut Context<Self>) {
+        self.machine = Some(machine);
+        self.failure = None;
+        self.checks = None;
+        self.refresh(cx);
+    }
+
+    /// The machine set up (see [`Self::machine`]).
+    pub(super) fn machine(&self) -> Backend {
+        self.machine
+            .clone()
+            .unwrap_or_else(crate::features::backend::current)
+    }
+
+    /// Save where new workspaces go (a server just paired, or this
+    /// computer again) and set that machine up from now on: on a server
+    /// only the server is checked and nothing is installed here. The window
+    /// opens a workspace there ([`OnboardingEvent::RunsOnChanged`]).
+    fn choose_runs_on(&mut self, choice: Backend, cx: &mut Context<Self>) {
+        if let Err(err) = crate::features::backend::save_default(&choice) {
+            eprintln!("gentle-shell-gpui: could not save where agents run: {err}");
+        }
+        self.set_machine(choice, cx);
+        cx.emit(OnboardingEvent::RunsOnChanged);
+    }
+
+    /// The Gentle Shell server set up, when it is one: its name.
+    fn server(&self) -> Option<String> {
+        match self.machine() {
+            Backend::Server { name, .. } => Some(name),
+            _ => None,
+        }
     }
 
     /// The install sequence for the welcome screen; its steps come in after
@@ -140,9 +217,10 @@ impl OnboardingView {
     pub fn sequence(
         probe: Option<Probe>,
         entrance: std::time::Duration,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let mut this = Self::new(probe, cx);
+        let mut this = Self::new(probe, window, cx);
         this.mode = Mode::Sequence;
         this.entrance = entrance;
         this
@@ -153,9 +231,10 @@ impl OnboardingView {
         self.entrance = std::time::Duration::ZERO;
     }
 
-    /// An install is running: the screen must stay open until it ends.
+    /// An install (or setup on the server) is running: the screen must stay
+    /// open until it ends.
     pub fn busy(&self) -> bool {
-        self.installing.is_some()
+        self.installing.is_some() || self.server_setup.running()
     }
 
     /// gentle-shell can start, as of the last look.

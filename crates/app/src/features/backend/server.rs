@@ -1,0 +1,997 @@
+//! Gentle Shell servers (`gentle-shell serve`) as where agents run: pairing
+//! this device with one (at a typed address, found on the local network for
+//! a short pairing code, or wherever on the network or through its relay a
+//! connection code's server answers), and the device token pairing returns.
+//! The token is a secret, so it stays out of `settings.json` (which names
+//! only the server, the device id and the server's name): it lives in
+//! `server-tokens.json` in the app's folder, owner-only (`0600`), keyed by
+//! the address the server was paired at. Beside it are how the server is
+//! reached safely (`fp`, the certificate pinned when it speaks HTTPS, and
+//! `relay`, the relay that reaches it from anywhere) and what finds it again
+//! when its computer gets another address: its server id, its machine's host
+//! name, the addresses it was reached at and the one it answers at now
+//! ([`relocate`]).
+//!
+//! Workspaces and saved tabs name a server by its server id ([`key`]; an
+//! address, saved before ids were kept, reads as the id once a pairing
+//! knows it, [`key_of`]). Pairing a known server again, at another address
+//! or after an unpair, takes its earlier pairing's place
+//! ([`replace_pairing`]), so its work finds it. Unpairing asks the server
+//! to forget this device first ([`unpair`]).
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::{Duration, Instant};
+
+use gentle_core::backend::Backend;
+use gentle_core::serve::{ConnectionCode, Nearby, ServerPage, ServerSession};
+use pi_rpc::serve::{Paired, ServeClient, ServeError, ServerInfo, Trust};
+use serde_json::{Map, Value, json};
+
+/// What a server can't do for its devices: its `gentle-shell serve` is
+/// older than the feature (its `GET /api/server` doesn't offer it).
+pub const UNAVAILABLE: &str =
+    "This Gentle Shell server can't do that yet: upgrade Gentle Shell there.";
+
+/// What only runs on this computer or a backend the app drives itself
+/// (Setup, a one-off `gentle-shell` run): a server runs only its sessions.
+pub const NOT_ON_SERVER: &str = "Not available on a Gentle Shell server.";
+
+/// What each server said about itself last, by address ([`info`]).
+static INFOS: LazyLock<Mutex<HashMap<String, ServerInfo>>> = LazyLock::new(Mutex::default);
+
+/// The server work rooted at `cwd` runs on, with this device's client;
+/// `None` when it runs elsewhere (this computer, a WSL distro, a command).
+pub fn at(cwd: &Path) -> Option<anyhow::Result<ServeClient>> {
+    let choice = super::for_tab(cwd);
+    choice.is_server().then(|| client(&choice))
+}
+
+/// The home folder of the server work rooted at `cwd` runs on, as it last
+/// said (without asking); `None` off a server.
+pub fn known_home_of(cwd: &Path) -> Option<String> {
+    match super::for_tab(cwd) {
+        Backend::Server { url, .. } => known_home(&url),
+        _ => None,
+    }
+}
+
+/// What `choice` (a server) says about itself: the last answer this run,
+/// else asked ([`info`]). Blocking the first time.
+pub fn known_info(choice: &Backend) -> Option<ServerInfo> {
+    let Backend::Server { url, .. } = choice else {
+        return None;
+    };
+    if let Some(info) = INFOS.lock().unwrap().get(url) {
+        return Some(info.clone());
+    }
+    info(choice).ok()
+}
+
+/// Whether `choice` (a server) offers `capability` (`files`, `git`,
+/// `uploads`, `terminals`, `services`, …), as it last said. Blocking the
+/// first time.
+pub fn offers(choice: &Backend, capability: &str) -> bool {
+    known_info(choice).is_some_and(|info| info.has(capability))
+}
+
+/// Whether the server work rooted at `cwd` runs on offers `capability`, as
+/// it already said this run, without asking: `None` off a server or before
+/// it said. For views that word what's missing while they draw.
+pub fn said(cwd: &Path, capability: &str) -> Option<bool> {
+    let Backend::Server { url, .. } = super::for_tab(cwd) else {
+        return None;
+    };
+    INFOS
+        .lock()
+        .unwrap()
+        .get(&url)
+        .map(|info| info.has(capability))
+}
+
+/// Ask `choice` what it offers again next time (a terminal host was
+/// installed, the device paired again).
+pub fn forget_info(choice: &Backend) {
+    if let Backend::Server { url, .. } = choice {
+        INFOS.lock().unwrap().remove(url);
+    }
+}
+
+fn tokens_path() -> Option<PathBuf> {
+    crate::shared::data_dir::app().map(|dir| dir.join("server-tokens.json"))
+}
+
+fn read_tokens() -> Map<String, Value> {
+    tokens_path()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default()
+}
+
+/// Replace the tokens file in one step, readable by its owner only.
+fn write_tokens(tokens: &Map<String, Value>) -> std::io::Result<()> {
+    let path = tokens_path().ok_or_else(|| std::io::Error::other("no data folder"))?;
+    let dir = path.parent().unwrap_or(std::path::Path::new("."));
+    std::fs::create_dir_all(dir)?;
+    let temp = dir.join(format!("server-tokens.json.{}.tmp", std::process::id()));
+    // Created afresh, so the owner-only mode always applies.
+    let _ = std::fs::remove_file(&temp);
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let written = (|| {
+        use std::io::Write as _;
+        let mut file = options.open(&temp)?;
+        file.write_all(format!("{}\n", Value::Object(tokens.clone())).as_bytes())?;
+        file.sync_all()?;
+        std::fs::rename(&temp, &path)
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    written
+}
+
+/// A token entry's server id, once known.
+fn id_of(entry: &Value) -> Option<&str> {
+    entry["serverId"].as_str().filter(|id| !id.is_empty())
+}
+
+/// The token entry (its key) for the server `server` names (its id, or an
+/// address, as saved before ids were kept), last known at `url`: the
+/// pairing made at `url` while it is still that server's, else that
+/// server's pairing made elsewhere since, else the pairing that was ever
+/// reached at `url`.
+fn find(tokens: &Map<String, Value>, server: &str, url: &str) -> Option<String> {
+    if let Some(entry) = tokens.get(url)
+        && (server == url || id_of(entry).is_none_or(|id| id == server))
+    {
+        return Some(url.to_string());
+    }
+    let paired =
+        |(key, entry): (&String, &Value)| (id_of(entry) == Some(server)).then(|| key.clone());
+    let reached = |(key, entry): (&String, &Value)| {
+        known_addresses(entry)
+            .iter()
+            .any(|known| known == url)
+            .then(|| key.clone())
+    };
+    tokens
+        .iter()
+        .find_map(paired)
+        .or_else(|| tokens.iter().find_map(reached))
+}
+
+/// What names the server `stored` names (its id, or an address) now: its
+/// id once a pairing knows it, else `stored`.
+fn key_in(tokens: &Map<String, Value>, stored: &str) -> String {
+    find(tokens, stored, stored)
+        .and_then(|key| id_of(&tokens[&key]).map(str::to_string))
+        .unwrap_or_else(|| stored.to_string())
+}
+
+/// What names `choice` (a server) for good in workspaces and saved tabs:
+/// its server id, once known (its address before). `None` off a server.
+pub fn key(choice: &Backend) -> Option<String> {
+    let Backend::Server { url, .. } = choice else {
+        return None;
+    };
+    Some(key_in(&read_tokens(), url))
+}
+
+/// [`key`] of the server a workspace or a tab saved as `stored`: an
+/// address saved before ids were kept reads as the server's id once a
+/// pairing knows it.
+pub fn key_of(stored: &str) -> String {
+    key_in(&read_tokens(), stored)
+}
+
+/// Whether `stored` (a workspace's or a tab's server, [`key_of`]) is the
+/// server `choice`.
+pub fn same(stored: &str, choice: &Backend) -> bool {
+    let Backend::Server { url, .. } = choice else {
+        return false;
+    };
+    let tokens = read_tokens();
+    stored == url || key_in(&tokens, stored) == key_in(&tokens, url)
+}
+
+/// `session` (a restored tab's) naming its server by id, once known.
+pub fn with_key(mut session: ServerSession) -> ServerSession {
+    if session.server_id.is_empty() {
+        let key = key_of(&session.url);
+        if key != session.url {
+            session.server_id = key;
+        }
+    }
+    session
+}
+
+/// Where a tab that ran on `runs_on` starts again: there, unless it is a
+/// server this device has no pairing with any more while the server its
+/// session (`attach`) runs on is paired now: paired again elsewhere, or
+/// after an unpair.
+pub fn paired_again(runs_on: Option<Backend>, attach: Option<&ServerSession>) -> Option<Backend> {
+    let (Some(Backend::Server { url, .. }), Some(attach)) = (&runs_on, attach) else {
+        return runs_on;
+    };
+    if find(&read_tokens(), url, url).is_some() {
+        return runs_on;
+    }
+    paired()
+        .into_iter()
+        .find(|server| same(attach.server(), server))
+        .or(runs_on)
+}
+
+/// Every server this device is paired with, by name: each pairing kept
+/// beside its token, whatever runs where. Choosing where new workspaces go
+/// never adds or removes one; pairing and [`unpair`] do.
+pub fn paired() -> Vec<Backend> {
+    let mut all: Vec<Backend> = read_tokens()
+        .iter()
+        .filter_map(|(url, entry)| pairing(url, entry))
+        .collect();
+    all.sort_by_key(|server| gentle_core::machines::name(server).to_lowercase());
+    all
+}
+
+/// The server a token entry (kept under `url`) pairs with, named as it was
+/// paired (its machine's host name, else its address, before names were
+/// kept); `None` for an entry without a token.
+fn pairing(url: &str, entry: &Value) -> Option<Backend> {
+    entry["token"].as_str()?;
+    let name = ["name", "host"]
+        .into_iter()
+        .find_map(|field| entry[field].as_str().filter(|name| !name.trim().is_empty()))
+        .map_or_else(|| host_of(url), str::to_string);
+    Some(Backend::Server {
+        url: url.to_string(),
+        device: entry["device"].as_str().unwrap_or_default().to_string(),
+        name,
+    })
+}
+
+/// The server a workspace saved as `stored` (its id, or an address, as
+/// [`key`] names it) runs on: its pairing; one this device isn't paired
+/// with any more is the server at `stored`, which answers that it isn't.
+pub fn by_key(stored: &str) -> Backend {
+    let tokens = read_tokens();
+    find(&tokens, stored, stored)
+        .and_then(|key| pairing(&key, &tokens[&key]))
+        .unwrap_or_else(|| Backend::Server {
+            url: stored.to_string(),
+            device: String::new(),
+            name: stored.to_string(),
+        })
+}
+
+/// Keep `choice`'s name (a server, as saved where agents ran before
+/// servers were listed) beside its pairing, when that has none yet.
+pub fn remember_name(choice: &Backend) {
+    let Backend::Server { url, name, .. } = choice else {
+        return;
+    };
+    if name.trim().is_empty() {
+        return;
+    }
+    let mut tokens = read_tokens();
+    let Some(key) = find(&tokens, url, url) else {
+        return;
+    };
+    let Some(entry) = tokens.get_mut(&key).and_then(Value::as_object_mut) else {
+        return;
+    };
+    if entry.get("name").and_then(Value::as_str).is_some() {
+        return;
+    }
+    entry.insert("name".into(), name.clone().into());
+    if let Err(err) = write_tokens(&tokens) {
+        eprintln!("gentle-shell-gpui: could not keep the server's name: {err}");
+    }
+}
+
+/// Where the server paired at `url` answers now: where it was last found,
+/// when its address changed since ([`relocate`]); else `url`.
+pub fn address(url: &str) -> String {
+    let tokens = read_tokens();
+    find(&tokens, url, url).map_or_else(
+        || url.to_string(),
+        |key| answers_at(&key, &tokens[&key]).to_string(),
+    )
+}
+
+fn answers_at<'a>(url: &'a str, entry: &'a Value) -> &'a str {
+    entry["at"].as_str().unwrap_or(url)
+}
+
+/// How the server a token entry is for is reached: the certificate pinned
+/// and its relay, as pairing found them.
+fn trust_of(entry: &Value) -> Trust {
+    let field = |key: &str| entry[key].as_str().map(str::to_string);
+    Trust {
+        fingerprint: field("fp"),
+        relay: field("relay"),
+    }
+}
+
+/// A client of `choice` with its token; an error in words when this device
+/// isn't paired with it (any more).
+pub fn client(choice: &Backend) -> anyhow::Result<ServeClient> {
+    let Backend::Server { url, .. } = choice else {
+        anyhow::bail!("{} isn't a Gentle Shell server.", choice.label());
+    };
+    client_at(url, url).ok_or_else(|| {
+        anyhow::anyhow!(
+            "This computer isn't paired with the Gentle Shell server at {url}. Pair it in \
+             Configuration › General › Where agents run."
+        )
+    })
+}
+
+/// A client of the server `server` names, last known at `url` ([`find`]),
+/// at the address it answers at now, that looks for it again when that
+/// address stops answering ([`relocate`]); `None` when this device isn't
+/// paired with it.
+fn client_at(server: &str, url: &str) -> Option<ServeClient> {
+    let tokens = read_tokens();
+    let key = find(&tokens, server, url)?;
+    let entry = &tokens[&key];
+    let token = entry["token"].as_str()?.to_string();
+    // By its id once known: a pairing made elsewhere since is where it went.
+    let server = id_of(entry).unwrap_or(&key).to_string();
+    let client = ServeClient::with_trust(answers_at(&key, entry), Some(token), trust_of(entry));
+    Some(client.relocating(Arc::new(move |failed| relocate(&server, &key, failed))))
+}
+
+/// After a search that found nothing, how long before the next one: a
+/// server that's down isn't looked for on every reconnect.
+const SEARCH_AGAIN: Duration = Duration::from_secs(20);
+
+/// When the last search for each server (by paired address) found nothing.
+/// Held while one runs, so requests failing together share one search.
+static SEARCHED: LazyLock<Mutex<HashMap<String, Instant>>> = LazyLock::new(Mutex::default);
+
+/// The server `server` names, paired at `url` (or since elsewhere,
+/// [`find`]), doesn't answer at `failed` any more (its computer got another
+/// address on the network, DHCP): look for it on the local network
+/// (discovery), at every address it was reached at, its host name and
+/// `<host>.local`, and through its relay; the first where
+/// `GET /.well-known/gentle-shell` names its server id, over HTTPS with the
+/// certificate pinned at pairing when it has one, is where it went (a
+/// server answering with its id but another certificate isn't it). That
+/// address is saved (`at`, beside the token), so the next launch starts
+/// there. `None` when it isn't found, or this pairing predates knowing its
+/// id. Blocking: up to about 6 s.
+fn relocate(server: &str, url: &str, failed: &str) -> Option<String> {
+    let mut searched = SEARCHED.lock().unwrap_or_else(|e| e.into_inner());
+    let tokens = read_tokens();
+    let key = find(&tokens, server, url)?;
+    let url = key.as_str();
+    let entry = &tokens[url];
+    // Another request found it meanwhile, or it was paired again elsewhere.
+    if answers_at(url, entry) != failed {
+        return Some(answers_at(url, entry).to_string());
+    }
+    if searched
+        .get(url)
+        .is_some_and(|when| when.elapsed() < SEARCH_AGAIN)
+    {
+        return None;
+    }
+    let server_id = entry["serverId"].as_str().filter(|id| !id.is_empty())?;
+    let trust = trust_of(entry);
+    let candidates = gentle_core::serve::relocation_urls(
+        failed,
+        &known_addresses(entry),
+        entry["host"].as_str(),
+        trust.relay.as_deref(),
+    );
+    let discovery = std::thread::Builder::new()
+        .name("serve-relocate".into())
+        .spawn(nearby)
+        .ok();
+    let found = pi_rpc::serve::find(server_id, &candidates, &trust).or_else(|| {
+        // Anyone can answer discovery: what answered with the server's id
+        // is asked again, pinned.
+        let heard: Vec<String> = discovery?
+            .join()
+            .ok()?
+            .ok()?
+            .into_iter()
+            .filter(|server| server.server_id == server_id)
+            .map(|server| server.url())
+            .collect();
+        pi_rpc::serve::find(server_id, &heard, &trust)
+    });
+    let Some(found) = found else {
+        searched.insert(url.to_string(), Instant::now());
+        return None;
+    };
+    searched.remove(url);
+    let mut tokens = tokens.clone();
+    if let Some(entry) = tokens.get_mut(url) {
+        moved(entry, url, &found);
+        if let Err(err) = write_tokens(&tokens) {
+            eprintln!("gentle-shell-gpui: could not save the server's new address: {err}");
+        }
+    }
+    eprintln!("gentle-shell-gpui: the Gentle Shell server {url} answers at {found} now");
+    Some(found)
+}
+
+/// A paired server's addresses, newest last.
+fn known_addresses(entry: &Value) -> Vec<String> {
+    entry["addresses"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|url| url.as_str().map(str::to_string))
+        .collect()
+}
+
+/// The server paired at `url` was found at `found`: requests go there from
+/// now on, and it is remembered as one of its addresses.
+fn moved(entry: &mut Value, url: &str, found: &str) {
+    let mut known = known_addresses(entry);
+    gentle_core::serve::remember_address(&mut known, found);
+    let Some(entry) = entry.as_object_mut() else {
+        return;
+    };
+    entry.insert("addresses".into(), known.into());
+    if found == url {
+        entry.remove("at");
+    } else {
+        entry.insert("at".into(), found.into());
+    }
+}
+
+/// Pair this device with the server at `url` (typed) using `code`: the
+/// backend to save, with what the server says about itself. A server that
+/// speaks HTTPS is paired with over HTTPS once it proved it knows the code
+/// (`pi_rpc::serve::pair_at`). The token is saved here. Blocking.
+pub fn pair(url: &str, code: &str) -> Result<(Backend, ServerInfo), String> {
+    let url = gentle_core::serve::normalize_url(url)?;
+    let code = gentle_core::serve::normalize_code(code)?;
+    let (url, paired) = pi_rpc::serve::pair_at(&url, &code, &device_name())?;
+    let name = host_of(&url);
+    // Its machine's host name, to look for it by should its address change.
+    let host = pi_rpc::serve::identify(&url, &paired.trust).map(|(_, host)| host);
+    paired_with(url.clone(), &url, name, host, &[], paired)
+}
+
+/// Pair this device with the server a connection code names, at `url`
+/// (where `pi_rpc::serve::locate` found it on the network, or its relay),
+/// named as the code names it. Through a relay the server is still saved
+/// under an address of its own (several servers can share a relay), and
+/// answers at the relay until it is found on the network. Blocking.
+pub fn pair_code(code: &ConnectionCode, url: &str) -> Result<(Backend, ServerInfo), String> {
+    let paired = pi_rpc::serve::pair_code(code, url, &device_name())?;
+    let key = match code.urls.first() {
+        Some(own) if gentle_core::serve::is_relay(url) => own.clone(),
+        _ => url.to_string(),
+    };
+    paired_with(
+        key,
+        url,
+        code.name.clone(),
+        Some(code.name.clone()),
+        &code.urls,
+        paired,
+    )
+}
+
+/// The Gentle Shell servers on the local network, each checked: the
+/// discovery query goes to 255.255.255.255 and to every network's directed
+/// broadcast address on this computer. Blocking (about 1.5 s).
+pub fn nearby() -> Result<Vec<Nearby>, String> {
+    let networks: Vec<(std::net::IpAddr, u8)> = sysinfo::Networks::new_with_refreshed_list()
+        .values()
+        .flat_map(|data| data.ip_networks().iter().map(|n| (n.addr, n.prefix)))
+        .collect();
+    pi_rpc::serve::nearby(&gentle_core::serve::discovery_targets(&networks))
+}
+
+/// Pair this device with `server` (found by [`nearby`]) using the short
+/// pairing `code`, named as it names itself. Blocking.
+pub fn pair_nearby(server: &Nearby, code: &str) -> Result<(Backend, ServerInfo), String> {
+    let paired = pi_rpc::serve::pair_nearby(server, code, &device_name())?;
+    let url = server.url();
+    paired_with(
+        url.clone(),
+        &url,
+        server.name.clone(),
+        Some(server.name.clone()),
+        &[],
+        paired,
+    )
+}
+
+/// How this device names itself to a server.
+fn device_name() -> String {
+    format!(
+        "Gentle Shell GPUI on {}",
+        sysinfo::System::host_name().unwrap_or_else(|| "this computer".into())
+    )
+}
+
+/// Save the token a pairing with the server at `url` returned: the backend
+/// to save, named `name`, with what the server says about itself. Its id,
+/// machine `host` name and addresses (`url`, and the `others` a connection
+/// code listed) are kept beside the token, to find it should its address
+/// change; a pairing with it made before takes its place
+/// ([`replace_pairing`]).
+fn paired_with(
+    url: String,
+    answers: &str,
+    name: String,
+    host: Option<String>,
+    others: &[String],
+    paired: Paired,
+) -> Result<(Backend, ServerInfo), String> {
+    let client = ServeClient::with_trust(answers, Some(paired.token.clone()), paired.trust.clone());
+    let info = client.server().map_err(|e| e.message)?;
+    let mut addresses = others.to_vec();
+    gentle_core::serve::remember_address(&mut addresses, &url);
+    let mut entry = json!({
+        "device": paired.device,
+        "token": paired.token,
+        "serverId": info.server_id,
+        "addresses": addresses,
+        "name": name,
+    });
+    if answers != url {
+        moved(&mut entry, &url, answers);
+    }
+    if let Some(fp) = &paired.trust.fingerprint {
+        entry["fp"] = fp.clone().into();
+    }
+    if let Some(relay) = &paired.trust.relay {
+        entry["relay"] = relay.clone().into();
+    }
+    if let Some(home) = &info.home {
+        entry["home"] = home.clone().into();
+    }
+    if let Some(host) = host.filter(|host| !host.trim().is_empty()) {
+        entry["host"] = host.into();
+    }
+    let mut tokens = read_tokens();
+    // The server forgets the device this pairing replaces, whose terminals
+    // are this one's now: they reattach, and one device stays listed. A
+    // token it no longer knows, or an older server, leaves things as they
+    // are.
+    for key in earlier_pairings(&tokens, &entry) {
+        if let Some(old) = tokens[&key]["token"].as_str()
+            && old != paired.token
+            && let Err(error) = client.replace(old)
+        {
+            eprintln!(
+                "gentle-shell-gpui: the server kept this computer's earlier pairing: {}",
+                error.message
+            );
+        }
+    }
+    replace_pairing(&mut tokens, &url, entry);
+    write_tokens(&tokens).map_err(|e| format!("Couldn't save the device token: {e}"))?;
+    // What it offers is asked again under its new pairing.
+    INFOS.lock().unwrap().remove(&url);
+    Ok((
+        Backend::Server {
+            name,
+            url,
+            device: paired.device,
+        },
+        info,
+    ))
+}
+
+/// The pairings in `tokens` with the server `entry` (a pairing just made)
+/// is for: by its id; one that predates knowing it, by the certificate it
+/// pinned.
+fn earlier_pairings(tokens: &Map<String, Value>, entry: &Value) -> Vec<String> {
+    let id = id_of(entry);
+    let fingerprint = entry["fp"].as_str();
+    tokens
+        .iter()
+        .filter(|(_, old)| match (id_of(old), id) {
+            (Some(old), Some(id)) => old == id,
+            (None, _) => fingerprint.is_some() && old["fp"].as_str() == fingerprint,
+            (Some(_), None) => false,
+        })
+        .map(|(key, _)| key.clone())
+        .collect()
+}
+
+/// Keep `entry`, a pairing just made at `url`, in `tokens` in place of the
+/// earlier pairings with the same server ([`earlier_pairings`]): the
+/// addresses those reached it at stay known, oldest first, and so do its
+/// home and host name when the new one doesn't say. Workspaces and tabs
+/// that named it by id, or by an address it had, find it here ([`find`]).
+fn replace_pairing(tokens: &mut Map<String, Value>, url: &str, mut entry: Value) {
+    let earlier = earlier_pairings(tokens, &entry);
+    let mut addresses = Vec::new();
+    for key in earlier {
+        let Some(old) = tokens.remove(&key) else {
+            continue;
+        };
+        for address in known_addresses(&old).iter().chain([&key]) {
+            gentle_core::serve::remember_address(&mut addresses, address);
+        }
+        for field in ["home", "host"] {
+            if entry.get(field).is_none()
+                && let Some(value) = old.get(field)
+            {
+                entry[field] = value.clone();
+            }
+        }
+    }
+    for address in known_addresses(&entry) {
+        gentle_core::serve::remember_address(&mut addresses, &address);
+    }
+    entry["addresses"] = addresses.into();
+    tokens.insert(url.to_string(), entry);
+}
+
+/// The host part of a server address, as its default name.
+fn host_of(url: &str) -> String {
+    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+    match rest.rsplit_once(':') {
+        Some((host, port)) if port.chars().all(|c| c.is_ascii_digit()) => host.to_string(),
+        _ => rest.to_string(),
+    }
+}
+
+/// What `choice` (a server) says about itself, with this device's token.
+/// Its home folder and server id are kept beside the token ([`known_home`],
+/// [`relocate`]; a pairing older than the id learns it here). Blocking.
+pub fn info(choice: &Backend) -> Result<ServerInfo, String> {
+    let info = client(choice)
+        .map_err(|e| e.to_string())?
+        .server()
+        .map_err(|e| e.message)?;
+    if let Backend::Server { url, .. } = choice {
+        let mut tokens = read_tokens();
+        let key = find(&tokens, url, url).unwrap_or_else(|| url.clone());
+        if let Some(entry) = tokens.get_mut(&key).and_then(Value::as_object_mut) {
+            let mut changed = false;
+            if let Some(home) = info.home.as_ref().filter(|home| !home.is_empty())
+                && entry.get("home").and_then(Value::as_str) != Some(home)
+            {
+                entry.insert("home".into(), home.clone().into());
+                changed = true;
+            }
+            if !info.server_id.is_empty()
+                && entry.get("serverId").and_then(Value::as_str) != Some(&info.server_id)
+            {
+                entry.insert("serverId".into(), info.server_id.clone().into());
+                changed = true;
+            }
+            if changed && let Err(err) = write_tokens(&tokens) {
+                eprintln!("gentle-shell-gpui: could not save what the server said: {err}");
+            }
+        }
+    }
+    if let Backend::Server { url, .. } = choice {
+        INFOS.lock().unwrap().insert(url.clone(), info.clone());
+    }
+    Ok(info)
+}
+
+/// The home folder of the user `choice` (a server) runs as, a path there:
+/// where new workspaces and tabs on it start, and Configuration's control
+/// session runs. Kept from the last answer, else asked ([`info`]); `None`
+/// when this server doesn't say (an older `gentle-shell serve`) or doesn't
+/// answer. Blocking the first time.
+pub fn home(choice: &Backend) -> Option<String> {
+    let Backend::Server { url, .. } = choice else {
+        return None;
+    };
+    known_home(url).or_else(|| info(choice).ok().and_then(|info| info.home))
+}
+
+/// The home folder the server paired at `url` last said it has (kept
+/// beside its token), without asking it.
+pub fn known_home(url: &str) -> Option<String> {
+    let tokens = read_tokens();
+    let key = find(&tokens, url, url)?;
+    tokens[&key]["home"]
+        .as_str()
+        .filter(|home| !home.is_empty())
+        .map(str::to_string)
+}
+
+/// The address that opens `url`, a page a server session gave, on this
+/// device: as it is unless it is on the server's own loopback, where it
+/// goes through a forward of `session` (`POST /api/sessions/:id/forwards`;
+/// the server reuses this device's forward of the port and mints a new
+/// single-use link each time), opened through this computer's proxy for
+/// it (`ServeClient::local_page`). An error in words when it can't.
+/// Blocking.
+pub fn page_url(session: &ServerSession, url: &str) -> Result<String, String> {
+    match gentle_core::serve::server_page(url) {
+        ServerPage::Elsewhere => Ok(url.to_string()),
+        ServerPage::Unreachable(why) => Err(why),
+        ServerPage::Loopback { port, path } => {
+            let client = client_at(session.server(), &session.url).ok_or_else(|| {
+                format!(
+                    "This computer isn't paired with the Gentle Shell server at {} any more.",
+                    session.url
+                )
+            })?;
+            let forward = client
+                .forward(&session.id, port, &path)
+                .map_err(|e| e.message)?;
+            client.local_page(&forward)
+        }
+    }
+}
+
+/// Gentle Tower running on `choice` (a server), through a forward and this
+/// computer's proxy for it: the address to open. Blocking.
+pub fn tower(choice: &Backend) -> Result<String, String> {
+    let client = client(choice).map_err(|e| e.to_string())?;
+    let forward = client.tower().map_err(|e| e.message)?;
+    client.local_page(&forward)
+}
+
+/// What unpairing from a server did.
+#[derive(Debug, Default)]
+pub struct Unpairing {
+    /// Every address the server was paired or reached at: the open tabs
+    /// that run there let go of it.
+    pub addresses: Vec<String>,
+    /// Why the server still lists this device, in words; `None` when it
+    /// removed it.
+    pub still_listed: Option<String>,
+}
+
+/// Unpair this device from `choice` (a server). The server is asked to
+/// remove it (`DELETE /api/devices/self`): its token stops working there
+/// and its streams close, while its sessions and terminals keep running.
+/// Then this computer forgets the token, and any earlier pairing with that
+/// server, whatever the server answered. Blocking: a server that doesn't
+/// answer where it was is looked for first ([`relocate`], about 6 s).
+pub fn unpair(choice: &Backend) -> std::io::Result<Unpairing> {
+    let Backend::Server { url, device, name } = choice else {
+        return Ok(Unpairing::default());
+    };
+    let tokens = read_tokens();
+    let Some(key) = find(&tokens, url, url) else {
+        return Ok(Unpairing::default());
+    };
+    let id = id_of(&tokens[&key]).map(str::to_string);
+    let pairings: Vec<String> = tokens
+        .iter()
+        .filter(|(other, entry)| **other == key || (id.is_some() && id_of(entry) == id.as_deref()))
+        .map(|(other, _)| other.clone())
+        .collect();
+    let name = if name.trim().is_empty() {
+        host_of(url)
+    } else {
+        name.clone()
+    };
+    let still_listed = client_at(url, url)
+        .and_then(|client| client.unpair().err())
+        .and_then(|error| still_listed(&name, device, &error));
+    if still_listed.is_none() {
+        // Pairings with it from before a pairing elsewhere took their place
+        // are removed there too, where it answers now.
+        let at = address(&key);
+        for other in pairings.iter().filter(|other| **other != key) {
+            let entry = &tokens[other];
+            if let Some(token) = entry["token"].as_str() {
+                let _ = ServeClient::with_trust(&at, Some(token.into()), trust_of(entry)).unpair();
+            }
+        }
+    }
+    // Read again: a search for it may have saved where it answers now.
+    let mut tokens = read_tokens();
+    let mut addresses = Vec::new();
+    for pairing in &pairings {
+        if let Some(entry) = tokens.remove(pairing) {
+            let at = answers_at(pairing, &entry).to_string();
+            for address in known_addresses(&entry)
+                .into_iter()
+                .chain([pairing.clone(), at])
+            {
+                gentle_core::serve::remember_address(&mut addresses, &address);
+            }
+        }
+    }
+    write_tokens(&tokens)?;
+    INFOS.lock().unwrap().remove(url);
+    SEARCHED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&key);
+    Ok(Unpairing {
+        addresses,
+        still_listed,
+    })
+}
+
+/// Why `name` still lists this device (`device`) after it was asked to
+/// remove it and answered `error`; `None` when it doesn't (a token it no
+/// longer accepts was removed there already).
+fn still_listed(name: &str, device: &str, error: &ServeError) -> Option<String> {
+    let revoke = format!("run gentle-shell serve devices --revoke {device} on that computer");
+    match error.status {
+        Some(401) => None,
+        // An older server: removing a device takes its admin there.
+        Some(403..=405) => Some(format!(
+            "{name} runs a Gentle Shell too old to remove this computer itself, so it still \
+             lists it: upgrade Gentle Shell there, or {revoke}."
+        )),
+        Some(_) => Some(format!(
+            "{name} didn't remove this computer ({}), so it still lists it: {revoke}.",
+            error.message
+        )),
+        None => Some(format!(
+            "{name} didn't answer ({}), so it still lists this computer: {revoke}.",
+            error.message
+        )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_server_found_elsewhere_answers_there_and_is_remembered() {
+        const PAIRED: &str = "http://192.168.1.20:8787";
+        const NOW: &str = "http://192.168.1.31:8787";
+        let mut entry = json!({"token": "gss_x", "serverId": "srv_1", "addresses": [PAIRED]});
+        assert_eq!(answers_at(PAIRED, &entry), PAIRED);
+
+        moved(&mut entry, PAIRED, NOW);
+        assert_eq!(answers_at(PAIRED, &entry), NOW);
+        assert_eq!(known_addresses(&entry), [PAIRED, NOW]);
+        // The token and the id stay.
+        assert_eq!(entry["token"], "gss_x");
+        assert_eq!(entry["serverId"], "srv_1");
+
+        // Back at the address it was paired at: nothing to redirect.
+        moved(&mut entry, PAIRED, PAIRED);
+        assert!(entry.get("at").is_none());
+        assert_eq!(answers_at(PAIRED, &entry), PAIRED);
+        assert_eq!(known_addresses(&entry), [NOW, PAIRED]);
+    }
+
+    fn tokens(value: Value) -> Map<String, Value> {
+        value.as_object().unwrap().clone()
+    }
+
+    /// Each pairing is a server of the list, named as it was paired; one
+    /// paired before names were kept goes by its machine's host name, else
+    /// its address. An entry without a token isn't a pairing.
+    #[test]
+    fn every_pairing_is_a_listed_server_with_a_name() {
+        let named = json!({"token": "gss_a", "device": "dev_1", "name": "studio", "host": "mini"});
+        let hosted = json!({"token": "gss_b", "device": "dev_2", "host": "mini"});
+        let bare = json!({"token": "gss_c", "device": "dev_3"});
+        let server = |url: &str, device: &str, name: &str| Backend::Server {
+            url: url.into(),
+            device: device.into(),
+            name: name.into(),
+        };
+        assert_eq!(
+            pairing("http://a:8787", &named),
+            Some(server("http://a:8787", "dev_1", "studio"))
+        );
+        assert_eq!(
+            pairing("http://b:8787", &hosted),
+            Some(server("http://b:8787", "dev_2", "mini"))
+        );
+        assert_eq!(
+            pairing("http://10.0.0.5:8787", &bare),
+            Some(server("http://10.0.0.5:8787", "dev_3", "10.0.0.5"))
+        );
+        assert_eq!(pairing("http://d:8787", &json!({"device": "dev_4"})), None);
+    }
+
+    /// Paired again at another address, a server takes its earlier
+    /// pairing's place: the new token, the old addresses kept, so what named
+    /// it by id or by its old address finds the new pairing. Another server
+    /// stays as it was.
+    #[test]
+    fn pairing_a_known_server_again_elsewhere_replaces_its_pairing_in_place() {
+        const OLD: &str = "http://192.168.1.20:8787";
+        const NEW: &str = "https://pc.tail.ts.net:8787";
+        const OTHER: &str = "http://10.0.0.5:8787";
+        let mut saved = tokens(json!({
+            OLD: {"token": "gss_old", "device": "dev_1", "serverId": "srv_1", "fp": "AA",
+                  "home": "/home/me", "host": "pc", "addresses": [OLD]},
+            OTHER: {"token": "gss_o", "serverId": "srv_2", "addresses": [OTHER]},
+        }));
+        assert_eq!(key_in(&saved, OLD), "srv_1");
+        replace_pairing(
+            &mut saved,
+            NEW,
+            json!({"token": "gss_new", "device": "dev_2", "serverId": "srv_1", "fp": "BB",
+                   "addresses": [NEW]}),
+        );
+        assert!(saved.get(OLD).is_none());
+        let entry = &saved[NEW];
+        assert_eq!(entry["token"], "gss_new");
+        assert_eq!(entry["device"], "dev_2");
+        assert_eq!(known_addresses(entry), [OLD, NEW]);
+        assert_eq!(entry["home"], "/home/me");
+        assert_eq!(entry["host"], "pc");
+        // Named by id, by its old address (a workspace or a tab saved before
+        // ids were kept), by the new one: the same pairing.
+        assert_eq!(find(&saved, "srv_1", OLD).as_deref(), Some(NEW));
+        assert_eq!(find(&saved, OLD, OLD).as_deref(), Some(NEW));
+        assert_eq!(find(&saved, NEW, NEW).as_deref(), Some(NEW));
+        assert_eq!(key_in(&saved, OLD), "srv_1");
+        assert_eq!(key_in(&saved, "srv_1"), "srv_1");
+        // Another server is another.
+        assert_eq!(saved[OTHER]["token"], "gss_o");
+        assert_eq!(key_in(&saved, OTHER), "srv_2");
+        // Never paired: the address is all there is.
+        assert_eq!(key_in(&saved, "http://nowhere:1"), "http://nowhere:1");
+        assert_eq!(find(&saved, "srv_9", "http://nowhere:1"), None);
+    }
+
+    /// A pairing from before ids were kept is the same server when it
+    /// pinned the same certificate; else it stays.
+    #[test]
+    fn a_pairing_without_an_id_is_replaced_by_its_certificate() {
+        const OLD: &str = "https://192.168.1.20:8787";
+        const NEW: &str = "https://192.168.1.31:8787";
+        let mut saved = tokens(json!({
+            OLD: {"token": "gss_old", "fp": "AA"},
+            "http://other:1": {"token": "gss_o"},
+        }));
+        replace_pairing(
+            &mut saved,
+            NEW,
+            json!({"token": "gss_new", "serverId": "srv_1", "fp": "AA", "addresses": [NEW]}),
+        );
+        assert!(saved.get(OLD).is_none());
+        assert!(saved.get("http://other:1").is_some());
+        assert_eq!(known_addresses(&saved[NEW]), [OLD, NEW]);
+        assert_eq!(key_in(&saved, OLD), "srv_1");
+    }
+
+    /// The pairing made at an address that another server answers at since
+    /// isn't the one a tab of the first server names by id.
+    #[test]
+    fn a_server_named_by_id_isnt_another_at_its_old_address() {
+        const AT: &str = "http://192.168.1.20:8787";
+        let saved = tokens(json!({
+            AT: {"token": "gss_2", "serverId": "srv_2", "addresses": [AT]},
+            "http://192.168.1.31:8787": {"token": "gss_1", "serverId": "srv_1",
+                                          "addresses": ["http://192.168.1.31:8787"]},
+        }));
+        assert_eq!(
+            find(&saved, "srv_1", AT).as_deref(),
+            Some("http://192.168.1.31:8787")
+        );
+        assert_eq!(find(&saved, AT, AT).as_deref(), Some(AT));
+    }
+
+    #[test]
+    fn unpairing_says_when_the_server_still_lists_this_device() {
+        let error = |status: Option<u16>| ServeError {
+            status,
+            error: None,
+            message: "Couldn't reach the server at http://pc:8787".into(),
+        };
+        // Removed now, or already.
+        assert_eq!(still_listed("pc", "dev_1", &error(Some(401))), None);
+        let old = still_listed("pc", "dev_1", &error(Some(403))).unwrap();
+        assert!(old.contains("too old"), "{old}");
+        assert!(
+            old.contains("gentle-shell serve devices --revoke dev_1"),
+            "{old}"
+        );
+        let away = still_listed("pc", "dev_1", &error(None)).unwrap();
+        assert!(away.starts_with("pc didn't answer"), "{away}");
+        assert!(away.contains("still lists this computer"), "{away}");
+        assert!(away.contains("--revoke dev_1"), "{away}");
+    }
+}

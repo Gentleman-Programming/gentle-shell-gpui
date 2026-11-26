@@ -8,9 +8,26 @@ publish.workspace = true
 [dependencies]
 anyhow.workspace = true
 async-channel.workspace = true
+# File contents, git output and terminal bytes on a Gentle Shell server's
+# API. The version the app already locks.
+base64 = "0.23"
 dunce = "1"
+# A Gentle Shell server's protocol rules (`gentle_core::serve`).
+gentle-core = { path = "../core" }
+# A Gentle Shell server on the network speaks TLS with a self-signed
+# certificate this device pins by fingerprint (`serve::tls`): rustls with
+# ring, the TLS stack ureq already locks for the app, driven by a verifier
+# of its own (no CA roots, no host name check).
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde.workspace = true
 serde_json.workspace = true
+# The terminal host binary's hash, as `PUT /api/term-host` checks it. The
+# version the app already locks.
+sha2 = "0.11"
+# A Gentle Shell server's session (`serve`): HTTP and its event stream, over
+# TCP, pinned TLS or a relay (`serve::tls` is its connector). The version the
+# app already locks.
+ureq = { version = "3", default-features = false }
 which = "8"
 
 # Windows: the neutral folder children start in (the user's profile, read

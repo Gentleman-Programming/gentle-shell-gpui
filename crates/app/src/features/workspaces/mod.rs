@@ -27,9 +27,18 @@ pub struct SavedPane {
     /// The file a file or canvas pane shows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<PathBuf>,
-    /// The conversation an agent pane had, resumed when it still exists.
+    /// The conversation an agent pane had, resumed when it still exists (on
+    /// a Gentle Shell server, a path there).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<PathBuf>,
+    /// The Gentle Shell server session an agent pane followed: it keeps
+    /// running while the app is closed, and the pane reattaches to it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server: Option<gentle_core::serve::ServerSession>,
+    /// The Gentle Shell server terminal (`t_…`) a terminal pane showed: it
+    /// keeps running while the app is closed, and the pane reattaches to it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -47,6 +56,17 @@ pub struct SavedTab {
 pub struct SavedWorkspace {
     pub name: String,
     pub root: PathBuf,
+    /// The Gentle Shell server whose folder `root` is, by its server id (by
+    /// its address when saved before ids were kept); absent for a folder on
+    /// this computer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server: Option<String>,
+    /// What runs a workspace that isn't a server's when it isn't this
+    /// computer: a WSL distro or a command (`gentle_core::backend`'s JSON).
+    /// Saved since [`VERSION`] 2; one saved before ran where the default
+    /// said ([`gentle_core::machines::saved_machine`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend: Option<serde_json::Value>,
     #[serde(default)]
     pub tabs: Vec<SavedTab>,
     #[serde(default)]
@@ -317,25 +337,34 @@ impl Default for SavedState {
     }
 }
 
-pub const VERSION: u32 = 1;
+/// Since 2, each workspace saves its own machine.
+pub const VERSION: u32 = gentle_core::machines::VERSION;
 
-/// How a workspace root is compared: canonical, so a folder reached through
-/// a symlink, `..` or another drive-letter case finds the same workspace as
-/// `gsd` (which passes canonical paths). Unresolvable paths stay as given.
-pub fn root_key(path: PathBuf) -> PathBuf {
+/// How a workspace root is compared. On this computer canonical, so a
+/// folder reached through a symlink, `..` or another drive-letter case
+/// finds the same workspace as `gsd` (which passes canonical paths);
+/// unresolvable paths stay as given. A Gentle Shell server's folder
+/// (`on_server`) is normalized by its text alone
+/// ([`gentle_core::serve::folder_key`]): it is never resolved here.
+pub fn root_key(path: PathBuf, on_server: bool) -> PathBuf {
+    if on_server {
+        return gentle_core::serve::folder_key(&path.to_string_lossy()).into();
+    }
     dunce::canonicalize(&path).unwrap_or(path)
 }
 
-/// The position of the root that is `folder` (already a [`root_key`]),
-/// comparing saved roots canonically too: older saves and other entry points
-/// may hold a root reached another way.
-pub fn find_root<'a>(
-    roots: impl Iterator<Item = &'a PathBuf>,
+/// The position of the workspace that is `folder` (already a
+/// [`root_key`], `on_server` saying how) on `machine`, among `(root,
+/// machine)` pairs: only a workspace on the same machine matches, and its
+/// root is compared the same way as `folder`, since older saves and other
+/// entry points may hold a root reached another way.
+pub fn find_root<'a, M: PartialEq>(
+    mut spaces: impl Iterator<Item = (&'a PathBuf, M)>,
     folder: &std::path::Path,
+    machine: M,
+    on_server: bool,
 ) -> Option<usize> {
-    roots
-        .map(|root| root_key(root.clone()))
-        .position(|root| root == folder)
+    spaces.position(|(root, there)| there == machine && root_key(root.clone(), on_server) == folder)
 }
 
 pub fn now() -> u64 {

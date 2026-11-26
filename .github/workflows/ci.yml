@@ -73,4 +73,7 @@ jobs:
           path: ~/apt-archives
           key: apt-${{ runner.arch }}-${{ env.ImageOS }}-v1
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - run: cargo test --workspace --locked
+      # Every test binary runs even after one fails, so the terminal host's
+      # (`crates/term-host`: loopback TCP and ConPTY everywhere, the Unix
+      # socket on Linux and macOS) report on all three systems.
+      - run: cargo test --workspace --locked --no-fail-fast

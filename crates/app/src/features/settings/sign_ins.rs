@@ -116,6 +116,7 @@ mod tests {
             configured: kind.is_some(),
             kind,
             source: kind.map(|_| AuthSource::Stored),
+            login_kinds: Vec::new(),
         }
     }
 

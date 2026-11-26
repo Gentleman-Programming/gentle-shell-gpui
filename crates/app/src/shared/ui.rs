@@ -82,6 +82,15 @@ fn with_hue(hex: u32, degrees: f32) -> Hsla {
 }
 
 impl Palette {
+    /// [`pane_ground`]: always opaque.
+    pub fn pane_ground(&self) -> Hsla {
+        Hsla {
+            a: 1.,
+            ..self.window_bg
+        }
+        .blend(self.panel)
+    }
+
     /// The theme's roles under `glass` (the Appearance sliders).
     ///
     /// Transparency fades the chrome (the window's ground: title bar, the
@@ -279,6 +288,13 @@ pub const INK_COVERAGE: f64 = 0.92;
 /// Panes, sidebars and screens.
 pub fn panel() -> Hsla {
     themes::palette(|p| p.panel)
+}
+/// A pane made opaque: its panel over the window's ground, over that
+/// ground's own color where glass would show the desktop. Code editors
+/// paint their line-number gutter with it ([`apply_theme`]): the kit's own
+/// gutter is translucent, so text scrolled sideways showed through it.
+pub fn pane_ground() -> Hsla {
+    themes::palette(|p| p.pane_ground())
 }
 /// Cards and fields.
 pub fn surface() -> Hsla {
@@ -577,6 +593,10 @@ pub fn apply_theme(cx: &mut App) {
         theme.mono_font_size = px(code_size * scale);
         theme.radius = px(8. * scale);
         theme.radius_lg = px(12. * scale);
+        // An opaque gutter the color of the pane the editor sits on.
+        let mut highlight = (*theme.highlight_theme).clone();
+        highlight.style.editor_gutter_background = Some(p.pane_ground());
+        theme.highlight_theme = std::sync::Arc::new(highlight);
     });
 }
 
@@ -772,6 +792,41 @@ pub fn screen_header() -> Div {
         .border_color(border())
 }
 
+/// After a [`screen_header`] title, the machine the screen shows ("· This
+/// Mac", "· <name> (server)").
+pub fn screen_machine(machine: &gentle_core::backend::Backend) -> Div {
+    div()
+        .flex_shrink_0()
+        .text_sm()
+        .text_color(muted())
+        .child(format!(
+            "· {}",
+            gentle_core::machines::screen_label(machine)
+        ))
+}
+
+/// Which machine a screen is about (Configuration's "Settings for",
+/// Profiles, Usage): `machines` as a [`segmented`] control, `machine`
+/// chosen; `on_select` gets the index picked. `None` with one machine.
+pub fn machine_picker(
+    id: &'static str,
+    machines: &[gentle_core::backend::Backend],
+    machine: &gentle_core::backend::Backend,
+    on_select: impl Fn(&usize, &mut gpui_kit::Window, &mut App) + 'static,
+) -> Option<Div> {
+    if machines.len() < 2 {
+        return None;
+    }
+    let labels: Vec<SharedString> = machines
+        .iter()
+        .map(|choice| gentle_core::machines::name(choice).into())
+        .collect();
+    let selected = machines
+        .iter()
+        .position(|choice| gentle_core::machines::same(choice, machine));
+    Some(segmented(id, &labels, selected, on_select))
+}
+
 /// A text field frame for `Input::new(..).appearance(false)`: same height,
 /// radius and border everywhere.
 pub fn field() -> Div {
@@ -879,7 +934,7 @@ pub fn picker_row(
 /// "This project / All", "Agents / Activity", "Pro / Max" switch.
 pub fn segmented(
     id: &'static str,
-    labels: &[&'static str],
+    labels: &[impl Into<SharedString> + Clone],
     selected: Option<usize>,
     on_select: impl Fn(&usize, &mut gpui_kit::Window, &mut App) + 'static,
 ) -> Div {
@@ -911,7 +966,7 @@ pub fn segmented(
                     d.text_color(muted()).hover(|d| d.text_color(fg()))
                 })
                 .on_click(move |_, window, cx| on_select(&i, window, cx))
-                .child(*label)
+                .child(Into::<SharedString>::into(label.clone()))
         }))
 }
 
@@ -1473,6 +1528,19 @@ mod tests {
         let latte = Palette::new(find("Catppuccin Latte"), clear_at(0.));
         assert!(latte.light);
         assert!(latte.fg.l < latte.window_bg.l);
+    }
+
+    #[test]
+    fn the_pane_ground_is_opaque_and_matches_a_solid_pane() {
+        let catalog = crate::shared::themes::load_catalog(Vec::new(), Vec::new());
+        let cute = catalog.iter().find(|t| t.name == "Gentleman-Cute").unwrap();
+        let clear = Palette::new(cute, clear_at(1.));
+        assert!(clear.panel.a < 1.);
+        assert_eq!(clear.pane_ground().a, 1.);
+        let solid = Palette::new(cute, clear_at(0.));
+        if solid.panel.a >= 1. {
+            assert_eq!(solid.pane_ground(), solid.panel);
+        }
     }
 
     #[test]

@@ -22,6 +22,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::panel::{Body, CHROME, MAX_HEIGHT, PanelView};
+use crate::shared::diff_fit::DiffFit;
 use crate::shared::ui;
 
 /// The file list's width (px at 100 %), shown with two files or more.
@@ -47,6 +48,8 @@ struct Viewer {
     state: Entity<DiffState>,
     /// What it shows.
     content: Review,
+    /// Redraws once the diff has measured itself, after it's (re)built.
+    fit: DiffFit,
     _observe: Subscription,
 }
 
@@ -417,6 +420,7 @@ impl PanelView {
             s.viewer = Some(Viewer {
                 state: state_entity.clone(),
                 content,
+                fit: DiffFit::default(),
                 _observe: observe,
             });
         }
@@ -428,6 +432,9 @@ impl PanelView {
             return div().into_any_element();
         };
         let Some(s) = self.review() else {
+            return div().into_any_element();
+        };
+        let Some(fit) = s.viewer.as_ref().map(|v| &v.fit) else {
             return div().into_any_element();
         };
         let review = s.edits.working();
@@ -494,8 +501,8 @@ impl PanelView {
                 let path = file.path().to_string();
                 let (decided, total) = counts.get(&path).copied().unwrap_or_default();
                 file_tools(&path, decided, total, &file_view)
-            })
-            .size_full();
+            });
+        let diff = fit.fill(diff, cx.entity_id());
 
         let list = (review.files.len() > 1).then(|| self.render_file_list(cx));
         h_flex()

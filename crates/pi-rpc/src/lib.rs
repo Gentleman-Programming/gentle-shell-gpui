@@ -3,7 +3,9 @@
 //! The protocol is strict JSONL over the child's stdin/stdout: commands go in,
 //! `response` records (correlated by `id`), session events and
 //! `extension_ui_request` records come out. Records are split on LF only, never
-//! on Unicode line separators, which are valid inside JSON strings.
+//! on Unicode line separators, which are valid inside JSON strings. A Gentle
+//! Shell server's session carries the same records over HTTP and an event
+//! stream ([`serve`]); [`PiProcess`] is the same for both.
 
 pub mod desktop_rpc;
 pub mod file_cache;
@@ -12,6 +14,7 @@ mod job;
 mod launch;
 mod login;
 mod record;
+pub mod serve;
 
 pub use home::{
     Homes, adopt_standalone_config, backend_homes, gentle_pi_root, launcher_config_path,
@@ -24,9 +27,9 @@ pub use job::contain;
 pub use launch::neutral_dir;
 pub use launch::{
     BundledInstall, LaunchSpec, backend_version, child_path, command, find_program, forget_cached,
-    forget_versions, managed_install_root, output_within, remote_backend, resolve_backend,
-    resolve_node, set_extensions, set_extra_path, set_system_prompt, split_args, version_output,
-    version_stderr,
+    forget_versions, managed_install_root, output_within, probe_host_tools, remote_backend,
+    resolve_backend, resolve_node, set_extensions, set_extra_path, set_system_prompt, split_args,
+    takes_host_tools, version_output, version_stderr,
 };
 pub use record::{Record, Response, UiMethod, UiRequest, parse_record};
 
@@ -36,10 +39,10 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, ChildStdin, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
-/// Everything the child process reports that is not a correlated response.
+/// Everything the backend reports that is not a correlated response.
 #[derive(Debug, Clone)]
 pub enum Incoming {
     /// A session event (`agent_start`, `message_update`, `tool_execution_end`, …).
@@ -48,27 +51,56 @@ pub enum Incoming {
     Ui(UiRequest),
     /// One diagnostic line from stderr. Never protocol data.
     Stderr(String),
+    /// Records the backend printed since the last one received are gone (a
+    /// Gentle Shell server's replay window passed them while the stream was
+    /// reconnecting): read the whole state again.
+    Resync,
+    /// A Gentle Shell server session's dialog was answered by another of its
+    /// clients: close it here if it is still shown. `refused` when this
+    /// client's own answer came second and the server didn't take it.
+    DialogResolved { id: String, refused: bool },
     /// The child exited; `None` when it was killed by a signal.
     Exited(Option<i32>),
 }
 
 type Pending = Arc<Mutex<HashMap<String, async_channel::Sender<Response>>>>;
 
-/// A running Pi RPC child process.
+/// Desktop requests a child was sent over stdin ([`PiProcess::desktop`]),
+/// by `requestId`: their answers go to the caller, never to `incoming`.
+type DesktopWaiters =
+    Arc<Mutex<HashMap<String, mpsc::Sender<Result<desktop_rpc::DesktopResponse, String>>>>>;
+
+/// How long a child has to answer a Desktop request sent over stdin.
+const DESKTOP_ANSWER: Duration = Duration::from_secs(30);
+
+/// A running Pi RPC backend: a child process, or a Gentle Shell server's
+/// session ([`Self::serve`]).
 pub struct PiProcess {
-    stdin: Mutex<Option<ChildStdin>>,
-    child: Arc<Mutex<Child>>,
+    io: Io,
     pending: Pending,
     next_id: AtomicU64,
-    /// Set by the first [`Self::shutdown`], so Drop after an explicit
-    /// shutdown doesn't signal and reap twice.
+    /// Set by the first [`Self::shutdown`] (or [`Self::detach`]), so Drop
+    /// after an explicit shutdown doesn't signal and reap twice.
     stopping: AtomicBool,
-    pid: u32,
     traffic: Arc<Traffic>,
 }
 
+/// Where commands go and what ends the backend.
+enum Io {
+    /// A child process: JSONL on its stdin.
+    Child {
+        stdin: Mutex<Option<ChildStdin>>,
+        child: Arc<Mutex<Child>>,
+        pid: u32,
+        desktop: DesktopWaiters,
+    },
+    /// A session of a Gentle Shell server (its client is several HTTP
+    /// agents: boxed, so a child's `Io` stays small).
+    Server(Box<serve::Remote>),
+}
+
 /// What a backend has sent so far, for the app's diagnostics: two relaxed
-/// counters per stdout line.
+/// counters per stdout line (per stream record from a server).
 #[derive(Debug, Default)]
 struct Traffic {
     records: AtomicU64,
@@ -111,6 +143,7 @@ impl PiProcess {
 
         let (tx, rx) = async_channel::unbounded();
         let pending: Pending = Arc::default();
+        let desktop: DesktopWaiters = Arc::default();
         let child = Arc::new(Mutex::new(child));
 
         {
@@ -128,34 +161,43 @@ impl PiProcess {
         }
         {
             let pending = pending.clone();
+            let desktop = desktop.clone();
             let traffic = traffic.clone();
             let child = child.clone();
             std::thread::Builder::new()
                 .name("pi-rpc-stdout".into())
                 .spawn(move || {
-                    read_records(stdout, &pending, &traffic, &tx);
+                    read_records(stdout, &pending, &desktop, &traffic, &tx);
                     // Unblock every caller still waiting for a response.
                     pending.lock().unwrap().clear();
+                    desktop.lock().unwrap().clear();
                     let code = wait_child(&child);
                     let _ = tx.send_blocking(Incoming::Exited(code));
                 })?;
         }
 
         let process = Arc::new(Self {
-            stdin: Mutex::new(Some(stdin)),
-            child,
+            io: Io::Child {
+                stdin: Mutex::new(Some(stdin)),
+                child,
+                pid,
+                desktop,
+            },
             pending,
             next_id: AtomicU64::new(1),
             stopping: AtomicBool::new(false),
-            pid,
             traffic,
         });
         Ok((process, rx))
     }
 
-    /// The backend's process id (the root of its process tree).
-    pub fn pid(&self) -> u32 {
-        self.pid
+    /// The backend's process id (the root of its process tree); `None` for
+    /// a server's session, which runs on another machine.
+    pub fn pid(&self) -> Option<u32> {
+        match &self.io {
+            Io::Child { pid, .. } => Some(*pid),
+            Io::Server(_) => None,
+        }
     }
 
     /// Records and bytes received from the backend since it started.
@@ -198,7 +240,7 @@ impl PiProcess {
         object.insert("id".into(), Value::String(id.clone()));
         let (tx, rx) = async_channel::bounded(1);
         self.pending.lock().unwrap().insert(id.clone(), tx);
-        if let Err(error) = self.write(&command) {
+        if let Err(error) = self.write(command) {
             self.pending.lock().unwrap().remove(&id);
             return Err(error);
         }
@@ -218,13 +260,17 @@ impl PiProcess {
                 json!({"type": "extension_ui_response", "id": id, "cancelled": true})
             }
         };
-        self.write(&record)
+        self.write(record)
     }
 
-    fn write(&self, record: &Value) -> Result<()> {
-        let mut line = serde_json::to_vec(record)?;
+    fn write(&self, record: Value) -> Result<()> {
+        let stdin = match &self.io {
+            Io::Child { stdin, .. } => stdin,
+            Io::Server(remote) => return remote.send(record),
+        };
+        let mut line = serde_json::to_vec(&record)?;
         line.push(b'\n');
-        let mut guard = self.stdin.lock().unwrap();
+        let mut guard = stdin.lock().unwrap();
         let stdin = guard
             .as_mut()
             .ok_or_else(|| anyhow!("gentle-shell is shutting down"))?;
@@ -237,15 +283,19 @@ impl PiProcess {
     /// SIGTERM: the launcher forwards it to Pi, whose handler stops the
     /// detached processes its agents started. Elsewhere it closes stdin.
     /// Once the backend exits, or after `grace`, whatever is left of it is
-    /// killed (see [`kill_tree`]) and the child reaped. Only the first call
-    /// acts.
+    /// killed (see [`kill_tree`]) and the child reaped. A server's session
+    /// is stopped and forgotten there (`DELETE`). Only the first call acts.
     pub fn shutdown(&self, grace: Duration) {
         if self.stopping.swap(true, Ordering::AcqRel) {
             return;
         }
+        let (stdin, child) = match &self.io {
+            Io::Child { stdin, child, .. } => (stdin, child),
+            Io::Server(remote) => return remote.stop(),
+        };
         // Taken now so nothing more is written.
-        let stdin = self.stdin.lock().unwrap().take();
-        let child = self.child.clone();
+        let stdin = stdin.lock().unwrap().take();
+        let child = child.clone();
         // Under the lock nothing reaps the child, so its pid (and group id)
         // is still its own when signalled. One that already exited was just
         // reaped here; its pid may be reused, so nothing is signalled.
@@ -284,6 +334,79 @@ impl PiProcess {
                 kill_tree(&mut child.lock().unwrap());
             });
     }
+
+    /// The app is quitting: a server's session is left running, so the next
+    /// launch reattaches to it (`true`); this client just stops following
+    /// it. A child process can't outlive the app (`false`): shut it down.
+    pub fn detach(&self) -> bool {
+        let Io::Server(remote) = &self.io else {
+            return false;
+        };
+        if !self.stopping.swap(true, Ordering::AcqRel) {
+            remote.detach();
+        }
+        true
+    }
+
+    /// A Desktop request to a child, as the `/gentle:desktop` prompt on its
+    /// stdin, and its answer: the widget record with the request's
+    /// `requestId`, which the stdout reader hands here instead of to
+    /// `incoming`. A prompt the child refuses (any disposition but
+    /// `handled`) fails at once. Blocking, up to [`DESKTOP_ANSWER`].
+    fn desktop_stdin(
+        &self,
+        desktop: &DesktopWaiters,
+        request: &desktop_rpc::DesktopRequest,
+    ) -> Result<desktop_rpc::DesktopResponse> {
+        let id = request.request_id().to_string();
+        let (tx, answer) = mpsc::channel();
+        desktop.lock().unwrap().insert(id.clone(), tx.clone());
+        let taken = match self.send(request.prompt_command()) {
+            Ok(taken) => taken,
+            Err(error) => {
+                desktop.lock().unwrap().remove(&id);
+                return Err(error);
+            }
+        };
+        // The prompt's own response only says whether the request was
+        // taken; a refusal means no answer will come.
+        let _ = std::thread::Builder::new()
+            .name("pi-rpc-desktop".into())
+            .spawn(move || {
+                let refused = match taken.recv_blocking() {
+                    Ok(response)
+                        if response.success && response.data["disposition"] == "handled" =>
+                    {
+                        return;
+                    }
+                    Ok(response) => format!(
+                        "gentle-shell didn't take the request: {}",
+                        response.error.unwrap_or_else(|| {
+                            response.data["disposition"]
+                                .as_str()
+                                .unwrap_or("no disposition")
+                                .to_string()
+                        })
+                    ),
+                    Err(_) => "gentle-shell exited before answering".to_string(),
+                };
+                let _ = tx.send(Err(refused));
+            });
+        let answer = answer.recv_timeout(DESKTOP_ANSWER);
+        desktop.lock().unwrap().remove(&id);
+        match answer {
+            Ok(Ok(response)) => Ok(response),
+            Ok(Err(refused)) => Err(anyhow!(refused)),
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(anyhow!(
+                "gentle-shell didn't answer {} within {} s",
+                request.method(),
+                DESKTOP_ANSWER.as_secs()
+            )),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                Err(anyhow!("gentle-shell exited before answering"))
+            }
+        }
+    }
 }
 
 impl Drop for PiProcess {
@@ -303,6 +426,7 @@ pub enum UiAnswer {
 fn read_records(
     stdout: impl Read,
     pending: &Pending,
+    desktop: &DesktopWaiters,
     traffic: &Traffic,
     tx: &async_channel::Sender<Incoming>,
 ) {
@@ -317,32 +441,70 @@ fn read_records(
                 traffic.bytes.fetch_add(n as u64, Ordering::Relaxed);
             }
         }
-        let incoming = match parse_record(&line) {
-            Ok(Record::Response(response)) => {
-                let sender = response
-                    .id
-                    .as_ref()
-                    .and_then(|id| pending.lock().unwrap().remove(id));
-                if let Some(sender) = sender {
-                    let _ = sender.send_blocking(response);
-                } else if !response.success {
-                    let error = response.error.unwrap_or_default();
-                    let _ = tx.send_blocking(Incoming::Stderr(format!(
-                        "{} failed: {error}",
-                        response.command
-                    )));
-                }
-                continue;
-            }
-            Ok(Record::Ui(request)) => Incoming::Ui(request),
-            Ok(Record::Event(event)) => Incoming::Event(event),
-            Ok(Record::Empty) => continue,
-            Err(error) => Incoming::Stderr(format!("unparseable RPC record: {error}")),
-        };
-        if tx.send_blocking(incoming).is_err() {
+        let record = parse_record(&line);
+        if let Ok(Record::Ui(request)) = &record
+            && answer_desktop(request, desktop)
+        {
+            continue;
+        }
+        if !dispatch(record, pending, tx) {
             return;
         }
     }
+}
+
+/// Hand a Desktop widget record to the [`PiProcess::desktop`] call waiting
+/// for it: a response whose `requestId` one awaits. `true` when taken, so
+/// the app's own Desktop channel never sees it (it carries no `seq`, and its
+/// id is none the channel issued). Events and every other record go on.
+fn answer_desktop(request: &UiRequest, desktop: &DesktopWaiters) -> bool {
+    let mut waiters = desktop.lock().unwrap();
+    if waiters.is_empty() {
+        return false;
+    }
+    let Ok(Some(desktop_rpc::DesktopRecord::Response(response))) =
+        desktop_rpc::decode_widget(request)
+    else {
+        return false;
+    };
+    let Some(waiter) = response.request_id().and_then(|id| waiters.remove(id)) else {
+        return false;
+    };
+    let _ = waiter.send(Ok(response));
+    true
+}
+
+/// Route one record: a response to the caller waiting for it (a failure
+/// nobody waits for becomes a diagnostic line), anything else to `tx`.
+/// `false` once nobody listens any more.
+fn dispatch(
+    record: Result<Record>,
+    pending: &Pending,
+    tx: &async_channel::Sender<Incoming>,
+) -> bool {
+    let incoming = match record {
+        Ok(Record::Response(response)) => {
+            let sender = response
+                .id
+                .as_ref()
+                .and_then(|id| pending.lock().unwrap().remove(id));
+            if let Some(sender) = sender {
+                let _ = sender.send_blocking(response);
+            } else if !response.success {
+                let error = response.error.unwrap_or_default();
+                let _ = tx.send_blocking(Incoming::Stderr(format!(
+                    "{} failed: {error}",
+                    response.command
+                )));
+            }
+            return true;
+        }
+        Ok(Record::Ui(request)) => Incoming::Ui(request),
+        Ok(Record::Event(event)) => Incoming::Event(event),
+        Ok(Record::Empty) => return true,
+        Err(error) => Incoming::Stderr(format!("unparseable RPC record: {error}")),
+    };
+    tx.send_blocking(incoming).is_ok()
 }
 
 fn wait_child(child: &Mutex<Child>) -> Option<i32> {

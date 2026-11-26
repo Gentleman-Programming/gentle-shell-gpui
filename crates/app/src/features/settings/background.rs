@@ -397,17 +397,37 @@ impl SettingsView {
     }
 
     /// Gentle Shell's agent behavior: permissions, persona and background
-    /// subagents (with their existing shell-command switch).
+    /// subagents (with their existing shell-command switch). On a server the
+    /// permission default and persona are what its Gentle Shell reported
+    /// (`get_permission_mode`, the `persona` store), never a file here.
     pub(super) fn gentle_ai_section(&self, s: &Snapshot, cx: &mut Context<Self>) -> Div {
+        let unreported = |reported: bool, fallback: &str| match self.server() {
+            Some(server) if !reported => format!("not reported by {}", server.name),
+            _ => fallback.to_string(),
+        };
+        let persona_read = self
+            .shell_config
+            .state(pi_rpc::desktop_rpc::ConfigStore::Persona)
+            .is_some();
         section(IconName::ShieldCheck, "Gentle AI")
             .child(row(
                 "Permissions (new sessions)",
-                or_dash(&s.permission_mode, "normal"),
+                or_dash(
+                    &s.permission_mode,
+                    &unreported(s.permission_mode.is_some(), "normal"),
+                ),
             ))
-            .child(row("Persona", or_dash(&s.persona, "gentleman")))
+            .child(row(
+                "Persona",
+                or_dash(&s.persona, &unreported(persona_read, "gentleman")),
+            ))
             .child(row(
                 "Background subagents",
-                s.background_subagents.describe(),
+                if self.server().is_some() && self.background.shell.is_none() {
+                    unreported(false, "")
+                } else {
+                    s.background_subagents.describe()
+                },
             ))
             .child(
                 v_flex()

@@ -10,6 +10,26 @@ impl Workspace {
             .unwrap_or_else(|| self.space().root.clone())
     }
 
+    /// Where a new agent starts: [`Self::active_cwd`], unless the focused
+    /// agent runs on another machine than the workspace (a tab restored
+    /// from before workspaces kept their machine): then the workspace's
+    /// folder, never a path of another machine.
+    pub(super) fn new_agent_cwd(&self, cx: &App) -> PathBuf {
+        let machine = self.space().machine();
+        let elsewhere = self
+            .focused_pane()
+            .and_then(|id| self.panes.get(&id))
+            .and_then(|pane| pane.session.as_ref())
+            .is_some_and(|session| {
+                !gentle_core::machines::same(&session.read(cx).runs_on(), &machine)
+            });
+        if elsewhere {
+            self.space().root.clone()
+        } else {
+            self.active_cwd(cx)
+        }
+    }
+
     /// The agent the screens act on: the focused pane's, else the first agent
     /// in the tab, else any in the workspace.
     pub(super) fn active_session(&self) -> Option<Entity<SessionView>> {
@@ -79,6 +99,16 @@ impl Workspace {
                 None if pane.item.kind == PaneKind::Canvas => pane.session_file.clone(),
                 None => None,
             },
+            // A canvas's floating agent on a server reattaches like a tab.
+            server: match &pane.session {
+                Some(session) => session.read(cx).server_session(),
+                None => self
+                    .canvas_view(id)
+                    .and_then(|canvas| canvas.read(cx).agent_server_session(cx)),
+            },
+            terminal: self
+                .terminal_view(id)
+                .and_then(|terminal| terminal.read(cx).server_terminal()),
         })
     }
 
@@ -95,6 +125,12 @@ impl Workspace {
                 SavedWorkspace {
                     name: space.name.clone(),
                     root: space.root.clone(),
+                    server: space.server.clone(),
+                    backend: space
+                        .server
+                        .is_none()
+                        .then(|| space.backend.to_json())
+                        .flatten(),
                     tabs,
                     active_tab: space.active,
                     last_active: space.last_active,
@@ -133,8 +169,10 @@ impl Workspace {
         }
     }
 
-    /// Save soon, at most once per half second.
+    /// Save soon, at most once per half second. What changed may be which
+    /// workspace shows or its folder: work finds its machine from now on.
     pub(super) fn schedule_save(&mut self, cx: &mut Context<Self>) {
+        self.publish_machines();
         if self.save_task.is_some() {
             return;
         }
@@ -187,6 +225,8 @@ mod tests {
             cwd: PathBuf::from(folder),
             path: None,
             session: None,
+            server: None,
+            terminal: None,
         }
     }
 

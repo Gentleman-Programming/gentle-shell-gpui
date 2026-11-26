@@ -3,6 +3,7 @@
 //! no OS APIs (see docs/adr/0002-nucleo-puro-incremental.md).
 
 pub mod activity;
+pub mod agent_config;
 pub mod alert_timing;
 pub mod backend;
 pub mod browser;
@@ -25,7 +26,9 @@ pub mod hydration;
 pub mod ides;
 pub mod input_style;
 pub mod interface_size;
+pub mod machines;
 pub mod markdown;
+pub mod model_defaults;
 pub mod music;
 pub mod notifications;
 pub mod preview;
@@ -33,12 +36,16 @@ pub mod profiles;
 pub mod prompt_history;
 pub mod screen;
 pub mod scroll;
+pub mod serve;
+pub mod server_checks;
 pub mod sessions;
 pub mod setup;
+pub mod sign_in;
 pub mod text;
 pub mod tools;
 pub mod tower;
 pub mod transcript;
+pub mod transfer;
 pub mod typing_kisses;
 pub mod usage;
 pub mod version;

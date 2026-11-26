@@ -1,7 +1,8 @@
 //! What a prompt carries besides its typed text: images (validation, the RPC
 //! payload, and the decode cache conversation thumbnails draw from), long
-//! pasted texts, and the `[Image #N]` / `[Pasted text #N]` composer tokens
-//! that stand for them.
+//! pasted texts, files sent to the server a tab runs on (named in the prompt
+//! by their server path), and the `[Image #N]` / `[Pasted text #N]` composer
+//! tokens that stand for them.
 
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
@@ -15,7 +16,10 @@ use base64::engine::general_purpose::STANDARD;
 use gpui_kit::{App, Image, ImageFormat, SharedString};
 use serde_json::{Value, json};
 
+use gentle_core::backend::Backend;
 use gentle_core::transcript::{UserImage, image_key};
+
+use crate::features::backend::server;
 
 /// Largest image accepted, before base64.
 pub const MAX_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
@@ -89,6 +93,40 @@ pub fn load_path(path: &Path) -> Result<Attachment, Rejection> {
     }
     let bytes = std::fs::read(path).map_err(unreadable)?;
     Attachment::from_bytes(&name, bytes)
+}
+
+/// Send a file from this computer to the server `choice` (`POST
+/// /api/uploads`) for the agent there to read: the path the server keeps it
+/// at, or why it couldn't (the server's own message). Blocking.
+pub fn upload_path(choice: &Backend, path: &Path) -> Result<String, String> {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string());
+    if !server::offers(choice, "uploads") {
+        return Err(format!("{name} wasn't attached. {}", server::UNAVAILABLE));
+    }
+    if !path.is_file() {
+        return Err(format!(
+            "{name} is not a file, so it can't be sent to the server."
+        ));
+    }
+    let bytes = std::fs::read(path).map_err(|e| format!("Couldn't read {name}: {e}"))?;
+    let client = server::client(choice).map_err(|e| e.to_string())?;
+    client
+        .upload(&name, &bytes)
+        .map(|uploaded| uploaded.path)
+        .map_err(|e| format!("{name} wasn't sent to the server: {}", e.message))
+}
+
+/// How a file the server keeps is named in the prompt: its path, quoted
+/// when it holds whitespace so it reads as one path.
+pub fn path_mention(path: &str) -> String {
+    if path.chars().any(char::is_whitespace) {
+        format!("\"{path}\"")
+    } else {
+        path.to_string()
+    }
 }
 
 /// Whether a pasted path is an image, judged by its first bytes rather than
@@ -786,6 +824,18 @@ mod tests {
         );
         let long = (0..40).map(|i| format!("{i}\n")).collect::<String>();
         assert_eq!(PastedText::new(long).preview.lines().count(), PREVIEW_LINES);
+    }
+
+    #[test]
+    fn server_paths_with_spaces_are_quoted() {
+        assert_eq!(
+            path_mention("/home/ana/.gentle-shell/serve/uploads/d/r/notes.md"),
+            "/home/ana/.gentle-shell/serve/uploads/d/r/notes.md"
+        );
+        assert_eq!(
+            path_mention("/srv/up/my notes.md"),
+            "\"/srv/up/my notes.md\""
+        );
     }
 
     #[test]
