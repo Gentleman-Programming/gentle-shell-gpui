@@ -3,7 +3,9 @@
 //! source and removing one (`install_package`, `remove_package`) with the
 //! job's output as it comes (`package_progress`, `package_finished`). The
 //! server validates the source as `gentle-shell install` does and reloads
-//! as it does afterwards. One job at a time from this screen.
+//! as it does afterwards: a list asked while the session reloads can go
+//! unanswered, so the one read after a job is asked again once
+//! ([`relist`]). One job at a time from this screen.
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -17,7 +19,7 @@ use pi_rpc::desktop_rpc::{DesktopMethod, InstalledPackage, PackageScope};
 use super::SettingsView;
 use super::layout::section;
 use super::remote::ServerPlace;
-use crate::features::session::{AccountEvent, ReadOutcome, ReadRequest, ReadTicket};
+use crate::features::session::{AccountEvent, ReadFailure, ReadOutcome, ReadRequest, ReadTicket};
 use crate::shared::ui;
 
 /// Output lines kept for a job.
@@ -118,8 +120,18 @@ pub(super) struct ServerPackages {
     /// Listing failed; not asked again until something changes.
     list_error: Option<String>,
     list_ticket: Option<ReadTicket>,
+    /// The list is read after a job: asked again once if the session,
+    /// reloading after the change, lets it go unanswered.
+    list_after_job: bool,
     pub(super) job: Option<PackageJob>,
     job_ticket: Option<ReadTicket>,
+}
+
+/// Whether a list read that failed with `failure` is asked again: only the
+/// one after a job (`after_job`), and only when nothing answered (the
+/// session reloading after the change), never a refusal.
+fn relist(failure: &ReadFailure, after_job: bool) -> bool {
+    after_job && matches!(failure, ReadFailure::Timeout | ReadFailure::Dropped)
 }
 
 impl ServerPackages {
@@ -189,8 +201,10 @@ impl SettingsView {
         });
         if let Some(outcome) = list {
             self.server_packages.list_ticket = None;
+            let after_job = std::mem::take(&mut self.server_packages.list_after_job);
             match outcome {
                 ReadOutcome::Packages(packages) => self.server_packages.list = Some(packages),
+                ReadOutcome::Failed(failure) if relist(&failure, after_job) => {}
                 ReadOutcome::Failed(failure) => {
                     self.server_packages.list_error = Some(failure.message())
                 }
@@ -237,6 +251,7 @@ impl SettingsView {
         {
             self.server_packages.list = None;
             self.server_packages.list_error = None;
+            self.server_packages.list_after_job = true;
             self.ask_server_packages(cx);
             self.ask_update_status(false, cx);
         }
@@ -432,8 +447,23 @@ fn job_view(job: &PackageJob, server: &str) -> Div {
 mod tests {
     use pi_rpc::desktop_rpc::{PackageFinished, PackageProgress};
 
-    use super::PackageJob;
-    use crate::features::session::AccountEvent;
+    use super::{PackageJob, relist};
+    use crate::features::session::{AccountEvent, ReadFailure};
+
+    #[test]
+    fn the_list_after_a_job_is_asked_again_when_nothing_answered() {
+        // The session reloads after the change: its answer can be lost.
+        assert!(relist(&ReadFailure::Timeout, true));
+        assert!(relist(&ReadFailure::Dropped, true));
+        // A refusal says why; it isn't asked again.
+        let refused = ReadFailure::Refused {
+            code: None,
+            message: "nope".into(),
+        };
+        assert!(!relist(&refused, true));
+        // Only the read after a job, and only once (the caller takes the flag).
+        assert!(!relist(&ReadFailure::Timeout, false));
+    }
 
     fn line(job: &str, text: &str) -> AccountEvent {
         AccountEvent::PackageProgress(PackageProgress {
