@@ -1254,6 +1254,7 @@ mod tests {
                     _lifecycle: Vec::new(),
                     notices: cx.new(|_| Notices::default()),
                     renaming: None,
+                    tab_strip: Default::default(),
                     surge: None,
                     surge_runs: 0,
                     _surge_end: None,

@@ -475,6 +475,8 @@ pub struct Workspace {
     /// The bell's notification center, shared by every tab.
     notices: Entity<Notices>,
     renaming: Option<TabRename>,
+    /// The horizontal tabs' scroll when they don't fit the title bar.
+    tab_strip: view::TabStrip,
     /// The max-effort surge playing over the window (its run number and when
     /// it started), and the timer that clears it.
     surge: Option<(u64, std::time::Instant, crate::shared::surge::Level)>,
@@ -650,6 +652,7 @@ impl Workspace {
             save_task: None,
             notices: cx.new(|_| Notices::default()),
             renaming: None,
+            tab_strip: Default::default(),
             surge: None,
             surge_runs: 0,
             stages: Vec::new(),
