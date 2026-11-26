@@ -421,8 +421,10 @@ impl SessionView {
                                     .w_full()
                                     .min_w_0()
                                     .rounded_lg()
+                                    .border_1()
+                                    .border_color(ui::border())
                                     .p(rems(10. / 16.))
-                                    .bg(ui::raised())
+                                    .bg(ui::surface())
                                     .child(code_block_header(&block, cx))
                                     .child(
                                         view.style(
@@ -430,7 +432,8 @@ impl SessionView {
                                                 StyleRefinement::default()
                                                     .rounded_md()
                                                     .bg(ui::well())
-                                                    .border_0()
+                                                    .border_1()
+                                                    .border_color(ui::border())
                                                     .pt(rems(14. / 16.))
                                                     .line_height(relative(1.7)),
                                             ),
@@ -2896,9 +2899,12 @@ fn code_block_header(block: &gpui_kit::base::text::CodeBlock, cx: &App) -> Div {
                 .id("code-language")
                 .debug_selector(|| "code-language".into())
                 .rounded_full()
+                .border_1()
+                .border_color(ui::border())
                 .px(rems(11. / 16.))
                 .py(rems(3. / 16.))
                 .font_weight(FontWeight::SEMIBOLD)
+                .text_color(ui::fg())
                 .bg(ui::surface_hover())
                 .children(language),
         )
