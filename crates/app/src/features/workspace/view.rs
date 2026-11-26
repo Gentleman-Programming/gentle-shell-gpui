@@ -147,12 +147,15 @@ impl Workspace {
             )
     }
 
-    pub(super) fn render_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(super) fn render_tabs(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let space = self.space();
         let weak = cx.entity().downgrade();
+        let rem = window.rem_size();
+        let at = |size: f32| rems(size / 16.).to_pixels(rem);
         h_flex()
             .id("horizontal-tab-strip")
             .gap(px(2.))
+            .flex_1()
             .min_w_0()
             .children(space.tabs.iter().enumerate().map(|(i, tab)| {
                 let active = i == space.active;
@@ -186,7 +189,46 @@ impl Workspace {
                     can_down: false,
                     compact: true,
                 };
+                // A tab's own parts (padding, border, icon, pane count; the
+                // close button on the active tab) never shrink; its title
+                // takes what is left. On the other tabs the close button
+                // floats over the tab's end while the pointer is on it, so
+                // an invisible button never eats their titles.
+                let renaming = self
+                    .renaming
+                    .as_ref()
+                    .is_some_and(|r| Some(r.pane) == focused);
+                let title_width = if renaming {
+                    at(160.)
+                } else {
+                    tab_title_width(&title, active, window, cx).min(at(180.))
+                };
+                let badge = if count > 1 {
+                    at(7.) + at(16.).max(at(8.) + at(6.5) * count.to_string().len() as f32)
+                } else {
+                    px(0.)
+                };
+                let close_slot = if active { at(7. + 18.) } else { px(0.) };
+                let chrome = at(10. + 4. + 14. + 7.) + px(2.) + badge + close_slot;
+                let close = div()
+                    .id(("close-tab", tab.id))
+                    .flex_none()
+                    .size(rems(18. / 16.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(rems(5. / 16.))
+                    .text_color(ui::faint())
+                    .invisible()
+                    .group_hover("tab", |s| s.visible())
+                    .hover(|s| s.bg(ui::surface_hover()).text_color(ui::fg()))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.close_tab(i, window, cx);
+                    }))
+                    .child(Icon::new(IconName::X).xsmall());
                 let item = h_flex()
+                    .flex_1()
                     .min_w_0()
                     .overflow_hidden()
                     .id(("tab", tab.id))
@@ -311,6 +353,7 @@ impl Workspace {
                     .when(count > 1, |d| {
                         d.child(
                             div()
+                                .flex_none()
                                 .h(rems(1.))
                                 .min_w(rems(1.))
                                 .px(rems(4. / 16.))
@@ -325,27 +368,37 @@ impl Workspace {
                                 .child(count.to_string()),
                         )
                     })
-                    .child(
-                        div()
-                            .id(("close-tab", tab.id))
-                            .size(rems(18. / 16.))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded(rems(5. / 16.))
-                            .text_color(ui::faint())
-                            .invisible()
-                            .group_hover("tab", |s| s.visible())
-                            .hover(|s| s.bg(ui::surface_hover()).text_color(ui::fg()))
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                cx.stop_propagation();
-                                this.close_tab(i, window, cx);
-                            }))
-                            .child(Icon::new(IconName::X).xsmall()),
-                    );
-                // Tabs shrink (titles end in …) so the title bar's buttons
-                // keep their place in a narrow window.
-                ui::appear(("tab-in", tab.id), div().flex().min_w_0().child(item))
+                    .map(|d| {
+                        if active {
+                            d.child(close)
+                        } else {
+                            d.child(
+                                div()
+                                    .absolute()
+                                    .top_0()
+                                    .bottom_0()
+                                    .right(rems(4. / 16.))
+                                    .flex()
+                                    .items_center()
+                                    .child(close.bg(ui::popover_bg())),
+                            )
+                        }
+                    });
+                // In a narrow window the titles share the room the title
+                // bar's buttons leave, evenly: each tab starts at its own
+                // parts and grows to at most its whole title, so a long
+                // title (a server shell's `user@host:~/folder`) ends in …
+                // before a short one loses its every letter.
+                ui::appear(
+                    ("tab-in", tab.id),
+                    div()
+                        .flex()
+                        .flex_grow(1.)
+                        .flex_basis(chrome)
+                        .max_w(chrome + title_width + px(1.))
+                        .min_w_0()
+                        .child(item),
+                )
             }))
             .child(
                 div()
@@ -844,6 +897,41 @@ impl Workspace {
                 .into_any_element(),
         }
     }
+}
+
+/// How wide `title` draws in a horizontal tab: the interface font at the
+/// tab's size, medium on the active tab.
+fn tab_title_width(title: &SharedString, active: bool, window: &Window, cx: &App) -> Pixels {
+    if title.is_empty() {
+        return px(0.);
+    }
+    let mut font = gpui_kit::font(
+        gpui_kit::component::ActiveTheme::theme(cx)
+            .font_family
+            .clone(),
+    );
+    if active {
+        font.weight = FontWeight::MEDIUM;
+    }
+    // One line: a title never wraps.
+    let text: SharedString = if title.contains(['\n', '\r']) {
+        title.replace(['\n', '\r'], " ").into()
+    } else {
+        title.clone()
+    };
+    let run = TextRun {
+        len: text.len(),
+        font,
+        color: ui::fg(),
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    };
+    let size = rems(12.5 / 16.).to_pixels(window.rem_size());
+    window
+        .text_system()
+        .shape_line(text, size, &[run], None)
+        .width
 }
 
 /// Height of the title bar's pills, tabs and buttons.

@@ -287,7 +287,7 @@ impl Render for Workspace {
                                                     .h(rems(14. / 16.))
                                                     .bg(ui::border()),
                                             )
-                                            .child(self.render_tabs(cx))
+                                            .child(self.render_tabs(window, cx))
                                     }),
                             )
                             .child(
