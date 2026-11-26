@@ -944,25 +944,26 @@ impl SessionView {
         self.refresh_thinking_levels(cx);
         self.refresh_commands(cx);
         self.request(json!({"type": "get_messages"}), cx, |this, result, _| {
-            if let Some(data) = this.report(result) {
-                let messages = data["messages"].as_array().cloned().unwrap_or_default();
-                if !messages.is_empty() {
-                    this.transcript.load_messages(&messages);
-                    this.prompt_history
-                        .seed(this.transcript.items.iter().filter_map(|item| match item {
-                            gentle_core::transcript::Item::User { text, .. } => Some(text.as_str()),
-                            _ => None,
-                        }));
-                    this.markdown.clear();
-                    this.sync_todo_from_history();
-                }
+            if let Some(data) = this.report(result)
+                && let Some(messages) = data["messages"].as_array()
+                && !messages.is_empty()
+            {
+                this.transcript.load_messages(messages);
+                this.prompt_history
+                    .seed(this.transcript.items.iter().filter_map(|item| match item {
+                        gentle_core::transcript::Item::User { text, .. } => Some(text.as_str()),
+                        _ => None,
+                    }));
+                this.markdown.clear();
+                this.sync_todo_from_history();
             }
         });
         self.refresh_stats(cx);
         self.refresh_model_default(cx);
     }
 
-    /// Re-read the model, thinking level and default after a profile apply.
+    /// Re-read the model, thinking level and default after a profile apply
+    /// or a model or thinking-level command.
     fn refresh_model(&mut self, cx: &mut Context<Self>) {
         self.request(json!({"type": "get_state"}), cx, |this, result, _| {
             if let Some(state) = this.report(result) {
@@ -1163,11 +1164,13 @@ impl SessionView {
         });
     }
 
-    /// Send any RPC command for a window-level screen; failures surface in the transcript.
+    /// Send a model or thinking-level command for a window-level screen;
+    /// failures surface in the transcript. Only the model state is re-read:
+    /// these commands leave the conversation as it was.
     pub fn send_command(&mut self, command: Value, cx: &mut Context<Self>) {
         self.request(command, cx, |this, result, cx| {
             this.report(result);
-            this.refresh_state(cx);
+            this.refresh_model(cx);
         });
     }
 

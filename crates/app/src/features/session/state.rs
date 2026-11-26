@@ -552,12 +552,23 @@ pub(in crate::features::session) mod desktop {
             }
         }
 
-        /// One incoming UI request; what it makes the tab send or report.
+        /// [`Self::ui_decoded`] for the raw request.
+        #[cfg(test)]
         pub(in crate::features::session) fn ui(&mut self, request: &UiRequest) -> Applied {
+            self.ui_decoded(pi_rpc::desktop_rpc::decode_widget(request))
+        }
+
+        /// One incoming UI request; what it makes the tab send or report.
+        /// `decoded` is the request's [`pi_rpc::desktop_rpc::decode_widget`]
+        /// result, so the record is not decoded again.
+        pub(in crate::features::session) fn ui_decoded(
+            &mut self,
+            decoded: Result<Option<DesktopRecord>, DesktopRpcError>,
+        ) -> Applied {
             // The adapter clears the pending request while correlating, so the
             // method it answered is read first.
             let awaiting = self.session.pending().map(|(_, method)| method);
-            match self.session.accept(request) {
+            match self.session.accept_decoded(decoded) {
                 Ok(Some(DesktopRecord::Response(response))) => match awaiting {
                     Some(DesktopMethod::Capabilities) => match response.capabilities() {
                         Ok(capabilities) => {
@@ -755,17 +766,28 @@ pub(in crate::features::session) mod desktop {
             supervision.seed(session)
         }
 
-        /// One incoming UI request for the supervision slice.
+        /// [`Self::supervision_apply_decoded`] for the raw request.
+        #[cfg(test)]
         pub(in crate::features::session) fn supervision_apply(
             &mut self,
             request: &UiRequest,
+        ) -> supervision::Applied {
+            self.supervision_apply_decoded(pi_rpc::desktop_rpc::decode_widget(request))
+        }
+
+        /// One incoming UI request for the supervision slice.
+        /// `decoded` is the request's [`pi_rpc::desktop_rpc::decode_widget`]
+        /// result, so the record is not decoded again.
+        pub(in crate::features::session) fn supervision_apply_decoded(
+            &mut self,
+            decoded: Result<Option<DesktopRecord>, DesktopRpcError>,
         ) -> supervision::Applied {
             let Desktop {
                 session,
                 supervision,
                 ..
             } = self;
-            supervision.apply(session, request)
+            supervision.apply_decoded(session, decoded)
         }
 
         /// The pending timeout for a supervision request.
@@ -846,12 +868,23 @@ pub(in crate::features::session) mod desktop {
             self.subscription.refresh(&mut self.session)
         }
 
-        /// One incoming UI request for the subscription slice.
+        /// [`Self::subscription_apply_decoded`] for the raw request.
+        #[cfg(test)]
         pub(in crate::features::session) fn subscription_apply(
             &mut self,
             request: &UiRequest,
         ) -> subscription::Applied {
-            self.subscription.apply(&mut self.session, request)
+            self.subscription_apply_decoded(pi_rpc::desktop_rpc::decode_widget(request))
+        }
+
+        /// One incoming UI request for the subscription slice.
+        /// `decoded` is the request's [`pi_rpc::desktop_rpc::decode_widget`]
+        /// result, so the record is not decoded again.
+        pub(in crate::features::session) fn subscription_apply_decoded(
+            &mut self,
+            decoded: Result<Option<DesktopRecord>, DesktopRpcError>,
+        ) -> subscription::Applied {
+            self.subscription.apply_decoded(&mut self.session, decoded)
         }
 
         /// The pending timeout for a subscription request.
@@ -890,12 +923,23 @@ pub(in crate::features::session) mod desktop {
             self.step == Step::Ready && self.design.emits_events()
         }
 
-        /// One incoming UI request for the design slice.
+        /// [`Self::design_apply_decoded`] for the raw request.
+        #[cfg(test)]
         pub(in crate::features::session) fn design_apply(
             &mut self,
             request: &UiRequest,
         ) -> design::Applied {
-            self.design.apply(&mut self.session, request)
+            self.design_apply_decoded(pi_rpc::desktop_rpc::decode_widget(request))
+        }
+
+        /// One incoming UI request for the design slice.
+        /// `decoded` is the request's [`pi_rpc::desktop_rpc::decode_widget`]
+        /// result, so the record is not decoded again.
+        pub(in crate::features::session) fn design_apply_decoded(
+            &mut self,
+            decoded: Result<Option<DesktopRecord>, DesktopRpcError>,
+        ) -> design::Applied {
+            self.design.apply_decoded(&mut self.session, decoded)
         }
 
         /// The pending timeout for a design request.
@@ -1001,12 +1045,23 @@ pub(in crate::features::session) mod desktop {
             self.config.pump(&mut self.session)
         }
 
-        /// One incoming UI request for the config slice.
+        /// [`Self::config_apply_decoded`] for the raw request.
+        #[cfg(test)]
         pub(in crate::features::session) fn config_apply(
             &mut self,
             request: &UiRequest,
         ) -> config::Applied {
-            self.config.apply(&mut self.session, request)
+            self.config_apply_decoded(pi_rpc::desktop_rpc::decode_widget(request))
+        }
+
+        /// One incoming UI request for the config slice.
+        /// `decoded` is the request's [`pi_rpc::desktop_rpc::decode_widget`]
+        /// result, so the record is not decoded again.
+        pub(in crate::features::session) fn config_apply_decoded(
+            &mut self,
+            decoded: Result<Option<DesktopRecord>, DesktopRpcError>,
+        ) -> config::Applied {
+            self.config.apply(&mut self.session, decoded)
         }
 
         /// The pending timeout for a config request.
@@ -1081,12 +1136,23 @@ pub(in crate::features::session) mod desktop {
             self.reads.release();
         }
 
-        /// One incoming UI request for the reads slice.
+        /// [`Self::reads_apply_decoded`] for the raw request.
+        #[cfg(test)]
         pub(in crate::features::session) fn reads_apply(
             &mut self,
             request: &UiRequest,
         ) -> reads::Applied {
-            self.reads.apply(&mut self.session, request)
+            self.reads_apply_decoded(pi_rpc::desktop_rpc::decode_widget(request))
+        }
+
+        /// One incoming UI request for the reads slice.
+        /// `decoded` is the request's [`pi_rpc::desktop_rpc::decode_widget`]
+        /// result, so the record is not decoded again.
+        pub(in crate::features::session) fn reads_apply_decoded(
+            &mut self,
+            decoded: Result<Option<DesktopRecord>, DesktopRpcError>,
+        ) -> reads::Applied {
+            self.reads.apply(&mut self.session, decoded)
         }
 
         /// The pending timeout for a read.
@@ -1183,12 +1249,23 @@ pub(in crate::features::session) mod desktop {
             self.output.pump(&mut self.session)
         }
 
-        /// One incoming UI request for the output slice.
+        /// [`Self::output_apply_decoded`] for the raw request.
+        #[cfg(test)]
         pub(in crate::features::session) fn output_apply(
             &mut self,
             request: &UiRequest,
         ) -> output::Applied {
-            self.output.apply(&mut self.session, request)
+            self.output_apply_decoded(pi_rpc::desktop_rpc::decode_widget(request))
+        }
+
+        /// One incoming UI request for the output slice.
+        /// `decoded` is the request's [`pi_rpc::desktop_rpc::decode_widget`]
+        /// result, so the record is not decoded again.
+        pub(in crate::features::session) fn output_apply_decoded(
+            &mut self,
+            decoded: Result<Option<DesktopRecord>, DesktopRpcError>,
+        ) -> output::Applied {
+            self.output.apply_decoded(&mut self.session, decoded)
         }
 
         /// The pending timeout for an output read.
@@ -1247,12 +1324,23 @@ pub(in crate::features::session) mod desktop {
             self.review.pump(&mut self.session)
         }
 
-        /// One incoming UI request for the review slice.
+        /// [`Self::review_apply_decoded`] for the raw request.
+        #[cfg(test)]
         pub(in crate::features::session) fn review_apply(
             &mut self,
             request: &UiRequest,
         ) -> review::Applied {
-            self.review.apply(&mut self.session, request)
+            self.review_apply_decoded(pi_rpc::desktop_rpc::decode_widget(request))
+        }
+
+        /// One incoming UI request for the review slice.
+        /// `decoded` is the request's [`pi_rpc::desktop_rpc::decode_widget`]
+        /// result, so the record is not decoded again.
+        pub(in crate::features::session) fn review_apply_decoded(
+            &mut self,
+            decoded: Result<Option<DesktopRecord>, DesktopRpcError>,
+        ) -> review::Applied {
+            self.review.apply_decoded(&mut self.session, decoded)
         }
 
         /// The pending timeout for a review request.
@@ -1379,7 +1467,6 @@ pub(in crate::features::session) mod desktop {
     /// the picker later, so none of them is live yet.
     #[allow(dead_code)]
     pub(in crate::features::session) mod permission {
-        use pi_rpc::UiRequest;
         use pi_rpc::desktop_rpc::{
             Capabilities, DesktopErrorInfo, DesktopEvent, DesktopMethod, DesktopRecord,
             DesktopResponse, DesktopRpcError, DesktopSession, PermissionMode,
@@ -1655,18 +1742,30 @@ pub(in crate::features::session) mod desktop {
                 }
             }
 
-            /// One incoming UI request; applies only the records this slice owns
-            /// (typed get/set responses and `permission_mode_changed` events)
-            /// and leaves everything else alone.
+            /// [`Self::apply_decoded`] for the raw request.
+            #[cfg(test)]
             pub(in crate::features::session) fn apply(
                 &mut self,
                 session: &mut DesktopSession,
-                request: &UiRequest,
+                request: &pi_rpc::UiRequest,
+            ) -> Applied {
+                self.apply_decoded(session, pi_rpc::desktop_rpc::decode_widget(request))
+            }
+
+            /// One incoming UI request; applies only the records this slice owns
+            /// (typed get/set responses and `permission_mode_changed` events)
+            /// and leaves everything else alone.
+            /// `decoded` is the request's [`pi_rpc::desktop_rpc::decode_widget`]
+            /// result, so the record is not decoded again.
+            pub(in crate::features::session) fn apply_decoded(
+                &mut self,
+                session: &mut DesktopSession,
+                decoded: Result<Option<DesktopRecord>, DesktopRpcError>,
             ) -> Applied {
                 // The session clears the pending request while correlating, so
                 // the method it answered is read first.
                 let awaiting = session.pending().map(|(_, method)| method);
-                match session.accept(request) {
+                match session.accept_decoded(decoded) {
                     Ok(Some(DesktopRecord::Response(response))) => match awaiting {
                         Some(DesktopMethod::GetPermissionMode) => self.apply_get(response),
                         Some(DesktopMethod::SetPermissionMode) => self.apply_set(response),
@@ -1864,7 +1963,6 @@ pub(in crate::features::session) mod desktop {
     /// lists are the primary source once seeded; the legacy `gentle-agents`
     /// widget and `details.gentleJobs` stay as the fallback for older Shells.
     pub(in crate::features::session) mod supervision {
-        use pi_rpc::UiRequest;
         use pi_rpc::desktop_rpc::{
             Capabilities, DesktopAgent, DesktopEvent, DesktopJob, DesktopMethod, DesktopRecord,
             DesktopResponse, DesktopRpcError, DesktopSession,
@@ -2109,18 +2207,30 @@ pub(in crate::features::session) mod desktop {
                 }
             }
 
-            /// One incoming UI request; applies only the records this slice owns
-            /// (typed list/cancel responses and `agents_update`/`jobs_update`
-            /// events) and leaves everything else alone.
+            /// [`Self::apply_decoded`] for the raw request.
+            #[cfg(test)]
             pub(in crate::features::session) fn apply(
                 &mut self,
                 session: &mut DesktopSession,
-                request: &UiRequest,
+                request: &pi_rpc::UiRequest,
+            ) -> Applied {
+                self.apply_decoded(session, pi_rpc::desktop_rpc::decode_widget(request))
+            }
+
+            /// One incoming UI request; applies only the records this slice owns
+            /// (typed list/cancel responses and `agents_update`/`jobs_update`
+            /// events) and leaves everything else alone.
+            /// `decoded` is the request's [`pi_rpc::desktop_rpc::decode_widget`]
+            /// result, so the record is not decoded again.
+            pub(in crate::features::session) fn apply_decoded(
+                &mut self,
+                session: &mut DesktopSession,
+                decoded: Result<Option<DesktopRecord>, DesktopRpcError>,
             ) -> Applied {
                 // The session clears the pending request while correlating, so
                 // the method it answered is read first.
                 let awaiting = session.pending().map(|(_, method)| method);
-                match session.accept(request) {
+                match session.accept_decoded(decoded) {
                     Ok(Some(DesktopRecord::Response(response))) => match awaiting {
                         Some(DesktopMethod::ListSubagents) => self.apply_list_subagents(response),
                         Some(DesktopMethod::ListJobs) => self.apply_list_jobs(response),
@@ -2474,7 +2584,6 @@ pub(in crate::features::session) mod desktop {
     /// When the peer does not offer the methods, the Usage screen keeps the
     /// legacy `auth.json` path; any other failure here never falls back to it.
     pub(in crate::features::session) mod subscription {
-        use pi_rpc::UiRequest;
         use pi_rpc::desktop_rpc::{
             Capabilities, DesktopEvent, DesktopMethod, DesktopRecord, DesktopResponse,
             DesktopRpcError, DesktopSession, ProviderUsage, UsageStatus,
@@ -2730,17 +2839,29 @@ pub(in crate::features::session) mod desktop {
                 }
             }
 
-            /// One incoming UI request; applies only the records this slice owns
-            /// (typed get/refresh responses and `rate_limit` events).
+            /// [`Self::apply_decoded`] for the raw request.
+            #[cfg(test)]
             pub(in crate::features::session) fn apply(
                 &mut self,
                 session: &mut DesktopSession,
-                request: &UiRequest,
+                request: &pi_rpc::UiRequest,
+            ) -> Applied {
+                self.apply_decoded(session, pi_rpc::desktop_rpc::decode_widget(request))
+            }
+
+            /// One incoming UI request; applies only the records this slice owns
+            /// (typed get/refresh responses and `rate_limit` events).
+            /// `decoded` is the request's [`pi_rpc::desktop_rpc::decode_widget`]
+            /// result, so the record is not decoded again.
+            pub(in crate::features::session) fn apply_decoded(
+                &mut self,
+                session: &mut DesktopSession,
+                decoded: Result<Option<DesktopRecord>, DesktopRpcError>,
             ) -> Applied {
                 // The session clears the pending request while correlating, so
                 // the method it answered is read first.
                 let awaiting = session.pending().map(|(_, method)| method);
-                match session.accept(request) {
+                match session.accept_decoded(decoded) {
                     Ok(Some(DesktopRecord::Response(response))) => match awaiting {
                         Some(DesktopMethod::GetSubscriptionUsage)
                         | Some(DesktopMethod::RefreshSubscriptionUsage) => {
@@ -2946,7 +3067,6 @@ pub(in crate::features::session) mod desktop {
     /// The canvas URL carries a token. It only ever reaches the browser notice
     /// for a loopback URL; reports never carry it and this slice keeps no copy.
     pub(in crate::features::session) mod design {
-        use pi_rpc::UiRequest;
         use pi_rpc::desktop_rpc::{
             Capabilities, DesignCanvas, DesignTransition, DesktopEvent, DesktopMethod,
             DesktopRecord, DesktopResponse, DesktopRpcError, DesktopSession,
@@ -3122,17 +3242,29 @@ pub(in crate::features::session) mod desktop {
                 }))
             }
 
-            /// One incoming UI request; applies only the records this slice
-            /// owns (the `get_design_canvas` answer and `design_canvas`).
+            /// [`Self::apply_decoded`] for the raw request.
+            #[cfg(test)]
             pub(in crate::features::session) fn apply(
                 &mut self,
                 session: &mut DesktopSession,
-                request: &UiRequest,
+                request: &pi_rpc::UiRequest,
+            ) -> Applied {
+                self.apply_decoded(session, pi_rpc::desktop_rpc::decode_widget(request))
+            }
+
+            /// One incoming UI request; applies only the records this slice
+            /// owns (the `get_design_canvas` answer and `design_canvas`).
+            /// `decoded` is the request's [`pi_rpc::desktop_rpc::decode_widget`]
+            /// result, so the record is not decoded again.
+            pub(in crate::features::session) fn apply_decoded(
+                &mut self,
+                session: &mut DesktopSession,
+                decoded: Result<Option<DesktopRecord>, DesktopRpcError>,
             ) -> Applied {
                 // The session clears the pending request while correlating, so
                 // the method it answered is read first.
                 let awaiting = session.pending().map(|(_, method)| method);
-                match session.accept(request) {
+                match session.accept_decoded(decoded) {
                     Ok(Some(DesktopRecord::Response(response))) => match awaiting {
                         Some(DesktopMethod::GetDesignCanvas) => self.apply_response(response),
                         _ => Applied::default(),
@@ -3308,7 +3440,6 @@ pub(in crate::features::session) mod desktop {
     pub(in crate::features::session) mod config {
         use std::collections::VecDeque;
 
-        use pi_rpc::UiRequest;
         use pi_rpc::desktop_rpc::{
             ApplyProfileOutcome, Capabilities, ConfigStore, ConfigWrite, DesktopEvent,
             DesktopMethod, DesktopRecord, DesktopResponse, DesktopRpcError, DesktopSession,
@@ -3616,15 +3747,17 @@ pub(in crate::features::session) mod desktop {
 
             /// One incoming UI request; applies only the records this slice
             /// owns (the config answers and `config_changed`).
+            /// `decoded` is the request's [`pi_rpc::desktop_rpc::decode_widget`]
+            /// result, so the record is not decoded again.
             pub(in crate::features::session) fn apply(
                 &mut self,
                 session: &mut DesktopSession,
-                request: &UiRequest,
+                decoded: Result<Option<DesktopRecord>, DesktopRpcError>,
             ) -> Applied {
                 // The session clears the pending request while correlating, so
                 // the method it answered is read first.
                 let awaiting = session.pending().map(|(_, method)| method);
-                match session.accept(request) {
+                match session.accept_decoded(decoded) {
                     Ok(Some(DesktopRecord::Response(response))) => match awaiting {
                         Some(
                             method @ (DesktopMethod::GetConfig

@@ -984,14 +984,14 @@ impl SessionView {
             Item::Tool { .. } | Item::Shell { .. } => {
                 let computed;
                 let spec = match self.list.prepared(ix) {
-                    Some(Prepared::Card(spec)) => spec,
+                    Some(Prepared::Card(cell)) => cell.get_or_init(|| card_spec(item)),
                     _ => {
                         computed = card_spec(item);
-                        match &computed {
-                            Some(spec) => spec,
-                            None => return div().into_any_element(),
-                        }
+                        &computed
                     }
+                };
+                let Some(spec) = spec else {
+                    return div().into_any_element();
                 };
                 let backend_ms = match item {
                     Item::Tool { duration_ms, .. } => *duration_ms,
@@ -1511,6 +1511,7 @@ impl SessionView {
         };
         h_flex()
             .id(id)
+            .debug_selector(|| format!("step-row:{}:{}", spec.title, spec.subject))
             .px_3()
             .py_2()
             .gap_2()
@@ -1772,6 +1773,7 @@ impl SessionView {
             .cursor_pointer()
             .hover(|s| s.text_color(ui::fg()))
             .on_click(cx.listener(move |this, _, _, cx| this.toggle(key, cx)))
+            .debug_selector(|| format!("fold:{label}"))
             .child(label)
             .child(
                 Icon::new(if up {
@@ -1999,9 +2001,18 @@ impl SessionView {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// `SessionView` renders on this thread, for tests that count a tab's
+    /// redraws (each GPUI test runs on its own thread).
+    pub(super) static RENDERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 impl Render for SessionView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         crate::shared::diagnostics::render("SessionView");
+        #[cfg(test)]
+        RENDERS.with(|renders| renders.set(renders.get() + 1));
         // Its indicators on the live layer are placed again as it draws.
         self.live_slots.clear(cx.entity_id());
         // A tab starts its backend once shown.
@@ -3246,6 +3257,90 @@ mod tests {
                     .any(|quad| quad.background == backing),
                 "inline code backing must be painted"
             );
+        });
+    }
+
+    /// What a card shows from its data, comparable.
+    type Shown = (
+        gpui_kit::assets::IconName,
+        String,
+        String,
+        Option<String>,
+        Option<usize>,
+        Option<usize>,
+        Option<usize>,
+        usize,
+        bool,
+        bool,
+        ToolStatus,
+    );
+
+    fn shown(spec: &super::CardSpec) -> Shown {
+        (
+            spec.icon,
+            spec.title.to_string(),
+            spec.subject.to_string(),
+            spec.chip.as_ref().map(|chip| chip.to_string()),
+            spec.added,
+            spec.removed,
+            spec.input_lines,
+            spec.output_lines,
+            spec.has_output,
+            spec.always_output,
+            spec.status,
+        )
+    }
+
+    /// Item `ix`'s card data, if it was built yet.
+    fn built(view: &super::SessionView, ix: usize) -> Option<Option<Shown>> {
+        match view.list.prepared(ix) {
+            Some(super::Prepared::Card(cell)) => cell.get().map(|spec| spec.as_ref().map(shown)),
+            _ => panic!("item {ix} has no card"),
+        }
+    }
+
+    /// A loaded conversation builds a tool or shell card's data when its row
+    /// first draws, not when the conversation loads.
+    #[gpui::test]
+    fn a_cards_data_is_built_when_its_row_first_draws(cx: &mut gpui_kit::TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let mut view = super::SessionView::new(std::env::temp_dir(), None, window, cx, false);
+            view.backend.started = true;
+            view
+        });
+        let (tool, shell) = (2, 3);
+        view.update(cx, |view, cx| {
+            view.transcript.load_messages(&[
+                serde_json::json!({"role": "user", "content": "run them"}),
+                serde_json::json!({"role": "assistant", "stopReason": "toolUse", "content": [
+                    {"type": "toolCall", "id": "t1", "name": "bash",
+                     "arguments": {"command": "cargo test", "description": "Run the tests"}},
+                ]}),
+                serde_json::json!({"role": "toolResult", "toolCallId": "t1", "isError": false,
+                    "content": [{"type": "text", "text": "ok\nok\nok"}], "details": {}}),
+                serde_json::json!({"role": "bashExecution", "command": "git status",
+                    "output": "clean", "exitCode": 0}),
+            ]);
+            view.sync_view(cx);
+            assert_eq!(built(view, tool), None, "not built when loaded");
+            assert_eq!(built(view, shell), None, "not built when loaded");
+            cx.notify();
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            for ix in [tool, shell] {
+                let expected = super::card_spec(&view.transcript.items[ix]).map(|s| shown(&s));
+                assert!(expected.is_some());
+                assert_eq!(
+                    built(view, ix),
+                    Some(expected),
+                    "item {ix} built when drawn"
+                );
+            }
         });
     }
 

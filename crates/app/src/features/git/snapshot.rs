@@ -12,7 +12,13 @@ use super::git;
 pub fn snapshot(cwd: &Path) -> Option<GitSnapshot> {
     let status = git(
         cwd,
-        &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+        &[
+            "--no-optional-locks",
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+        ],
     )?;
     // `symbolic-ref` also names the branch of a repository without commits;
     // it fails only on a detached HEAD.
@@ -20,9 +26,31 @@ pub fn snapshot(cwd: &Path) -> Option<GitSnapshot> {
         .map(|b| b.trim().to_string())
         .filter(|b| !b.is_empty());
     // Staged + unstaged against HEAD; a repository without commits has no HEAD.
-    let numstat = git(cwd, &["diff", "--numstat", "-z", "HEAD"])
-        .or_else(|| git(cwd, &["diff", "--numstat", "-z"]))
-        .unwrap_or_default();
+    // `diff` rewrites a stat-dirty index even without optional locks.
+    let numstat = git(
+        cwd,
+        &[
+            "-c",
+            "diff.autoRefreshIndex=false",
+            "diff",
+            "--numstat",
+            "-z",
+            "HEAD",
+        ],
+    )
+    .or_else(|| {
+        git(
+            cwd,
+            &[
+                "-c",
+                "diff.autoRefreshIndex=false",
+                "diff",
+                "--numstat",
+                "-z",
+            ],
+        )
+    })
+    .unwrap_or_default();
     let mut files = parse_status(&status);
     let stats = parse_numstat(&numstat);
     for file in &mut files {
@@ -95,5 +123,34 @@ mod tests {
         std::fs::write(&path, "a\0b\n").unwrap();
         assert_eq!(count_lines_in(&cache, &path), None);
         std::fs::remove_file(&path).unwrap();
+    }
+
+    /// The Files tab polls `snapshot` every few seconds: it must not rewrite
+    /// `.git/index` (and take `index.lock`) under the user's own git.
+    #[test]
+    fn snapshot_leaves_a_stat_dirty_index_unwritten() {
+        let Some(dir) = super::super::tests::stat_dirty_repo("snapshot") else {
+            return;
+        };
+        let index = std::fs::read(dir.join(".git/index")).unwrap();
+
+        let snapshot = snapshot(&dir).unwrap();
+
+        let unchanged = std::fs::read(dir.join(".git/index")).unwrap() == index;
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(snapshot.branch.as_deref(), Some("main"));
+        let files: Vec<_> = snapshot
+            .files
+            .iter()
+            .map(|f| (f.path.as_str(), f.status, f.added, f.removed))
+            .collect();
+        assert_eq!(
+            files,
+            vec![
+                ("edit.txt", 'M', Some(2), Some(1)),
+                ("new.txt", '?', Some(1), Some(0)),
+            ]
+        );
+        assert!(unchanged, "snapshot rewrote .git/index");
     }
 }

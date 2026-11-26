@@ -346,8 +346,8 @@ impl SessionView {
     }
 
     /// Route one Desktop widget record to the slice that owns it, then hand
-    /// the original request to that slice so the shared session accepts it
-    /// exactly once. Permission responses go to whoever's request is pending;
+    /// the record, decoded once here, to that slice so the shared session
+    /// accepts it exactly once. Permission responses go to whoever's request is pending;
     /// permission events to the permission slice; everything else stays on the
     /// channel (probe, sequencing, resync, and every benign foreign record).
     fn handle_desktop_ui(&mut self, request: &UiRequest, cx: &mut Context<Self>) {
@@ -390,7 +390,9 @@ impl SessionView {
                     .permission
                     .requested()
                     .map(|requested| super::from_desktop_mode(requested.mode));
-                let applied = self.permission.apply(self.desktop.session(), request);
+                let applied = self
+                    .permission
+                    .apply_decoded(self.desktop.session(), decoded);
                 let mut legacy_fallback = false;
                 match applied.report.as_ref() {
                     // Events were lost: the channel owns the get_snapshot
@@ -424,7 +426,7 @@ impl SessionView {
                 {
                     self.desktop.output_mut().refresh_thread();
                 }
-                let applied = self.desktop.supervision_apply(request);
+                let applied = self.desktop.supervision_apply_decoded(decoded);
                 match applied.report.as_ref() {
                     // Events were lost: the channel owns the get_snapshot
                     // resync, and the lists re-seed once it lands.
@@ -449,7 +451,7 @@ impl SessionView {
                 self.sync_output(cx);
             }
             DesktopRoute::Subscription => {
-                let applied = self.desktop.subscription_apply(request);
+                let applied = self.desktop.subscription_apply_decoded(decoded);
                 match applied.report.as_ref() {
                     // Events were lost: the channel owns the get_snapshot
                     // resync. The record was already accepted, so it is never
@@ -465,7 +467,7 @@ impl SessionView {
                 self.sync_output(cx);
             }
             DesktopRoute::Design => {
-                let applied = self.desktop.design_apply(request);
+                let applied = self.desktop.design_apply_decoded(decoded);
                 match applied.report.as_ref() {
                     // Events were lost: the channel owns the get_snapshot
                     // resync, and the canvas re-seeds once it lands.
@@ -481,7 +483,7 @@ impl SessionView {
                 self.sync_output(cx);
             }
             DesktopRoute::Config => {
-                let applied = self.desktop.config_apply(request);
+                let applied = self.desktop.config_apply_decoded(decoded);
                 match applied.report.as_ref() {
                     // Events were lost: the channel owns the get_snapshot
                     // resync, and the Profiles screen re-reads every store
@@ -500,7 +502,7 @@ impl SessionView {
                 self.sync_output(cx);
             }
             DesktopRoute::Output => {
-                let applied = self.desktop.output_apply(request);
+                let applied = self.desktop.output_apply_decoded(decoded);
                 self.apply_output(applied, cx);
                 self.sync_supervision(cx);
                 self.sync_design(cx);
@@ -508,7 +510,7 @@ impl SessionView {
                 self.sync_output(cx);
             }
             DesktopRoute::Review => {
-                let applied = self.desktop.review_apply(request);
+                let applied = self.desktop.review_apply_decoded(decoded);
                 match applied.report.as_ref() {
                     // Events were lost: the channel owns the get_snapshot
                     // resync, and the switch is read again behind it.
@@ -524,7 +526,7 @@ impl SessionView {
                 self.sync_output(cx);
             }
             DesktopRoute::Reads => {
-                let applied = self.desktop.reads_apply(request);
+                let applied = self.desktop.reads_apply_decoded(decoded);
                 self.apply_reads(applied, cx);
                 self.sync_supervision(cx);
                 self.sync_design(cx);
@@ -532,7 +534,7 @@ impl SessionView {
                 self.sync_output(cx);
             }
             DesktopRoute::Channel => {
-                let applied = self.desktop.ui(request);
+                let applied = self.desktop.ui_decoded(decoded);
                 self.apply_desktop(applied, cx);
                 self.sync_sections_if_context(context_changed, cx);
                 self.sync_permission_capabilities(cx);

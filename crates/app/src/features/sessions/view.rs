@@ -22,6 +22,20 @@ fn same_file(a: &Path, b: &Path) -> bool {
     a == b || matches!((dunce::canonicalize(a), dunce::canonicalize(b)), (Ok(x), Ok(y)) if x == y)
 }
 
+/// The paths in `sessions` that are the file `current`, also when spelled
+/// differently (a symlinked folder, a `..`). Blocking (it resolves every
+/// path): call off the UI thread.
+pub(super) fn current_rows(current: Option<&Path>, sessions: &[SessionSummary]) -> Vec<PathBuf> {
+    let Some(current) = current else {
+        return Vec::new();
+    };
+    sessions
+        .iter()
+        .filter(|s| same_file(current, &s.path))
+        .map(|s| s.path.clone())
+        .collect()
+}
+
 /// One listed session, from either source.
 #[derive(Clone, Copy)]
 pub(super) enum Row<'a> {
@@ -141,6 +155,7 @@ impl SessionsView {
             session,
             source: Source::Files,
             sessions: Vec::new(),
+            current_rows: Vec::new(),
             entries: Vec::new(),
             next_cursor: None,
             pending: None,
@@ -222,14 +237,20 @@ impl SessionsView {
         let agent = pi_rpc::resolve_homes().agent;
         let cwd = self.cwd.clone();
         let scope = self.scope;
+        let current = self.current.clone();
         // Replacing the task drops (cancels) any load still in flight.
         self._load = cx.spawn(async move |this, cx| {
-            let sessions = cx
+            let (sessions, current_rows) = cx
                 .background_executor()
-                .spawn(async move { list_sessions(&agent, &cwd, scope) })
+                .spawn(async move {
+                    let sessions = list_sessions(&agent, &cwd, scope);
+                    let current_rows = current_rows(current.as_deref(), &sessions);
+                    (sessions, current_rows)
+                })
                 .await;
             let _ = this.update(cx, |this, cx| {
                 this.sessions = sessions;
+                this.current_rows = current_rows;
                 this.loading = false;
                 cx.notify();
             });
@@ -330,12 +351,11 @@ impl SessionsView {
         }
     }
 
+    /// Whether `row` is the tab's session; drawn per row, so it compares
+    /// paths resolved when the list loaded.
     pub(super) fn is_current(&self, row: Row) -> bool {
         match row {
-            Row::File(session) => self
-                .current
-                .as_deref()
-                .is_some_and(|c| same_file(c, &session.path)),
+            Row::File(session) => self.current_rows.contains(&session.path),
             Row::Shell(entry) => entry.current,
         }
     }
@@ -391,7 +411,12 @@ impl SessionsView {
     }
 
     pub(super) fn open(&mut self, session: &SessionSummary, cx: &mut Context<Self>) {
-        if self.is_current(Row::File(session)) {
+        // Not `is_current`: a session found by id may not be listed.
+        if self
+            .current
+            .as_deref()
+            .is_some_and(|c| same_file(c, &session.path))
+        {
             cx.emit(SessionsEvent::Close);
             return;
         }

@@ -6,13 +6,13 @@ use gentle_core::genui::{Outcome, Snapshot};
 // Not a glob: GPUI exports a `test` attribute that would shadow `#[test]`.
 use gpui_kit::{
     AppContext as _, Bounds, Context, Entity, IntoElement, Modifiers, MouseButton, MouseDownEvent,
-    MouseUpEvent, ParentElement as _, Pixels, Point, Render, Styled as _, Subscription,
-    TestAppContext, VisualTestContext, Window, div, point, px,
+    MouseUpEvent, ParentElement as _, Pixels, Point, Render, ScrollDelta, ScrollEvent, Styled as _,
+    Subscription, TestAppContext, VisualTestContext, Window, div, point, px,
 };
 use serde_json::{Value, json};
 
 use super::super::diagram::{DiagramEvent, SendState};
-use super::super::panel::PanelView;
+use super::super::panel::{Body, PanelView};
 use super::{Seen, event_json, ops};
 
 /// Stands in for the conversation: shows one surface and keeps what it asks for.
@@ -245,6 +245,209 @@ fn table_sort_select_edit_and_send(cx: &mut TestAppContext) {
     assert_eq!(event["summary"][1], "selected 1 row: Web");
     assert_eq!(event["spec"]["rows"][0]["cells"]["tests"], json!(1300.0));
     assert_eq!(event["version"], 1);
+}
+
+/// A table as long as the parser allows, with every aligned column type.
+fn long_table() -> Value {
+    let rows: Vec<Value> = (0..500)
+        .map(|r| {
+            let state = ["passing", "failing", "pending"][r % 3];
+            json!({
+                "id": format!("r{r}"),
+                "name": format!("Item {r}"),
+                "tests": (r * 37) % 500,
+                "state": state,
+                "log": {"text": "log", "url": format!("https://example.com/{r}")}
+            })
+        })
+        .collect();
+    json!({
+        "columns": [
+            {"key": "name", "label": "Name"},
+            {"key": "tests", "label": "Tests", "type": "number"},
+            {"key": "state", "label": "State", "type": "status"},
+            {"key": "log", "label": "Log", "type": "link", "align": "center"}
+        ],
+        "rows": rows
+    })
+}
+
+/// Where row `r{ix}` of [`long_table`] is drawn, if it is.
+fn row_at(cx: &mut VisualTestContext, ix: usize) -> Option<Bounds<Pixels>> {
+    let selector: &'static str = Box::leak(format!("genui-row-r{ix}").into_boxed_str());
+    cx.debug_bounds(selector)
+}
+
+/// The ids of the first `n` rows drawn, top to bottom.
+fn first_rows(cx: &mut VisualTestContext, n: usize) -> Vec<String> {
+    cx.run_until_parked();
+    let mut drawn: Vec<(Pixels, usize)> = (0..500)
+        .filter_map(|ix| row_at(cx, ix).map(|b| (b.origin.y, ix)))
+        .collect();
+    drawn.sort();
+    drawn
+        .iter()
+        .take(n)
+        .map(|(_, ix)| format!("r{ix}"))
+        .collect()
+}
+
+#[gpui::test]
+fn a_long_table_draws_only_the_rows_in_view(cx: &mut TestAppContext) {
+    let (host, cx) = open(cx, "table", long_table());
+    cx.run_until_parked();
+    assert!(row_at(cx, 0).is_some(), "the first row");
+    assert!(row_at(cx, 499).is_none(), "the last row is out of view");
+
+    // Scrolled to the end, the last row is drawn and the first isn't.
+    let first = bounds(cx, "genui-row-r0");
+    cx.simulate_event(ScrollEvent {
+        position: first.center(),
+        delta: ScrollDelta::Pixels(point(px(0.), px(-20_000.))),
+        ..Default::default()
+    });
+    cx.run_until_parked();
+    assert!(row_at(cx, 499).is_some(), "scrolled to the last row");
+    assert!(row_at(cx, 0).is_none());
+
+    // Selected from the end, the last row is the one ticked.
+    click(cx, "genui-check-r499");
+    assert_eq!(pending(&host, cx), 1);
+}
+
+#[gpui::test]
+fn a_cell_edit_survives_scrolling_its_row_out_of_view(cx: &mut TestAppContext) {
+    use gpui_kit::Focusable as _;
+
+    let mut spec = long_table();
+    spec["editable"] = json!(true);
+    let (host, cx) = open(cx, "table", spec);
+    let view = view(&host, cx);
+    double_click(cx, "genui-cell-r0-name");
+    cx.simulate_keystrokes("cmd-a");
+    cx.simulate_input("Typed 4242");
+    cx.run_until_parked();
+
+    // The edit's row, column, typed text and focus; the cell's value; and
+    // whether every other row is as the agent sent it.
+    let state = |cx: &mut VisualTestContext| {
+        cx.update(|window, cx| match &view.read(cx).body {
+            Some(Body::Table(s)) => {
+                let editing = s.editing.as_ref().map(|e| {
+                    (
+                        e.row.clone(),
+                        e.column.clone(),
+                        e.input.read(cx).value().to_string(),
+                        e.input.read(cx).focus_handle(cx).is_focused(window),
+                    )
+                });
+                let (working, base) = (s.edits.working(), s.edits.base());
+                let cell = working.cell("r0", "name").clone();
+                (editing, cell, working.rows[1..] == base.rows[1..])
+            }
+            _ => panic!("a table"),
+        })
+    };
+    let editing = Some(("r0".into(), "name".into(), "Typed 4242".into(), true));
+    let unsent = (editing, json!("Item 0"), true);
+
+    // Scrolled away the row isn't drawn, and its edit stays open.
+    let at = bounds(cx, "genui-row-r1").center();
+    let scroll = |cx: &mut VisualTestContext, dy: f32| {
+        cx.simulate_event(ScrollEvent {
+            position: at,
+            delta: ScrollDelta::Pixels(point(px(0.), px(dy))),
+            ..Default::default()
+        });
+        cx.run_until_parked();
+    };
+    scroll(cx, -20_000.);
+    assert!(row_at(cx, 0).is_none());
+    assert_eq!(pending(&host, cx), 0);
+    assert_eq!(state(cx), unsent);
+
+    // Back in view, the cell is still its editor with the typed text.
+    scroll(cx, 20_000.);
+    assert_eq!(pending(&host, cx), 0);
+    assert_eq!(state(cx), unsent);
+    assert_eq!(f32::from(bounds(cx, "genui-cell-r0-name").size.height), 26.);
+
+    // Enter keeps it: one pending edit with the typed value.
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert_eq!(pending(&host, cx), 1);
+    assert_eq!(state(cx), (None, json!("Typed 4242"), true));
+}
+
+#[gpui::test]
+fn a_long_table_keeps_its_layout_order_and_card_height(cx: &mut TestAppContext) {
+    let (host, cx) = open(cx, "table", long_table());
+    let view = view(&host, cx);
+    assert_eq!(cx.update(|_, cx| view.read(cx).card_height()), 470.);
+
+    // The header, the first rows and their cells where they have always
+    // been (x, y, width, height).
+    for (selector, expected) in [
+        ("genui-th-name", [55., 96., 452., 18.]),
+        ("genui-th-tests", [515., 96., 96., 18.]),
+        ("genui-th-state", [619., 96., 136., 18.]),
+        ("genui-th-log", [763., 96., 110., 18.]),
+        ("genui-row-r0", [17., 120., 898., 32.]),
+        ("genui-row-r1", [17., 152., 898., 32.]),
+        ("genui-row-r9", [17., 408., 898., 32.]),
+        ("genui-check-r0", [29., 129.5, 18., 12.]),
+        ("genui-cell-r0-name", [55., 125.5, 452., 20.]),
+        ("genui-cell-r0-tests", [515., 125.5, 96., 20.]),
+        ("genui-cell-r0-state", [619., 125., 136., 21.]),
+        ("genui-cell-r0-log", [763., 125.5, 110., 20.]),
+        ("genui-cell-r9-log", [763., 413.5, 110., 20.]),
+    ] {
+        let b = bounds(cx, selector);
+        let drawn = [b.origin.x, b.origin.y, b.size.width, b.size.height].map(f32::from);
+        assert_eq!(drawn, expected, "{selector}");
+    }
+
+    // Sorting and filtering show the same rows first (ten fit in view).
+    assert_eq!(first_rows(cx, 3), ["r0", "r1", "r2"]);
+    click(cx, "genui-th-tests");
+    assert_eq!(
+        first_rows(cx, 10),
+        [
+            "r0", "r473", "r446", "r419", "r392", "r365", "r338", "r311", "r284", "r257"
+        ]
+    );
+    click(cx, "genui-th-tests");
+    assert_eq!(
+        first_rows(cx, 10),
+        [
+            "r27", "r54", "r81", "r108", "r135", "r162", "r189", "r216", "r243", "r270"
+        ]
+    );
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            if let Some(Body::Table(s)) = &mut view.body {
+                s.filter_text = "item 49".into();
+            }
+            cx.notify();
+        })
+    });
+    assert_eq!(
+        first_rows(cx, 10),
+        [
+            "r499", "r498", "r497", "r496", "r495", "r49", "r494", "r493", "r492", "r491"
+        ]
+    );
+}
+
+#[gpui::test]
+fn a_short_table_keeps_its_card_height(cx: &mut TestAppContext) {
+    let (host, cx) = open(
+        cx,
+        "table",
+        json!({"columns": ["name"], "rows": [{"id": "a", "name": "A"}, {"id": "b", "name": "B"}]}),
+    );
+    let view = view(&host, cx);
+    assert_eq!(cx.update(|_, cx| view.read(cx).card_height()), 214.);
 }
 
 #[gpui::test]

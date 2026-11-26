@@ -17,7 +17,7 @@ use pi_rpc::file_cache::FileCache;
 
 use super::discovery::{find_session, list_sessions};
 use super::summary::{cached_summary_in, summarize};
-use super::view::{choose_source, opens_elsewhere, switch_scope};
+use super::view::{Row, choose_source, current_rows, opens_elsewhere, switch_scope};
 use super::{Scope, SessionsEvent, SessionsView, Source};
 use crate::features::session::{ReadFailure, ReadSupport};
 
@@ -414,4 +414,89 @@ fn a_shell_listing_renders_and_its_current_session_closes(cx: &mut TestAppContex
     cx.simulate_click(at, Modifiers::none());
     cx.run_until_parked();
     assert_eq!(cx.update(|_, cx| host.read(cx).closed), 1);
+}
+
+/// The files view of `current` with `listed` loaded, the way a load leaves it.
+fn listed_view<'a>(
+    current: &Path,
+    listed: Vec<SessionSummary>,
+    cx: &'a mut TestAppContext,
+) -> (Entity<SessionsView>, &'a mut gpui_kit::VisualTestContext) {
+    cx.update(|cx| {
+        gpui_kit::init(cx);
+        cx.set_reduce_motion(true);
+    });
+    let current = current.to_path_buf();
+    cx.add_window_view(|window, cx| {
+        let mut view = SessionsView::empty(PathBuf::from("/w"), Some(current), None, window, cx);
+        view.current_rows = current_rows(view.current.as_deref(), &listed);
+        view.sessions = listed;
+        view
+    })
+}
+
+/// A summary of `file` listed under the spelling `listed`.
+fn listed_as(file: &Path, listed: PathBuf) -> SessionSummary {
+    let mut summary = read_summary(file).unwrap();
+    summary.path = listed;
+    summary
+}
+
+/// Which listed rows are drawn as the current session.
+fn marked(view: &Entity<SessionsView>, cx: &mut gpui_kit::VisualTestContext) -> Vec<bool> {
+    cx.update(|_, cx| {
+        let view = view.read(cx);
+        view.sessions
+            .iter()
+            .map(|s| view.is_current(Row::File(s)))
+            .collect()
+    })
+}
+
+#[gpui::test]
+fn drawing_a_row_does_not_resolve_its_path_again(cx: &mut TestAppContext) {
+    let tmp = TempDir::new("current-resolved");
+    std::fs::create_dir_all(tmp.0.join("sub")).unwrap();
+    let head = [header("c", "/w", "2024-01-01T00:00:00Z")];
+    let current = write_session(&tmp.0, "current.jsonl", &head);
+    let other = write_session(&tmp.0, "other.jsonl", &head);
+    let listed = vec![
+        listed_as(&current, tmp.0.join("sub").join("..").join("current.jsonl")),
+        listed_as(&other, other.clone()),
+    ];
+    let (view, cx) = listed_view(&current, listed, cx);
+    // Gone from disk, the files cannot be resolved: a row answers from what
+    // was resolved when the list loaded.
+    std::fs::remove_dir_all(&tmp.0).unwrap();
+    assert_eq!(marked(&view, cx), [true, false]);
+}
+
+#[gpui::test]
+fn a_row_spelled_differently_is_still_the_current_session(cx: &mut TestAppContext) {
+    let tmp = TempDir::new("current-spelling");
+    std::fs::create_dir_all(tmp.0.join("real").join("sub")).unwrap();
+    let head = [header("c", "/w", "2024-01-01T00:00:00Z")];
+    let real = tmp.0.join("real");
+    let current = write_session(&real, "current.jsonl", &head);
+    let other = write_session(&real, "other.jsonl", &head);
+    #[cfg_attr(not(unix), allow(unused_mut))]
+    let mut listed = vec![
+        listed_as(&current, current.clone()),
+        listed_as(&current, real.join("sub").join("..").join("current.jsonl")),
+        listed_as(&other, real.join("sub").join("..").join("other.jsonl")),
+    ];
+    #[cfg_attr(not(unix), allow(unused_mut))]
+    let mut expected = vec![true, true, false];
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(&real, tmp.0.join("link")).unwrap();
+        listed.push(listed_as(
+            &current,
+            tmp.0.join("link").join("current.jsonl"),
+        ));
+        listed.push(listed_as(&other, tmp.0.join("link").join("other.jsonl")));
+        expected.extend([true, false]);
+    }
+    let (view, cx) = listed_view(&current, listed, cx);
+    assert_eq!(marked(&view, cx), expected);
 }

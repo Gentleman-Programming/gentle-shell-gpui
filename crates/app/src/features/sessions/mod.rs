@@ -104,6 +104,9 @@ pub struct SessionsView {
     source: Source,
     /// The files' summaries (`Source::Files`).
     sessions: Vec<SessionSummary>,
+    /// The listed files that are `current` under any spelling, resolved
+    /// when the list loads so drawing a row never touches the disk.
+    current_rows: Vec<PathBuf>,
     /// Gentle Shell's pages so far (`Source::Shell`).
     entries: Vec<SessionEntry>,
     /// Where Gentle Shell's next page starts, when there is one.

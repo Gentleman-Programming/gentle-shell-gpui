@@ -28,6 +28,10 @@ pub fn work_tree(toplevel: &Path) -> Option<WorkTree> {
         let mut args = vec!["--no-optional-locks", "diff", "--numstat", "-z"];
         if cached {
             args.push("--cached");
+        } else {
+            // Against the work tree, `diff` rewrites a stat-dirty index even
+            // without optional locks.
+            args.splice(0..0, ["-c", "diff.autoRefreshIndex=false"]);
         }
         git(toplevel, &args).unwrap_or_default()
     };
@@ -248,5 +252,36 @@ mod tests {
         assert_eq!(kind("notes[1].txt"), EntryKind::Tracked);
         assert_eq!(kind("notes1.txt"), EntryKind::Untracked);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The Changes tab polls `work_tree` every few seconds: it must not
+    /// rewrite `.git/index` (and take `index.lock`) under the user's own git.
+    #[test]
+    fn work_tree_leaves_a_stat_dirty_index_unwritten() {
+        let Some(dir) = super::super::tests::stat_dirty_repo("work-tree") else {
+            return;
+        };
+        let index = std::fs::read(dir.join(".git/index")).unwrap();
+
+        let tree = work_tree(&dir).unwrap();
+
+        let unchanged = std::fs::read(dir.join(".git/index")).unwrap() == index;
+        let _ = std::fs::remove_dir_all(&dir);
+        let entries: Vec<_> = tree
+            .entries
+            .iter()
+            .map(|e| {
+                let sides = (e.staged(), e.unstaged());
+                (e.path.as_str(), sides, e.staged_lines, e.unstaged_lines)
+            })
+            .collect();
+        assert_eq!(
+            entries,
+            vec![
+                ("edit.txt", (None, Some('M')), None, Some((2, 1))),
+                ("new.txt", (None, Some('?')), None, None),
+            ]
+        );
+        assert!(unchanged, "work_tree rewrote .git/index");
     }
 }

@@ -324,32 +324,38 @@ impl SessionView {
     }
 
     /// Drop the kisses that landed and end a finished focus pulse; whether
-    /// either still plays (the view then asks for the next frame).
+    /// the pulse still plays (the view then asks for the next frame; the
+    /// kisses ask for the live layer's).
     pub(super) fn composer_animating(&mut self) -> bool {
         self.kisses.retain(|(at, _, _)| at.elapsed() < KISS_LIFE);
         if self.composer_pulse.is_some_and(|at| at.elapsed() >= PULSE) {
             self.composer_pulse = None;
         }
-        !self.kisses.is_empty() || self.composer_pulse.is_some()
+        self.composer_pulse.is_some()
     }
 
     /// The kisses in the air: each rises from where it was blown, swaying,
     /// pops in small, and fades. Every fourth one is a heart. Painted in
-    /// window coordinates, over the composer.
-    fn render_kisses(&self) -> Option<impl IntoElement> {
+    /// window coordinates, over the composer, on the live layer: while one
+    /// flies it asks for the layer's next frame, and the conversation is
+    /// reused from its cache.
+    fn render_kisses(&self) -> Option<Div> {
         if self.kisses.is_empty() {
             return None;
         }
         let kisses = self.kisses.clone();
-        Some(
+        let build = move || {
+            let kisses = kisses.clone();
             canvas(
                 |_, _, _| {},
                 move |_, _, window, _| {
+                    let mut flying = false;
                     for (born, from, i) in &kisses {
                         let age = born.elapsed().as_secs_f32() / KISS_LIFE.as_secs_f32();
                         if age >= 1. {
                             continue;
                         }
+                        flying = true;
                         let i = *i;
                         let travel = 1. - (1. - age).powi(3);
                         let rise = 26. + 18. * noise(i, 2);
@@ -380,11 +386,17 @@ impl SessionView {
                             line.opacity(alpha),
                         );
                     }
+                    // Only the layer's copy paints: the slot's is invisible.
+                    if flying {
+                        ui::request_animation_frame(window);
+                    }
                 },
             )
             .absolute()
-            .size_0(),
-        )
+            .size_0()
+            .into_any_element()
+        };
+        Some(self.live_slots.slot("kisses", build).absolute().size_0())
     }
 
     /// Play the focus pulse (none with reduced motion): frames are asked

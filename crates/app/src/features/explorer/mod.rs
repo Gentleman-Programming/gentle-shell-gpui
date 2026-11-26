@@ -27,6 +27,9 @@ use gentle_core::explorer::{self, Entry, visible};
 use crate::features::backend;
 use crate::shared::ui;
 
+#[cfg(test)]
+mod tests;
+
 /// Directories with more entries than this list only the first ones.
 const MAX_ENTRIES: usize = 5_000;
 /// How many of a server folder's folders are checked for a `.git` at once
@@ -77,8 +80,9 @@ pub struct ExplorerView {
     error: Option<String>,
     /// A folder is being read (a server's answers over the network).
     loading: bool,
-    scroll: ScrollHandle,
-    /// The folder being read; reading another one replaces it.
+    scroll: UniformListScrollHandle,
+    /// The folder (or home) being read off the UI thread; a newer
+    /// navigation replaces it, which drops the older read.
     _load: Task<()>,
     _subscription: Subscription,
 }
@@ -111,8 +115,8 @@ impl ExplorerView {
             selected: None,
             filter,
             error: None,
-            loading: false,
-            scroll: ScrollHandle::new(),
+            loading: true,
+            scroll: UniformListScrollHandle::new(),
             _load: Task::ready(()),
             _subscription: subscription,
         };
@@ -133,18 +137,22 @@ impl ExplorerView {
         if gentle_core::machines::same(&machine, &self.machine) {
             return;
         }
+        // Nothing of the machine left is shown, or opened, meanwhile.
         self.machine = machine;
         self.loading = true;
+        self.dir = PathBuf::new();
         self.entries.clear();
+        self.repos.clear();
         self.shown.clear();
+        self.selected = None;
         self.error = None;
         cx.notify();
         self.go_home(window, cx);
     }
 
-    /// Show `dir`, read off the UI thread, highlighting the entry named
-    /// `select` when it is there. The folder being read is the one shown
-    /// (and the one ⌘↵ opens) from now on.
+    /// Show `dir` once it is read off the UI thread (a server's through its
+    /// API), highlighting the entry named `select` when it is there. The
+    /// folder shown (and the one ⌘↵ opens) stays until then.
     fn load(
         &mut self,
         dir: PathBuf,
@@ -153,30 +161,38 @@ impl ExplorerView {
         cx: &mut Context<Self>,
     ) {
         self.loading = true;
-        self.dir = dir.clone();
-        self.entries.clear();
-        self.repos.clear();
-        self.shown.clear();
-        self.selected = None;
-        self.error = None;
-        self.filter
-            .update(cx, |state, cx| state.set_value("", window, cx));
         cx.notify();
         let machine = self.machine.clone();
         self._load = cx.spawn_in(window, async move |this, cx| {
+            let listed = dir.clone();
             let read = cx
                 .background_executor()
-                .spawn(async move { backend::on(&machine, || read_dir(&dir)) })
+                .spawn(async move { backend::on(&machine, || read_dir(&listed)) })
                 .await;
-            let _ = this.update(cx, |this, cx| {
-                (this.entries, this.repos, this.error) = match read {
-                    Ok((entries, repos)) => (entries, repos, None),
-                    Err(error) => (Vec::new(), HashSet::new(), Some(error.to_string())),
-                };
-                this.loading = false;
-                this.refilter(select, cx);
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.show(dir, read, select, window, cx)
             });
         });
+    }
+
+    /// `dir`, just read, as the folder shown.
+    fn show(
+        &mut self,
+        dir: PathBuf,
+        read: std::io::Result<(Vec<Entry>, HashSet<String>)>,
+        select: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        (self.entries, self.repos, self.error) = match read {
+            Ok((entries, repos)) => (entries, repos, None),
+            Err(error) => (Vec::new(), HashSet::new(), Some(error.to_string())),
+        };
+        self.dir = dir;
+        self.loading = false;
+        self.filter
+            .update(cx, |state, cx| state.set_value("", window, cx));
+        self.refilter(select, cx);
     }
 
     /// The entries matching the filter, highlighted as
@@ -187,7 +203,8 @@ impl ExplorerView {
         let select = select.and_then(|name| self.shown.iter().position(|e| e.name == name));
         self.selected = explorer::highlight(select, !filter.trim().is_empty(), self.shown.len());
         if let Some(selected) = self.selected {
-            self.scroll.scroll_to_item(selected);
+            self.scroll
+                .scroll_to_item(selected, ScrollStrategy::Nearest);
         }
         cx.notify();
     }
@@ -197,12 +214,15 @@ impl ExplorerView {
     }
 
     /// The folder an "open here" acts on: the highlighted folder, else the
-    /// one shown.
-    fn target(&self) -> PathBuf {
-        match self.selected_entry() {
+    /// one shown; none until a folder of the machine browsed is read.
+    fn target(&self) -> Option<PathBuf> {
+        if self.dir.as_os_str().is_empty() {
+            return None;
+        }
+        Some(match self.selected_entry() {
             Some(entry) if entry.is_dir => self.dir.join(&entry.name),
             _ => self.dir.clone(),
-        }
+        })
     }
 
     /// Move the highlight by `delta` rows ([`explorer::step`]).
@@ -211,7 +231,7 @@ impl ExplorerView {
             return;
         };
         self.selected = Some(next);
-        self.scroll.scroll_to_item(next);
+        self.scroll.scroll_to_item(next, ScrollStrategy::Nearest);
         cx.notify();
     }
 
@@ -265,16 +285,22 @@ impl ExplorerView {
     /// ⌘↵: an agent tab in the target folder, or the folder handed back
     /// when picking one.
     fn open_agent(&mut self, cx: &mut Context<Self>) {
+        let Some(target) = self.target() else {
+            return;
+        };
         cx.emit(match self.purpose {
-            Purpose::Open => ExplorerEvent::OpenAgent(self.target()),
-            Purpose::Choose(_) => ExplorerEvent::Choose(self.target()),
+            Purpose::Open => ExplorerEvent::OpenAgent(target),
+            Purpose::Choose(_) => ExplorerEvent::Choose(target),
         });
     }
 
     /// ⌥↵: a terminal tab in the target folder (nothing when picking one).
     fn open_terminal(&mut self, cx: &mut Context<Self>) {
-        if self.purpose == Purpose::Open {
-            cx.emit(ExplorerEvent::OpenTerminal(self.target()));
+        if self.purpose != Purpose::Open {
+            return;
+        }
+        if let Some(target) = self.target() {
+            cx.emit(ExplorerEvent::OpenTerminal(target));
         }
     }
 
@@ -357,7 +383,7 @@ impl ExplorerView {
             }))
     }
 
-    fn render_row(&self, i: usize, entry: &Entry, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_row(&self, i: usize, entry: &Entry, cx: &mut Context<Self>) -> Stateful<Div> {
         let selected = Some(i) == self.selected;
         let repo = entry.is_dir && self.repos.contains(&entry.name);
         let icon = match (entry.is_dir, repo) {
@@ -367,6 +393,8 @@ impl ExplorerView {
         };
         h_flex()
             .id(("explorer-row", i))
+            .debug_selector(move || format!("explorer-row-{i}"))
+            .w_full()
             .h(px(32.))
             .flex_none()
             .px_3()
@@ -525,32 +553,44 @@ fn hint(keys: impl IntoIterator<Item = impl IntoElement>, label: &'static str) -
 
 impl Render for ExplorerView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut list = v_flex()
-            .id("explorer-list")
-            .flex_1()
-            .min_h_0()
-            .overflow_y_scroll()
-            .track_scroll(&self.scroll)
-            .p_2();
-        for (i, entry) in self.shown.iter().enumerate() {
-            list = list.child(self.render_row(i, entry, cx));
-        }
-        if self.shown.is_empty() {
+        // Only the rows in view are built.
+        let list = if self.shown.is_empty() {
             let text = match &self.error {
                 _ if self.loading => "Loading…".into(),
                 Some(error) => format!("Can't read this folder: {error}"),
                 None if self.entries.is_empty() => "Empty folder".into(),
                 None => "No matches".into(),
             };
-            list = list.child(
-                div()
-                    .py_8()
-                    .text_center()
-                    .text_sm()
-                    .text_color(ui::muted())
-                    .child(text),
-            );
-        }
+            v_flex()
+                .id("explorer-list")
+                .flex_1()
+                .min_h_0()
+                .p_2()
+                .child(
+                    div()
+                        .py_8()
+                        .text_center()
+                        .text_sm()
+                        .text_color(ui::muted())
+                        .child(text),
+                )
+                .into_any_element()
+        } else {
+            uniform_list(
+                "explorer-list",
+                self.shown.len(),
+                cx.processor(|this, range: std::ops::Range<usize>, _, cx| {
+                    range
+                        .map(|i| this.render_row(i, &this.shown[i], cx))
+                        .collect::<Vec<_>>()
+                }),
+            )
+            .flex_1()
+            .min_h_0()
+            .p_2()
+            .track_scroll(&self.scroll)
+            .into_any_element()
+        };
         let (secondary, alt) = if cfg!(target_os = "macos") {
             ("⌘", "⌥")
         } else {
@@ -597,6 +637,10 @@ impl Render for ExplorerView {
                             .icon(Icon::new(icon))
                             .label(label)
                             .on_click(cx.listener(|this, _, _, cx| {
+                                // Nothing to open before a folder is read.
+                                if this.dir.as_os_str().is_empty() {
+                                    return;
+                                }
                                 cx.emit(match this.purpose {
                                     Purpose::Open => ExplorerEvent::OpenAgent(this.dir.clone()),
                                     Purpose::Choose(_) => ExplorerEvent::Choose(this.dir.clone()),

@@ -24,7 +24,7 @@ pub use gentle_core::git::refs::{RefEntry, RefsSnapshot, Worktree};
 pub use gentle_core::git::status::{
     ChangeGroup, EntryKind, GitSnapshot, StatusEntry, WorkTree, change_groups,
 };
-pub use log::{History, Scope, history};
+pub use log::{History, Scope, earlier, history};
 pub use refs::{
     StashAction, add_worktree, checkout_remote, prune_worktrees, refs_snapshot, remove_worktree,
     stash,
@@ -115,6 +115,45 @@ pub fn run(cwd: &Path, args: &[&str]) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A fresh repository under the temp folder, named after `test`, with one
+    /// commit and three changes: `same.txt` rewritten with the same content
+    /// and an older mtime (its index entry is stat-dirty, so a git command
+    /// that refreshes the index rewrites `.git/index`), `edit.txt` edited
+    /// (one line added, one replaced: 2 added, 1 removed) and `new.txt`
+    /// untracked (one line). `None` without git.
+    pub(super) fn stat_dirty_repo(test: &str) -> Option<PathBuf> {
+        pi_rpc::command("git").arg("--version").output().ok()?;
+        let dir = std::env::temp_dir().join(format!(
+            "gs-git-{test}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sh = |args: &[&str]| run(&dir, args).unwrap();
+        sh(&["init", "-q", "-b", "main"]);
+        sh(&["config", "user.email", "t@example.com"]);
+        sh(&["config", "user.name", "T"]);
+        sh(&["config", "commit.gpgsign", "false"]);
+        let same = dir.join("same.txt");
+        std::fs::write(&same, "one\n").unwrap();
+        std::fs::write(dir.join("edit.txt"), "a\nb\n").unwrap();
+        sh(&["add", "same.txt", "edit.txt"]);
+        sh(&["commit", "-q", "-m", "first"]);
+        std::fs::write(dir.join("edit.txt"), "a\nc\nd\n").unwrap();
+        std::fs::write(dir.join("new.txt"), "x\n").unwrap();
+        std::fs::write(&same, "one\n").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&same)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000))
+            .unwrap();
+        Some(dir)
+    }
 
     /// The real git commands against a throwaway repository.
     #[test]
