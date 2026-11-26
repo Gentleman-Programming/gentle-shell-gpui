@@ -221,6 +221,9 @@ impl Workspace {
         let old_dock = self.active_right_tool(cx);
         self.cancel_workspace_rename_state(cx);
         self.layout_profiles = profiles;
+        if let Some(tree) = self.sidebar.clone() {
+            tree.update(cx, |tree, cx| tree.set_original_tabs(p.original_controls, cx));
+        }
         self.tab_layout = p.tab_layout;
         self.sidebar_compact = p.tab_layout == TabLayout::Vertical && !p.workspace_visible;
         self.tabs_sidebar_hidden = p.tabs_sidebar_hidden;
