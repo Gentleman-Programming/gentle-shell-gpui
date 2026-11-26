@@ -1,13 +1,13 @@
 //! Pi's `models.json` and `mcp.json` on a Gentle Shell server, edited as
 //! JSON in Configuration and saved over Desktop RPC (`custom_models`,
-//! `mcp_servers`): the server validates a write with Pi's own rules and
+//! `mcp`): the server validates a write with Pi's own rules and
 //! refuses one over a file that changed since the editor opened it. Secrets
 //! come as `•••` and stay as they are when sent back so. Nothing here
 //! touches a file: a server too old for these stores keeps saying "Do this
 //! on <server>".
 
 use gentle_core::agent_config::{
-    AgentDocument, McpLayers, SECRET_MARKER, custom_providers, mcp_server_names, parse_document,
+    AgentDocument, McpLayers, SECRET_MARKER, custom_providers, parse_document,
 };
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -15,8 +15,8 @@ use gpui_kit::component::input::{Editor, EditorState};
 use gpui_kit::component::{Disableable as _, Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::*;
 use pi_rpc::desktop_rpc::{
-    ConfigState, ConfigStore, ConfigWrite, ConfigWriteTarget, CustomModelsData, McpDocumentData,
-    McpLayer,
+    ConfigLayerSource, ConfigState, ConfigStore, ConfigWrite, ConfigWriteTarget, CustomModelsData,
+    McpDocumentData, McpLayer,
 };
 
 use super::SettingsView;
@@ -61,7 +61,7 @@ impl ServerDocuments {
 fn store_of(document: AgentDocument) -> ConfigStore {
     match document {
         AgentDocument::CustomModels => ConfigStore::CustomModels,
-        AgentDocument::McpGlobal | AgentDocument::McpProject => ConfigStore::McpServers,
+        AgentDocument::McpGlobal | AgentDocument::McpProject => ConfigStore::Mcp,
     }
 }
 
@@ -91,7 +91,7 @@ fn write_of(document: AgentDocument, text: &str) -> Result<ConfigWrite, String> 
         AgentDocument::CustomModels => {
             ConfigWrite::CustomModels(CustomModelsData::new(value).map_err(invalid)?)
         }
-        AgentDocument::McpGlobal | AgentDocument::McpProject => ConfigWrite::McpServers {
+        AgentDocument::McpGlobal | AgentDocument::McpProject => ConfigWrite::Mcp {
             layer: if document == AgentDocument::McpProject {
                 McpLayer::Project
             } else {
@@ -238,11 +238,11 @@ impl SettingsView {
         .child(self.document_area(&[AgentDocument::CustomModels], server, state, cx))
     }
 
-    /// Integrations › MCP servers on a server: both layers' servers, and
-    /// editing their `mcp.json` there.
+    /// Integrations › MCP servers on a server: the servers Pi loads there,
+    /// and editing each `mcp.json` it reads.
     pub(super) fn server_mcp(&self, server: &ServerPlace, cx: &mut Context<Self>) -> Div {
         let card = section(IconName::Bot, "MCP servers");
-        let state = match self.served(ConfigStore::McpServers, cx) {
+        let state = match self.served(ConfigStore::Mcp, cx) {
             Err(()) => {
                 return card.child(note(
                     server.act("edit mcp.json in its Gentle Shell agent folder"),
@@ -252,28 +252,16 @@ impl SettingsView {
             Ok(Some(state)) => state,
         };
         let layers = McpLayers::from_value(state.value.as_ref());
-        let names = |document: Option<&serde_json::Value>| {
-            let names = mcp_server_names(document);
-            if names.is_empty() {
-                "—".to_string()
-            } else {
-                names.join(", ")
-            }
-        };
-        // A dedicated session's folder is the server's home, not a
-        // project: only the active tab's project is offered.
-        let project = layers.project_trusted && !self.control.hidden();
+        // Pi reads the project file only in a trusted project, and only
+        // then does the store list its layer. A dedicated session's folder
+        // is the server's home, not a project: only the active tab's
+        // project is offered.
+        let project = project_trusted(state) && !self.control.hidden();
         let mut documents = vec![AgentDocument::McpGlobal];
         if project {
             documents.push(AgentDocument::McpProject);
         }
-        card.child(row("Global (mcp.json)", names(layers.global.as_ref())))
-            .children(project.then(|| {
-                row(
-                    "This project (.pi/mcp.json)",
-                    names(layers.project.as_ref()),
-                )
-            }))
+        card.child(row("Configured servers", layers.summary()))
             .child(self.document_area(&documents, server, state, cx))
     }
 
@@ -399,6 +387,14 @@ fn asking(server: &str) -> Div {
         .child(format!("Asking {server}…"))
 }
 
+/// Whether the `mcp` read includes the project layer (Pi trusts it).
+fn project_trusted(state: &ConfigState) -> bool {
+    state
+        .layers
+        .iter()
+        .any(|layer| layer.source == ConfigLayerSource::Project)
+}
+
 #[cfg(test)]
 mod tests {
     use gentle_core::agent_config::AgentDocument;
@@ -408,23 +404,33 @@ mod tests {
     };
     use serde_json::json;
 
-    use super::{ServerDocuments, document_in, write_of};
+    use super::{ServerDocuments, document_in, project_trusted, write_of};
 
     fn mcp_state() -> ConfigState {
         ConfigState {
-            store: ConfigStore::McpServers,
+            store: ConfigStore::Mcp,
             scope: ConfigScope::GlobalProject,
             read_only: false,
             status: ConfigStatus::Ok,
             revision: "r1".into(),
             value: Some(json!({
-                "projectTrusted": true,
-                "global": { "mcpServers": { "docs": { "url": "https://x" } } },
+                "servers": [{ "name": "docs", "transport": "http", "enabled": true }],
+                "truncated": false,
+                "omitted": 0,
+                "documents": {
+                    "global": { "mcpServers": { "docs": { "url": "https://x" } } },
+                },
             })),
-            layers: vec![ConfigLayer {
-                source: ConfigLayerSource::Global,
-                status: ConfigStatus::Ok,
-            }],
+            layers: vec![
+                ConfigLayer {
+                    source: ConfigLayerSource::Global,
+                    status: ConfigStatus::Ok,
+                },
+                ConfigLayer {
+                    source: ConfigLayerSource::Project,
+                    status: ConfigStatus::Missing,
+                },
+            ],
             write_targets: Some(vec![
                 ConfigWriteTargetState {
                     target: ConfigWriteTarget::Global,
@@ -443,6 +449,7 @@ mod tests {
     #[test]
     fn each_mcp_layer_opens_its_own_document_and_saves_to_it() {
         let state = mcp_state();
+        assert!(project_trusted(&state));
         assert_eq!(
             document_in(AgentDocument::McpGlobal, &state),
             Some(json!({ "mcpServers": { "docs": { "url": "https://x" } } }))
@@ -452,12 +459,20 @@ mod tests {
         let write = write_of(AgentDocument::McpProject, "{ \"mcpServers\": {} }").unwrap();
         assert!(matches!(
             &write,
-            ConfigWrite::McpServers {
+            ConfigWrite::Mcp {
                 layer: McpLayer::Project,
                 ..
             }
         ));
+        assert_eq!(write.store(), ConfigStore::Mcp);
         assert_eq!(write.write_target(), ConfigWriteTarget::Project);
+    }
+
+    #[test]
+    fn an_untrusted_project_offers_only_the_global_file() {
+        let mut state = mcp_state();
+        state.layers.truncate(1);
+        assert!(!project_trusted(&state));
     }
 
     #[test]

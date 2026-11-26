@@ -4,8 +4,8 @@
 //! methods, or one that answers `unknown_store` for a settings store (4.9.0
 //! and older), keeps the direct file read (and, for notifications, the file
 //! write) of before. Nothing here touches a file on the RPC path. On a
-//! Gentle Shell server the `profiles` and `model_defaults` stores are read
-//! too (no file of them is read there; the model defaults are written
+//! Gentle Shell server the `profiles` and `pi_settings` stores are read
+//! too (no file of them is read there; Pi's model defaults are written
 //! there too), and a store it does not serve is never read or written from
 //! this computer's files.
 
@@ -15,7 +15,7 @@ use gentle_core::notifications::{self, FileState, Policy};
 use gpui_kit::*;
 use pi_rpc::desktop_rpc::{
     ConfigErrorCode, ConfigState, ConfigStatus, ConfigStore, ConfigWrite, ConfigWriteTarget,
-    ModelDefaultsData, NotificationsData,
+    NotificationsData, PiSettingsPatch,
 };
 
 use super::SettingsView;
@@ -34,9 +34,9 @@ pub(super) const SETTINGS_STORES: [ConfigStore; 3] = [
 /// `settings.json`, `models.json` and `mcp.json`.
 const SERVER_STORES: [ConfigStore; 4] = [
     ConfigStore::Profiles,
-    ConfigStore::ModelDefaults,
+    ConfigStore::PiSettings,
     ConfigStore::CustomModels,
-    ConfigStore::McpServers,
+    ConfigStore::Mcp,
 ];
 
 /// The stores Configuration asks for, on a server (`server`) or not.
@@ -230,12 +230,12 @@ fn policy_at(state: &ConfigState, file: std::path::PathBuf) -> Policy {
 fn conflict_note(store: ConfigStore) -> String {
     let what = match store {
         ConfigStore::Notifications => "notifications",
-        ConfigStore::ModelDefaults => "the model defaults",
+        ConfigStore::PiSettings => "the model defaults",
         // The editor keeps the text; Reload shows the server's.
         ConfigStore::CustomModels => {
             return "Not saved: models.json changed on the server since you opened it.".into();
         }
-        ConfigStore::McpServers => {
+        ConfigStore::Mcp => {
             return "Not saved: mcp.json changed on the server since you opened it.".into();
         }
         _ => "this setting",
@@ -440,20 +440,24 @@ impl SettingsView {
         }
     }
 
-    /// Replace the server's model defaults (`model_defaults`, guarded by the
-    /// revision Gentle Shell reported).
+    /// Change the server's model defaults (`pi_settings`, guarded by the
+    /// revision Gentle Shell reported): only the keys that differ from its
+    /// last read are sent.
     pub(super) fn set_model_defaults(
         &mut self,
         defaults: &gentle_core::model_defaults::ModelDefaults,
         cx: &mut Context<Self>,
     ) {
-        match ModelDefaultsData::new(defaults.to_value()) {
-            Ok(data) => self.write_shell_store(ConfigWrite::ModelDefaults(data), cx),
+        let store = ConfigStore::PiSettings;
+        let read = gentle_core::model_defaults::ModelDefaults::from_value(
+            self.shell_config
+                .state(store)
+                .and_then(|state| state.value.as_ref()),
+        );
+        match PiSettingsPatch::new(defaults.patch_from(&read)) {
+            Ok(patch) => self.write_shell_store(ConfigWrite::PiSettings(patch), cx),
             Err(error) => {
-                self.config_note(
-                    ConfigStore::ModelDefaults,
-                    Some(format!("Not saved: {error}")),
-                );
+                self.config_note(store, Some(format!("Not saved: {error}")));
                 cx.notify();
             }
         }

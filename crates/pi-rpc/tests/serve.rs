@@ -568,7 +568,7 @@ fn the_servers_desktop_rpc_answers_like_a_session_without_one() {
     // A Desktop prompt is answered as a session would: handled, then the
     // widget record under the app's own requestId.
     let ask = |request_id: &str, method: &str| {
-        let inner = json!({"schema": "gentle-shell.desktop-rpc/v1", "requestId": request_id, "method": method, "params": {"store": "model_defaults"}});
+        let inner = json!({"schema": "gentle-shell.desktop-rpc/v1", "requestId": request_id, "method": method, "params": {"store": "pi_settings"}});
         pollster::block_on(
             process
                 .request(json!({"type": "prompt", "message": format!("/gentle:desktop {inner}")})),
@@ -592,7 +592,7 @@ fn the_servers_desktop_rpc_answers_like_a_session_without_one() {
     assert_eq!(answer["data"]["method"], "get_config");
     assert_eq!(
         fake.state.lock().unwrap().desktop.last().unwrap()["params"]["store"],
-        "model_defaults"
+        "pi_settings"
     );
     // A refusal of the server is the answer's error, in its words.
     ask("app-2", "set_api_key");

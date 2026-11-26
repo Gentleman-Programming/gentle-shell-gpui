@@ -1,7 +1,7 @@
 //! Model defaults and provider/profile inventory; actual profile routing
 //! remains in the application's dedicated Profiles editor. On a Gentle
-//! Shell server the model defaults are its Gentle Shell's `model_defaults`
-//! store, read and changed over Desktop RPC; a server too old for it keeps
+//! Shell server the model defaults are its Gentle Shell's `pi_settings`
+//! store (Pi's merged view), read and changed over Desktop RPC; a server too old for it keeps
 //! saying "Do this on <server>".
 
 use gentle_core::model_defaults::ModelDefaults;
@@ -51,12 +51,12 @@ pub(super) fn models_section(
 }
 
 impl SettingsView {
-    /// The server's model defaults, changed there: a pick writes the whole
-    /// store over the revision read (another change meanwhile is refused
-    /// and shown afresh).
+    /// The server's model defaults, changed there: a pick patches the keys
+    /// it changes over the revision read (another change meanwhile is
+    /// refused and shown afresh).
     fn server_model_defaults(&self, server: &ServerPlace, cx: &mut Context<Self>) -> Div {
         let card = section(IconName::Cpu, "Model defaults");
-        let store = ConfigStore::ModelDefaults;
+        let store = ConfigStore::PiSettings;
         if self.server_lacks(store, cx) {
             return card.child(note(run_on(&server.name, commands::SETTINGS)));
         }

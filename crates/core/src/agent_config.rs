@@ -1,8 +1,8 @@
 //! Pi's own configuration documents a Gentle Shell server serves over
-//! Desktop RPC: `custom_models` (its `models.json`) and `mcp_servers` (its
-//! `mcp.json`, global and project). Each is edited here as the whole JSON
-//! document, secrets shown as [`SECRET_MARKER`] (sent back in place, the
-//! marker keeps that secret).
+//! Desktop RPC: `custom_models` (its `models.json`) and `mcp` (its
+//! `mcp.json`, global and project, with the servers Pi loads from them).
+//! Each is edited here as the whole JSON document, secrets shown as
+//! [`SECRET_MARKER`] (sent back in place, the marker keeps that secret).
 
 use serde_json::{Value, json};
 
@@ -14,11 +14,6 @@ pub fn custom_providers(document: Option<&Value>) -> Vec<String> {
     keys(document.map(|document| &document["providers"]))
 }
 
-/// The servers an `mcp.json` document defines, in its order.
-pub fn mcp_server_names(document: Option<&Value>) -> Vec<String> {
-    keys(document.map(|document| &document["mcpServers"]))
-}
-
 fn keys(object: Option<&Value>) -> Vec<String> {
     object
         .and_then(Value::as_object)
@@ -26,11 +21,24 @@ fn keys(object: Option<&Value>) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// The `mcp_servers` store's value: each layer's document when its file
-/// reads well, and whether Pi reads the project one (a trusted project).
+/// One server Pi loads from the `mcp.json` layers it reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpServer {
+    pub name: String,
+    /// `stdio` or `http`, as Pi connects.
+    pub transport: String,
+    pub enabled: bool,
+}
+
+/// The `mcp` store's value: the servers Pi loads (at most 64, in its
+/// order), how many were left out, and each layer's document where the
+/// server reads it (a missing or unreadable file, or a project Pi doesn't
+/// trust, has none).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct McpLayers {
-    pub project_trusted: bool,
+    pub servers: Vec<McpServer>,
+    /// Servers beyond the 64 listed, or left out for an overlong name.
+    pub more: bool,
     pub global: Option<Value>,
     pub project: Option<Value>,
 }
@@ -40,11 +48,51 @@ impl McpLayers {
         let Some(value) = value else {
             return Self::default();
         };
-        let document = |key: &str| value.get(key).filter(|doc| doc.is_object()).cloned();
+        let servers = value["servers"]
+            .as_array()
+            .map(|all| {
+                all.iter()
+                    .filter_map(|server| {
+                        Some(McpServer {
+                            name: server["name"].as_str()?.to_string(),
+                            transport: server["transport"].as_str().unwrap_or("").to_string(),
+                            enabled: server["enabled"].as_bool().unwrap_or(true),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let documents = &value["documents"];
+        let document = |key: &str| documents.get(key).filter(|doc| doc.is_object()).cloned();
         Self {
-            project_trusted: value["projectTrusted"].as_bool().unwrap_or(false),
+            servers,
+            more: value["truncated"].as_bool().unwrap_or(false)
+                || value["omitted"].as_u64().unwrap_or(0) > 0,
             global: document("global"),
             project: document("project"),
+        }
+    }
+
+    /// The servers as a line: each name, a disabled one marked so.
+    pub fn summary(&self) -> String {
+        let mut names: Vec<String> = self
+            .servers
+            .iter()
+            .map(|server| {
+                if server.enabled {
+                    server.name.clone()
+                } else {
+                    format!("{} (off)", server.name)
+                }
+            })
+            .collect();
+        if self.more {
+            names.push("…".into());
+        }
+        if names.is_empty() {
+            "—".into()
+        } else {
+            names.join(", ")
         }
     }
 }
@@ -119,28 +167,36 @@ fn reason(error: &serde_json::Error) -> String {
 mod tests {
     use serde_json::json;
 
-    use super::{AgentDocument, McpLayers, custom_providers, mcp_server_names, parse_document};
+    use super::{AgentDocument, McpLayers, custom_providers, parse_document};
 
     #[test]
-    fn names_come_from_the_documents() {
+    fn providers_come_from_the_document() {
         let models = json!({ "providers": { "ollama": {}, "lab": {} } });
         assert_eq!(custom_providers(Some(&models)), ["ollama", "lab"]);
         assert!(custom_providers(None).is_empty());
         assert!(custom_providers(Some(&json!({ "providers": [] }))).is_empty());
-        let mcp = json!({ "mcpServers": { "docs": { "url": "https://x" } } });
-        assert_eq!(mcp_server_names(Some(&mcp)), ["docs"]);
     }
 
     #[test]
-    fn the_mcp_value_names_each_layer_that_reads_well() {
+    fn the_mcp_value_lists_the_servers_and_each_readable_document() {
         let layers = McpLayers::from_value(Some(&json!({
-            "projectTrusted": true,
-            "global": { "mcpServers": {} },
+            "servers": [
+                { "name": "docs", "transport": "http", "enabled": true },
+                { "name": "fs", "transport": "stdio", "enabled": false },
+            ],
+            "truncated": false,
+            "omitted": 0,
+            "documents": { "global": { "mcpServers": {} } },
         })));
-        assert!(layers.project_trusted);
+        assert_eq!(layers.servers.len(), 2);
+        assert_eq!(layers.servers[0].transport, "http");
+        assert_eq!(layers.summary(), "docs, fs (off)");
         assert_eq!(layers.global, Some(json!({ "mcpServers": {} })));
         assert_eq!(layers.project, None);
+        let cut = McpLayers::from_value(Some(&json!({ "servers": [], "omitted": 1 })));
+        assert_eq!(cut.summary(), "…");
         assert_eq!(McpLayers::from_value(None), McpLayers::default());
+        assert_eq!(McpLayers::default().summary(), "—");
     }
 
     #[test]

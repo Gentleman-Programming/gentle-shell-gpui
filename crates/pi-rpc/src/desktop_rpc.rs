@@ -3014,14 +3014,15 @@ impl DesignCanvasEvent {
     }
 }
 
-/// The twelve configuration stores the protocol names. A store is an
+/// The thirteen configuration stores the protocol names. A store is an
 /// identifier, never a path; anything else is refused. Gentle Shell 4.9.0
 /// knows only the first six: it answers `unknown_store` for the settings
 /// stores (`persona`, `banner`, `notifications`), and a Shell older than
-/// the last three answers it for those: `model_defaults` (Pi's default
-/// model, effort and scoped models in the agent home's `settings.json`),
-/// `custom_models` (Pi's `models.json`) and `mcp_servers` (Pi's
-/// `mcp.json`, global and project).
+/// the last four answers it for those: `mcp` (Pi's `mcp.json`, global and
+/// project, with the servers Pi loads from them), `pi_settings` (Pi's
+/// merged `settings.json` view; its four model keys are writable),
+/// `claude_bridge` (the plan of `pi-claude-bridge`, read-only) and
+/// `custom_models` (Pi's `models.json`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ConfigStore {
     Profiles,
@@ -3033,14 +3034,15 @@ pub enum ConfigStore {
     Persona,
     Banner,
     Notifications,
-    ModelDefaults,
+    Mcp,
+    PiSettings,
+    ClaudeBridge,
     CustomModels,
-    McpServers,
 }
 
 impl ConfigStore {
     /// Every store the protocol speaks, in wire order.
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 13] = [
         Self::Profiles,
         Self::Models,
         Self::ProfileFallbacks,
@@ -3050,9 +3052,10 @@ impl ConfigStore {
         Self::Persona,
         Self::Banner,
         Self::Notifications,
-        Self::ModelDefaults,
+        Self::Mcp,
+        Self::PiSettings,
+        Self::ClaudeBridge,
         Self::CustomModels,
-        Self::McpServers,
     ];
 
     /// The wire name of the store.
@@ -3067,9 +3070,10 @@ impl ConfigStore {
             Self::Persona => "persona",
             Self::Banner => "banner",
             Self::Notifications => "notifications",
-            Self::ModelDefaults => "model_defaults",
+            Self::Mcp => "mcp",
+            Self::PiSettings => "pi_settings",
+            Self::ClaudeBridge => "claude_bridge",
             Self::CustomModels => "custom_models",
-            Self::McpServers => "mcp_servers",
         }
     }
 
@@ -3081,24 +3085,24 @@ impl ConfigStore {
             | Self::ManagedAssets
             | Self::Banner
             | Self::Notifications
-            | Self::ModelDefaults
+            | Self::ClaudeBridge
             | Self::CustomModels => ConfigScope::Global,
-            Self::Models | Self::Subagents | Self::Persona | Self::McpServers => {
+            Self::Models | Self::Subagents | Self::Persona | Self::Mcp | Self::PiSettings => {
                 ConfigScope::GlobalProject
             }
             Self::Pins => ConfigScope::LocalRepo,
         }
     }
 
-    /// Whether the store is derived or installer-owned, so `set_config` can
-    /// never target it.
+    /// Whether the store is derived, installer-owned or display-only, so
+    /// `set_config` can never target it.
     pub fn is_read_only(self) -> bool {
         self.write_targets().is_empty()
     }
 
     /// The files a write to this store may replace; empty when read-only.
     /// `persona`'s `global` target also covers the project file when that
-    /// one already exists.
+    /// one already exists; `pi_settings` writes only the global file.
     pub fn write_targets(self) -> &'static [ConfigWriteTarget] {
         match self {
             Self::Profiles
@@ -3106,11 +3110,11 @@ impl ConfigStore {
             | Self::Persona
             | Self::Banner
             | Self::Notifications
-            | Self::ModelDefaults
+            | Self::PiSettings
             | Self::CustomModels => &[ConfigWriteTarget::Global],
-            Self::McpServers => &[ConfigWriteTarget::Global, ConfigWriteTarget::Project],
+            Self::Mcp => &[ConfigWriteTarget::Global, ConfigWriteTarget::Project],
             Self::Pins => &[ConfigWriteTarget::Local, ConfigWriteTarget::Repo],
-            Self::Models | Self::Subagents | Self::ManagedAssets => &[],
+            Self::Models | Self::Subagents | Self::ManagedAssets | Self::ClaudeBridge => &[],
         }
     }
 }
@@ -3420,17 +3424,33 @@ impl NotificationsData {
     }
 }
 
-/// The complete `model_defaults` store content: `defaultProvider`,
-/// `defaultModel`, `defaultThinkingLevel` and `enabledModels`, an absent
-/// key unset (written as removed; `{}` clears them all). Only the JSON
-/// object shape is checked here; the server's owner validates the rest
-/// (`invalid_data`) and keeps every other `settings.json` key.
+/// A `pi_settings` write: a patch of Pi's four model keys
+/// (`defaultProvider`, `defaultModel`, `defaultThinkingLevel`,
+/// `enabledModels`) in the agent home's `settings.json`. A key set to
+/// `null` is removed, an omitted key is kept, and no other key may be sent.
+/// The server's owner validates the values (`invalid_data`).
 #[derive(Debug, Clone, PartialEq)]
-pub struct ModelDefaultsData(Value);
+pub struct PiSettingsPatch(Value);
 
-impl ModelDefaultsData {
+impl PiSettingsPatch {
+    /// The keys a patch may name.
+    pub const KEYS: [&'static str; 4] = [
+        "defaultProvider",
+        "defaultModel",
+        "defaultThinkingLevel",
+        "enabledModels",
+    ];
+
     pub fn new(data: Value) -> Result<Self, DesktopRpcError> {
-        store_document(&data, "model_defaults")?;
+        store_document(&data, "pi_settings")?;
+        if let Some(key) = data
+            .as_object()
+            .and_then(|patch| patch.keys().find(|key| !Self::KEYS.contains(&key.as_str())))
+        {
+            return Err(DesktopRpcError::InvalidConfigData(format!(
+                "pi_settings data may not name {key}"
+            )));
+        }
         Ok(Self(data))
     }
 
@@ -3458,9 +3478,9 @@ impl CustomModelsData {
     }
 }
 
-/// Which `mcp.json` an `mcp_servers` write replaces: the agent home's, or
-/// the session folder's `.pi/mcp.json` (read by Pi only in a trusted
-/// project).
+/// Which `mcp.json` an `mcp` write replaces: the agent home's, or the
+/// session folder's `.pi/mcp.json` (read by Pi only in a trusted project;
+/// otherwise the write answers `project_untrusted`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum McpLayer {
     Global,
@@ -3493,7 +3513,7 @@ pub struct McpDocumentData(Value);
 
 impl McpDocumentData {
     pub fn new(data: Value) -> Result<Self, DesktopRpcError> {
-        store_document(&data, "mcp_servers")?;
+        store_document(&data, "mcp")?;
         Ok(Self(data))
     }
 
@@ -3523,13 +3543,12 @@ pub enum ConfigWrite {
     Banner(BannerData),
     /// Replace the whole `notifications` store.
     Notifications(NotificationsData),
-    /// Replace the whole `model_defaults` store.
-    ModelDefaults(ModelDefaultsData),
+    /// Patch Pi's model keys (`pi_settings`).
+    PiSettings(PiSettingsPatch),
     /// Replace Pi's whole `models.json` (`custom_models`).
     CustomModels(CustomModelsData),
-    /// Replace one whole `mcp.json` (`mcp_servers`), sent as
-    /// `{ source, document }`.
-    McpServers {
+    /// Replace one whole `mcp.json` (`mcp`), sent as `{ source, document }`.
+    Mcp {
         layer: McpLayer,
         document: McpDocumentData,
     },
@@ -3561,9 +3580,9 @@ impl ConfigWrite {
             Self::Persona(_) => ConfigStore::Persona,
             Self::Banner(_) => ConfigStore::Banner,
             Self::Notifications(_) => ConfigStore::Notifications,
-            Self::ModelDefaults(_) => ConfigStore::ModelDefaults,
+            Self::PiSettings(_) => ConfigStore::PiSettings,
             Self::CustomModels(_) => ConfigStore::CustomModels,
-            Self::McpServers { .. } => ConfigStore::McpServers,
+            Self::Mcp { .. } => ConfigStore::Mcp,
         }
     }
 
@@ -3571,13 +3590,13 @@ impl ConfigWrite {
     pub fn write_target(&self) -> ConfigWriteTarget {
         match self {
             Self::Pin { source, .. } => source.write_target(),
-            Self::McpServers { layer, .. } => layer.write_target(),
+            Self::Mcp { layer, .. } => layer.write_target(),
             Self::Profiles(_)
             | Self::ProfileFallbacks(_)
             | Self::Persona(_)
             | Self::Banner(_)
             | Self::Notifications(_)
-            | Self::ModelDefaults(_)
+            | Self::PiSettings(_)
             | Self::CustomModels(_) => ConfigWriteTarget::Global,
         }
     }
@@ -3610,9 +3629,9 @@ fn set_config_params(
         ConfigWrite::Persona(mode) => json!({ "mode": mode.as_str() }),
         ConfigWrite::Banner(data) => data.as_value().clone(),
         ConfigWrite::Notifications(data) => data.as_value().clone(),
-        ConfigWrite::ModelDefaults(data) => data.as_value().clone(),
+        ConfigWrite::PiSettings(patch) => patch.as_value().clone(),
         ConfigWrite::CustomModels(data) => data.as_value().clone(),
-        ConfigWrite::McpServers { layer, document } => {
+        ConfigWrite::Mcp { layer, document } => {
             json!({ "source": layer.as_str(), "document": document.as_value() })
         }
     };
@@ -3627,11 +3646,13 @@ fn set_config_params(
 /// (`invalid_request`, `internal_error`) are not config-specific.
 /// `profile_apply_busy` is also an `apply_profile` failure: `set_config` for
 /// `profiles`, `profile_fallbacks` or `pins` answers it while an apply runs,
-/// and writes nothing.
+/// and writes nothing. `project_untrusted` refuses an `mcp` write of the
+/// project layer while the session does not trust the project.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ConfigErrorCode {
     UnknownStore,
     ReadOnly,
+    ProjectUntrusted,
     InvalidData,
     RevisionConflict,
     WriteFailed,
@@ -3641,9 +3662,10 @@ pub enum ConfigErrorCode {
 
 impl ConfigErrorCode {
     /// Every config failure code, in documented order.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::UnknownStore,
         Self::ReadOnly,
+        Self::ProjectUntrusted,
         Self::InvalidData,
         Self::RevisionConflict,
         Self::WriteFailed,
@@ -3656,6 +3678,7 @@ impl ConfigErrorCode {
         match self {
             Self::UnknownStore => "unknown_store",
             Self::ReadOnly => "read_only",
+            Self::ProjectUntrusted => "project_untrusted",
             Self::InvalidData => "invalid_data",
             Self::RevisionConflict => "revision_conflict",
             Self::WriteFailed => "write_failed",

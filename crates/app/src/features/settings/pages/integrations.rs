@@ -19,7 +19,7 @@ pub(super) fn render(
     cx: &mut Context<SettingsView>,
 ) -> Div {
     let mcp = match view.server() {
-        // Its Gentle Shell's `mcp_servers` store, edited there.
+        // Its Gentle Shell's `mcp` store, edited there.
         Some(server) => view.server_mcp(server, cx),
         None => section(IconName::Bot, "MCP servers")
             .child(row(

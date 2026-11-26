@@ -1,7 +1,7 @@
-//! Pi's model defaults as Gentle Shell's `model_defaults` config store holds
+//! Pi's model defaults as Gentle Shell's `pi_settings` config store shows
 //! them (`defaultProvider`, `defaultModel`, `defaultThinkingLevel`,
-//! `enabledModels` of the agent home's `settings.json`): read from a
-//! `get_config` value and written back whole, an absent key unset.
+//! `enabledModels`, Pi's merged view of `settings.json`): read from a
+//! `get_config` value and written back as a patch of the keys that changed.
 
 use serde_json::{Map, Value};
 
@@ -43,19 +43,27 @@ impl ModelDefaults {
         }
     }
 
-    /// The complete write: every key set, nothing else.
-    pub fn to_value(&self) -> Value {
+    /// The write that turns `read` into these defaults: only the keys that
+    /// differ, an unset one as `null` (removed). The server writes the
+    /// agent home's `settings.json` alone, so a key left as it was read
+    /// (perhaps from the project's file) is not copied there.
+    pub fn patch_from(&self, read: &Self) -> Value {
         let mut out = Map::new();
-        let mut put = |key: &str, value: &Option<String>| {
-            if let Some(value) = value {
-                out.insert(key.into(), Value::from(value.as_str()));
+        let mut put = |key: &str, now: &Option<String>, was: &Option<String>| {
+            if now != was {
+                out.insert(key.into(), now.as_deref().map_or(Value::Null, Value::from));
             }
         };
-        put("defaultProvider", &self.provider);
-        put("defaultModel", &self.model);
-        put("defaultThinkingLevel", &self.thinking);
-        if !self.enabled.is_empty() {
-            out.insert("enabledModels".into(), Value::from(self.enabled.clone()));
+        put("defaultProvider", &self.provider, &read.provider);
+        put("defaultModel", &self.model, &read.model);
+        put("defaultThinkingLevel", &self.thinking, &read.thinking);
+        if self.enabled != read.enabled {
+            let enabled = if self.enabled.is_empty() {
+                Value::Null
+            } else {
+                Value::from(self.enabled.clone())
+            };
+            out.insert("enabledModels".into(), enabled);
         }
         Value::Object(out)
     }
@@ -125,7 +133,7 @@ mod tests {
     }
 
     #[test]
-    fn a_write_is_the_whole_store_and_an_unset_key_is_left_out() {
+    fn a_write_patches_only_what_changed_and_an_unset_key_is_null() {
         let read = ModelDefaults::from_value(Some(&json!({
             "defaultProvider": "openai",
             "defaultModel": "gpt-5",
@@ -134,24 +142,28 @@ mod tests {
         })));
         assert_eq!(
             read.with_model(Some(("anthropic", "claude-opus-4-5")))
-                .to_value(),
+                .patch_from(&read),
             json!({
                 "defaultProvider": "anthropic",
                 "defaultModel": "claude-opus-4-5",
-                "defaultThinkingLevel": "high",
-                "enabledModels": ["openai/gpt-5", "anthropic/claude-opus-4-5"],
             })
         );
         assert_eq!(
             read.with_model(None)
                 .with_thinking(None)
                 .with_all_models()
-                .to_value(),
-            json!({})
+                .patch_from(&read),
+            json!({
+                "defaultProvider": null,
+                "defaultModel": null,
+                "defaultThinkingLevel": null,
+                "enabledModels": null,
+            })
         );
         assert_eq!(
-            read.with_thinking(Some("low")).to_value()["defaultThinkingLevel"],
-            "low"
+            read.with_thinking(Some("low")).patch_from(&read),
+            json!({ "defaultThinkingLevel": "low" })
         );
+        assert_eq!(read.patch_from(&read), json!({}));
     }
 }

@@ -15,9 +15,9 @@ use pi_rpc::desktop_rpc::{
     DesktopJob, DesktopMethod, DesktopRecord, DesktopRequest, DesktopResponse, DesktopRpcError,
     DesktopSession, DevBinary, DevBinaryState, Handoff, JobExitCode, JobOutput, ListSessionsQuery,
     MAX_REQUEST_BYTES, MAX_SESSION_ID_UNITS, MAX_SESSIONS_LIMIT, McpDocumentData, McpLayer,
-    ModelConfigPresence, ModelDefaultsData, NotificationsData, OrchestratorStatus, PROMPT_COMMAND,
-    PackageKind, PackageScope, PackageUpdate, PackageUpdateState, PendingQuestionKind,
-    PermissionMode, PermissionModeChanged, PermissionModeState, PersonaMode, PiUpdate, PinSource,
+    ModelConfigPresence, NotificationsData, OrchestratorStatus, PROMPT_COMMAND, PackageKind,
+    PackageScope, PackageUpdate, PackageUpdateState, PendingQuestionKind, PermissionMode,
+    PermissionModeChanged, PermissionModeState, PersonaMode, PiSettingsPatch, PiUpdate, PinSource,
     PolicyFile, ProfileApplied, ProfileApplyErrorCode, ProfileApplyMode, ProfileBinding,
     ProfileBindingChanged, ProfileBindingKind, ProfileBindingOrigin, ProfileConfirmation,
     ProfileFallbacksData, ProfileNote, ProfileNoteLevel, ProfilesData, ProviderAuth, ProviderUsage,
@@ -3273,22 +3273,23 @@ fn config_stores_are_a_closed_vocabulary_with_their_documented_shape() {
             ConfigScope::Global,
             false,
         ),
+        (ConfigStore::Mcp, "mcp", ConfigScope::GlobalProject, false),
         (
-            ConfigStore::ModelDefaults,
-            "model_defaults",
-            ConfigScope::Global,
+            ConfigStore::PiSettings,
+            "pi_settings",
+            ConfigScope::GlobalProject,
             false,
+        ),
+        (
+            ConfigStore::ClaudeBridge,
+            "claude_bridge",
+            ConfigScope::Global,
+            true,
         ),
         (
             ConfigStore::CustomModels,
             "custom_models",
             ConfigScope::Global,
-            false,
-        ),
-        (
-            ConfigStore::McpServers,
-            "mcp_servers",
-            ConfigScope::GlobalProject,
             false,
         ),
     ];
@@ -3353,9 +3354,18 @@ fn config_stores_are_a_closed_vocabulary_with_their_documented_shape() {
         Err(DesktopRpcError::InvalidConfigWriteTarget(_))
     ));
     assert_eq!(
-        ConfigStore::McpServers.write_targets(),
+        ConfigStore::Mcp.write_targets(),
         [ConfigWriteTarget::Global, ConfigWriteTarget::Project]
     );
+    // Pi's settings are merged from both files, but only the global one
+    // is written.
+    assert_eq!(
+        ConfigStore::PiSettings.write_targets(),
+        [ConfigWriteTarget::Global]
+    );
+    for retired in ["mcp_servers", "model_defaults"] {
+        assert!(retired.parse::<ConfigStore>().is_err(), "{retired}");
+    }
     assert_eq!(PinSource::Local.as_str(), "local");
     assert_eq!(PinSource::Repo.as_str(), "repo");
     assert_eq!(PinSource::Local.write_target(), ConfigWriteTarget::Local);
@@ -3730,11 +3740,11 @@ fn set_config_writes_the_settings_stores_through_their_global_target() {
         NotificationsData::new(json!([])),
         Err(DesktopRpcError::InvalidConfigData(_))
     ));
-    // Model defaults: the four keys, an absent one removed there.
-    let defaults = json!({ "defaultProvider": "anthropic", "defaultModel": "claude-opus-4-5",
-                           "defaultThinkingLevel": "high" });
-    let write = ConfigWrite::ModelDefaults(ModelDefaultsData::new(defaults.clone()).unwrap());
-    assert_eq!(write.store(), ConfigStore::ModelDefaults);
+    // Pi's model keys: a patch, `null` removing a key, an omitted one kept.
+    let patch = json!({ "defaultProvider": "anthropic", "defaultModel": "claude-opus-4-5",
+                        "enabledModels": null });
+    let write = ConfigWrite::PiSettings(PiSettingsPatch::new(patch.clone()).unwrap());
+    assert_eq!(write.store(), ConfigStore::PiSettings);
     assert_eq!(write.write_target(), ConfigWriteTarget::Global);
     assert_eq!(
         DesktopRequest::set_config("desktop-6", write, "r4")
@@ -3743,13 +3753,19 @@ fn set_config_writes_the_settings_stores_through_their_global_target() {
         request_payload(
             "desktop-6",
             "set_config",
-            json!({ "store": "model_defaults", "data": defaults, "expectedRevision": "r4" }),
+            json!({ "store": "pi_settings", "data": patch, "expectedRevision": "r4" }),
         )
     );
     assert!(matches!(
-        ModelDefaultsData::new(json!("gpt")),
+        PiSettingsPatch::new(json!("gpt")),
         Err(DesktopRpcError::InvalidConfigData(_))
     ));
+    // Only the four model keys may be patched.
+    assert!(matches!(
+        PiSettingsPatch::new(json!({ "theme": "dark" })),
+        Err(DesktopRpcError::InvalidConfigData(_))
+    ));
+    assert!(PiSettingsPatch::new(json!({})).is_ok());
     // Pi's models.json, whole; a secret marker goes back as read.
     let models = json!({ "providers": { "local": { "baseUrl": "http://localhost:11434/v1",
                          "apiKey": "•••", "models": [{ "id": "qwen3" }] } } });
@@ -3767,11 +3783,11 @@ fn set_config_writes_the_settings_stores_through_their_global_target() {
     );
     // One mcp.json, named by its layer, guarded by that file's revision.
     let mcp = json!({ "mcpServers": { "docs": { "url": "https://docs.example/mcp" } } });
-    let write = ConfigWrite::McpServers {
+    let write = ConfigWrite::Mcp {
         layer: McpLayer::Project,
         document: McpDocumentData::new(mcp.clone()).unwrap(),
     };
-    assert_eq!(write.store(), ConfigStore::McpServers);
+    assert_eq!(write.store(), ConfigStore::Mcp);
     assert_eq!(write.write_target(), ConfigWriteTarget::Project);
     assert_eq!(
         DesktopRequest::set_config("desktop-8", write, "r6")
@@ -3780,7 +3796,7 @@ fn set_config_writes_the_settings_stores_through_their_global_target() {
         request_payload(
             "desktop-8",
             "set_config",
-            json!({ "store": "mcp_servers", "data": { "source": "project", "document": mcp },
+            json!({ "store": "mcp", "data": { "source": "project", "document": mcp },
                     "expectedRevision": "r6" }),
         )
     );
@@ -4285,6 +4301,8 @@ fn config_failures_keep_their_documented_codes() {
     let codes = [
         (ConfigErrorCode::UnknownStore, "unknown_store"),
         (ConfigErrorCode::ReadOnly, "read_only"),
+        // An `mcp` write of the project file Pi doesn't read.
+        (ConfigErrorCode::ProjectUntrusted, "project_untrusted"),
         (ConfigErrorCode::InvalidData, "invalid_data"),
         (ConfigErrorCode::RevisionConflict, "revision_conflict"),
         (ConfigErrorCode::WriteFailed, "write_failed"),

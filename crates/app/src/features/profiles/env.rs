@@ -312,6 +312,11 @@ impl ConfigFailure {
                     "Gentle Shell is applying a profile right now, so nothing was written."
                         .to_string()
                 }
+                ConfigErrorCode::ProjectUntrusted => {
+                    "Pi doesn't trust this project, so it doesn't read its \
+                     .pi/mcp.json; nothing was written."
+                        .to_string()
+                }
                 ConfigErrorCode::UnknownStore | ConfigErrorCode::ReadOnly => {
                     format!("Gentle Shell refused the request ({code}: {message}).")
                 }
