@@ -206,6 +206,7 @@ impl Workspace {
                     cx.notify();
                 }
             }
+            SessionEvent::AgentsPanelChanged => cx.notify(),
             SessionEvent::OpenProviders => self.open_providers(window, cx),
             // A double Ctrl+C on the idle agent closes its pane as ⌘W does.
             SessionEvent::CloseRequested => self.close_pane(id, window, cx),
