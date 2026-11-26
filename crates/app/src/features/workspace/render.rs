@@ -385,26 +385,6 @@ impl Render for Workspace {
                                                 cx,
                                             ))
                                     })
-                                    .when(vertical_tabs, |row| {
-                                        row.child(
-                                            Button::new("toggle-tab-sidebar")
-                                                .ghost()
-                                                .xsmall()
-                                                .icon(Icon::new(if !self.tabs_sidebar_hidden {
-                                                    IconName::PanelLeftClose
-                                                } else {
-                                                    IconName::PanelLeftOpen
-                                                }))
-                                                .tooltip(if !self.tabs_sidebar_hidden {
-                                                    "Hide workspace sidebar"
-                                                } else {
-                                                    "Show workspace sidebar"
-                                                })
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.toggle_tabs_sidebar(cx)
-                                                })),
-                                        )
-                                    })
                                     .child(
                                         Button::new("open-palette")
                                             .ghost()
