@@ -26,6 +26,7 @@ pub mod hydration;
 pub mod ides;
 pub mod input_style;
 pub mod interface_size;
+pub mod machines;
 pub mod markdown;
 pub mod model_defaults;
 pub mod music;
