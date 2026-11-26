@@ -122,6 +122,9 @@ impl Workspace {
             PaletteAction::ClosePane => self.on_close_pane(&ClosePane, window, cx),
             PaletteAction::ReopenClosed => self.reopen_closed(window, cx),
             PaletteAction::ToggleSidebar => self.toggle_sidebar(cx),
+            PaletteAction::OpenFiles => self.select_right_tool(LayoutTool::Files, window, cx),
+            PaletteAction::OpenGit => self.select_right_tool(LayoutTool::Git, window, cx),
+            PaletteAction::ToggleNavigation => self.show_navigation(cx),
             PaletteAction::SetTabLayout(layout) => self.set_tab_layout(layout, cx),
             PaletteAction::Agents => {
                 if let Some(session) = tab {
@@ -499,6 +502,7 @@ impl Workspace {
                         this.toggle_sidebar(cx);
                     }
                 }
+                SettingsEvent::PresentationChanged(profiles) => this.apply_presentation(profiles.clone(), window, cx),
                 SettingsEvent::OpenProfiles => this.open_profiles(window, cx),
                 SettingsEvent::Changed => {
                     for tab in this.sessions() {

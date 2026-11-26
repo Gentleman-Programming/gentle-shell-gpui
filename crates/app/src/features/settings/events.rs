@@ -3,7 +3,7 @@
 //! This is the public integration contract. Keep it separate from how a page
 //! renders or persists preferences.
 
-use crate::features::workspaces::TabLayout;
+use crate::features::workspaces::{LayoutProfiles, TabLayout};
 
 pub enum SettingsEvent {
     Close,
@@ -15,6 +15,8 @@ pub enum SettingsEvent {
     TabsSidebarHidden(bool),
     /// Show or hide the right Files sidebar.
     FilesSidebarShown(bool),
+    /// Apply a presentation edit without changing the workspace's sessions.
+    PresentationChanged(LayoutProfiles),
     /// Open the application's full profile-routing editor.
     OpenProfiles,
     /// Packages or sign-ins changed: tabs should reload their backend.

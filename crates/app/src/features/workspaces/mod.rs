@@ -12,7 +12,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::shared::pane::{PaneKind, PaneTree};
 
+mod presentation;
 mod store;
+
+pub use presentation::{LayoutPreset, LayoutProfile, LayoutProfiles, LayoutTool, ToolPlacement};
 #[cfg(test)]
 mod tests;
 
@@ -294,6 +297,9 @@ pub struct SavedState {
     /// compacting stops at the rail, hiding removes the panel.
     #[serde(default)]
     pub tabs_sidebar_hidden: bool,
+    /// Optional for compatibility with older workspace snapshots.
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "known_or_none")]
+    pub presentation: Option<LayoutProfiles>,
 }
 
 // Read both spellings independently so a mixed-version file is not rejected
@@ -318,6 +324,8 @@ struct SavedStateOnDisk {
     sidebar_compact: bool,
     #[serde(default)]
     tabs_sidebar_hidden: bool,
+    #[serde(default, deserialize_with = "known_or_none")]
+    presentation: Option<LayoutProfiles>,
 }
 
 impl From<SavedStateOnDisk> for SavedState {
@@ -335,6 +343,7 @@ impl From<SavedStateOnDisk> for SavedState {
             files_sidebar_width: state.files_sidebar_width,
             sidebar_compact: state.sidebar_compact,
             tabs_sidebar_hidden: state.tabs_sidebar_hidden,
+            presentation: state.presentation,
         }
     }
 }
@@ -360,6 +369,7 @@ impl Default for SavedState {
             files_sidebar_width: default_sidebar_width(),
             sidebar_compact: false,
             tabs_sidebar_hidden: false,
+            presentation: None,
         }
     }
 }

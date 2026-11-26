@@ -97,10 +97,13 @@ impl Workspace {
         }
         let scale = f32::from(window.rem_size()) / 16.;
         let x = event.event.position.x;
+        let left_rail = self.layout_profiles.current().has(ToolPlacement::Left);
+        let right_rail = self.layout_profiles.current().has(ToolPlacement::Right);
         let (distance, open, revision) = match drag.side {
+            Side::Tabs if self.sidebar_compact => return,
             Side::Tabs => (
                 x - event.bounds.left(),
-                self.tabs_sidebar_visible(),
+                self.navigation_visible(),
                 self.tabs_sidebar_motion.revision,
             ),
             Side::Files if self.sidebar.is_some() => (
@@ -115,7 +118,8 @@ impl Workspace {
             return;
         }
         // The row's horizontal padding is 6 px at 100% interface scale.
-        let rail = if matches!(drag.side, Side::Files) {
+        let rail = if (matches!(drag.side, Side::Files) && right_rail)
+            || (matches!(drag.side, Side::Tabs) && left_rail) {
             right_sidebar::ACTIVITY_BAR_WIDTH + 6.
         } else {
             0.
@@ -171,7 +175,13 @@ impl Render for Workspace {
             tab.state.set_focused(inside);
         }
         let has_files_sidebar = self.sidebar.is_some();
+        let profile = self.layout_profiles.current();
+        let tabs_visible = profile.tabs_visible;
         let vertical_tabs = self.tab_layout == TabLayout::Vertical;
+        let left_rail = profile.has(ToolPlacement::Left);
+        let right_rail = profile.has(ToolPlacement::Right);
+        let expanded = self.layout_profiles.active == workspaces::LayoutPreset::Expanded;
+        let navigation_visible = self.navigation_visible();
         let window_px_at_100 =
             f32::from(window.viewport_size().width) / (f32::from(window.rem_size()) / 16.);
         let now = std::time::Instant::now();
@@ -303,7 +313,7 @@ impl Render for Workspace {
                                     .when(vertical_tabs, |row| {
                                         row.child(self.new_tab_button("title-new-tab", None, cx))
                                     })
-                                    .when(!vertical_tabs, |row| {
+                                    .when(tabs_visible && !vertical_tabs, |row| {
                                         row.child(
                                             div()
                                                 .flex_none()
@@ -327,7 +337,7 @@ impl Render for Workspace {
                                     // Tern keeps pane layout in the title bar, so
                                     // panes carry no header: one menu acts on the
                                     // focused pane, each entry with its shortcut.
-                                    .when(self.tab().is_some(), |d| {
+                                    .when(expanded && self.tab().is_some(), |d| {
                                         d.child(self.render_layout_menu(cx)).child(
                                             div()
                                                 .w(px(1.))
@@ -357,10 +367,11 @@ impl Render for Workspace {
                                             )
                                         },
                                     )
-                                    .children(crate::features::music::title_button(&self.music, cx))
-                                    .children(self.render_devices_button(cx))
-                                    .children(self.render_tray(cx))
-                                    .child({
+                                    .when(expanded, |d| {
+                                        d.children(crate::features::music::title_button(&self.music, cx))
+                                            .children(self.render_tray(cx))
+                                    })
+                                    .when(expanded, |d| d.child({
                                         let weak = cx.entity().downgrade();
                                         div()
                                             .on_mouse_down(MouseButton::Left, |_, _, cx| {
@@ -384,7 +395,8 @@ impl Render for Workspace {
                                                 }),
                                                 cx,
                                             ))
-                                    })
+                                    }))
+                                    .child(self.render_title_shortcuts(cx))
                                     .child(
                                         Button::new("open-palette")
                                             .ghost()
@@ -410,6 +422,7 @@ impl Render for Workspace {
                             this.resize_sidebar(event, window, cx);
                         },
                     ))
+                    .when(left_rail, |row| row.child(self.render_activity_bar(ToolPlacement::Left, cx)))
                     // The vertical tab navigator remains independent of the Files panel.
                     .when(tabs_width > 0., |row| {
                         row.child(
@@ -431,7 +444,7 @@ impl Render for Workspace {
                                 .child(sidebar_surface(Side::Tabs, self.render_tab_sidebar(cx)))
                                 .when(
                                     tabs_resizing
-                                        || (vertical_tabs && !self.sidebar_compact && !tabs_moving),
+                                        || (navigation_visible && !self.sidebar_compact && !tabs_moving),
                                     |column| column.child(self.sidebar_handle(Side::Tabs, cx)),
                                 ),
                         )
@@ -469,8 +482,8 @@ impl Render for Workspace {
                                 ),
                         )
                     })
-                    .when(has_files_sidebar, |row| {
-                        row.child(self.render_right_activity_bar(cx))
+                    .when(right_rail, |row| {
+                        row.child(self.render_activity_bar(ToolPlacement::Right, cx))
                     }),
             )
             .children(floating_stages)
@@ -502,8 +515,8 @@ impl Render for Workspace {
                 div()
                     .absolute()
                     .top(rems(TITLE_BAR_HEIGHT / 16.))
-                    .left_0()
-                    .right(rems(if has_files_sidebar {
+                    .left(rems(if left_rail { (right_sidebar::ACTIVITY_BAR_WIDTH + 6.) / 16. } else { 0. }))
+                    .right(rems(if right_rail {
                         (right_sidebar::ACTIVITY_BAR_WIDTH + 6.) / 16.
                     } else {
                         0.

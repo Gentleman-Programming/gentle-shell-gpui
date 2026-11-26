@@ -113,6 +113,7 @@ impl Workspace {
             files_sidebar_width: self.files_sidebar_width,
             sidebar_compact: self.sidebar_compact,
             tabs_sidebar_hidden: self.tabs_sidebar_hidden,
+            presentation: Some(self.presentation_snapshot(cx)),
         }
     }
 

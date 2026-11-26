@@ -95,7 +95,7 @@ impl Workspace {
         let (saved, open, motion) = match side {
             Side::Tabs => (
                 self.tabs_sidebar_width,
-                self.tabs_sidebar_visible(),
+                self.navigation_visible(),
                 &self.tabs_sidebar_motion,
             ),
             Side::Files => (

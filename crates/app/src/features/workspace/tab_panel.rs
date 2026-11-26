@@ -24,6 +24,7 @@ impl Workspace {
         self.cancel_workspace_rename_state(cx);
         self.sidebar_compact = compact;
         self.tabs_sidebar_motion.revision += 1;
+        self.layout_profiles.current_mut().workspace_visible = !compact;
         self.schedule_save(cx);
         cx.notify();
     }
@@ -31,7 +32,7 @@ impl Workspace {
     /// Whether the left navigator's vertical panel is showing (expanded or
     /// rail), independent of tab placement.
     pub(super) fn tabs_sidebar_visible(&self) -> bool {
-        self.tab_layout == TabLayout::Vertical && !self.tabs_sidebar_hidden
+        self.navigation_visible()
     }
 
     /// Live state for the Configuration screen, which observes the workspace
@@ -59,6 +60,7 @@ impl Workspace {
         self.tabs_sidebar_motion
             .retarget(!self.tabs_sidebar_hidden, cx.reduce_motion());
         self.tabs_sidebar_hidden = hidden;
+        self.layout_profiles.current_mut().tabs_sidebar_hidden = hidden;
         self.schedule_save(cx);
         cx.notify();
     }
@@ -89,20 +91,19 @@ impl Workspace {
 
     /// All presentation controls share one idempotent, persisted state change.
     pub(super) fn set_tab_layout(&mut self, layout: TabLayout, cx: &mut Context<Self>) {
-        if self.tab_layout == layout {
+        if self.tab_layout == layout && self.layout_profiles.current().tabs_visible {
             return;
         }
         self.cancel_workspace_rename_state(cx);
-        // Animate only when the panel's effective visibility actually
-        // changes. A hidden vertical panel stays hidden (and unmounted)
-        // across a round trip through horizontal, so it never flashes in.
-        let was_open = self.tabs_sidebar_visible();
-        let will_open = layout == TabLayout::Vertical && !self.tabs_sidebar_hidden;
-        if was_open != will_open {
-            self.tabs_sidebar_motion
-                .retarget(was_open, cx.reduce_motion());
-        }
+        let was_open = self.navigation_visible();
+        let profile = self.layout_profiles.current_mut();
+        profile.tabs_visible = true;
+        profile.tab_layout = layout;
+        profile.workspace_visible = layout == TabLayout::Vertical && !self.sidebar_compact;
         self.tab_layout = layout;
+        if was_open != self.navigation_visible() {
+            self.tabs_sidebar_motion.retarget(was_open, cx.reduce_motion());
+        }
         // File browsing is a separate right sidebar; switching tab placement
         // must neither open nor hide that independent panel.
         self.schedule_save(cx);
@@ -1048,6 +1049,7 @@ mod tests {
                         sidebar_history_active: false,
                         sidebar_history: None,
                         sidebar_visible: false,
+                        layout_profiles: crate::features::workspaces::LayoutProfiles::from_saved(&crate::features::workspaces::SavedState { version: 1, ..Default::default() }),
                         tab_layout: TabLayout::Horizontal,
                         tabs_sidebar_motion: Default::default(),
                         files_sidebar_motion: Default::default(),
