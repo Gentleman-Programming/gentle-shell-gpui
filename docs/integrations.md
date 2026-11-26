@@ -388,7 +388,7 @@ The app-level live check `live_review_changes_and_external_config` (`session/sta
 | `get_last_assistant_text` | — | `copy_last_answer` | `/copy` |
 | `export_html` | `outputPath` | `export_to` | `/export` |
 
-Window screens that need another command use `SessionView::send_command(Value)`, which reports errors in the conversation and refreshes the state.
+The window's model picker sends `set_model` and `set_thinking_level` with `SessionView::send_command(Value)`, which reports errors in the conversation and re-reads the model, the thinking level and the stats. It doesn't reload the conversation: a command that changes more than the model needs its own refresh.
 
 ### Events the app handles
 
@@ -746,7 +746,7 @@ If the data comes from an event or a tool result (like jobs), read it in `handle
 1. `crates/core/src/commands.rs`: a variant in `Screen` and a case in `route`; remove it from `hidden` if it was there. Update the tests (`routed_and_hidden_never_overlap`).
 2. `workspace/overlays.rs` `open_screen`: open the screen for the new variant.
 3. The screen, in its own `features/<name>/` folder, reading files via `pi_rpc::resolve_homes()`.
-4. If it must ask the backend for something, emit an event that the window turns into `run_prompt` or `run_extension_command` (the `ProfilesEvent::RunCommand` and `SettingsEvent::ShellCommand` pattern), or use `send_command` for an RPC command.
+4. If it must ask the backend for something, emit an event that the window turns into `run_prompt` or `run_extension_command` (the `ProfilesEvent::RunCommand` and `SettingsEvent::ShellCommand` pattern), or use `send_command` for a model or thinking-level command (it re-reads only the model state).
 
 The palette and the composer already use `route`/`hidden`; there is no need to touch them. A new Pi built-in goes in `session/builtins.rs` (`BUILTINS`, `Builtin`, `parse_builtin`) and `submit.rs` `run_builtin`.
 

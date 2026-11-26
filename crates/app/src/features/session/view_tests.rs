@@ -1876,3 +1876,384 @@ fn change_cwd_drops_a_pending_resume(cx: &mut TestAppContext) {
         assert!(!view.has_conversation());
     });
 }
+
+/// A stand-in for `gentle-shell --mode rpc`: it appends every command it
+/// reads to the file named by its first argument and answers each with
+/// success; `get_messages` returns a conversation of one user message.
+#[cfg(unix)]
+const FAKE_BACKEND: &str = r#"while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$1"
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  case "$line" in
+    *'"type":"get_messages"'*) data='{"messages":[{"role":"user","content":"hello"}]}' ;;
+    *) data='{}' ;;
+  esac
+  printf '{"type":"response","id":"%s","success":true,"data":%s}\n' "$id" "$data"
+done"#;
+
+/// A tab whose backend is [`FAKE_BACKEND`]; its commands go to `log`.
+#[cfg(unix)]
+struct Backend {
+    dir: std::path::PathBuf,
+    log: std::path::PathBuf,
+    incoming: async_channel::Receiver<pi_rpc::Incoming>,
+}
+
+#[cfg(unix)]
+impl Backend {
+    fn start(view: &Entity<SessionView>, cx: &mut VisualTestContext) -> Self {
+        // The answers come from the process's reader thread.
+        cx.executor().allow_parking();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("gs-fake-backend-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("commands.jsonl");
+        let spec = pi_rpc::LaunchSpec {
+            program: "/bin/sh".into(),
+            args: vec![
+                "-c".into(),
+                FAKE_BACKEND.into(),
+                "sh".into(),
+                log.to_string_lossy().into_owned(),
+            ],
+            cwd: dir.clone(),
+            env: Vec::new(),
+            launcher: "/bin/sh".into(),
+            bundled: None,
+        };
+        let (process, incoming) = pi_rpc::PiProcess::spawn(&spec).expect("spawn the fake backend");
+        view.update(cx, |view, _| {
+            view.backend.status = super::state::BackendStatus::Ready(process);
+        });
+        Self { dir, log, incoming }
+    }
+
+    /// The `type` of every command the backend has read so far.
+    fn read(&self) -> Vec<String> {
+        std::fs::read_to_string(&self.log)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .map(|command| command["type"].as_str().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    /// Run the tab until `ready` holds for what the backend has read, then
+    /// every command sent before a marker, with the answers to all of them
+    /// applied: the pipe keeps their order, so once the marker is answered
+    /// nothing sent earlier is still on its way.
+    fn settle(
+        &self,
+        view: &Entity<SessionView>,
+        cx: &mut VisualTestContext,
+        ready: impl Fn(&[String]) -> bool,
+    ) -> Vec<String> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !ready(&self.read()) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the backend never got there; it read {:?}",
+                self.read()
+            );
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let process = view
+            .read_with(cx, |view, _| view.process())
+            .expect("a backend");
+        smol::block_on(process.request(json!({"type": "marker"}))).expect("the marker's answer");
+        cx.run_until_parked();
+        let mut read = self.read();
+        let marker = read
+            .iter()
+            .position(|command| command == "marker")
+            .expect("the marker");
+        read.truncate(marker);
+        read
+    }
+
+    /// Stop the process, wait until it has exited and remove its folder.
+    fn stop(self, view: &Entity<SessionView>, cx: &mut VisualTestContext) {
+        let status = view.update(cx, |view, _| {
+            std::mem::replace(
+                &mut view.backend.status,
+                super::state::BackendStatus::Exited(None),
+            )
+        });
+        if let super::state::BackendStatus::Ready(process) = status {
+            process.shutdown(std::time::Duration::ZERO);
+        }
+        while let Ok(incoming) = self.incoming.recv_blocking() {
+            if matches!(incoming, pi_rpc::Incoming::Exited(_)) {
+                break;
+            }
+        }
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+#[cfg(unix)]
+fn user_texts(view: &Entity<SessionView>, cx: &mut VisualTestContext) -> Vec<String> {
+    view.read_with(cx, |view, _| {
+        view.transcript
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                gentle_core::transcript::Item::User { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    })
+}
+
+/// Changing the model or the thinking level (the Profiles screen) re-reads
+/// the session's state, but not its conversation, which they cannot change.
+#[cfg(unix)]
+#[gpui::test]
+fn a_model_or_thinking_change_does_not_reload_the_conversation(cx: &mut TestAppContext) {
+    let (view, cx) = tab(cx);
+    let backend = Backend::start(&view, cx);
+    view.update(cx, |view, cx| {
+        view.send_command(
+            json!({"type": "set_model", "provider": "anthropic", "modelId": "claude"}),
+            cx,
+        );
+        view.send_command(json!({"type": "set_thinking_level", "level": "high"}), cx);
+    });
+    let read = backend.settle(&view, cx, |read| {
+        read.iter()
+            .filter(|command| *command == "get_state")
+            .count()
+            == 2
+    });
+    assert_eq!(read[..2], ["set_model", "set_thinking_level"]);
+    assert!(
+        !read.iter().any(|command| command == "get_messages"),
+        "it read {read:?}"
+    );
+    assert!(
+        user_texts(&view, cx).is_empty(),
+        "the conversation was rebuilt"
+    );
+    backend.stop(&view, cx);
+}
+
+/// Opening a saved session still loads its conversation.
+#[cfg(unix)]
+#[gpui::test]
+fn opening_a_saved_session_loads_its_conversation(cx: &mut TestAppContext) {
+    let (view, cx) = tab(cx);
+    let backend = Backend::start(&view, cx);
+    let saved = backend.dir.join("saved.jsonl");
+    view.update(cx, |view, cx| view.open_session(saved.clone(), cx));
+    let read = backend.settle(&view, cx, |read| {
+        read.iter().any(|command| command == "get_state")
+    });
+    assert_eq!(read[0], "switch_session");
+    assert!(
+        read.iter().any(|command| command == "get_messages"),
+        "it read {read:?}"
+    );
+    assert_eq!(user_texts(&view, cx), ["hello"]);
+    backend.stop(&view, cx);
+}
+
+/// A tab as the workspace pane draws it: the agent's view, cached, with its
+/// live layer over it.
+#[cfg(unix)]
+struct Pane(Entity<SessionView>);
+
+#[cfg(unix)]
+impl gpui_kit::Render for Pane {
+    fn render(
+        &mut self,
+        _: &mut gpui_kit::Window,
+        cx: &mut gpui_kit::Context<Self>,
+    ) -> impl gpui_kit::IntoElement {
+        use gpui_kit::{ParentElement as _, StyleRefinement, Styled as _};
+        gpui_kit::div()
+            .relative()
+            .size_full()
+            .child(
+                self.0
+                    .clone()
+                    .cached(StyleRefinement::default().size_full()),
+            )
+            .child(self.0.read(cx).live_layer())
+    }
+}
+
+/// A pane whose tab has a ready backend and its composer focused, with
+/// typing kisses on (the default) unless `reduce_motion`.
+#[cfg(unix)]
+fn typing_pane(
+    cx: &mut TestAppContext,
+    reduce_motion: bool,
+) -> (Entity<SessionView>, &mut VisualTestContext, Backend) {
+    use gpui_kit::AppContext as _;
+    cx.update(|cx| {
+        gpui_kit::init(cx);
+        cx.set_reduce_motion(reduce_motion);
+    });
+    let cwd = std::env::temp_dir();
+    let (pane, cx) = cx.add_window_view(|window, cx| {
+        Pane(cx.new(|cx| {
+            let mut view = SessionView::new(cwd, None, window, cx, false);
+            view.backend.started = true;
+            view
+        }))
+    });
+    let view = pane.read_with(cx, |pane, _| pane.0.clone());
+    cx.update(|window, _| window.activate_window());
+    let backend = Backend::start(&view, cx);
+    cx.update(|window, cx| {
+        let composer = view.read(cx).composer.clone();
+        composer.update(cx, |state, cx| state.focus(window, cx));
+    });
+    cx.run_until_parked();
+    // The focus pulse plays out first.
+    frames_for(std::time::Duration::from_millis(600), cx);
+    assert_eq!(cx.update(|window, cx| window.simulate_next_frame(cx)), 0);
+    (view, cx, backend)
+}
+
+/// Deliver display frames, one every 16 ms, for `span`; how many of them
+/// something asked for.
+#[cfg(unix)]
+fn frames_for(span: std::time::Duration, cx: &mut VisualTestContext) -> usize {
+    let start = std::time::Instant::now();
+    let mut asked = 0;
+    while start.elapsed() < span {
+        std::thread::sleep(std::time::Duration::from_millis(16));
+        asked += cx.update(|window, cx| window.simulate_next_frame(cx));
+        cx.run_until_parked();
+    }
+    asked
+}
+
+/// Typing blows a kiss from the caret; it flies while it lives (frames are
+/// asked for) and lands after its 900 ms (none are).
+#[cfg(unix)]
+#[gpui::test]
+fn a_typed_kiss_rises_from_the_caret_and_lands(cx: &mut TestAppContext) {
+    let (view, cx, backend) = typing_pane(cx, false);
+    let caret = view.read_with(cx, |view, cx| {
+        let caret = view.composer.read(cx).prepaint_caret_geometry();
+        caret
+            .expect("the composer was drawn")
+            .cursor_bounds()
+            .origin
+    });
+    cx.simulate_keystrokes("a");
+    let blown: Vec<_> = view.read_with(cx, |view, _| {
+        view.kisses.iter().map(|(_, at, _)| *at).collect()
+    });
+    assert_eq!(blown, [caret]);
+    assert!(frames_for(std::time::Duration::from_millis(200), cx) > 0);
+    frames_for(std::time::Duration::from_millis(900), cx);
+    assert_eq!(cx.update(|window, cx| window.simulate_next_frame(cx)), 0);
+    backend.stop(&view, cx);
+}
+
+/// With reduced motion the composer blows no kiss and asks for no frame.
+#[cfg(unix)]
+#[gpui::test]
+fn reduced_motion_blows_no_kiss(cx: &mut TestAppContext) {
+    let (view, cx, backend) = typing_pane(cx, true);
+    cx.simulate_keystrokes("a");
+    assert!(view.read_with(cx, |view, _| view.kisses.is_empty()));
+    assert_eq!(cx.update(|window, cx| window.simulate_next_frame(cx)), 0);
+    backend.stop(&view, cx);
+}
+
+/// A kiss's flight redraws only the tab's live layer: the conversation is
+/// drawn for the keystroke and reused from its cache while the kiss flies.
+#[cfg(unix)]
+#[gpui::test]
+fn a_typed_kiss_redraws_only_the_live_layer(cx: &mut TestAppContext) {
+    let (view, cx, backend) = typing_pane(cx, false);
+    let renders = || super::view::RENDERS.with(std::cell::Cell::get);
+    cx.simulate_keystrokes("a");
+    // The keystroke draws the tab, and so does the next frame: an edit
+    // leaves it to draw once more, as the text area reports its moved caret
+    // while it paints (gpui-base's input element), kiss or no kiss.
+    assert!(cx.update(|window, cx| window.simulate_next_frame(cx)) > 0);
+    cx.run_until_parked();
+    let flying = renders();
+    assert!(frames_for(std::time::Duration::from_secs(1), cx) > 0);
+    assert_eq!(
+        renders() - flying,
+        0,
+        "SessionView renders during the flight"
+    );
+    assert_eq!(cx.update(|window, cx| window.simulate_next_frame(cx)), 0);
+    backend.stop(&view, cx);
+}
+
+/// `n` numbered lines.
+fn lines(n: usize) -> String {
+    (1..=n).map(|i| format!("line {i}\n")).collect()
+}
+
+/// A loaded conversation's tool and shell cards show their title, subject
+/// and line counts.
+#[gpui::test]
+fn loaded_tool_and_shell_cards_show_their_title_subject_and_line_count(cx: &mut TestAppContext) {
+    let (view, cx) = tab(cx);
+    view.update(cx, |view, cx| {
+        view.transcript.load_messages(&[
+            json!({"role": "user", "content": "run them"}),
+            json!({"role": "assistant", "stopReason": "toolUse", "content": [
+                {"type": "text", "text": "Running the tests."},
+                {"type": "toolCall", "id": "t1", "name": "bash",
+                 "arguments": {"command": "cargo test", "description": "Run the tests"}},
+            ]}),
+            json!({"role": "toolResult", "toolCallId": "t1", "isError": false,
+                   "content": [{"type": "text", "text": lines(20)}], "details": {}}),
+            json!({"role": "assistant", "stopReason": "stop",
+                   "content": [{"type": "text", "text": "Done."}]}),
+            json!({"role": "bashExecution", "command": "git status",
+                   "output": lines(12), "exitCode": 0}),
+        ]);
+        cx.notify();
+    });
+    // The finished step shows its quiet line; the shell its card.
+    assert!(drawn(cx, "step-row:Run the tests:cargo test"));
+    assert!(drawn(cx, "step-row:Shell:"));
+    assert!(drawn(cx, "fold:4 earlier lines"));
+    assert!(!drawn(cx, "fold:12 earlier lines"));
+
+    click(cx, "step-row:Run the tests:cargo test");
+    assert!(drawn(cx, "fold:12 earlier lines"));
+}
+
+/// A running tool's card follows its output: the line count it shows is the
+/// latest output's.
+#[gpui::test]
+fn a_running_tools_card_shows_its_growing_output(cx: &mut TestAppContext) {
+    let (view, cx) = tab(cx);
+    let update = |text: String| {
+        json!({"type": "tool_execution_update", "toolCallId": "r1",
+               "partialResult": {"content": [{"type": "text", "text": text}]}})
+    };
+    view.update(cx, |view, cx| {
+        view.transcript
+            .apply(&json!({"type": "tool_execution_start", "toolCallId": "r1",
+            "toolName": "bash", "args": {"command": "npm test", "description": "Run npm"}}));
+        view.transcript.apply(&update(lines(10)));
+        cx.notify();
+    });
+    click(cx, "step-row:Run npm:npm test");
+    assert!(drawn(cx, "fold:2 earlier lines"));
+
+    view.update(cx, |view, cx| {
+        view.transcript.apply(&update(lines(30)));
+        cx.notify();
+    });
+    assert!(drawn(cx, "fold:22 earlier lines"));
+    assert!(!drawn(cx, "fold:2 earlier lines"));
+}

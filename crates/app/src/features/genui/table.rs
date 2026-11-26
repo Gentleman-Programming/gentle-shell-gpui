@@ -402,32 +402,40 @@ impl PanelView {
             })
             .child(div().w(rems(22. / 16.)).flex_shrink_0());
 
-        let rows: Vec<AnyElement> = visible
-            .iter()
-            .map(|&ix| self.render_row(ix, animate, cx))
-            .collect();
-        let empty = rows.is_empty();
+        // Only the rows in view are built: rows have one fixed height.
+        let rows = if visible.is_empty() {
+            div()
+                .id("genui-table-rows")
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scroll()
+                .child(
+                    div()
+                        .p_4()
+                        .text_sm()
+                        .text_color(ui::muted())
+                        .child("No rows match the filter."),
+                )
+                .into_any_element()
+        } else {
+            uniform_list(
+                "genui-table-rows",
+                visible.len(),
+                cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
+                    range
+                        .map(|i| this.render_row(visible[i], animate, cx))
+                        .collect::<Vec<_>>()
+                }),
+            )
+            .flex_1()
+            .min_h_0()
+            .into_any_element()
+        };
         v_flex()
             .size_full()
             .child(toolbar)
             .child(header)
-            .child(
-                div()
-                    .id("genui-table-rows")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .children(rows)
-                    .when(empty, |d| {
-                        d.child(
-                            div()
-                                .p_4()
-                                .text_sm()
-                                .text_color(ui::muted())
-                                .child("No rows match the filter."),
-                        )
-                    }),
-            )
+            .child(rows)
             .into_any_element()
     }
 
@@ -446,6 +454,7 @@ impl PanelView {
             .id(SharedString::from(format!("genui-row-{}", row.id)))
             .debug_selector(move || selector)
             .group("genui-row")
+            .w_full()
             .h(rems(ROW_H / 16.))
             .flex_shrink_0()
             .px_3()
