@@ -14,8 +14,10 @@ pub enum SettingsEvent {
     /// Open the application's full profile-routing editor (for the machine
     /// Configuration is about).
     OpenProfiles,
-    /// "Settings for" picked another machine: open Configuration for it.
-    MachineChanged(Backend),
+    /// Open Configuration again for this machine, on the page shown:
+    /// "Settings for" picked another one, or the tab it asked on a server
+    /// stopped answering (the server's own Desktop RPC answers then).
+    Reopen(Backend),
     /// This device paired with a Gentle Shell server (it is listed now; a
     /// server paired again: the tabs that let go of it follow it).
     Paired(Backend),

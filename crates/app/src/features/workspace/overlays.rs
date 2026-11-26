@@ -456,8 +456,11 @@ impl Workspace {
         self.start_active_session(window, cx);
         let active = self.active_session();
         let tabs: Vec<_> = active.iter().cloned().chain(self.sessions()).collect();
-        let runs_on: Vec<_> = tabs.iter().map(|tab| tab.read(cx).runs_on()).collect();
-        let Some(index) = crate::features::settings::remote::ask_tab(machine, &runs_on) else {
+        let places: Vec<_> = tabs
+            .iter()
+            .map(|tab| crate::features::settings::remote::TabPlace::of(tab.read(cx)))
+            .collect();
+        let Some(index) = crate::features::settings::remote::ask_tab(machine, &places) else {
             return active;
         };
         let tab = tabs[index].clone();
@@ -532,9 +535,9 @@ impl Workspace {
         }
     }
 
-    /// Configuration about the shown workspace's machine; its update status
-    /// is asked of the window's active agent tab when it runs there and its
-    /// Gentle Shell reports it.
+    /// Configuration about the shown workspace's machine; Gentle Shell's
+    /// answers come from a tab there that answers (`remote::ask_tab`), else
+    /// on a server from the server itself.
     pub(super) fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.open_settings_on(None, window, cx);
     }
@@ -547,13 +550,12 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.start_active_session(window, cx);
         let active = self.space().machine();
         let machines = self.machines();
         let machine = machine
             .unwrap_or_else(|| machines[gentle_core::machines::pick(&active, &machines)].clone());
         let cwd = self.folder_on(&machine, cx);
-        let session = self.active_session();
+        let session = self.session_on(&machine, window, cx);
         let tab_layout = self.tab_layout;
         let view =
             cx.new(|cx| SettingsView::new(machine, machines, cwd, tab_layout, session, window, cx));
@@ -574,7 +576,7 @@ impl Workspace {
                     let machine = view.read(cx).machine().clone();
                     this.open_profiles_on(Some(machine), window, cx)
                 }
-                SettingsEvent::MachineChanged(machine) => {
+                SettingsEvent::Reopen(machine) => {
                     let previous = view.clone();
                     this.open_settings_on(Some(machine.clone()), window, cx);
                     if let Some((Overlay::Settings(next), _)) = &this.overlay {

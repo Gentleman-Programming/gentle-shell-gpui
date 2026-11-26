@@ -372,10 +372,18 @@ impl SessionView {
     /// (it failed or exited) is the direct-file path too: there is no writer
     /// to race.
     pub(crate) fn config_support(&self) -> ConfigSupport {
-        match self.backend.status {
-            BackendStatus::Failed(_) | BackendStatus::Exited(_) => ConfigSupport::Legacy,
-            BackendStatus::Starting | BackendStatus::Ready(_) => self.desktop.config_support(),
+        if self.backend_down() {
+            return ConfigSupport::Legacy;
         }
+        self.desktop.config_support()
+    }
+
+    /// Its backend failed to start or exited: nothing asked of it answers.
+    pub(crate) fn backend_down(&self) -> bool {
+        matches!(
+            self.backend.status,
+            BackendStatus::Failed(_) | BackendStatus::Exited(_)
+        )
     }
 
     /// Read one config store over the channel; the answer arrives as an

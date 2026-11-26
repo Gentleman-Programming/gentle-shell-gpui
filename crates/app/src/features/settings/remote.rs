@@ -16,8 +16,11 @@
 //! `list_available_models`, …) are asked of an agent session or, on a
 //! server, of the server itself:
 //!
-//! - The active agent tab's, when it runs on that same server: reused as is,
-//!   and left running when the screen closes (it is the user's tab).
+//! - The active agent tab's, when it runs on that same server and answers:
+//!   reused as is, and left running when the screen closes (it is the
+//!   user's tab). A tab whose agent failed to start or exited isn't asked:
+//!   Configuration opens again on the server's own Desktop RPC when it
+//!   stops answering ([`ControlSession::lost`]).
 //! - Otherwise a dedicated one ([`ControlSession::open`]): a [`SessionView`]
 //!   entity the screen owns and never shows. Reusing `SessionView` keeps one
 //!   Desktop RPC client (its capability probe, request queue, timeouts and
@@ -151,36 +154,63 @@ pub(crate) enum Control {
     /// another environment): the files only, never another machine's
     /// answers.
     Files,
-    /// The active tab runs on the screen's server: ask it.
+    /// A tab that answers runs on the screen's server: ask it.
     Reuse,
-    /// The screen's server, with no tab there to ask: a dedicated session.
+    /// The screen's server, with no tab there that answers (none, or its
+    /// agent failed to start or exited): the server's own Desktop RPC, or a
+    /// dedicated session on an older server.
     Hidden,
 }
 
-/// Decide from the machine the screen is for (`screen`) and where the
-/// active tab's agent runs (`tab`).
-pub(crate) fn control_for(screen: &Backend, tab: Option<&Backend>) -> Control {
+/// Where an agent tab runs, and whether its backend can answer: it didn't
+/// fail to start or exit.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct TabPlace {
+    pub(crate) runs_on: Backend,
+    pub(crate) answers: bool,
+}
+
+impl TabPlace {
+    pub(crate) fn of(session: &SessionView) -> Self {
+        Self {
+            runs_on: session.runs_on(),
+            answers: !session.backend_down(),
+        }
+    }
+}
+
+/// Decide from the machine the screen is for (`screen`) and the tab it
+/// would ask (`tab`). A server screen asks a tab only when it runs there
+/// and answers: whether the server serves a setting is the server's to
+/// say, never a dead tab's.
+pub(crate) fn control_for(screen: &Backend, tab: Option<&TabPlace>) -> Control {
     let Backend::Server { url, .. } = screen else {
         return match tab {
-            Some(tab) if !gentle_core::machines::same(tab, screen) => Control::Files,
+            Some(tab) if !gentle_core::machines::same(&tab.runs_on, screen) => Control::Files,
             _ => Control::Local,
         };
     };
     match tab {
-        Some(Backend::Server { url: there, .. }) if there == url => Control::Reuse,
+        Some(TabPlace {
+            runs_on: Backend::Server { url: there, .. },
+            answers: true,
+        }) if there == url => Control::Reuse,
         _ => Control::Hidden,
     }
 }
 
 /// Which of the window's agent tabs a screen about `screen` asks (its
 /// models, config, usage): `tabs` are where each runs, the active tab
-/// first; the first on `screen` is taken, so This Mac's list comes from a
-/// tab here even while the active one runs on a server. `None`: no tab
-/// runs there ([`control_for`] then reads the files here, or a server's
-/// own Desktop RPC or a hidden session there).
-pub(crate) fn ask_tab(screen: &Backend, tabs: &[Backend]) -> Option<usize> {
+/// first; the first on `screen` that answers is taken (else the first
+/// there), so This Mac's list comes from a tab here even while the active
+/// one runs on a server. `None`: no tab runs there ([`control_for`] then
+/// reads the files here, or a server's own Desktop RPC or a hidden session
+/// there).
+pub(crate) fn ask_tab(screen: &Backend, tabs: &[TabPlace]) -> Option<usize> {
+    let on_screen = |tab: &TabPlace| gentle_core::machines::same(&tab.runs_on, screen);
     tabs.iter()
-        .position(|tab| gentle_core::machines::same(tab, screen))
+        .position(|tab| on_screen(tab) && tab.answers)
+        .or_else(|| tabs.iter().position(on_screen))
 }
 
 /// Whether a view that asked for it (`requested`, Configuration's control
@@ -217,7 +247,9 @@ impl ControlSession {
         window: &mut Window,
         cx: &mut Context<V>,
     ) -> Self {
-        let tab = active.as_ref().map(|session| session.read(cx).runs_on());
+        let tab = active
+            .as_ref()
+            .map(|session| TabPlace::of(session.read(cx)));
         let server = ServerPlace::of(screen);
         let reused = |session| Self {
             session,
@@ -316,6 +348,18 @@ impl ControlSession {
     pub(crate) fn hidden(&self) -> bool {
         self.hidden
     }
+
+    /// The tab it asks on a server stopped answering (its agent failed to
+    /// start or exited): the screen should open again on the server's own
+    /// Desktop RPC.
+    pub(crate) fn lost(&self, cx: &App) -> bool {
+        !self.hidden
+            && self.server.is_some()
+            && self
+                .session
+                .as_ref()
+                .is_some_and(|session| session.read(cx).backend_down())
+    }
 }
 
 #[cfg(test)]
@@ -323,7 +367,8 @@ mod tests {
     use gentle_core::backend::Backend;
 
     use super::{
-        Control, ServerPlace, ask_tab, commands, control_for, do_on, run_on, uses_server_desktop,
+        Control, ServerPlace, TabPlace, ask_tab, commands, control_for, do_on, run_on,
+        uses_server_desktop,
     };
 
     fn info(capabilities: &[&str]) -> pi_rpc::serve::ServerInfo {
@@ -365,9 +410,23 @@ mod tests {
         }
     }
 
+    fn up(runs_on: &Backend) -> TabPlace {
+        TabPlace {
+            runs_on: runs_on.clone(),
+            answers: true,
+        }
+    }
+
+    fn down(runs_on: &Backend) -> TabPlace {
+        TabPlace {
+            runs_on: runs_on.clone(),
+            answers: false,
+        }
+    }
+
     /// Where a screen's lists (Profiles' models, Usage) come from: the
     /// tab picked by `ask_tab` (else the active one) through `control_for`.
-    fn source(screen: &Backend, tabs: &[Backend]) -> (Option<usize>, Control) {
+    fn source(screen: &Backend, tabs: &[TabPlace]) -> (Option<usize>, Control) {
         let tab = ask_tab(screen, tabs).or((!tabs.is_empty()).then_some(0));
         (tab, control_for(screen, tab.map(|i| &tabs[i])))
     }
@@ -377,26 +436,41 @@ mod tests {
         let pc = server("http://pc:8787", "pc");
         let other = server("http://other:8787", "other");
         // A server with a tab there, active or not: that tab.
+        assert_eq!(source(&pc, &[up(&pc)]), (Some(0), Control::Reuse));
         assert_eq!(
-            source(&pc, std::slice::from_ref(&pc)),
-            (Some(0), Control::Reuse)
-        );
-        assert_eq!(
-            source(&pc, &[Backend::Local, pc.clone()]),
+            source(&pc, &[up(&Backend::Local), up(&pc)]),
             (Some(1), Control::Reuse)
         );
         // A server without one: its own Desktop RPC (or a hidden session),
         // never the active tab's models from another machine.
-        assert_eq!(source(&pc, &[Backend::Local]).1, Control::Hidden);
-        assert_eq!(source(&pc, std::slice::from_ref(&other)).1, Control::Hidden);
+        assert_eq!(source(&pc, &[up(&Backend::Local)]).1, Control::Hidden);
+        assert_eq!(source(&pc, &[up(&other)]).1, Control::Hidden);
         assert_eq!(source(&pc, &[]).1, Control::Hidden);
         // This Mac: a tab here, even while the active one is on a server.
         assert_eq!(
-            source(&Backend::Local, &[pc.clone(), Backend::Local]),
+            source(&Backend::Local, &[up(&pc), up(&Backend::Local)]),
             (Some(1), Control::Local)
         );
         // This Mac with every tab on a server: the files here only.
-        assert_eq!(source(&Backend::Local, &[pc]).1, Control::Files);
+        assert_eq!(source(&Backend::Local, &[up(&pc)]).1, Control::Files);
+    }
+
+    #[test]
+    fn a_server_with_only_a_dead_tab_answers_for_itself() {
+        let pc = server("http://pc:8787", "pc");
+        // The open tab's agent failed to start ("Host is down"): the
+        // server's own Desktop RPC, not "Do this on pc".
+        assert_eq!(source(&pc, &[down(&pc)]), (Some(0), Control::Hidden));
+        // Another tab there that answers is asked instead.
+        assert_eq!(
+            source(&pc, &[down(&pc), up(&pc)]),
+            (Some(1), Control::Reuse)
+        );
+        // This Mac keeps its own tab, answering or not: the files back it.
+        assert_eq!(
+            source(&Backend::Local, &[down(&Backend::Local)]),
+            (Some(0), Control::Local)
+        );
     }
 
     #[test]
@@ -405,17 +479,25 @@ mod tests {
         let box_b = server("http://b:7420", "lab");
         assert_eq!(control_for(&Backend::Local, None), Control::Local);
         assert_eq!(
-            control_for(&Backend::Local, Some(&Backend::Local)),
+            control_for(&Backend::Local, Some(&up(&Backend::Local))),
             Control::Local
         );
         assert_eq!(
-            control_for(&Backend::Local, Some(&box_a)),
+            control_for(&Backend::Local, Some(&up(&box_a))),
             Control::Files,
             "a screen about this computer never reads a server tab's answers"
         );
-        assert_eq!(control_for(&box_a, Some(&box_a)), Control::Reuse);
-        assert_eq!(control_for(&box_a, Some(&box_b)), Control::Hidden);
-        assert_eq!(control_for(&box_a, Some(&Backend::Local)), Control::Hidden);
+        assert_eq!(
+            control_for(&Backend::Local, Some(&down(&box_a))),
+            Control::Files
+        );
+        assert_eq!(control_for(&box_a, Some(&up(&box_a))), Control::Reuse);
+        assert_eq!(control_for(&box_a, Some(&down(&box_a))), Control::Hidden);
+        assert_eq!(control_for(&box_a, Some(&up(&box_b))), Control::Hidden);
+        assert_eq!(
+            control_for(&box_a, Some(&up(&Backend::Local))),
+            Control::Hidden
+        );
         assert_eq!(control_for(&box_a, None), Control::Hidden);
     }
 

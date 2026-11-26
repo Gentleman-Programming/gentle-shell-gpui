@@ -114,6 +114,9 @@ pub struct SettingsView {
     /// [`Self::control`]'s session, if any.
     session: Option<Entity<crate::features::session::SessionView>>,
     _session_sub: Option<Subscription>,
+    /// [`SettingsEvent::Reopen`] was sent because the tab asked stopped
+    /// answering: once is enough.
+    reopening: bool,
     /// RPC status and its in-flight ticket; separate from upgrade UI state.
     shell_updates: upgrade::ShellUpdates,
     /// Gentle Shell's settings stores (persona, banner, notifications) as
@@ -144,8 +147,9 @@ impl EventEmitter<SettingsEvent> for SettingsView {}
 
 impl SettingsView {
     /// Configuration for `machine`, one of `machines` (what "Settings for"
-    /// offers), opened on `cwd` (a folder there) with the window's active
-    /// agent tab `session` (asked only when it runs on `machine`).
+    /// offers), opened on `cwd` (a folder there) with the agent tab
+    /// `session` the window picked (asked only when it runs on `machine`,
+    /// and on a server only while it answers).
     pub fn new(
         machine: Backend,
         machines: Vec<Backend>,
@@ -215,6 +219,7 @@ impl SettingsView {
                 .as_ref()
                 .map(|session| cx.observe(session, |this, _, cx| this.session_changed(cx))),
             session,
+            reopening: false,
             control,
             shell_updates: upgrade::ShellUpdates::default(),
             shell_config: shell_config::ShellConfig::default(),
@@ -278,6 +283,12 @@ impl SettingsView {
     /// The active agent tab changed: its probe answered, or a Desktop answer
     /// or event arrived.
     fn session_changed(&mut self, cx: &mut Context<Self>) {
+        if self.control.lost(cx) {
+            if !std::mem::replace(&mut self.reopening, true) {
+                cx.emit(SettingsEvent::Reopen(self.machine.clone()));
+            }
+            return;
+        }
         self.update_status_changed(cx);
         self.shell_status_changed(cx);
         self.shell_config_changed(cx);
@@ -414,7 +425,7 @@ impl SettingsView {
         if let Some(machine) = self.machines.get(index)
             && !gentle_core::machines::same(machine, &self.machine)
         {
-            cx.emit(SettingsEvent::MachineChanged(machine.clone()));
+            cx.emit(SettingsEvent::Reopen(machine.clone()));
         }
     }
 }
