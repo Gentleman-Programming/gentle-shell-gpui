@@ -22,6 +22,23 @@ impl ProfilesView {
             matches!(self.pin.as_ref().map(|p| &p.local), Some(PinRead::Valid(p)) if *p == name);
         let declared_here =
             matches!(self.pin.as_ref().map(|p| &p.repo), Some(PinRead::Valid(p)) if *p == name);
+        // Repository and session actions act on the open workspace: named
+        // ("gs-remote-test on ismael"), and off with the reason elsewhere.
+        let target = self.project_target();
+        let elsewhere = target.is_err();
+        let about = |what: &str| -> SharedString {
+            match &target {
+                Ok(place) => format!("{what} ({place})").into(),
+                Err(why) => why.clone().into(),
+            }
+        };
+        let (target_icon, target_text) = match &target {
+            Ok(place) => (
+                IconName::FolderOpen,
+                format!("This repo and session: {place}"),
+            ),
+            Err(why) => (IconName::Info, why.clone()),
+        };
         v_flex()
             .border_t_1()
             .border_color(ui::border())
@@ -46,6 +63,16 @@ impl ProfilesView {
             .child(
                 h_flex()
                     .px_4()
+                    .pt_2()
+                    .gap_2()
+                    .text_xs()
+                    .text_color(ui::muted())
+                    .child(Icon::new(target_icon).xsmall().flex_shrink_0())
+                    .child(div().flex_1().min_w_0().truncate().child(target_text)),
+            )
+            .child(
+                h_flex()
+                    .px_4()
                     .py_3()
                     .gap_2()
                     .flex_wrap()
@@ -60,8 +87,8 @@ impl ProfilesView {
                                     .ghost()
                                     .icon(Icon::new(IconName::GitBranch))
                                     .label(if pinned_here { "Stop using in this repo" } else { "Use in this repo" })
-                                    .tooltip("Clone-local pin in the Git common dir; subagent launches here resolve it")
-                                    .disabled(disabled || self.pin.is_none())
+                                    .tooltip(about("Clone-local pin in the Git common dir; subagent launches here resolve it"))
+                                    .disabled(disabled || elsewhere || self.pin.is_none())
                                     .on_click(cx.listener(|this, _, _, cx| this.toggle_repo_pin(cx))),
                             )
                             .child(
@@ -70,8 +97,8 @@ impl ProfilesView {
                                     .ghost()
                                     .icon(Icon::new(IconName::Upload))
                                     .label(if declared_here { "Unpublish from repo" } else { "Publish to repo" })
-                                    .tooltip("Toggle the committed .pi/gentle-ai/profile.json declaration")
-                                    .disabled(disabled)
+                                    .tooltip(about("Toggle the committed .pi/gentle-ai/profile.json declaration"))
+                                    .disabled(disabled || elsewhere)
                                     .on_click(cx.listener(|this, _, _, cx| this.publish(cx))),
                             )
                             .child(
@@ -80,7 +107,8 @@ impl ProfilesView {
                                     .ghost()
                                     .icon(Icon::new(IconName::Unlink))
                                     .label("Clear session binding")
-                                    .disabled(self.busy)
+                                    .tooltip(about("Unbind the open session from its profile"))
+                                    .disabled(self.busy || elsewhere)
                                     .on_click(cx.listener(|this, _, _, cx| this.clear_session(cx))),
                             ),
                     )
@@ -126,8 +154,8 @@ impl ProfilesView {
                                         .primary()
                                         .icon(Icon::new(IconName::CircleCheck))
                                         .label("Use in this session")
-                                        .tooltip("Switch this session's orchestrator to the profile (saves edits first)")
-                                        .disabled(disabled)
+                                        .tooltip(about("Switch this session's orchestrator to the profile (saves edits first)"))
+                                        .disabled(disabled || elsewhere)
                                         .on_click(cx.listener(|this, _, _, cx| this.use_in_session(cx))),
                                 )
                             }),

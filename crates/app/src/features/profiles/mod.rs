@@ -142,6 +142,8 @@ pub enum ProfilesEvent {
     /// Send this slash command as a prompt (`/gentle:profiles clear`,
     /// `/gentle:profiles publish <name>`).
     RunCommand(String),
+    /// The machine picker chose another machine: open Profiles for it.
+    MachineChanged(gentle_core::backend::Backend),
     /// `profiles.json`, routing, pins or Pi settings were written.
     Changed,
 }
@@ -189,6 +191,8 @@ const ALL_ROW: &str = "__all";
 
 pub struct ProfilesView {
     env: Option<Env>,
+    /// The machine shown, the ones to switch to and the open workspace's.
+    shown: gentle_core::machines::Shown,
     cwd: PathBuf,
     /// Where the session below comes from, and the server agents run on.
     control: ControlSession,
@@ -252,10 +256,11 @@ pub struct ProfilesView {
 impl EventEmitter<ProfilesEvent> for ProfilesView {}
 
 impl ProfilesView {
-    /// Profiles of `machine` (the active workspace's, or Configuration's
-    /// "Settings for"), read through `session` when it runs there.
+    /// Profiles of `shown.shows` (the active workspace's machine, or
+    /// Configuration's "Settings for"), read through `session` when it runs
+    /// there.
     pub fn new(
-        machine: &gentle_core::backend::Backend,
+        shown: gentle_core::machines::Shown,
         cwd: PathBuf,
         models: Vec<ModelChoice>,
         session: Option<Entity<SessionView>>,
@@ -306,7 +311,7 @@ impl ProfilesView {
                 },
             ),
         ];
-        let control = ControlSession::open(session, machine, &cwd, window, cx);
+        let control = ControlSession::open(session, &shown.shows, &cwd, window, cx);
         let session = control.session().cloned();
         if let Some(session) = &session {
             subscriptions.push(cx.observe(session, |this, _, cx| this.session_changed(cx)));
@@ -318,6 +323,7 @@ impl ProfilesView {
             env: None,
             cwd,
             control,
+            shown,
             session,
             backend: Backend::Undecided,
             local_loaded: false,
@@ -808,6 +814,33 @@ impl ProfilesView {
     /// tab of the user's: "Use in this session" has nothing to act on.
     pub(super) fn control_only(&self) -> bool {
         self.control.hidden()
+    }
+
+    /// What the repository and session actions act on ("gs-remote-test on
+    /// ismael"), or why they are off on this machine.
+    pub(super) fn project_target(&self) -> Result<String, String> {
+        self.shown.project_target(&self.cwd)
+    }
+
+    /// The machine picker chose `index`: the window opens Profiles again
+    /// for it, everything read afresh. Unsaved edits stay until saved or
+    /// discarded: they belong to this machine's profile.
+    pub(super) fn pick_machine(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(machine) = self.shown.switch_to(index).cloned() else {
+            return;
+        };
+        if self.change_count() > 0 {
+            self.say(
+                format!(
+                    "Save or discard this profile's changes before showing {}.",
+                    gentle_core::machines::name(&machine)
+                ),
+                Tone::Info,
+            );
+            cx.notify();
+            return;
+        }
+        cx.emit(ProfilesEvent::MachineChanged(machine));
     }
 
     /// On a server, what the screen says instead of opening when its Gentle

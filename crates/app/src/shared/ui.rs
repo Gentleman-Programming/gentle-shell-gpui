@@ -772,6 +772,41 @@ pub fn screen_header() -> Div {
         .border_color(border())
 }
 
+/// After a [`screen_header`] title, the machine the screen shows ("· This
+/// Mac", "· <name> (server)").
+pub fn screen_machine(machine: &gentle_core::backend::Backend) -> Div {
+    div()
+        .flex_shrink_0()
+        .text_sm()
+        .text_color(muted())
+        .child(format!(
+            "· {}",
+            gentle_core::machines::screen_label(machine)
+        ))
+}
+
+/// Which machine a screen is about (Configuration's "Settings for",
+/// Profiles, Usage): `machines` as a [`segmented`] control, `machine`
+/// chosen; `on_select` gets the index picked. `None` with one machine.
+pub fn machine_picker(
+    id: &'static str,
+    machines: &[gentle_core::backend::Backend],
+    machine: &gentle_core::backend::Backend,
+    on_select: impl Fn(&usize, &mut gpui_kit::Window, &mut App) + 'static,
+) -> Option<Div> {
+    if machines.len() < 2 {
+        return None;
+    }
+    let labels: Vec<SharedString> = machines
+        .iter()
+        .map(|choice| gentle_core::machines::name(choice).into())
+        .collect();
+    let selected = machines
+        .iter()
+        .position(|choice| gentle_core::machines::same(choice, machine));
+    Some(segmented(id, &labels, selected, on_select))
+}
+
 /// A text field frame for `Input::new(..).appearance(false)`: same height,
 /// radius and border everywhere.
 pub fn field() -> Div {

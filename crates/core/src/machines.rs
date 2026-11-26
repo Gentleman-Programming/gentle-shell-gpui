@@ -115,6 +115,72 @@ pub fn this_computer() -> &'static str {
     }
 }
 
+/// What a screen about one machine (Profiles, Usage) says it shows, after
+/// its title: "This Mac", "<name> (server)", "WSL · <distro>", a command.
+pub fn screen_label(machine: &Backend) -> String {
+    match machine {
+        Backend::Local => this_computer().to_string(),
+        other => other.label(),
+    }
+}
+
+/// What a screen's project-scoped actions (a repository pin, the session's
+/// profile) act on when it shows `shown` and the window's workspace runs on
+/// `active` in `folder`: "<folder> on <machine>". They act on that
+/// workspace only, so on another machine they are off, and `Err` says why.
+pub fn project_target(shown: &Backend, active: &Backend, folder: &Path) -> Result<String, String> {
+    if !same(shown, active) {
+        return Err(format!(
+            "Acts on the open workspace, which runs on {}; switch to it to use this.",
+            name(active)
+        ));
+    }
+    let text = folder.to_string_lossy();
+    let base = text
+        .trim_end_matches(['/', '\\'])
+        .rsplit(['/', '\\'])
+        .next()
+        .filter(|base| !base.is_empty())
+        .unwrap_or(&text);
+    Ok(format!("{base} on {}", name(shown)))
+}
+
+/// A screen about one machine at a time (Profiles, Usage): the one it
+/// `shows`, the `choices` it can switch to, and the machine the window's
+/// open workspace runs on (`active`), where its project actions act.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Shown {
+    pub shows: Backend,
+    pub choices: Vec<Backend>,
+    pub active: Backend,
+}
+
+impl Shown {
+    /// Open on `shows` (a machine chosen elsewhere, e.g. Configuration's
+    /// "Settings for"), else on the `active` workspace's machine ([`pick`]).
+    pub fn new(shows: Option<Backend>, active: Backend, choices: Vec<Backend>) -> Self {
+        let shows = shows.unwrap_or_else(|| choices[pick(&active, &choices)].clone());
+        Self {
+            shows,
+            choices,
+            active,
+        }
+    }
+
+    /// The machine the picker's `index` switches to; `None` when it is the
+    /// one shown already (or out of range).
+    pub fn switch_to(&self, index: usize) -> Option<&Backend> {
+        self.choices
+            .get(index)
+            .filter(|machine| !same(machine, &self.shows))
+    }
+
+    /// [`project_target`] for the shown machine.
+    pub fn project_target(&self, folder: &Path) -> Result<String, String> {
+        project_target(&self.shows, &self.active, folder)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -232,5 +298,63 @@ mod tests {
         assert_eq!(name(&server("http://pc:8787", " pc ")), "pc");
         assert_eq!(name(&server("https://10.0.0.2:8787", "")), "10.0.0.2:8787");
         assert_eq!(name(&orb()), "orb --");
+    }
+
+    #[test]
+    fn a_screen_says_which_machine_it_shows() {
+        assert_eq!(screen_label(&Backend::Local), this_computer());
+        assert_eq!(
+            screen_label(&server("http://pc:8787", "ismael")),
+            "ismael (server)"
+        );
+        assert_eq!(
+            screen_label(&Backend::Wsl {
+                distro: "Ubuntu".into()
+            }),
+            "WSL · Ubuntu"
+        );
+        assert_eq!(screen_label(&orb()), "orb --");
+    }
+
+    #[test]
+    fn project_actions_act_on_the_open_workspace_only() {
+        let pc = server("http://pc:8787", "ismael");
+        let folder = Path::new("/home/ismael/gs-remote-test/");
+        assert_eq!(
+            project_target(&pc, &pc, folder).as_deref(),
+            Ok("gs-remote-test on ismael")
+        );
+        assert_eq!(
+            project_target(&Backend::Local, &Backend::Local, Path::new(r"C:\src\app")),
+            Ok(format!("app on {}", this_computer()))
+        );
+        // Another machine than the workspace's: off, and why.
+        let off = project_target(&Backend::Local, &pc, folder).unwrap_err();
+        assert!(off.contains("ismael"), "{off}");
+        assert!(project_target(&pc, &Backend::Local, folder).is_err());
+    }
+
+    #[test]
+    fn a_screen_opens_on_the_workspace_machine_and_switches_among_the_choices() {
+        let pc = server("http://pc:8787", "ismael");
+        let folder = Path::new("/home/ismael/gs-remote-test");
+        let all = choices(&pc, &Backend::Local, std::slice::from_ref(&pc));
+        // Default: the active workspace's machine, project actions on.
+        let shown = Shown::new(None, pc.clone(), all.clone());
+        assert_eq!(shown.shows, pc);
+        assert!(shown.project_target(folder).is_ok());
+        // Picking the machine shown changes nothing; This Mac switches.
+        assert_eq!(shown.switch_to(1), None);
+        assert_eq!(shown.switch_to(0), Some(&Backend::Local));
+        assert_eq!(shown.switch_to(9), None);
+        // Shown on This Mac (the switch, or Configuration's "Settings for"):
+        // project actions are off, they act on the server's workspace.
+        let local = Shown::new(Some(Backend::Local), pc.clone(), all.clone());
+        assert_eq!(local.shows, Backend::Local);
+        assert!(local.project_target(folder).is_err());
+        assert_eq!(local.switch_to(1), Some(&pc));
+        // A workspace on a server no longer paired opens on this computer.
+        let gone = server("http://old:8787", "old");
+        assert_eq!(Shown::new(None, gone, all).shows, Backend::Local);
     }
 }

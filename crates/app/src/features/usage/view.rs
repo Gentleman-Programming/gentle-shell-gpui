@@ -106,6 +106,7 @@ impl Render for UsageView {
                                 .text_color(ui::fg())
                                 .child("Usage"),
                         )
+                        .child(ui::screen_machine(&self.shown.shows))
                         .child(
                             div()
                                 .flex_1()
@@ -115,6 +116,12 @@ impl Render for UsageView {
                                 .text_color(ui::muted())
                                 .child(subtitle),
                         )
+                        .children(ui::machine_picker(
+                            "usage-machine",
+                            &self.shown.choices,
+                            &self.shown.shows,
+                            cx.listener(|this, index: &usize, _, cx| this.pick_machine(*index, cx)),
+                        ))
                         .child(
                             segmented()
                                 .child(tab_button(

@@ -140,7 +140,12 @@ impl SettingsView {
     /// "Settings for": the machines Configuration can be about, the one it
     /// is about chosen; the subtitle when this computer is the only one.
     fn render_machine_picker(&self, cx: &mut Context<Self>) -> Div {
-        if self.machines.len() < 2 {
+        let Some(picker) = ui::machine_picker(
+            "settings-for",
+            &self.machines,
+            &self.machine,
+            cx.listener(|this, index: &usize, _, cx| this.pick_machine(*index, cx)),
+        ) else {
             return div()
                 .flex_1()
                 .min_w_0()
@@ -148,16 +153,7 @@ impl SettingsView {
                 .text_xs()
                 .text_color(ui::muted())
                 .child("Manage Gentle Shell and the desktop experience");
-        }
-        let labels: Vec<SharedString> = self
-            .machines
-            .iter()
-            .map(|machine| gentle_core::machines::name(machine).into())
-            .collect();
-        let selected = self
-            .machines
-            .iter()
-            .position(|machine| gentle_core::machines::same(machine, &self.machine));
+        };
         h_flex()
             .flex_1()
             .min_w_0()
@@ -170,11 +166,6 @@ impl SettingsView {
                     .text_color(ui::muted())
                     .child("Settings for"),
             )
-            .child(ui::segmented(
-                "settings-for",
-                &labels,
-                selected,
-                cx.listener(|this, index: &usize, _, cx| this.pick_machine(*index, cx)),
-            ))
+            .child(picker)
     }
 }

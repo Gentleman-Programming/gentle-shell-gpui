@@ -49,6 +49,8 @@ pub(crate) use view::subscription::updated_ago;
 
 pub enum UsageEvent {
     Close,
+    /// The machine picker chose another machine: open Usage for it.
+    MachineChanged(gentle_core::backend::Backend),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -278,6 +280,8 @@ fn rpc_usage_state(
 }
 
 pub struct UsageView {
+    /// The machine shown and the ones the screen switches between.
+    shown: gentle_core::machines::Shown,
     tab: Tab,
     usage: UsageState,
     stats: StatsState,
@@ -310,18 +314,20 @@ pub fn now_ms() -> i64 {
 }
 
 impl UsageView {
-    /// Usage on `machine` (the active workspace's, or Configuration's
-    /// "Settings for"), read through `session` when it runs there.
+    /// Usage on `shown.shows` (the active workspace's machine, or
+    /// Configuration's "Settings for"), read through `session` when it runs
+    /// there.
     pub fn new(
-        machine: &gentle_core::backend::Backend,
+        shown: gentle_core::machines::Shown,
         cwd: &std::path::Path,
         window: &mut Window,
         cx: &mut Context<Self>,
         session: Option<Entity<SessionView>>,
     ) -> Self {
-        let control = ControlSession::open(session, machine, cwd, window, cx);
+        let control = ControlSession::open(session, &shown.shows, cwd, window, cx);
         let session = control.session().cloned();
         let mut this = Self {
+            shown,
             tab: Tab::Usage,
             usage: UsageState::Loading,
             stats: StatsState::Idle,
@@ -709,6 +715,21 @@ impl UsageView {
     /// Switch to the Local stats tab (the `/gentle:stats` command).
     pub fn show_stats(&mut self, cx: &mut Context<Self>) {
         self.set_tab(Tab::Stats, cx);
+    }
+
+    /// The machine picker chose `index`: the window opens Usage again for
+    /// it, everything read afresh.
+    fn pick_machine(&mut self, index: usize, cx: &mut Context<Self>) {
+        if let Some(machine) = self.shown.switch_to(index) {
+            cx.emit(UsageEvent::MachineChanged(machine.clone()));
+        }
+    }
+
+    /// Show the tab `previous` (the same screen, for another machine)
+    /// showed.
+    pub fn keep_tab(&mut self, previous: &Entity<Self>, cx: &mut Context<Self>) {
+        let tab = previous.read(cx).tab;
+        self.set_tab(tab, cx);
     }
 
     fn set_tab(&mut self, tab: Tab, cx: &mut Context<Self>) {

@@ -130,6 +130,7 @@ impl Render for ProfilesView {
                                 .text_color(ui::fg())
                                 .child("Profiles"),
                         )
+                        .child(ui::screen_machine(&self.shown.shows))
                         .child(
                             div()
                                 .flex_1()
@@ -139,6 +140,12 @@ impl Render for ProfilesView {
                                 .text_color(ui::muted())
                                 .child("Agent-model routing snapshots, like /gentle:profiles."),
                         )
+                        .children(ui::machine_picker(
+                            "profiles-machine",
+                            &self.shown.choices,
+                            &self.shown.shows,
+                            cx.listener(|this, index: &usize, _, cx| this.pick_machine(*index, cx)),
+                        ))
                         .when(self.busy, |d| {
                             d.child(Spinner::new().small().color(ui::muted()))
                         })

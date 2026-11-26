@@ -494,6 +494,8 @@ With an older Shell the list falls back to that widget alone (time, turns, tools
 
 `/gentle:profiles` rebuilt: profiles, per-agent model, effort and Fast tier. Supports Use in this session, Make default, Publish and Clear binding. With Gentle Shell 4.8+ every edit is a `set_config` through its Desktop channel, guarded by the store's revision (a concurrent change is re-read, never overwritten), and Make default / Use in this session run Shell's own `apply_profile`, showing its confirmation exactly; an older Shell keeps the direct file writes.
 
+Profiles and Usage say which machine they show ("· This Mac", "· <server> (server)") and, with a server paired or another environment in use, switch machines from their header, as Configuration's "Settings for" does. They open on the workspace's machine. Use in this repo, Publish to repo, Clear session binding and Use in this session name the folder and machine they act on, and are off on any machine but the open workspace's.
+
 <details>
 <summary><kbd>More</kbd> <strong>Editing, pickers and import/export</strong></summary>
 

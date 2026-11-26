@@ -430,20 +430,30 @@ impl Workspace {
     }
 
     pub(super) fn open_profiles(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let machine = self.space().machine();
-        self.open_profiles_on(machine, window, cx);
+        self.open_profiles_on(None, window, cx);
     }
 
-    /// Profiles of `machine` (Configuration's "Settings for", else the
-    /// shown workspace's).
+    /// Which machine a screen about one machine (Profiles, Usage) shows:
+    /// `machine` (Configuration's "Settings for", the screen's own picker),
+    /// else the shown workspace's; and the machines it can switch to.
+    fn shown_machine(
+        &self,
+        machine: Option<gentle_core::backend::Backend>,
+    ) -> gentle_core::machines::Shown {
+        gentle_core::machines::Shown::new(machine, self.space().machine(), self.machines())
+    }
+
+    /// Profiles of `machine` (Configuration's "Settings for", the screen's
+    /// picker; `None`: the shown workspace's).
     fn open_profiles_on(
         &mut self,
-        machine: gentle_core::backend::Backend,
+        machine: Option<gentle_core::backend::Backend>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.start_active_session(window, cx);
-        let cwd = self.folder_on(&machine, cx);
+        let shown = self.shown_machine(machine);
+        let cwd = self.folder_on(&shown.shows, cx);
         let models = self
             .active_session()
             .map(|t| t.read(cx).model_choices())
@@ -457,12 +467,15 @@ impl Workspace {
             })
             .collect();
         let session = self.active_session();
-        let view = cx.new(|cx| ProfilesView::new(&machine, cwd, models, session, window, cx));
+        let view = cx.new(|cx| ProfilesView::new(shown, cwd, models, session, window, cx));
         let subscription = cx.subscribe_in(&view, window, |this, _, event: &ProfilesEvent, window, cx| {
             let tab = this.active_session();
             match event {
                 ProfilesEvent::Close => this.close_overlay(window, cx),
                 ProfilesEvent::Changed => {}
+                ProfilesEvent::MachineChanged(machine) => {
+                    this.open_profiles_on(Some(machine.clone()), window, cx)
+                }
                 ProfilesEvent::RunCommand(text) => {
                     if let Some(tab) = tab {
                         let text = text.clone();
@@ -550,7 +563,7 @@ impl Workspace {
                 SettingsEvent::TabLayoutChanged(layout) => this.set_tab_layout(*layout, cx),
                 SettingsEvent::OpenProfiles => {
                     let machine = view.read(cx).machine().clone();
-                    this.open_profiles_on(machine, window, cx)
+                    this.open_profiles_on(Some(machine), window, cx)
                 }
                 SettingsEvent::MachineChanged(machine) => {
                     let previous = view.clone();
@@ -698,20 +711,38 @@ impl Workspace {
     }
 
     pub(super) fn open_usage(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_usage_on(None, window, cx);
+    }
+
+    /// Usage of `machine` (the screen's picker; `None`: the shown
+    /// workspace's).
+    fn open_usage_on(
+        &mut self,
+        machine: Option<gentle_core::backend::Backend>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         // The Subscription tab reads through the active agent's RPC slice, so
         // its backend must be started (probe included) before it is opened.
         // On a Gentle Shell server without a tab there, the screen starts
         // its own control session there (see `settings::remote`).
         self.start_active_session(window, cx);
         let session = self.active_session();
-        let machine = self.space().machine();
-        let cwd = self.active_cwd(cx);
-        let view = cx.new(|cx| UsageView::new(&machine, &cwd, window, cx, session));
+        let shown = self.shown_machine(machine);
+        let cwd = self.folder_on(&shown.shows, cx);
+        let view = cx.new(|cx| UsageView::new(shown, &cwd, window, cx, session));
         let subscription = cx.subscribe_in(
             &view,
             window,
-            |this, _, event: &UsageEvent, window, cx| match event {
+            |this, view, event: &UsageEvent, window, cx| match event {
                 UsageEvent::Close => this.close_overlay(window, cx),
+                UsageEvent::MachineChanged(machine) => {
+                    let previous = view.clone();
+                    this.open_usage_on(Some(machine.clone()), window, cx);
+                    if let Some((Overlay::Usage(next), _)) = &this.overlay {
+                        next.update(cx, |next, cx| next.keep_tab(&previous, cx));
+                    }
+                }
             },
         );
         self.overlay = Some((Overlay::Usage(view), subscription));
