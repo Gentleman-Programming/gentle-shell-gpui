@@ -65,7 +65,7 @@ impl WelcomeView {
             setup,
             // Agents on a Gentle Shell server: this computer's Gentle Shell
             // home isn't theirs (and may not exist), so the default banner.
-            banner: if crate::features::backend::saved().is_server() {
+            banner: if crate::features::backend::current().is_server() {
                 BannerConfig::default()
             } else {
                 banner::read_config(&pi_rpc::resolve_homes().config)

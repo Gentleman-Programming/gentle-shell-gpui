@@ -150,21 +150,6 @@ impl SessionView {
         }
     }
 
-    /// [`Self::retry_start`] in `cwd`: agents now run on a Gentle Shell
-    /// server, where this computer's folder isn't one (`cwd` is the
-    /// server's home). A tab that let go of a server session (this device
-    /// was unpaired) picks it up again where it is instead.
-    pub fn retry_start_in(&mut self, cwd: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.never_ran() {
-            return;
-        }
-        if self.backend.attach.is_some() {
-            self.start(window, cx);
-        } else {
-            self.change_cwd(cwd, window, cx);
-        }
-    }
-
     /// Started, but its backend never came up.
     fn never_ran(&self) -> bool {
         let never_ran = match &self.backend.status {

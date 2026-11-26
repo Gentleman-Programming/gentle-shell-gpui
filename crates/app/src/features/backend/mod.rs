@@ -1,14 +1,22 @@
-//! Where agents run (`gentle_core::backend`): the choice saved in the app's
-//! `settings.json`, the WSL distro a project folder implies, that
-//! environment's login PATH and Gentle Shell homes, the WSL distros on this
-//! computer, and what runs through it: `gentle-shell` (agent tabs and its
-//! commands), terminals, files ([`fs`]) and `git`. On a Gentle Shell server
-//! ([`server`]) sessions, files, git and terminals go through its API; what
-//! a server doesn't offer answers [`server::UNAVAILABLE`].
+//! Where agents run (`gentle_core::backend`): the default machine saved in
+//! the app's `settings.json` (where a new workspace goes), the machine each
+//! open workspace runs on ([`set_workspaces`]), the WSL distro a project
+//! folder implies, that environment's login PATH and Gentle Shell homes, the
+//! WSL distros on this computer, and what runs through it: `gentle-shell`
+//! (agent tabs and its commands), terminals, files ([`fs`]) and `git`. On a
+//! Gentle Shell server ([`server`]) sessions, files, git and terminals go
+//! through its API; what a server doesn't offer answers
+//! [`server::UNAVAILABLE`].
+//!
+//! Work is found its machine by its folder ([`for_tab`]): the workspace
+//! whose folder holds it ([`gentle_core::machines::owner`]). A screen that
+//! acts on a machine it chose (Configuration's "Settings for", Open folder)
+//! runs its work inside [`on`], which wins over any folder.
 
 pub mod fs;
 pub mod server;
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -24,45 +32,119 @@ use serde_json::Value;
 /// or VM boots first.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// The saved choice, read once: `git` asks for it on every refresh.
-static SAVED: RwLock<Option<Backend>> = RwLock::new(None);
+/// The default machine, read once: where a new workspace goes.
+static DEFAULT: RwLock<Option<Backend>> = RwLock::new(None);
 
-/// Read the backend's homes, if agents run in one, in the background.
+/// The open workspaces' folders and machines, the shown one's first, then
+/// the homes of the servers they run on ([`set_workspaces`]).
+static ROOTS: RwLock<Vec<(PathBuf, Backend)>> = RwLock::new(Vec::new());
+
+/// The shown workspace's machine, once a window shows one.
+static SHOWN: RwLock<Option<Backend>> = RwLock::new(None);
+
+thread_local! {
+    /// The machine work on this thread acts on, inside [`on`].
+    static ON: RefCell<Option<Backend>> = const { RefCell::new(None) };
+}
+
+/// Read the shown machine's homes, if it is an environment of its own, in
+/// the background; a server's name kept from before servers were listed
+/// is kept beside its pairing ([`server::remember_name`]).
 pub fn init(cx: &mut App) {
     cx.background_executor()
-        .spawn(async { sync_homes() })
+        .spawn(async {
+            server::remember_name(&default_machine());
+            sync_homes();
+        })
         .detach();
 }
 
-/// The backend new agent tabs use; [`Backend::Local`] when none is saved.
-pub fn saved() -> Backend {
-    if let Some(known) = SAVED.read().ok().and_then(|saved| saved.clone()) {
+/// Where a new workspace goes ("Agents run on"); [`Backend::Local`] when
+/// none is saved. Open workspaces keep their own machine.
+pub fn default_machine() -> Backend {
+    if let Some(known) = DEFAULT.read().ok().and_then(|saved| saved.clone()) {
         return known;
     }
     let choice = crate::shared::themes::store_path()
         .and_then(|path| crate::shared::themes::read_key(&path, backend::KEY))
         .map_or_else(Backend::default, |value| Backend::from_json(&value));
-    if let Ok(mut saved) = SAVED.write() {
+    if let Ok(mut saved) = DEFAULT.write() {
         *saved = Some(choice.clone());
     }
     choice
 }
 
-/// Save the backend new agent tabs use (`null` for this computer).
-pub fn save(choice: &Backend) -> std::io::Result<()> {
+/// Save where new workspaces go (`null` for this computer). Choosing this
+/// computer forgets no server: pairings stay listed ([`server::paired`]).
+pub fn save_default(choice: &Backend) -> std::io::Result<()> {
     let path = crate::shared::themes::store_path()
         .ok_or_else(|| std::io::Error::other("no data folder"))?;
     crate::shared::themes::write_key(&path, backend::KEY, choice.to_json().unwrap_or(Value::Null))?;
-    if let Ok(mut saved) = SAVED.write() {
+    if let Ok(mut saved) = DEFAULT.write() {
         *saved = Some(choice.clone());
     }
     Ok(())
 }
 
-/// Where work rooted at `cwd` runs: the distro of a folder under
-/// `\\wsl.localhost\<distro>\`, else the saved choice.
+/// The open workspaces' folders and machines, the shown workspace's first:
+/// work in one of those folders runs on its machine ([`for_tab`]). A
+/// server's home holds what its workspaces' folders don't (a tab started
+/// there), after them.
+pub fn set_workspaces(roots: Vec<(PathBuf, Backend)>, active: Backend) {
+    let mut all = roots;
+    let homes: Vec<(PathBuf, Backend)> = all
+        .iter()
+        .filter_map(|(_, machine)| match machine {
+            Backend::Server { url, .. } => {
+                server::known_home(url).map(|home| (PathBuf::from(home), machine.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    all.extend(homes);
+    if let Ok(mut roots) = ROOTS.write() {
+        *roots = all;
+    }
+    if let Ok(mut shown) = SHOWN.write() {
+        *shown = Some(active);
+    }
+}
+
+/// Run `work` acting on `machine`: every folder it reaches is that
+/// machine's ([`for_tab`]), and so is [`current`]. For screens that act on
+/// a machine the user chose; blocking work runs inside it on its own
+/// thread.
+pub fn on<R>(machine: &Backend, work: impl FnOnce() -> R) -> R {
+    let before = ON.with(|on| on.replace(Some(machine.clone())));
+    let out = work();
+    ON.with(|on| *on.borrow_mut() = before);
+    out
+}
+
+/// The machine whole-machine work acts on (Setup, Gentle Shell's own
+/// commands, its homes): the one [`on`] names, else the shown workspace's,
+/// else the default.
+pub fn current() -> Backend {
+    ON.with(|on| on.borrow().clone())
+        .or_else(|| SHOWN.read().ok().and_then(|shown| shown.clone()))
+        .unwrap_or_else(default_machine)
+}
+
+/// Where work rooted at `cwd` runs: the machine [`on`] names; else the
+/// distro of a folder under `\\wsl.localhost\<distro>\`; else the machine
+/// of the workspace whose folder holds it; else the shown workspace's.
 pub fn for_tab(cwd: &Path) -> Backend {
-    Backend::for_folder(&cwd.to_string_lossy()).unwrap_or_else(saved)
+    if let Some(machine) = ON.with(|on| on.borrow().clone()) {
+        return machine;
+    }
+    if let Some(distro) = Backend::for_folder(&cwd.to_string_lossy()) {
+        return distro;
+    }
+    ROOTS
+        .read()
+        .ok()
+        .and_then(|roots| gentle_core::machines::owner(cwd, &roots).cloned())
+        .unwrap_or_else(current)
 }
 
 /// Whether work rooted at `cwd` runs on a Gentle Shell server, where its
@@ -320,12 +402,13 @@ pub fn shell_spec(cwd: &Path) -> Result<pi_rpc::LaunchSpec> {
     launch_spec(&for_tab(cwd), cwd, &[], &[])
 }
 
-/// `gentle-shell` where new agent tabs run, for commands about the
-/// installation (`--version`, `setup`, `install`): from the user's home
-/// here, or the backend's root, which every backend has (a container may not
-/// see this computer's home). Blocking, like [`launch_spec`].
+/// `gentle-shell` on the machine whole-machine work acts on ([`current`]),
+/// for commands about the installation (`--version`, `setup`, `install`):
+/// from the user's home here, or the backend's root, which every backend
+/// has (a container may not see this computer's home). Blocking, like
+/// [`launch_spec`].
 pub fn home_shell_spec() -> Result<pi_rpc::LaunchSpec> {
-    match saved() {
+    match current() {
         Backend::Local => {
             pi_rpc::resolve_backend(&dirs::home_dir().unwrap_or_else(std::env::temp_dir))
         }
@@ -540,10 +623,11 @@ pub fn run(choice: &Backend, program: &str, args: &[&str]) -> Option<(bool, Stri
 /// The backend whose homes the app last pointed at ([`sync_homes`]).
 static SYNCED: Mutex<Option<Backend>> = Mutex::new(None);
 
-/// Point the app at the saved backend's Gentle Shell homes ([`use_home`]).
-/// Blocking: it asks `gentle-shell --version` there.
+/// Point the app at the Gentle Shell homes of the machine whole-machine
+/// work acts on ([`current`], [`use_home`]). Blocking: it asks
+/// `gentle-shell --version` there.
 pub fn sync_homes() {
-    let choice = saved();
+    let choice = current();
     let home = match choice {
         Backend::Local => None,
         _ => crate::features::setup::launcher_home(),
@@ -554,12 +638,12 @@ pub fn sync_homes() {
     }
 }
 
-/// [`sync_homes`] unless the app already reads the saved backend's homes,
-/// so a screen that reads them never shows this computer's by mistake.
+/// [`sync_homes`] unless the app already reads [`current`]'s homes, so a
+/// screen that reads them never shows another machine's by mistake.
 /// Blocking.
 pub fn ensure_homes() {
-    let current = SYNCED.lock().ok().and_then(|synced| synced.clone());
-    if current.as_ref() != Some(&saved()) {
+    let synced = SYNCED.lock().ok().and_then(|synced| synced.clone());
+    if synced.as_ref() != Some(&current()) {
         sync_homes();
     }
 }

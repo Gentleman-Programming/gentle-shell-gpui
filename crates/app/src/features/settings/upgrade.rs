@@ -386,12 +386,12 @@ impl SettingsView {
         self.shell_update.upgrading = Some(target);
         self.shell_update.result = None;
         self.start_clock(cx);
-        let cwd = self.cwd.clone();
+        let (cwd, machine) = (self.cwd.clone(), self.machine.clone());
         self._job = cx.spawn(async move |this, cx| {
-            let upgrade = cx
-                .background_executor()
-                .spawn(async move { super::services::updates::upgrade_shell(&cwd, channel.args()) })
-                .await;
+            let upgrade = super::on_machine(cx.background_executor(), &machine, move || {
+                super::services::updates::upgrade_shell(&cwd, channel.args())
+            })
+            .await;
             let _ = this.update(cx, |this, cx| {
                 let target = target_version;
                 this.shell_update.upgrading = None;
@@ -518,12 +518,12 @@ impl SettingsView {
         self.shell_update.pi_running = true;
         self.shell_update.pi_result = None;
         self.start_clock(cx);
-        let cwd = self.cwd.clone();
+        let (cwd, machine) = (self.cwd.clone(), self.machine.clone());
         self._job = cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move { crate::features::setup::run_gentle_shell(&cwd, &["update"]) })
-                .await;
+            let result = super::on_machine(cx.background_executor(), &machine, move || {
+                crate::features::setup::run_gentle_shell(&cwd, &["update"])
+            })
+            .await;
             let _ = this.update(cx, |this, cx| {
                 let (text, failed) = match result {
                     Ok(text) => (text, false),
@@ -599,11 +599,14 @@ impl SettingsView {
         }
         self.engram.upgrading = true;
         self.engram.result = None;
+        let machine = self.machine.clone();
         self.engram._job = cx.spawn(async move |this, cx| {
-            let (result, lines) = cx
-                .background_executor()
-                .spawn(async move { super::services::updates::upgrade_engram() })
-                .await;
+            let (result, lines) = super::on_machine(
+                cx.background_executor(),
+                &machine,
+                super::services::updates::upgrade_engram,
+            )
+            .await;
             let _ = this.update(cx, |this, cx| {
                 this.engram.upgrading = false;
                 let mut shown = lines[lines.len().saturating_sub(8)..].to_vec();

@@ -98,9 +98,9 @@ pub(super) fn screen_rows(tab_layout: TabLayout) -> Vec<Row> {
         ),
         row(
             IconName::Folder,
-            "Browse folders",
+            "Open folder…",
             &format!(
-                "Open Gentle Shell in any folder, oil-style ({})",
+                "Open Gentle Shell in any folder, on this computer or a paired server ({})",
                 ui::shortcut("O")
             ),
             PaletteAction::OpenExplorer,

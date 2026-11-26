@@ -7,8 +7,9 @@
 //! one shown (as a folder picker's Open does), ⌥↵ / Alt+↵ a terminal; both
 //! show the workspace rooted there, creating it, like `gsd <folder>`.
 //! Picking a folder for something else ([`Purpose::Choose`]), ⌘↵ hands it
-//! back. Where agents run on a Gentle Shell server, it browses the server's
-//! folders (through its API), home being the server's.
+//! back. It browses one machine (this computer, or a Gentle Shell server
+//! through its API, home being the server's); when the app knows several,
+//! a row at its top switches between them, each from its home folder.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -20,6 +21,7 @@ use gpui_kit::component::{Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use gentle_core::backend::Backend;
 use gentle_core::explorer::{self, Entry, visible};
 
 use crate::features::backend;
@@ -57,6 +59,10 @@ impl EventEmitter<ExplorerEvent> for ExplorerView {}
 
 pub struct ExplorerView {
     purpose: Purpose,
+    /// The machine browsed.
+    machine: Backend,
+    /// The machines it can browse (the row at its top, with two or more).
+    machines: Vec<Backend>,
     dir: PathBuf,
     entries: Vec<Entry>,
     /// Folders holding a `.git`, marked as repositories.
@@ -78,7 +84,10 @@ pub struct ExplorerView {
 }
 
 impl ExplorerView {
+    /// Browse `dir` on `machine`, one of `machines`.
     pub fn new(
+        machine: Backend,
+        machines: Vec<Backend>,
         dir: PathBuf,
         purpose: Purpose,
         window: &mut Window,
@@ -93,6 +102,8 @@ impl ExplorerView {
         });
         let mut this = Self {
             purpose,
+            machine,
+            machines,
             dir: PathBuf::new(),
             entries: Vec::new(),
             repos: HashSet::new(),
@@ -107,6 +118,28 @@ impl ExplorerView {
         };
         this.load(dir, None, window, cx);
         this
+    }
+
+    /// The machine browsed: the folder picked is one of its.
+    pub fn machine(&self) -> &Backend {
+        &self.machine
+    }
+
+    /// Browse the machine at `index` of the row, from its home folder.
+    fn switch_machine(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(machine) = self.machines.get(index).cloned() else {
+            return;
+        };
+        if gentle_core::machines::same(&machine, &self.machine) {
+            return;
+        }
+        self.machine = machine;
+        self.loading = true;
+        self.entries.clear();
+        self.shown.clear();
+        self.error = None;
+        cx.notify();
+        self.go_home(window, cx);
     }
 
     /// Show `dir`, read off the UI thread, highlighting the entry named
@@ -129,10 +162,11 @@ impl ExplorerView {
         self.filter
             .update(cx, |state, cx| state.set_value("", window, cx));
         cx.notify();
+        let machine = self.machine.clone();
         self._load = cx.spawn_in(window, async move |this, cx| {
             let read = cx
                 .background_executor()
-                .spawn(async move { read_dir(&dir) })
+                .spawn(async move { backend::on(&machine, || read_dir(&dir)) })
                 .await;
             let _ = this.update(cx, |this, cx| {
                 (this.entries, this.repos, this.error) = match read {
@@ -205,18 +239,26 @@ impl ExplorerView {
         self.load(parent, from, window, cx);
     }
 
-    /// The home folder: the server's where the folder shown is one's (asked
-    /// off the UI thread the first time), else this computer's.
+    /// The home folder of the machine browsed (a server's asked off the UI
+    /// thread the first time).
     fn go_home(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let dir = self.dir.clone();
+        let machine = self.machine.clone();
         self._load = cx.spawn_in(window, async move |this, cx| {
             let home = cx
                 .background_executor()
-                .spawn(async move { home_of(&dir) })
+                .spawn(async move { home_of(&machine) })
                 .await;
-            if let Some(home) = home {
-                let _ = this.update_in(cx, |this, window, cx| this.load(home, None, window, cx));
-            }
+            let _ = this.update_in(cx, |this, window, cx| match home {
+                Some(home) => this.load(home, None, window, cx),
+                None => {
+                    this.loading = false;
+                    this.error = Some(format!(
+                        "{} didn't say where its home folder is.",
+                        gentle_core::machines::name(&this.machine)
+                    ));
+                    cx.notify();
+                }
+            });
         });
     }
 
@@ -424,14 +466,50 @@ fn server_repos(
     })
 }
 
-/// The home folder where `dir` is: the server's when work there runs on
-/// one (asked the first time), else this computer's. Blocking.
-fn home_of(dir: &Path) -> Option<PathBuf> {
-    let choice = backend::for_tab(dir);
-    if choice.is_server() {
-        backend::server::home(&choice).map(PathBuf::from)
+/// `machine`'s home folder: a server's (asked the first time), else this
+/// computer's. Blocking.
+fn home_of(machine: &Backend) -> Option<PathBuf> {
+    if machine.is_server() {
+        backend::server::home(machine).map(PathBuf::from)
     } else {
         dirs::home_dir()
+    }
+}
+
+impl ExplorerView {
+    /// The machines it can browse, the one browsed chosen; nothing with
+    /// only one.
+    fn render_machines(&self, cx: &mut Context<Self>) -> Option<Div> {
+        if self.machines.len() < 2 {
+            return None;
+        }
+        let labels: Vec<SharedString> = self
+            .machines
+            .iter()
+            .map(|machine| gentle_core::machines::name(machine).into())
+            .collect();
+        let selected = self
+            .machines
+            .iter()
+            .position(|machine| gentle_core::machines::same(machine, &self.machine));
+        Some(
+            h_flex()
+                .h(px(40.))
+                .flex_none()
+                .px_4()
+                .gap_3()
+                .border_b_1()
+                .border_color(ui::border())
+                .child(div().text_xs().text_color(ui::muted()).child("Browse"))
+                .child(ui::segmented(
+                    "explorer-machine",
+                    &labels,
+                    selected,
+                    cx.listener(|this, index: &usize, window, cx| {
+                        this.switch_machine(*index, window, cx)
+                    }),
+                )),
+        )
     }
 }
 
@@ -526,6 +604,7 @@ impl Render for ExplorerView {
                             }))
                     }),
             )
+            .children(self.render_machines(cx))
             .child(
                 h_flex()
                     .h(px(44.))

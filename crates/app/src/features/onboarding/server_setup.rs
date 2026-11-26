@@ -17,7 +17,7 @@ use gpui_kit::*;
 use pi_rpc::serve::UpgradeEvent;
 
 use super::OnboardingView;
-use crate::features::backend::{self, server};
+use crate::features::backend::server;
 use crate::shared::ui;
 
 /// Output lines kept.
@@ -162,7 +162,7 @@ impl OnboardingView {
     /// Ask whether this device may run setup on the server agents run on
     /// (with every look: another pairing may answer differently).
     pub(super) fn ask_server_setup(&mut self, cx: &mut Context<Self>) {
-        let choice = backend::saved();
+        let choice = self.machine();
         if !choice.is_server() || self.server_setup.running() {
             self.server_setup.allowed = false;
             return;
@@ -188,7 +188,7 @@ impl OnboardingView {
 
     /// Run Gentle Shell's setup on the server, then look again.
     fn run_server_setup(&mut self, cx: &mut Context<Self>) {
-        let choice = backend::saved();
+        let choice = self.machine();
         if !choice.is_server() || !self.server_setup.allowed || self.server_setup.running() {
             return;
         }

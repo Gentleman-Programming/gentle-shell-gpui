@@ -212,8 +212,8 @@ pub fn with_key(mut session: ServerSession) -> ServerSession {
 
 /// Where a tab that ran on `runs_on` starts again: there, unless it is a
 /// server this device has no pairing with any more while the server its
-/// session (`attach`) runs on is the one agents run on now: paired again
-/// elsewhere, or after an unpair.
+/// session (`attach`) runs on is paired now: paired again elsewhere, or
+/// after an unpair.
 pub fn paired_again(runs_on: Option<Backend>, attach: Option<&ServerSession>) -> Option<Backend> {
     let (Some(Backend::Server { url, .. }), Some(attach)) = (&runs_on, attach) else {
         return runs_on;
@@ -221,11 +221,76 @@ pub fn paired_again(runs_on: Option<Backend>, attach: Option<&ServerSession>) ->
     if find(&read_tokens(), url, url).is_some() {
         return runs_on;
     }
-    let saved = super::saved();
-    if same(attach.server(), &saved) {
-        Some(saved)
-    } else {
-        runs_on
+    paired()
+        .into_iter()
+        .find(|server| same(attach.server(), server))
+        .or(runs_on)
+}
+
+/// Every server this device is paired with, by name: each pairing kept
+/// beside its token, whatever runs where. Choosing where new workspaces go
+/// never adds or removes one; pairing and [`unpair`] do.
+pub fn paired() -> Vec<Backend> {
+    let mut all: Vec<Backend> = read_tokens()
+        .iter()
+        .filter_map(|(url, entry)| pairing(url, entry))
+        .collect();
+    all.sort_by_key(|server| gentle_core::machines::name(server).to_lowercase());
+    all
+}
+
+/// The server a token entry (kept under `url`) pairs with, named as it was
+/// paired (its machine's host name, else its address, before names were
+/// kept); `None` for an entry without a token.
+fn pairing(url: &str, entry: &Value) -> Option<Backend> {
+    entry["token"].as_str()?;
+    let name = ["name", "host"]
+        .into_iter()
+        .find_map(|field| entry[field].as_str().filter(|name| !name.trim().is_empty()))
+        .map_or_else(|| host_of(url), str::to_string);
+    Some(Backend::Server {
+        url: url.to_string(),
+        device: entry["device"].as_str().unwrap_or_default().to_string(),
+        name,
+    })
+}
+
+/// The server a workspace saved as `stored` (its id, or an address, as
+/// [`key`] names it) runs on: its pairing; one this device isn't paired
+/// with any more is the server at `stored`, which answers that it isn't.
+pub fn by_key(stored: &str) -> Backend {
+    let tokens = read_tokens();
+    find(&tokens, stored, stored)
+        .and_then(|key| pairing(&key, &tokens[&key]))
+        .unwrap_or_else(|| Backend::Server {
+            url: stored.to_string(),
+            device: String::new(),
+            name: stored.to_string(),
+        })
+}
+
+/// Keep `choice`'s name (a server, as saved where agents ran before
+/// servers were listed) beside its pairing, when that has none yet.
+pub fn remember_name(choice: &Backend) {
+    let Backend::Server { url, name, .. } = choice else {
+        return;
+    };
+    if name.trim().is_empty() {
+        return;
+    }
+    let mut tokens = read_tokens();
+    let Some(key) = find(&tokens, url, url) else {
+        return;
+    };
+    let Some(entry) = tokens.get_mut(&key).and_then(Value::as_object_mut) else {
+        return;
+    };
+    if entry.get("name").and_then(Value::as_str).is_some() {
+        return;
+    }
+    entry.insert("name".into(), name.clone().into());
+    if let Err(err) = write_tokens(&tokens) {
+        eprintln!("gentle-shell-gpui: could not keep the server's name: {err}");
     }
 }
 
@@ -476,6 +541,7 @@ fn paired_with(
         "token": paired.token,
         "serverId": info.server_id,
         "addresses": addresses,
+        "name": name,
     });
     if answers != url {
         moved(&mut entry, &url, answers);
@@ -797,6 +863,34 @@ mod tests {
 
     fn tokens(value: Value) -> Map<String, Value> {
         value.as_object().unwrap().clone()
+    }
+
+    /// Each pairing is a server of the list, named as it was paired; one
+    /// paired before names were kept goes by its machine's host name, else
+    /// its address. An entry without a token isn't a pairing.
+    #[test]
+    fn every_pairing_is_a_listed_server_with_a_name() {
+        let named = json!({"token": "gss_a", "device": "dev_1", "name": "studio", "host": "mini"});
+        let hosted = json!({"token": "gss_b", "device": "dev_2", "host": "mini"});
+        let bare = json!({"token": "gss_c", "device": "dev_3"});
+        let server = |url: &str, device: &str, name: &str| Backend::Server {
+            url: url.into(),
+            device: device.into(),
+            name: name.into(),
+        };
+        assert_eq!(
+            pairing("http://a:8787", &named),
+            Some(server("http://a:8787", "dev_1", "studio"))
+        );
+        assert_eq!(
+            pairing("http://b:8787", &hosted),
+            Some(server("http://b:8787", "dev_2", "mini"))
+        );
+        assert_eq!(
+            pairing("http://10.0.0.5:8787", &bare),
+            Some(server("http://10.0.0.5:8787", "dev_3", "10.0.0.5"))
+        );
+        assert_eq!(pairing("http://d:8787", &json!({"device": "dev_4"})), None);
     }
 
     /// Paired again at another address, a server takes its earlier

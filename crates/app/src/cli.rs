@@ -56,7 +56,7 @@ pub fn default_cwd() -> PathBuf {
 /// `--cwd` the folder the app was launched in; `None` restores the last
 /// workspace.
 pub fn requested_folder(cli: &Cli) -> Option<PathBuf> {
-    let on_server = crate::features::backend::saved().is_server();
+    let on_server = crate::features::backend::default_machine().is_server();
     resolve_folder(cli.folder.clone(), cli.here, launch_dir(), on_server)
 }
 

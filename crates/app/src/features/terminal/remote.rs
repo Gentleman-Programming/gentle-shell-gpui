@@ -679,6 +679,12 @@ impl TerminalView {
         .or_else(|| self.resume.clone())
     }
 
+    /// What names the server this pane's terminal runs on, once opened
+    /// there.
+    pub fn server_key(&self) -> Option<String> {
+        self.server.clone()
+    }
+
     /// The pane closes for good: its server terminal closes there too
     /// (dropping the pane, as quitting does, only detaches from it). A
     /// local shell ends when the pane drops.
@@ -842,24 +848,23 @@ impl TerminalView {
             window,
             |this, _, event: &ConnectEvent, window, cx| {
                 let ConnectEvent::Paired(choice, _) = event;
-                // The same server keeps the name the user knows it by.
-                let saved = backend::saved();
-                let choice = match (&saved, choice) {
-                    (Backend::Server { name, .. }, Backend::Server { url, device, .. })
-                        if server::key(&saved) == server::key(choice) =>
-                    {
-                        Backend::Server {
-                            name: name.clone(),
-                            url: url.clone(),
-                            device: device.clone(),
-                        }
+                // Where new workspaces go follows it when it was this
+                // server, under the name the user knows it by.
+                let default = backend::default_machine();
+                if let (Backend::Server { name, .. }, Backend::Server { url, device, .. }) =
+                    (&default, choice)
+                    && server::key(&default) == server::key(choice)
+                {
+                    let moved = Backend::Server {
+                        name: name.clone(),
+                        url: url.clone(),
+                        device: device.clone(),
+                    };
+                    if let Err(err) = backend::save_default(&moved) {
+                        eprintln!("gentle-shell-gpui: could not save where agents run: {err}");
                     }
-                    (_, choice) => choice.clone(),
-                };
-                if let Err(err) = backend::save(&choice) {
-                    eprintln!("gentle-shell-gpui: could not save where agents run: {err}");
                 }
-                server::forget_info(&choice);
+                server::forget_info(choice);
                 this.start_remote(window, cx);
                 cx.emit(TerminalEvent::Paired);
             },

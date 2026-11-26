@@ -78,14 +78,12 @@ impl SettingsView {
         }
         self.package.running = Some(format!("{verb} {source}"));
         self.package.log.clear();
-        let cwd = self.cwd.clone();
+        let (cwd, machine) = (self.cwd.clone(), self.machine.clone());
         self._job = cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(
-                    async move { crate::features::setup::run_gentle_shell(&cwd, &[verb, &source]) },
-                )
-                .await;
+            let result = super::on_machine(cx.background_executor(), &machine, move || {
+                crate::features::setup::run_gentle_shell(&cwd, &[verb, &source])
+            })
+            .await;
             let _ = this.update(cx, |this, cx| {
                 this.package.running = None;
                 forget_claude_auth();

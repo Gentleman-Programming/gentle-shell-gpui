@@ -221,7 +221,7 @@ fn check_order(os: &str) -> Vec<CheckId> {
 /// Blocking: probes every dependency relevant to this OS.
 pub fn run_checks() -> Vec<Check> {
     apply_toolchain_path();
-    let choice = crate::features::backend::saved();
+    let choice = crate::features::backend::current();
     if choice.is_server() {
         return remote::server_checks(&choice);
     }

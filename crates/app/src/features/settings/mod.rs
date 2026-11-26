@@ -1,11 +1,16 @@
 //! Configuration: everything the user's Gentle Shell is already set up with,
 //! read from the same homes the launcher uses, plus package management
-//! (`gentle-shell install|remove`) and the Claude bridge's plan. Where agents
-//! run on a Gentle Shell server it reads only what that server's Gentle Shell
-//! reports over Desktop RPC, through a control session ([`remote`]).
+//! (`gentle-shell install|remove`) and the Claude bridge's plan. It is about
+//! one machine at a time, "Settings for" at its top (this computer, its WSL
+//! distro or command environment, or a paired Gentle Shell server; the
+//! active workspace's first): every page reads and writes that machine's,
+//! its blocking work inside `backend::on` ([`on_machine`]). On a Gentle
+//! Shell server it reads only what that server's Gentle Shell reports over
+//! Desktop RPC, through a control session ([`remote`]).
 
 use std::path::PathBuf;
 
+use gentle_core::backend::Backend;
 use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::*;
 
@@ -57,8 +62,11 @@ use navigation::SettingsPage;
 use snapshot::Snapshot;
 
 pub struct SettingsView {
+    /// The machine these settings are for ("Settings for").
+    machine: Backend,
+    /// The machines "Settings for" offers.
+    machines: Vec<Backend>,
     cwd: PathBuf,
-    /// Tab placement is owned and persisted by the workspace.
     tab_layout: TabLayout,
     page: SettingsPage,
     body_scroll: ScrollHandle,
@@ -135,7 +143,12 @@ pub struct SettingsView {
 impl EventEmitter<SettingsEvent> for SettingsView {}
 
 impl SettingsView {
+    /// Configuration for `machine`, one of `machines` (what "Settings for"
+    /// offers), opened on `cwd` (a folder there) with the window's active
+    /// agent tab `session` (asked only when it runs on `machine`).
     pub fn new(
+        machine: Backend,
+        machines: Vec<Backend>,
         cwd: PathBuf,
         tab_layout: TabLayout,
         session: Option<Entity<crate::features::session::SessionView>>,
@@ -162,13 +175,16 @@ impl SettingsView {
                 _ => {}
             },
         );
-        let setup = cx.new(crate::features::onboarding::OnboardingView::embedded);
-        let control = remote::ControlSession::open(session, &cwd, window, cx);
+        let setup =
+            cx.new(|cx| crate::features::onboarding::OnboardingView::embedded(machine.clone(), cx));
+        let control = remote::ControlSession::open(session, &machine, &cwd, window, cx);
         let session = control.session().cloned();
         let setup_sub = cx.subscribe(&setup, |_, _, event, cx| {
             cx.emit(SettingsEvent::Setup(event.clone()));
         });
         let mut this = Self {
+            machine,
+            machines,
             cwd,
             tab_layout,
             page: SettingsPage::default(),
@@ -365,15 +381,13 @@ impl SettingsView {
             self.ask_server_packages(cx);
             self.ask_server_upgrade(cx);
         }
-        let cwd = self.cwd.clone();
+        let (cwd, machine) = (self.cwd.clone(), self.machine.clone());
         let server = self.server().cloned();
         self._load = cx.spawn(async move |this, cx| {
-            let snapshot = cx
-                .background_executor()
-                .spawn(
-                    async move { services::snapshot::load(&cwd, shell_updates, server.as_ref()) },
-                )
-                .await;
+            let snapshot = on_machine(cx.background_executor(), &machine, move || {
+                services::snapshot::load(&cwd, shell_updates, server.as_ref())
+            })
+            .await;
             let _ = this.update(cx, |this, cx| {
                 this.snapshot = Some(snapshot);
                 this.adopt_shell(cx);
@@ -381,4 +395,37 @@ impl SettingsView {
             });
         });
     }
+
+    /// The machine these settings are for.
+    pub fn machine(&self) -> &Backend {
+        &self.machine
+    }
+
+    /// Show the page `previous` (the same screen, for another machine)
+    /// showed.
+    pub fn keep_page(&mut self, previous: &Entity<Self>, cx: &mut Context<Self>) {
+        let page = previous.read(cx).page;
+        self.navigate_to(page, cx);
+    }
+
+    /// "Settings for" picked another machine: the window opens
+    /// Configuration again for it, everything read afresh.
+    fn pick_machine(&mut self, index: usize, cx: &mut Context<Self>) {
+        if let Some(machine) = self.machines.get(index)
+            && !gentle_core::machines::same(machine, &self.machine)
+        {
+            cx.emit(SettingsEvent::MachineChanged(machine.clone()));
+        }
+    }
+}
+
+/// Run blocking `work` on `executor` acting on `machine` (`backend::on`):
+/// what it reads and runs is that machine's, whatever workspace is shown.
+fn on_machine<R: Send + 'static>(
+    executor: &BackgroundExecutor,
+    machine: &Backend,
+    work: impl FnOnce() -> R + Send + 'static,
+) -> Task<R> {
+    let machine = machine.clone();
+    executor.spawn(async move { crate::features::backend::on(&machine, work) })
 }

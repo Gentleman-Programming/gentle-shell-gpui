@@ -14,9 +14,10 @@ use super::probe::{parse_version, show_version};
 use super::{Check, CheckId, Fix, Log, MIN_NODE, Status, extras, fetch, meta};
 use crate::features::backend;
 
-/// The backend agents run in, when they don't run on this computer.
+/// The machine Setup acts on ([`backend::current`]), when it isn't this
+/// computer.
 pub(super) fn backend() -> Option<Backend> {
-    Some(backend::saved()).filter(|choice| *choice != Backend::Local)
+    Some(backend::current()).filter(|choice| *choice != Backend::Local)
 }
 
 /// Installs and fixes can't reach a Gentle Shell server: the error to show

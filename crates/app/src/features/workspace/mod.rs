@@ -274,13 +274,17 @@ impl Tab {
     }
 }
 
-/// One named workspace.
+/// One named workspace, on the machine it was opened on: its tabs,
+/// terminals, files and git run there, whatever the default.
 struct Space {
     name: String,
     root: PathBuf,
-    /// The Gentle Shell server (its address) whose folder `root` is; `None`
-    /// for a folder on this computer.
+    /// The Gentle Shell server (its server id, or address) whose folder
+    /// `root` is; `None` for a folder of this computer's.
     server: Option<String>,
+    /// What runs it when it isn't a server's: this computer, a WSL distro
+    /// or a command.
+    backend: gentle_core::backend::Backend,
     last_active: u64,
     tabs: Vec<Tab>,
     active: usize,
@@ -291,17 +295,39 @@ struct Space {
 }
 
 impl Space {
+    /// A workspace at `root` on this computer ([`Self::set_machine`] moves
+    /// it elsewhere before it holds anything).
     fn new(name: String, root: PathBuf) -> Self {
         Self {
             name,
             root,
             server: None,
+            backend: gentle_core::backend::Backend::Local,
             last_active: workspaces::now(),
             tabs: Vec::new(),
             active: 0,
             badge: Badge::default(),
             sidebar_expanded: true,
         }
+    }
+
+    /// The machine it runs on: its server's pairing (one this device isn't
+    /// paired with any more says so when asked), else its own.
+    fn machine(&self) -> gentle_core::backend::Backend {
+        match &self.server {
+            Some(server) => crate::features::backend::server::by_key(server),
+            None => self.backend.clone(),
+        }
+    }
+
+    /// Run on `machine` from now on (a server by what names it for good).
+    fn set_machine(&mut self, machine: &gentle_core::backend::Backend) {
+        self.server = crate::features::backend::server::key(machine);
+        self.backend = if machine.is_server() {
+            gentle_core::backend::Backend::Local
+        } else {
+            machine.clone()
+        };
     }
 }
 
@@ -503,6 +529,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> Self {
         let saved = workspaces::load();
+        let default = crate::features::backend::default_machine();
         let mut restored = Vec::new();
         let spaces: Vec<Space> = saved
             .workspaces
@@ -522,11 +549,19 @@ impl Workspace {
                             .find_map(|pane| pane.server.as_ref().map(|s| s.server().to_string()))
                     })
                     .map(|server| crate::features::backend::server::key_of(&server));
+                // Saved before each workspace kept its machine: where the
+                // default ran its agents then.
+                let backend = gentle_core::machines::saved_machine(
+                    saved.version,
+                    w.backend.as_ref(),
+                    &default,
+                );
                 restored.push((w.tabs, w.active_tab));
                 Space {
                     name: w.name,
                     root: w.root,
                     server,
+                    backend,
                     last_active: w.last_active,
                     tabs: Vec::new(),
                     active: 0,
@@ -657,25 +692,27 @@ impl Workspace {
             space.tabs = tabs;
         }
         let target = match folder {
-            Some(folder) => this.space_for(folder, Self::agents_server()),
-            // Agents on a Gentle Shell server: the first workspace is the
-            // server's home folder, not one on this computer.
-            None if this.spaces.is_empty() => match crate::features::backend::saved() {
+            Some(folder) => this.space_for(folder, &default),
+            // The first workspace goes where new ones do: on a Gentle Shell
+            // server, its home folder, not one on this computer.
+            None if this.spaces.is_empty() => match &default {
                 gentle_core::backend::Backend::Server { url, .. } => {
-                    match crate::features::backend::server::known_home(&url) {
-                        Some(home) => {
-                            let index = this.push_space(None, home.into());
-                            this.spaces[index].server = Self::agents_server();
-                            index
-                        }
-                        None => this.push_space(None, crate::cli::default_cwd()),
+                    match crate::features::backend::server::known_home(url) {
+                        Some(home) => this.push_space(None, home.into(), &default),
+                        None => this.push_space(
+                            None,
+                            crate::cli::default_cwd(),
+                            &gentle_core::backend::Backend::Local,
+                        ),
                     }
                 }
-                _ => this.push_space(None, crate::cli::default_cwd()),
+                _ => this.push_space(None, crate::cli::default_cwd(), &default),
             },
             None => this.current,
         };
         this.current = target;
+        // Tabs built from here on run on their workspace's machine.
+        this.publish_machines();
         if let Some(prompt) = prompt {
             let root = this.space().root.clone();
             this.open_tab(PaneKind::Agent, root, Some(prompt), None, window, cx);
@@ -729,7 +766,9 @@ impl Workspace {
             device,
         } = request;
         if let Some(folder) = folder {
-            self.show_folder(folder, window, cx);
+            // A folder `gsd` names goes where new workspaces do.
+            let machine = crate::features::backend::default_machine();
+            self.show_folder(folder, &machine, window, cx);
         }
         if let Some(prompt) = prompt {
             let root = self.space().root.clone();

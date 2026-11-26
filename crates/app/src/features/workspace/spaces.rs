@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::features::explorer::Purpose;
+use gentle_core::backend::Backend;
 
 impl Workspace {
     pub(super) fn space(&self) -> &Space {
@@ -12,11 +13,49 @@ impl Workspace {
         &mut self.spaces[self.current]
     }
 
-    pub(super) fn push_space(&mut self, name: Option<String>, root: PathBuf) -> usize {
+    /// A new workspace at `root` on `machine`, named `name`, else after its
+    /// folder.
+    pub(super) fn push_space(
+        &mut self,
+        name: Option<String>,
+        root: PathBuf,
+        machine: &Backend,
+    ) -> usize {
         let base = name.unwrap_or_else(|| ui::split_path(&root).1);
         let name = workspaces::unique_name(self.spaces.iter().map(|s| s.name.as_str()), &base);
-        self.spaces.push(Space::new(name, root));
+        let mut space = Space::new(name, root);
+        space.set_machine(machine);
+        self.spaces.push(space);
+        self.publish_machines();
         self.spaces.len() - 1
+    }
+
+    /// Tell `backend` every workspace's folder and machine, the shown one
+    /// first: work in a folder runs on its workspace's machine.
+    pub(super) fn publish_machines(&self) {
+        let Some(shown) = self.spaces.get(self.current) else {
+            return;
+        };
+        let order = std::iter::once(self.current)
+            .chain((0..self.spaces.len()).filter(|index| *index != self.current));
+        let roots = order
+            .map(|index| {
+                let space = &self.spaces[index];
+                (space.root.clone(), space.machine())
+            })
+            .collect();
+        crate::features::backend::set_workspaces(roots, shown.machine());
+    }
+
+    /// The machines a folder can be opened on: this computer (its WSL
+    /// distro or command environment when the shown workspace or the
+    /// default runs there), then every paired server.
+    pub(super) fn machines(&self) -> Vec<Backend> {
+        gentle_core::machines::choices(
+            &self.space().machine(),
+            &crate::features::backend::default_machine(),
+            &crate::features::backend::server::paired(),
+        )
     }
 
     pub(super) fn switch_workspace(
@@ -51,76 +90,100 @@ impl Workspace {
         cx.notify();
     }
 
+    /// A new workspace named `name` at `root` on `machine`, shown.
     pub(super) fn create_workspace(
         &mut self,
         name: Option<String>,
         root: PathBuf,
+        machine: &Backend,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let index = self.push_space(name.filter(|n| !n.trim().is_empty()), root);
+        let index = self.push_space(name.filter(|n| !n.trim().is_empty()), root, machine);
         self.switch_workspace(index, window, cx);
     }
 
-    /// What names the Gentle Shell server agents run on in workspaces (its
-    /// server id once known, `server::key`); `None` when they run
-    /// elsewhere.
-    pub(super) fn agents_server() -> Option<String> {
-        crate::features::backend::server::key(&crate::features::backend::saved())
-    }
-
-    /// The workspace rooted at `folder` on `server` (`None`: this
-    /// computer; else what names the server, [`Self::agents_server`]),
-    /// created when there is none. A folder of a Gentle Shell server is
-    /// compared by its text alone and only with that server's workspaces;
-    /// one on this computer is compared canonically
-    /// ([`workspaces::root_key`]) with this computer's.
-    pub(super) fn space_for(&mut self, folder: PathBuf, server: Option<String>) -> usize {
+    /// The workspace rooted at `folder` on `machine`, created when there is
+    /// none. A folder of a Gentle Shell server is compared by its text
+    /// alone and only with that server's workspaces; one here is compared
+    /// canonically ([`workspaces::root_key`]) with the workspaces on the
+    /// same environment (this computer, a WSL distro, a command).
+    pub(super) fn space_for(&mut self, folder: PathBuf, machine: &Backend) -> usize {
+        let server = crate::features::backend::server::key(machine);
+        let here = if server.is_some() {
+            Backend::Local
+        } else {
+            machine.clone()
+        };
         let folder = workspaces::root_key(folder, server.is_some());
-        let spaces = self.spaces.iter().map(|s| (&s.root, s.server.as_deref()));
-        match workspaces::find_root(spaces, &folder, server.as_deref()) {
+        let spaces = self
+            .spaces
+            .iter()
+            .map(|s| (&s.root, (s.server.as_deref(), &s.backend)));
+        match workspaces::find_root(
+            spaces,
+            &folder,
+            (server.as_deref(), &here),
+            server.is_some(),
+        ) {
             Some(index) => index,
-            None => {
-                let index = self.push_space(None, folder);
-                self.spaces[index].server = server;
-                index
-            }
+            None => self.push_space(None, folder, machine),
         }
     }
 
-    /// A new workspace at `root`, a folder on the Gentle Shell server agents
-    /// run on, as the server names it: its tabs start there.
-    pub(super) fn create_server_workspace(
+    /// Where browsing `machine` starts: the shown workspace's folder when
+    /// it is that machine's, else its home (a server's as it last said,
+    /// else this computer's).
+    pub(super) fn browse_from(&self, machine: &Backend, cx: &App) -> PathBuf {
+        if gentle_core::machines::same(&self.space().machine(), machine) {
+            return self.new_agent_cwd(cx);
+        }
+        match machine {
+            Backend::Server { url, .. } => crate::features::backend::server::known_home(url)
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("/")),
+            _ => dirs::home_dir().unwrap_or_else(crate::cli::default_cwd),
+        }
+    }
+
+    /// Browse `machine`'s folders (the explorer can switch to the others):
+    /// the workspace of the folder picked opens on the machine browsed.
+    pub(super) fn open_folder_on(
         &mut self,
-        name: Option<String>,
-        root: PathBuf,
+        machine: Backend,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let index = self.push_space(name.filter(|n| !n.trim().is_empty()), root);
-        self.spaces[index].server = Self::agents_server();
-        self.switch_workspace(index, window, cx);
-    }
-
-    /// Browse the folders of the Gentle Shell server agents run on, from
-    /// its home folder (else where a new agent would start): the workspace
-    /// of the folder picked opens.
-    pub(super) fn open_server_folder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let gentle_core::backend::Backend::Server { url, .. } = crate::features::backend::saved()
-        else {
-            return;
-        };
         if self.overlay.is_some() {
             self.close_overlay(window, cx);
         }
-        let home = crate::features::backend::server::known_home(&url)
-            .map(PathBuf::from)
-            .unwrap_or_else(|| self.new_agent_cwd(cx));
-        self.show_explorer(home, Purpose::Open, |_, _, _, _| {}, window, cx);
+        let dir = self.browse_from(&machine, cx);
+        let machines = self.machines();
+        self.show_explorer(
+            machine,
+            machines,
+            dir,
+            Purpose::Open,
+            |_, _, _, _, _| {},
+            window,
+            cx,
+        );
+    }
+
+    /// "Open another folder on <server>" of an agent tab: browse the
+    /// server it runs on, else the shown workspace's machine.
+    pub(super) fn open_server_folder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let machine = self
+            .active_session()
+            .map(|session| session.read(cx).runs_on())
+            .filter(Backend::is_server)
+            .unwrap_or_else(|| self.space().machine());
+        self.open_folder_on(machine, window, cx);
     }
 
     /// Open a new tab in a specific workspace, using its root rather than
-    /// the working directory of a previously focused agent.
+    /// the working directory of a previously focused agent. It runs on
+    /// that workspace's machine.
     pub(super) fn open_workspace_tab(
         &mut self,
         index: usize,
@@ -132,20 +195,7 @@ impl Workspace {
             return;
         };
         space.sidebar_expanded = true;
-        let mut root = space.root.clone();
-        // Agents on a Gentle Shell server: a workspace not opened there
-        // starts them in the server's home.
-        if kind == PaneKind::Agent
-            && let choice @ gentle_core::backend::Backend::Server { url, .. } =
-                &crate::features::backend::saved()
-        {
-            let there = space
-                .server
-                .as_deref()
-                .is_some_and(|server| crate::features::backend::server::same(server, choice));
-            let home = crate::features::backend::server::known_home(url);
-            root = gentle_core::serve::tab_folder(&root, there, home.as_deref());
-        }
+        let root = space.root.clone();
         if index != self.current {
             self.switch_workspace(index, window, cx);
         }
@@ -155,21 +205,26 @@ impl Workspace {
     }
 
     /// Ask for the folder of a new workspace named `name`: this computer's
-    /// folder picker, or the explorer over the folders of the Gentle Shell
-    /// server agents run on.
+    /// folder picker, or, with a server paired, the explorer from where new
+    /// workspaces go, switching machines there; it opens on the machine of
+    /// the folder picked.
     pub(super) fn pick_workspace_folder(
         &mut self,
         name: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if Self::agents_server().is_some() {
-            let dir = self.new_agent_cwd(cx);
+        let default = crate::features::backend::default_machine();
+        let machines = self.machines();
+        if default.is_server() || machines.len() > 1 {
+            let dir = self.browse_from(&default, cx);
             return self.show_explorer(
+                default,
+                machines,
                 dir,
                 Purpose::Choose("Create Workspace"),
-                move |this, folder, window, cx| {
-                    this.create_server_workspace(name.clone(), folder, window, cx)
+                move |this, folder, machine, window, cx| {
+                    this.create_workspace(name.clone(), folder, &machine, window, cx)
                 },
                 window,
                 cx,
@@ -187,24 +242,21 @@ impl Workspace {
             };
             let Some(path) = paths.pop() else { return };
             let _ = this.update_in(cx, |this, window, cx| {
-                this.create_workspace(name, path, window, cx)
+                this.create_workspace(name, path, &default, window, cx)
             });
         })
         .detach();
     }
 
-    /// Point the shown workspace at another folder (an existing one: its
-    /// pickers and `gsd workspace set-root` checked), marked as the Gentle
-    /// Shell server's where agents run on one: the sidebar re-roots on
-    /// [`WorkspaceEvent::RootChanged`] and new tabs open there. Open tabs
-    /// keep their own folders.
+    /// Point the shown workspace at another folder of its machine (an
+    /// existing one: its pickers and `gsd workspace set-root` checked): the
+    /// sidebar re-roots on [`WorkspaceEvent::RootChanged`] and new tabs open
+    /// there. Open tabs keep their own folders.
     pub(super) fn set_root(&mut self, root: PathBuf, cx: &mut Context<Self>) {
         if self.space().root == root {
             return;
         }
-        let space = self.space_mut();
-        space.root = root.clone();
-        space.server = Self::agents_server();
+        self.space_mut().root = root.clone();
         cx.emit(WorkspaceEvent::RootChanged(root));
         self.schedule_save(cx);
         cx.notify();
@@ -215,18 +267,21 @@ impl Workspace {
         self.open_palette(Category::Files, window, cx);
     }
 
-    /// The sidebar header: pick a folder (this computer's picker, or the
-    /// explorer over the folders of the Gentle Shell server agents run on),
-    /// [`Self::set_root`] to it and move the focused agent there too, so
-    /// the files shown are the ones it works on. An agent with a
+    /// The sidebar header: pick a folder of the workspace's machine (this
+    /// computer's picker, or the explorer over a Gentle Shell server's
+    /// folders), [`Self::set_root`] to it and move the focused agent there
+    /// too, so the files shown are the ones it works on. An agent with a
     /// conversation asks first (it restarts fresh).
     pub fn choose_root(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if Self::agents_server().is_some() {
+        let machine = self.space().machine();
+        if machine.is_server() {
             let dir = self.new_agent_cwd(cx);
             return self.show_explorer(
+                machine.clone(),
+                vec![machine],
                 dir,
                 Purpose::Choose("Open Folder"),
-                |this, folder, window, cx| this.move_root(folder, window, cx),
+                |this, folder, _, window, cx| this.move_root(folder, window, cx),
                 window,
                 cx,
             );

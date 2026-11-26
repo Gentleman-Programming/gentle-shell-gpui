@@ -15,11 +15,9 @@ impl Workspace {
             Command::Create { name, root } => {
                 self.check_workspace_name(&name, None)?;
                 let root = command_root(root)?;
-                if Self::agents_server().is_some() {
-                    self.create_server_workspace(Some(name.clone()), root, window, cx);
-                } else {
-                    self.create_workspace(Some(name.clone()), root, window, cx);
-                }
+                // A new workspace goes where new ones do.
+                let machine = crate::features::backend::default_machine();
+                self.create_workspace(Some(name.clone()), root, &machine, window, cx);
                 window.activate_window();
                 format!("Created workspace '{name}'")
             }
@@ -41,9 +39,8 @@ impl Workspace {
                 if index == self.current {
                     self.set_root(root.clone(), cx);
                 } else {
-                    let space = &mut self.spaces[index];
-                    space.root = root.clone();
-                    space.server = Self::agents_server();
+                    // It keeps its machine: the folder is one of its.
+                    self.spaces[index].root = root.clone();
                     self.schedule_save(cx);
                     cx.notify();
                 }

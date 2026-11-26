@@ -343,7 +343,7 @@ impl Music {
     pub fn set_mood(&mut self, mood: String, cx: &mut Context<Self>) {
         // In a backend the player runs there, with its login PATH: its
         // `gentle-shell` reads the mood.
-        let shell = if crate::features::backend::saved() != gentle_core::backend::Backend::Local {
+        let shell = if crate::features::backend::current() != gentle_core::backend::Backend::Local {
             PathBuf::from("gentle-shell")
         } else {
             let Ok(spec) = pi_rpc::resolve_backend(&std::env::temp_dir()) else {

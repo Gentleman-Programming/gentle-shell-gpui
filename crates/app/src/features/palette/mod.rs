@@ -77,13 +77,13 @@ pub enum PaletteAction {
         name: String,
         pick_folder: bool,
     },
-    /// The workspace at `root`, typed: a folder on the Gentle Shell server
-    /// agents run on, as the server names it. The one already open there is
-    /// shown, else one is created.
-    ShowServerFolder(PathBuf),
-    /// Browse the folders of the Gentle Shell server agents run on, from
-    /// its home folder.
-    OpenServerFolder,
+    /// The workspace at `root` on a Gentle Shell server, typed as the
+    /// server names it. The one already open there is shown, else one is
+    /// created.
+    ShowServerFolder(PathBuf, gentle_core::backend::Backend),
+    /// Browse the folders of a paired Gentle Shell server, from its home
+    /// folder.
+    OpenFolderOn(gentle_core::backend::Backend),
     OpenFile(PathBuf),
     /// Asks for confirmation before running `git switch`.
     SwitchBranch(String),

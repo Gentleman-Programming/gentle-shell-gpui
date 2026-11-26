@@ -879,7 +879,7 @@ pub fn picker_row(
 /// "This project / All", "Agents / Activity", "Pro / Max" switch.
 pub fn segmented(
     id: &'static str,
-    labels: &[&'static str],
+    labels: &[impl Into<SharedString> + Clone],
     selected: Option<usize>,
     on_select: impl Fn(&usize, &mut gpui_kit::Window, &mut App) + 'static,
 ) -> Div {
@@ -911,7 +911,7 @@ pub fn segmented(
                     d.text_color(muted()).hover(|d| d.text_color(fg()))
                 })
                 .on_click(move |_, window, cx| on_select(&i, window, cx))
-                .child(*label)
+                .child(Into::<SharedString>::into(label.clone()))
         }))
 }
 

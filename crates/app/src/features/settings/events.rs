@@ -3,14 +3,24 @@
 //! This is the public integration contract. Keep it separate from how a page
 //! renders or persists preferences.
 
+use gentle_core::backend::Backend;
+
 use crate::features::workspaces::TabLayout;
 
 pub enum SettingsEvent {
     Close,
     /// Switch the current window's persisted tab placement.
     TabLayoutChanged(TabLayout),
-    /// Open the application's full profile-routing editor.
+    /// Open the application's full profile-routing editor (for the machine
+    /// Configuration is about).
     OpenProfiles,
+    /// "Settings for" picked another machine: open Configuration for it.
+    MachineChanged(Backend),
+    /// This device paired with a Gentle Shell server (it is listed now; a
+    /// server paired again: the tabs that let go of it follow it).
+    Paired(Backend),
+    /// Open Gentle Tower running on this machine (a server) in a tab.
+    OpenTower(Backend),
     /// Packages or sign-ins changed: tabs should reload their backend.
     Changed,
     /// Credentials changed on a Gentle Shell server (a sign-in, a key, a

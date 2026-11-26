@@ -148,81 +148,90 @@ impl Workspace {
                 name,
                 pick_folder: false,
             } => {
-                // On a Gentle Shell server: a folder there (the focused
-                // agent's, else the server's home), never this computer's.
-                if crate::features::backend::saved().is_server() {
-                    let root = self.new_agent_cwd(cx);
-                    self.create_server_workspace(Some(name), root, window, cx);
-                } else {
-                    let root = self.active_cwd(cx);
-                    self.create_workspace(Some(name), root, window, cx);
-                }
+                // The current folder, on the shown workspace's machine (the
+                // focused agent's, else the workspace's folder there).
+                let root = self.new_agent_cwd(cx);
+                let machine = self.space().machine();
+                self.create_workspace(Some(name), root, &machine, window, cx);
             }
             PaletteAction::CreateWorkspace {
                 name,
                 pick_folder: true,
             } => self.pick_workspace_folder(Some(name), window, cx),
-            PaletteAction::ShowServerFolder(root) => {
-                if let Some(server) = Self::agents_server() {
-                    self.show_server_folder(root, server, window, cx)
-                }
+            PaletteAction::ShowServerFolder(root, server) => {
+                self.show_folder(root, &server, window, cx)
             }
-            PaletteAction::OpenServerFolder => self.open_server_folder(window, cx),
+            PaletteAction::OpenFolderOn(server) => self.open_folder_on(server, window, cx),
             PaletteAction::OpenFile(path) => self.open_file(path, window, cx),
             PaletteAction::SwitchBranch(branch) => self.confirm_switch_branch(branch, window, cx),
         }
     }
 
-    /// The folder explorer (⌘O / Ctrl+O), from the focused pane's folder.
-    /// Where agents run on a Gentle Shell server it browses the server's
-    /// folders, from where a new agent would start.
+    /// The folder explorer (⌘O / Ctrl+O, Open folder…), on the shown
+    /// workspace's machine from where a new agent would start; a row at its
+    /// top switches to this computer or another paired server.
     pub(super) fn open_explorer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some((Overlay::Explorer(_), _)) = &self.overlay {
             self.close_overlay(window, cx);
             return;
         }
-        let dir = self.new_agent_cwd(cx);
-        self.show_explorer(dir, Purpose::Open, |_, _, _, _| {}, window, cx);
+        let machine = self.space().machine();
+        self.open_folder_on(machine, window, cx);
     }
 
-    /// The folder explorer at `dir` for `purpose`: a folder chosen for
-    /// [`Purpose::Choose`] goes to `chosen`. A Gentle Shell server's folder
-    /// opened from it is marked as that server's ([`Self::show_server_folder`]).
+    /// The folder explorer at `dir` on `machine` (one of `machines`, which
+    /// it can switch between) for `purpose`: a folder chosen for
+    /// [`Purpose::Choose`] goes to `chosen` with the machine browsed. A
+    /// folder opened from it opens on that machine
+    /// ([`Self::show_folder`]).
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn show_explorer(
         &mut self,
+        machine: gentle_core::backend::Backend,
+        machines: Vec<gentle_core::backend::Backend>,
         dir: PathBuf,
         purpose: Purpose,
-        chosen: impl Fn(&mut Self, PathBuf, &mut Window, &mut Context<Self>) + 'static,
+        chosen: impl Fn(
+            &mut Self,
+            PathBuf,
+            gentle_core::backend::Backend,
+            &mut Window,
+            &mut Context<Self>,
+        ) + 'static,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let server = Self::agents_server();
-        let view = cx.new(|cx| ExplorerView::new(dir, purpose, window, cx));
+        let view = cx.new(|cx| ExplorerView::new(machine, machines, dir, purpose, window, cx));
         let subscription = cx.subscribe_in(
             &view,
             window,
-            move |this, _, event: &ExplorerEvent, window, cx| {
+            move |this, view, event: &ExplorerEvent, window, cx| {
+                let machine = view.read(cx).machine().clone();
                 this.close_overlay(window, cx);
-                let show = |this: &mut Self,
-                            folder: PathBuf,
-                            window: &mut Window,
-                            cx: &mut Context<Self>| match &server {
-                    Some(server) => this.show_server_folder(folder, server.clone(), window, cx),
-                    None => this.show_folder(folder, window, cx),
-                };
                 match event {
                     // Open Gentle Shell here: an agent in that folder, on
-                    // this computer or on the server agents run on.
+                    // the machine browsed.
                     ExplorerEvent::OpenAgent(folder) => {
-                        show(this, folder.clone(), window, cx);
+                        this.show_folder(folder.clone(), &machine, window, cx);
                         this.open_tab(PaneKind::Agent, folder.clone(), None, None, window, cx);
                     }
                     ExplorerEvent::OpenTerminal(folder) => {
-                        show(this, folder.clone(), window, cx);
+                        this.show_folder(folder.clone(), &machine, window, cx);
                         this.open_tab(PaneKind::Terminal, folder.clone(), None, None, window, cx);
                     }
-                    ExplorerEvent::Choose(folder) => chosen(this, folder.clone(), window, cx),
-                    ExplorerEvent::OpenFile(path) => this.open_file(path.clone(), window, cx),
+                    ExplorerEvent::Choose(folder) => {
+                        chosen(this, folder.clone(), machine, window, cx)
+                    }
+                    ExplorerEvent::OpenFile(path) => {
+                        // A file of another machine than the shown
+                        // workspace's opens in that machine's workspace.
+                        if !gentle_core::machines::same(&this.space().machine(), &machine)
+                            && let Some(parent) = path.parent()
+                        {
+                            this.show_folder(parent.to_path_buf(), &machine, window, cx);
+                        }
+                        this.open_file(path.clone(), window, cx)
+                    }
                     ExplorerEvent::Close => {}
                 }
             },
@@ -231,35 +240,18 @@ impl Workspace {
         cx.notify();
     }
 
-    /// [`Self::show_folder`] for `folder` on the Gentle Shell server
-    /// `server` names ([`Self::agents_server`]), as the server names it
-    /// (never resolved on this computer): its workspace, marked as that
-    /// server's so tabs there start in it.
-    fn show_server_folder(
-        &mut self,
-        folder: PathBuf,
-        server: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let index = self.space_for(folder, Some(server));
-        self.switch_workspace(index, window, cx);
-    }
-
-    /// Show the workspace rooted at `folder`, creating it (a new workspace
-    /// opens with an agent tab). `gsd <folder>` and the explorer both land
-    /// here. Where agents run on a Gentle Shell server, `folder` is one of
-    /// its folders ([`Self::show_server_folder`]).
+    /// Show the workspace rooted at `folder` on `machine`, creating it (a
+    /// new workspace opens with an agent tab). `gsd <folder>` and the
+    /// explorer both land here. A Gentle Shell server's folder is as the
+    /// server names it, never resolved on this computer.
     pub(super) fn show_folder(
         &mut self,
         folder: PathBuf,
+        machine: &gentle_core::backend::Backend,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(server) = Self::agents_server() {
-            return self.show_server_folder(folder, server, window, cx);
-        }
-        let index = self.space_for(folder, None);
+        let index = self.space_for(folder, machine);
         self.switch_workspace(index, window, cx);
     }
 
@@ -438,8 +430,20 @@ impl Workspace {
     }
 
     pub(super) fn open_profiles(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let machine = self.space().machine();
+        self.open_profiles_on(machine, window, cx);
+    }
+
+    /// Profiles of `machine` (Configuration's "Settings for", else the
+    /// shown workspace's).
+    fn open_profiles_on(
+        &mut self,
+        machine: gentle_core::backend::Backend,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.start_active_session(window, cx);
-        let cwd = self.active_cwd(cx);
+        let cwd = self.folder_on(&machine, cx);
         let models = self
             .active_session()
             .map(|t| t.read(cx).model_choices())
@@ -453,7 +457,7 @@ impl Workspace {
             })
             .collect();
         let session = self.active_session();
-        let view = cx.new(|cx| ProfilesView::new(cwd, models, session, window, cx));
+        let view = cx.new(|cx| ProfilesView::new(&machine, cwd, models, session, window, cx));
         let subscription = cx.subscribe_in(&view, window, |this, _, event: &ProfilesEvent, window, cx| {
             let tab = this.active_session();
             match event {
@@ -506,14 +510,31 @@ impl Workspace {
         }
     }
 
-    /// Configuration's update status is asked of the window's active agent
-    /// tab when its Gentle Shell reports it.
+    /// Configuration about the shown workspace's machine; its update status
+    /// is asked of the window's active agent tab when it runs there and its
+    /// Gentle Shell reports it.
     pub(super) fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_settings_on(None, window, cx);
+    }
+
+    /// Configuration about `machine` ("Settings for"; `None`: the shown
+    /// workspace's), every page read afresh.
+    fn open_settings_on(
+        &mut self,
+        machine: Option<gentle_core::backend::Backend>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.start_active_session(window, cx);
-        let cwd = self.active_cwd(cx);
+        let active = self.space().machine();
+        let machines = self.machines();
+        let machine = machine
+            .unwrap_or_else(|| machines[gentle_core::machines::pick(&active, &machines)].clone());
+        let cwd = self.folder_on(&machine, cx);
         let session = self.active_session();
         let tab_layout = self.tab_layout;
-        let view = cx.new(|cx| SettingsView::new(cwd, tab_layout, session, window, cx));
+        let view =
+            cx.new(|cx| SettingsView::new(machine, machines, cwd, tab_layout, session, window, cx));
         let subscription = cx.subscribe_in(
             &view,
             window,
@@ -527,7 +548,28 @@ impl Workspace {
                     }
                 }
                 SettingsEvent::TabLayoutChanged(layout) => this.set_tab_layout(*layout, cx),
-                SettingsEvent::OpenProfiles => this.open_profiles(window, cx),
+                SettingsEvent::OpenProfiles => {
+                    let machine = view.read(cx).machine().clone();
+                    this.open_profiles_on(machine, window, cx)
+                }
+                SettingsEvent::MachineChanged(machine) => {
+                    let previous = view.clone();
+                    this.open_settings_on(Some(machine.clone()), window, cx);
+                    if let Some((Overlay::Settings(next), _)) = &this.overlay {
+                        next.update(cx, |next, cx| next.keep_page(&previous, cx));
+                    }
+                }
+                SettingsEvent::Paired(server) => this.server_paired(server, window, cx),
+                SettingsEvent::OpenTower(machine) => {
+                    this.close_overlay(window, cx);
+                    // In a workspace on that machine: the tab reaches its
+                    // Tower from there.
+                    if !gentle_core::machines::same(&this.space().machine(), machine) {
+                        let folder = this.folder_on(machine, cx);
+                        this.show_folder(folder, machine, window, cx);
+                    }
+                    this.open_tower(window, cx);
+                }
                 SettingsEvent::Changed => {
                     for tab in this.sessions() {
                         tab.update(cx, |session, cx| session.reload_models(window, cx));
@@ -662,8 +704,9 @@ impl Workspace {
         // its own control session there (see `settings::remote`).
         self.start_active_session(window, cx);
         let session = self.active_session();
+        let machine = self.space().machine();
         let cwd = self.active_cwd(cx);
-        let view = cx.new(|cx| UsageView::new(&cwd, window, cx, session));
+        let view = cx.new(|cx| UsageView::new(&machine, &cwd, window, cx, session));
         let subscription = cx.subscribe_in(
             &view,
             window,
@@ -805,33 +848,57 @@ impl Workspace {
         }
     }
 
-    /// Onboarding changed where agents run. On a Gentle Shell server, the
-    /// tabs and terminals on it that this device's earlier pairing reached
-    /// follow their sessions through the new one; the shown workspace, when
-    /// it isn't one of that server's folders, moves to the server's home
-    /// folder (a folder on this computer is none there) and the agent tabs
-    /// that never came up start again there; on this computer, they start
-    /// again where they are.
+    /// Onboarding changed where new workspaces go. A Gentle Shell server
+    /// just paired: the tabs and terminals on it that this device's earlier
+    /// pairing reached follow their sessions through the new one, and its
+    /// home folder opens as a workspace of its own (named after that
+    /// folder, with an agent tab when new), beside this computer's, which
+    /// stay where they are. This computer chosen: the agent tabs that
+    /// never came up start again where they are.
     fn runs_on_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let choice = crate::features::backend::saved();
+        let choice = crate::features::backend::default_machine();
         let gentle_core::backend::Backend::Server { url, .. } = &choice else {
             return self.retry_failed_sessions(window, cx);
         };
-        self.follow_pairing(None, window, cx);
-        let server = crate::features::backend::server::key(&choice);
+        if let Some(server) = crate::features::backend::server::key(&choice) {
+            self.follow_server(&server, None, window, cx);
+        }
         let Some(home) = crate::features::backend::server::known_home(url) else {
             return self.retry_failed_sessions(window, cx);
         };
-        if self.space().server != server {
-            let space = self.space_mut();
-            space.root = PathBuf::from(&home);
-            space.server = server;
-            cx.emit(WorkspaceEvent::RootChanged(PathBuf::from(&home)));
-            self.schedule_save(cx);
+        let home = PathBuf::from(home);
+        self.show_folder(home.clone(), &choice, window, cx);
+        if self.space().tabs.is_empty() {
+            self.open_tab(PaneKind::Agent, home, None, None, window, cx);
         }
-        for tab in self.sessions() {
-            let home = PathBuf::from(&home);
-            tab.update(cx, |session, cx| session.retry_start_in(home, window, cx));
+        cx.notify();
+    }
+
+    /// Where a screen about `machine` opens: the shown workspace's folder
+    /// when it is that machine's, else the folder of a workspace on it,
+    /// else its home.
+    pub(super) fn folder_on(&self, machine: &gentle_core::backend::Backend, cx: &App) -> PathBuf {
+        if gentle_core::machines::same(&self.space().machine(), machine) {
+            return self.active_cwd(cx);
+        }
+        self.spaces
+            .iter()
+            .find(|space| gentle_core::machines::same(&space.machine(), machine))
+            .map(|space| space.root.clone())
+            .unwrap_or_else(|| self.browse_from(machine, cx))
+    }
+
+    /// Configuration paired this device with `server`: it can hold
+    /// workspaces now, and the tabs and terminals that let go of it (a
+    /// server paired again) follow it.
+    fn server_paired(
+        &mut self,
+        server: &gentle_core::backend::Backend,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(key) = crate::features::backend::server::key(server) {
+            self.follow_server(&key, None, window, cx);
         }
         cx.notify();
     }
@@ -883,28 +950,44 @@ impl Workspace {
         }
     }
 
-    /// The Gentle Shell server agents run on was paired again: the agents
-    /// and terminals on it that this device's earlier pairing reached
-    /// follow their sessions through the new one (`except`: a terminal
-    /// pane that did that itself).
+    /// A terminal pane (`except`) paired its server again: the other
+    /// agents and terminals on that server follow it too.
     pub(super) fn follow_pairing(
         &mut self,
         except: Option<PaneId>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(server) = Self::agents_server() else {
-            return;
-        };
+        let server = except
+            .and_then(|id| self.terminal_view(id))
+            .and_then(|terminal| terminal.read(cx).server_key());
+        if let Some(server) = server {
+            self.follow_server(&server, except, window, cx);
+        }
+    }
+
+    /// The Gentle Shell server `server` names was paired again: the agents
+    /// and terminals on it that this device's earlier pairing reached
+    /// follow their sessions through the new one (`except`: a terminal
+    /// pane that did that itself).
+    fn follow_server(
+        &mut self,
+        server: &str,
+        except: Option<PaneId>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Its workspaces reach it at its new pairing from now on.
+        self.publish_machines();
         let (agents, _) = self.agents_and_terminals(cx);
         for agent in agents {
-            agent.update(cx, |agent, cx| agent.follow_pairing(&server, window, cx));
+            agent.update(cx, |agent, cx| agent.follow_pairing(server, window, cx));
         }
         let terminals: Vec<PaneId> = self.panes.keys().copied().collect();
         for id in terminals.into_iter().filter(|id| Some(*id) != except) {
             if let Some(terminal) = self.terminal_view(id) {
                 terminal.update(cx, |terminal, cx| {
-                    terminal.follow_pairing(&server, window, cx)
+                    terminal.follow_pairing(server, window, cx)
                 });
             }
         }

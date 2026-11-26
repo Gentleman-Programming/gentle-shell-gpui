@@ -10,8 +10,12 @@ use crate::features::setup::{self, CheckId, Fix};
 impl OnboardingView {
     pub(super) fn refresh(&mut self, cx: &mut Context<Self>) {
         self.checking = true;
+        let machine = self.machine();
         self._probe = cx.spawn(async move |this, cx| {
-            let probe = cx.background_executor().spawn(async { Probe::run() }).await;
+            let probe = cx
+                .background_executor()
+                .spawn(async move { crate::features::backend::on(&machine, Probe::run) })
+                .await;
             let _ = this.update(cx, |this, cx| this.apply(probe, cx));
         });
         self.ask_server_setup(cx);
@@ -73,6 +77,7 @@ impl OnboardingView {
         self.log.clear();
         self.failure = None;
         let (tx, rx) = async_channel::unbounded::<String>();
+        let machine = self.machine();
         self._job = cx.spawn(async move |this, cx| {
             let work = cx.background_executor().spawn(async move {
                 let log = move |line: String| {
@@ -80,7 +85,7 @@ impl OnboardingView {
                 };
                 // `log` (and the sender) drops when this returns, which ends
                 // the stream below.
-                setup::install(id, &log)
+                crate::features::backend::on(&machine, || setup::install(id, &log))
             });
             while let Ok(first) = rx.recv().await {
                 let mut chunk = first;

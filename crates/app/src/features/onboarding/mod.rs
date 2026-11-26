@@ -45,10 +45,11 @@ pub struct Probe {
 }
 
 impl Probe {
-    /// BLOCKING: runs every check; call it on the background executor.
+    /// BLOCKING: runs every check; call it on the background executor
+    /// (inside `backend::on` for a machine of its own).
     pub fn run() -> Self {
         // The checks run where agents do: the badge says so.
-        let platform = match crate::features::backend::saved() {
+        let platform = match crate::features::backend::current() {
             gentle_core::backend::Backend::Local => setup::platform_label(),
             choice => format!("Agents on {}", choice.label()),
         };
@@ -110,6 +111,10 @@ pub struct OnboardingView {
     connect: Option<(Entity<ServerConnect>, Subscription)>,
     /// Gentle Shell's setup run on the server agents run on.
     server_setup: server_setup::ServerSetup,
+    /// The machine set up: Configuration's "Settings for", or a server
+    /// just paired here; `None` for the shown workspace's
+    /// (`backend::current`).
+    machine: Option<Backend>,
     _probe: Task<()>,
     _job: Task<()>,
 }
@@ -120,8 +125,8 @@ impl OnboardingView {
     /// `probe` is a look already taken (the startup check); `None` looks now.
     /// Offers connecting to a Gentle Shell server as the other way in.
     pub fn new(probe: Option<Probe>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let mut this = Self::build(probe, cx);
-        let url = match crate::features::backend::saved() {
+        let mut this = Self::build(probe, None, cx);
+        let url = match crate::features::backend::default_machine() {
             Backend::Server { url, .. } => url,
             _ => String::new(),
         };
@@ -134,7 +139,7 @@ impl OnboardingView {
         this
     }
 
-    fn build(probe: Option<Probe>, cx: &mut Context<Self>) -> Self {
+    fn build(probe: Option<Probe>, machine: Option<Backend>, cx: &mut Context<Self>) -> Self {
         let mut this = Self {
             mode: Mode::Screen,
             entrance: std::time::Duration::ZERO,
@@ -151,6 +156,7 @@ impl OnboardingView {
             registry_sign_in: None,
             connect: None,
             server_setup: server_setup::ServerSetup::default(),
+            machine,
             _probe: Task::ready(()),
             _job: Task::ready(()),
         };
@@ -161,31 +167,46 @@ impl OnboardingView {
         this
     }
 
-    /// The checklist for Configuration → Setup & requirements: looks at the
-    /// machine now, installs and hands off actions like the screen does.
-    /// Where agents run is Configuration's own section there.
-    pub fn embedded(cx: &mut Context<Self>) -> Self {
-        let mut this = Self::build(None, cx);
+    /// The checklist for Configuration → Setup & requirements of `machine`
+    /// (its "Settings for"): looks at it now, installs and hands off actions
+    /// like the screen does. Where agents run is Configuration's own section
+    /// there.
+    pub fn embedded(machine: Backend, cx: &mut Context<Self>) -> Self {
+        let mut this = Self::build(None, Some(machine), cx);
         this.mode = Mode::Embedded;
         this
     }
 
-    /// Save where agents run (a server just paired, or this computer
-    /// again), then look again: on a server only the server is checked and
-    /// nothing is installed here.
-    fn choose_runs_on(&mut self, choice: Backend, cx: &mut Context<Self>) {
-        if let Err(err) = crate::features::backend::save(&choice) {
-            eprintln!("gentle-shell-gpui: could not save where agents run: {err}");
-        }
+    /// Look at `machine` from now on.
+    fn set_machine(&mut self, machine: Backend, cx: &mut Context<Self>) {
+        self.machine = Some(machine);
         self.failure = None;
         self.checks = None;
         self.refresh(cx);
+    }
+
+    /// The machine set up (see [`Self::machine`]).
+    pub(super) fn machine(&self) -> Backend {
+        self.machine
+            .clone()
+            .unwrap_or_else(crate::features::backend::current)
+    }
+
+    /// Save where new workspaces go (a server just paired, or this
+    /// computer again) and set that machine up from now on: on a server
+    /// only the server is checked and nothing is installed here. The window
+    /// opens a workspace there ([`OnboardingEvent::RunsOnChanged`]).
+    fn choose_runs_on(&mut self, choice: Backend, cx: &mut Context<Self>) {
+        if let Err(err) = crate::features::backend::save_default(&choice) {
+            eprintln!("gentle-shell-gpui: could not save where agents run: {err}");
+        }
+        self.set_machine(choice, cx);
         cx.emit(OnboardingEvent::RunsOnChanged);
     }
 
-    /// The Gentle Shell server agents run on, as saved: its name.
+    /// The Gentle Shell server set up, when it is one: its name.
     fn server(&self) -> Option<String> {
-        match crate::features::backend::saved() {
+        match self.machine() {
             Backend::Server { name, .. } => Some(name),
             _ => None,
         }

@@ -69,43 +69,54 @@ impl PaletteView {
                 current: w.current,
             })
             .collect();
-        // A Gentle Shell server's folders: typed as the server sees them (a
-        // path), or browsed from its home folder. Both show in All too.
-        let runs_on = crate::features::backend::saved();
-        let server = runs_on.is_server().then(|| runs_on.label());
-        let typed_folder = server
-            .as_ref()
+        // Every paired Gentle Shell server's folders: typed as the server
+        // sees them (a path), or browsed from its home folder. Both show in
+        // All too.
+        let servers = crate::features::backend::server::paired();
+        let typed_folders: Vec<Row> = servers
+            .iter()
             .filter(|_| query.starts_with('/'))
-            .map(|name| Row {
+            .map(|server| Row {
                 icon: IconName::Server,
-                title: format!("Open \u{201c}{query}\u{201d} on {name}"),
+                title: format!(
+                    "Open \u{201c}{query}\u{201d} on {}",
+                    gentle_core::machines::name(server)
+                ),
                 meta: String::new(),
                 detail: "A workspace in that folder on the server".into(),
                 group: "Workspaces",
-                action: PaletteAction::ShowServerFolder(query.into()),
+                action: PaletteAction::ShowServerFolder(query.into(), server.clone()),
                 workspace: None,
                 current: false,
-            });
-        let server_folder = server
-            .as_ref()
+            })
+            .collect();
+        let server_folders: Vec<Row> = servers
+            .iter()
             .filter(|_| !query.starts_with('/'))
-            .map(|name| format!("Open folder on {name}\u{2026}"))
-            .filter(|title| query.is_empty() || fuzzy_score(&self.needle.lower, title).is_some())
-            .map(|title| Row {
+            .map(|server| {
+                let title = format!(
+                    "Open folder on {}\u{2026}",
+                    gentle_core::machines::name(server)
+                );
+                (title, server)
+            })
+            .filter(|(title, _)| {
+                query.is_empty() || fuzzy_score(&self.needle.lower, title).is_some()
+            })
+            .map(|(title, server)| Row {
                 icon: IconName::Server,
                 title,
                 meta: String::new(),
                 detail: "Browse its folders for a workspace".into(),
                 group: "Workspaces",
-                action: PaletteAction::OpenServerFolder,
+                action: PaletteAction::OpenFolderOn(server.clone()),
                 workspace: None,
                 current: false,
-            });
+            })
+            .collect();
         if all {
-            if let Some(row) = typed_folder {
-                rows.insert(0, row);
-            }
-            rows.extend(server_folder);
+            rows.splice(0..0, typed_folders);
+            rows.extend(server_folders);
             return rows;
         }
         let exists = self
@@ -130,15 +141,16 @@ impl PaletteView {
                 },
             );
         }
-        if let Some(row) = typed_folder {
-            rows.insert(0, row);
-        }
-        rows.extend(server_folder);
+        rows.splice(0..0, typed_folders);
+        rows.extend(server_folders);
         rows.push(Row {
             icon: IconName::Folder,
-            title: "Browse folders…".into(),
+            title: "Open folder…".into(),
             meta: String::new(),
-            detail: format!("Open Gentle Shell in any folder ({})", ui::shortcut("O")),
+            detail: format!(
+                "On this computer or a paired server ({})",
+                ui::shortcut("O")
+            ),
             group: "Workspaces",
             action: PaletteAction::OpenExplorer,
             workspace: None,

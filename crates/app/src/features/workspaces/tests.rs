@@ -44,6 +44,7 @@ fn sample() -> SavedState {
                 name: "Default".into(),
                 root: PathBuf::from("/tmp"),
                 server: None,
+                backend: Some(serde_json::json!({"kind": "command", "prefix": ["orb", "--"]})),
                 tabs: vec![SavedTab {
                     layout: PaneTree::Leaf(agent.clone()),
                     pinned: true,
@@ -58,6 +59,7 @@ fn sample() -> SavedState {
                 name: "project".into(),
                 root: PathBuf::from("/tmp/project"),
                 server: Some("http://pc:8787".into()),
+                backend: None,
                 tabs: vec![SavedTab {
                     pinned: false,
                     layout: PaneTree::Split {
@@ -299,11 +301,11 @@ fn a_workspace_saved_with_a_non_canonical_root_is_still_found() {
     std::fs::create_dir_all(base.join("b")).unwrap();
     // Saved before roots were canonical: `a/../a`.
     let roots = [base.join("b"), base.join("a").join("..").join("a")];
-    let spaces = || roots.iter().map(|root| (root, None));
+    let spaces = || roots.iter().map(|root| (root, None::<&str>));
     let canonical = dunce::canonicalize(base.join("a")).unwrap();
-    assert_eq!(super::find_root(spaces(), &canonical, None), Some(1));
+    assert_eq!(super::find_root(spaces(), &canonical, None, false), Some(1));
     assert_eq!(
-        super::find_root(spaces(), &base.join("missing"), None),
+        super::find_root(spaces(), &base.join("missing"), None, false),
         None
     );
     std::fs::remove_dir_all(&base).unwrap();
@@ -325,7 +327,7 @@ fn a_server_folder_is_never_resolved_on_this_computer() {
     assert_ne!(super::root_key(link.clone(), false), link);
     let roots = [base.join("real"), base.join("link").join(".")];
     let spaces = roots.iter().map(|root| (root, Some(SERVER)));
-    assert_eq!(super::find_root(spaces, &link, Some(SERVER)), Some(1));
+    assert_eq!(super::find_root(spaces, &link, Some(SERVER), true), Some(1));
     std::fs::remove_dir_all(&base).unwrap();
 }
 
@@ -346,7 +348,12 @@ fn a_server_folder_finds_only_that_servers_workspace() {
     ];
     let find = |folder: &str, server: Option<&str>| {
         let folder = super::root_key(folder.into(), server.is_some());
-        super::find_root(spaces.iter().map(|(r, s)| (r, *s)), &folder, server)
+        super::find_root(
+            spaces.iter().map(|(r, s)| (r, *s)),
+            &folder,
+            server,
+            server.is_some(),
+        )
     };
     assert_eq!(find("/home/me/project", Some(SERVER)), Some(3));
     assert_eq!(find("/home/me/./project/src/..", Some(SERVER)), Some(3));

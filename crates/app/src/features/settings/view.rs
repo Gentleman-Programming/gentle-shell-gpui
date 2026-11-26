@@ -57,15 +57,7 @@ impl Render for SettingsView {
                                 .text_color(ui::fg())
                                 .child("Configuration"),
                         )
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .truncate()
-                                .text_xs()
-                                .text_color(ui::muted())
-                                .child("Manage Gentle Shell and the desktop experience"),
-                        )
+                        .child(self.render_machine_picker(cx))
                         .child(
                             Button::new("settings-refresh")
                                 .ghost()
@@ -141,5 +133,48 @@ impl Render for SettingsView {
                         ),
                 ),
         ))
+    }
+}
+
+impl SettingsView {
+    /// "Settings for": the machines Configuration can be about, the one it
+    /// is about chosen; the subtitle when this computer is the only one.
+    fn render_machine_picker(&self, cx: &mut Context<Self>) -> Div {
+        if self.machines.len() < 2 {
+            return div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .text_xs()
+                .text_color(ui::muted())
+                .child("Manage Gentle Shell and the desktop experience");
+        }
+        let labels: Vec<SharedString> = self
+            .machines
+            .iter()
+            .map(|machine| gentle_core::machines::name(machine).into())
+            .collect();
+        let selected = self
+            .machines
+            .iter()
+            .position(|machine| gentle_core::machines::same(machine, &self.machine));
+        h_flex()
+            .flex_1()
+            .min_w_0()
+            .gap_2()
+            .overflow_hidden()
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .text_xs()
+                    .text_color(ui::muted())
+                    .child("Settings for"),
+            )
+            .child(ui::segmented(
+                "settings-for",
+                &labels,
+                selected,
+                cx.listener(|this, index: &usize, _, cx| this.pick_machine(*index, cx)),
+            ))
     }
 }

@@ -1,5 +1,9 @@
-//! Gentle Tower: whether the Gentle Shell the app runs has Tower's web app,
-//! and building it when its release shipped without it (`setup::tower`).
+//! Gentle Tower on the machine Configuration is about: on this computer
+//! (or its WSL distro or command environment), whether the Gentle Shell
+//! there has Tower's web app, and building it when its release shipped
+//! without it (`setup::tower`); on a Gentle Shell server, whether the
+//! server offers Tower (it runs it there, for every device), and opening
+//! it.
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -8,8 +12,9 @@ use gpui_kit::component::{Disableable as _, Icon, Sizable as _, h_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use super::SettingsView;
 use super::layout::{row, section};
+use super::{SettingsEvent, SettingsView, on_machine};
+use crate::features::backend::server;
 use crate::features::setup::tower::{self, TowerStatus};
 use crate::shared::ui;
 
@@ -19,6 +24,9 @@ const LOG_KEEP: usize = 8;
 #[derive(Default)]
 pub(super) struct Tower {
     status: Option<TowerStatus>,
+    /// On a server: whether it offers Tower, or why it couldn't be asked;
+    /// `None` while asking.
+    offered: Option<Result<bool, String>>,
     busy: bool,
     log: Vec<String>,
     note: Option<(String, bool)>,
@@ -27,16 +35,88 @@ pub(super) struct Tower {
 
 impl SettingsView {
     pub(super) fn refresh_tower(&mut self, cx: &mut Context<Self>) {
+        let machine = self.machine.clone();
+        if machine.is_server() {
+            self.tower.offered = None;
+            self.tower.task = Some(cx.spawn(async move |this, cx| {
+                let offered = cx
+                    .background_executor()
+                    .spawn(async move { server::info(&machine).map(|info| info.has("tower")) })
+                    .await;
+                let _ = this.update(cx, |this, cx| {
+                    this.tower.offered = Some(offered);
+                    cx.notify();
+                });
+            }));
+            return;
+        }
         self.tower.task = Some(cx.spawn(async move |this, cx| {
-            let status = cx
-                .background_executor()
-                .spawn(async { tower::status() })
-                .await;
+            let status = on_machine(cx.background_executor(), &machine, tower::status).await;
             let _ = this.update(cx, |this, cx| {
                 this.tower.status = Some(status);
                 cx.notify();
             });
         }));
+    }
+
+    /// On a server: Tower runs there; whether it offers it, and opening it
+    /// in a tab.
+    fn server_tower_section(&self, name: &str, cx: &mut Context<Self>) -> Div {
+        let section = section(IconName::Building2, "Gentle Tower").child(
+            div()
+                .pb_2()
+                .text_xs()
+                .text_color(ui::muted())
+                .child(format!(
+                    "Every open session as a floor of its project's building: tasks, talk, \
+                 artifacts, cost and permissions. It runs on {name}, for every device paired \
+                 with it; a Tower tab opens it from there."
+                )),
+        );
+        let Some(offered) = &self.tower.offered else {
+            return section.child(
+                h_flex()
+                    .gap_2()
+                    .text_xs()
+                    .text_color(ui::muted())
+                    .child(Spinner::new().xsmall().color(ui::accent()))
+                    .child(format!("Asking {name}…")),
+            );
+        };
+        let (state, color) = match offered {
+            Ok(true) => (format!("Available on {name}"), ui::success()),
+            Ok(false) => (server::UNAVAILABLE.to_string(), ui::warning()),
+            Err(error) => (error.clone(), ui::warning()),
+        };
+        let machine = self.machine.clone();
+        section
+            .child(h_flex().pb_2().child(ui::chip(state, color)))
+            .child(
+                h_flex()
+                    .pt_1()
+                    .gap_2()
+                    .flex_wrap()
+                    .when(matches!(offered, Ok(true)), |d| {
+                        d.child(
+                            Button::new("tower-open")
+                                .small()
+                                .primary()
+                                .icon(Icon::new(IconName::Building2))
+                                .label("Open Gentle Tower")
+                                .on_click(cx.listener(move |_, _, _, cx| {
+                                    cx.emit(SettingsEvent::OpenTower(machine.clone()))
+                                })),
+                        )
+                    })
+                    .child(
+                        Button::new("tower-refresh")
+                            .small()
+                            .ghost()
+                            .icon(Icon::new(IconName::RefreshCw))
+                            .label("Check again")
+                            .on_click(cx.listener(|this, _, _, cx| this.refresh_tower(cx))),
+                    ),
+            )
     }
 
     fn enable_tower(&mut self, cx: &mut Context<Self>) {
@@ -47,8 +127,9 @@ impl SettingsView {
         self.tower.log.clear();
         self.tower.note = None;
         let (tx, rx) = async_channel::unbounded::<String>();
+        let machine = self.machine.clone();
         self.tower.task = Some(cx.spawn(async move |this, cx| {
-            let done = cx.background_executor().spawn(async move {
+            let done = on_machine(cx.background_executor(), &machine, move || {
                 tower::install(&move |line: String| {
                     let _ = tx.send_blocking(line);
                 })
@@ -71,10 +152,7 @@ impl SettingsView {
                 }
             }
             let result = done.await;
-            let status = cx
-                .background_executor()
-                .spawn(async { tower::status() })
-                .await;
+            let status = on_machine(cx.background_executor(), &machine, tower::status).await;
             let _ = this.update(cx, |this, cx| {
                 this.tower.busy = false;
                 this.tower.status = Some(status);
@@ -94,6 +172,9 @@ impl SettingsView {
     }
 
     pub(super) fn tower_section(&self, cx: &mut Context<Self>) -> Div {
+        if let Some(server) = self.server() {
+            return self.server_tower_section(&server.name, cx);
+        }
         let section = section(IconName::Building2, "Gentle Tower").child(
             div().pb_2().text_xs().text_color(ui::muted()).child(
                 "Every open session as a floor of its project's building: tasks, talk, \

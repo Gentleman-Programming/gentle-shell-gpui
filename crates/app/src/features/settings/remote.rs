@@ -48,7 +48,7 @@ use gpui_kit::assets::IconName;
 use gpui_kit::component::{Icon, Sizable as _, h_flex};
 use gpui_kit::*;
 
-use crate::features::backend::{self, server};
+use crate::features::backend::server;
 use crate::features::session::SessionView;
 use crate::shared::ui;
 
@@ -144,20 +144,27 @@ pub(crate) fn note(text: impl Into<SharedString>) -> Div {
 /// Which session a screen asks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Control {
-    /// Agents run on this computer (or WSL, or a command): the active tab,
-    /// as before; the files are the fallback.
+    /// The screen is on this computer (or WSL, or a command) and so is the
+    /// active tab: ask it; the files are the fallback.
     Local,
+    /// The screen is on this computer, the active tab elsewhere (a server,
+    /// another environment): the files only, never another machine's
+    /// answers.
+    Files,
     /// The active tab runs on the screen's server: ask it.
     Reuse,
     /// The screen's server, with no tab there to ask: a dedicated session.
     Hidden,
 }
 
-/// Decide from where the screen's agents run (`screen`) and where the
-/// active tab's runs (`tab`).
+/// Decide from the machine the screen is for (`screen`) and where the
+/// active tab's agent runs (`tab`).
 pub(crate) fn control_for(screen: &Backend, tab: Option<&Backend>) -> Control {
     let Backend::Server { url, .. } = screen else {
-        return Control::Local;
+        return match tab {
+            Some(tab) if !gentle_core::machines::same(tab, screen) => Control::Files,
+            _ => Control::Local,
+        };
     };
     match tab {
         Some(Backend::Server { url: there, .. }) if there == url => Control::Reuse,
@@ -188,27 +195,30 @@ pub(crate) struct ControlSession {
 }
 
 impl ControlSession {
-    /// The session for a screen opened on `cwd`, whose window's active agent
-    /// tab is `active`. A dedicated session is stopped when the screen
-    /// (`cx`'s entity) is released, or when the app quits.
+    /// The session for a screen about `screen` (a machine) opened on `cwd`,
+    /// whose window's active agent tab is `active`. A dedicated session is
+    /// stopped when the screen (`cx`'s entity) is released, or when the app
+    /// quits.
     pub(crate) fn open<V: 'static>(
         active: Option<Entity<SessionView>>,
+        screen: &Backend,
         cwd: &Path,
         window: &mut Window,
         cx: &mut Context<V>,
     ) -> Self {
-        let screen = backend::for_tab(cwd);
         let tab = active.as_ref().map(|session| session.read(cx).runs_on());
-        let server = ServerPlace::of(&screen);
-        match control_for(&screen, tab.as_ref()) {
-            Control::Local | Control::Reuse => Self {
-                session: active,
-                server,
-                hidden: false,
-                _start: Task::ready(()),
-                _quit: None,
-            },
-            Control::Hidden => Self::start_hidden(screen, server, cwd, window, cx),
+        let server = ServerPlace::of(screen);
+        let reused = |session| Self {
+            session,
+            server: server.clone(),
+            hidden: false,
+            _start: Task::ready(()),
+            _quit: None,
+        };
+        match control_for(screen, tab.as_ref()) {
+            Control::Local | Control::Reuse => reused(active),
+            Control::Files => reused(None),
+            Control::Hidden => Self::start_hidden(screen.clone(), server, cwd, window, cx),
         }
     }
 
@@ -348,9 +358,13 @@ mod tests {
         let box_b = server("http://b:7420", "lab");
         assert_eq!(control_for(&Backend::Local, None), Control::Local);
         assert_eq!(
+            control_for(&Backend::Local, Some(&Backend::Local)),
+            Control::Local
+        );
+        assert_eq!(
             control_for(&Backend::Local, Some(&box_a)),
-            Control::Local,
-            "a local screen keeps the active tab, as before"
+            Control::Files,
+            "a screen about this computer never reads a server tab's answers"
         );
         assert_eq!(control_for(&box_a, Some(&box_a)), Control::Reuse);
         assert_eq!(control_for(&box_a, Some(&box_b)), Control::Hidden);

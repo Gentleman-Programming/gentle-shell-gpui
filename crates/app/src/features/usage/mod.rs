@@ -310,13 +310,16 @@ pub fn now_ms() -> i64 {
 }
 
 impl UsageView {
+    /// Usage on `machine` (the active workspace's, or Configuration's
+    /// "Settings for"), read through `session` when it runs there.
     pub fn new(
+        machine: &gentle_core::backend::Backend,
         cwd: &std::path::Path,
         window: &mut Window,
         cx: &mut Context<Self>,
         session: Option<Entity<SessionView>>,
     ) -> Self {
-        let control = ControlSession::open(session, cwd, window, cx);
+        let control = ControlSession::open(session, machine, cwd, window, cx);
         let session = control.session().cloned();
         let mut this = Self {
             tab: Tab::Usage,

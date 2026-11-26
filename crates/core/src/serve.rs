@@ -1422,18 +1422,6 @@ pub fn without_ticket(url: &str) -> String {
     }
 }
 
-/// The folder a new agent tab starts in while agents run on a Gentle Shell
-/// server: `cwd` when it is known to be a folder there (`there`: the
-/// focused agent runs there, or the workspace was opened there), else the
-/// server user's `home`: a folder on this computer is no folder on the
-/// server. Without a home to go to (an older server doesn't say), `cwd`.
-pub fn tab_folder(cwd: &std::path::Path, there: bool, home: Option<&str>) -> std::path::PathBuf {
-    match home {
-        Some(home) if !there => home.into(),
-        _ => cwd.to_path_buf(),
-    }
-}
-
 /// A folder on a Gentle Shell server as workspaces compare it: normalized
 /// by its text alone, since this computer can't resolve the server's links
 /// (resolving it here would read this computer's file system). `.` segments
@@ -1622,19 +1610,6 @@ mod tests {
         }
         let long = format!("http://localhost:1/{}", "a".repeat(FORWARD_PATH));
         assert!(matches!(server_page(&long), ServerPage::Unreachable(_)));
-    }
-
-    #[test]
-    fn new_tabs_on_a_server_never_start_in_a_folder_of_this_computer() {
-        use std::path::{Path, PathBuf};
-        let mac = Path::new("/Users/ana/project");
-        assert_eq!(
-            tab_folder(mac, false, Some("/home/ana")),
-            PathBuf::from("/home/ana")
-        );
-        let there = Path::new("/home/ana/api");
-        assert_eq!(tab_folder(there, true, Some("/home/ana")), there);
-        assert_eq!(tab_folder(mac, false, None), mac);
     }
 
     #[test]

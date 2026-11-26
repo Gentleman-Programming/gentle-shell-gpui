@@ -61,6 +61,12 @@ pub struct SavedWorkspace {
     /// this computer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server: Option<String>,
+    /// What runs a workspace that isn't a server's when it isn't this
+    /// computer: a WSL distro or a command (`gentle_core::backend`'s JSON).
+    /// Saved since [`VERSION`] 2; one saved before ran where the default
+    /// said ([`gentle_core::machines::saved_machine`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend: Option<serde_json::Value>,
     #[serde(default)]
     pub tabs: Vec<SavedTab>,
     #[serde(default)]
@@ -331,7 +337,8 @@ impl Default for SavedState {
     }
 }
 
-pub const VERSION: u32 = 1;
+/// Since 2, each workspace saves its own machine.
+pub const VERSION: u32 = gentle_core::machines::VERSION;
 
 /// How a workspace root is compared. On this computer canonical, so a
 /// folder reached through a symlink, `..` or another drive-letter case
@@ -347,18 +354,17 @@ pub fn root_key(path: PathBuf, on_server: bool) -> PathBuf {
 }
 
 /// The position of the workspace that is `folder` (already a
-/// [`root_key`]) on `server` (what names the Gentle Shell server; `None` for
-/// this computer), among `(root, server)` pairs: only a workspace of the
-/// same server matches, and its root is compared the same way as `folder`,
-/// since older saves and other entry points may hold a root reached another
-/// way.
-pub fn find_root<'a>(
-    mut spaces: impl Iterator<Item = (&'a PathBuf, Option<&'a str>)>,
+/// [`root_key`], `on_server` saying how) on `machine`, among `(root,
+/// machine)` pairs: only a workspace on the same machine matches, and its
+/// root is compared the same way as `folder`, since older saves and other
+/// entry points may hold a root reached another way.
+pub fn find_root<'a, M: PartialEq>(
+    mut spaces: impl Iterator<Item = (&'a PathBuf, M)>,
     folder: &std::path::Path,
-    server: Option<&str>,
+    machine: M,
+    on_server: bool,
 ) -> Option<usize> {
-    let on_server = server.is_some();
-    spaces.position(|(root, there)| there == server && root_key(root.clone(), on_server) == folder)
+    spaces.position(|(root, there)| there == machine && root_key(root.clone(), on_server) == folder)
 }
 
 pub fn now() -> u64 {

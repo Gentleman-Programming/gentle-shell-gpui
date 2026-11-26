@@ -252,7 +252,10 @@ pub struct ProfilesView {
 impl EventEmitter<ProfilesEvent> for ProfilesView {}
 
 impl ProfilesView {
+    /// Profiles of `machine` (the active workspace's, or Configuration's
+    /// "Settings for"), read through `session` when it runs there.
     pub fn new(
+        machine: &gentle_core::backend::Backend,
         cwd: PathBuf,
         models: Vec<ModelChoice>,
         session: Option<Entity<SessionView>>,
@@ -303,7 +306,7 @@ impl ProfilesView {
                 },
             ),
         ];
-        let control = ControlSession::open(session, &cwd, window, cx);
+        let control = ControlSession::open(session, machine, &cwd, window, cx);
         let session = control.session().cloned();
         if let Some(session) = &session {
             subscriptions.push(cx.observe(session, |this, _, cx| this.session_changed(cx)));

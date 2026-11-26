@@ -12,7 +12,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::layout::{row, section};
-use super::{SettingsEvent, SettingsView};
+use super::{SettingsEvent, SettingsView, on_machine};
 use crate::features::setup::maestro::{self, MaestroStatus};
 use crate::shared::ui;
 
@@ -37,11 +37,9 @@ type Work = fn(&(dyn Fn(String) + Send + Sync)) -> Result<(), String>;
 impl SettingsView {
     /// Look at the machine again (CLI, Java, the agent's `mcp.json`).
     pub(super) fn refresh_maestro(&mut self, cx: &mut Context<Self>) {
+        let machine = self.machine.clone();
         self.maestro.task = Some(cx.spawn(async move |this, cx| {
-            let status = cx
-                .background_executor()
-                .spawn(async { maestro::status() })
-                .await;
+            let status = on_machine(cx.background_executor(), &machine, maestro::status).await;
             let _ = this.update(cx, |this, cx| {
                 this.maestro.status = Some(status);
                 cx.notify();
@@ -65,8 +63,9 @@ impl SettingsView {
         self.maestro.log.clear();
         self.maestro.note = None;
         let (tx, rx) = async_channel::unbounded::<String>();
+        let machine = self.machine.clone();
         self.maestro.task = Some(cx.spawn(async move |this, cx| {
-            let done = cx.background_executor().spawn(async move {
+            let done = on_machine(cx.background_executor(), &machine, move || {
                 let log = move |line: String| {
                     let _ = tx.send_blocking(line);
                 };
@@ -92,10 +91,7 @@ impl SettingsView {
                 }
             }
             let result = done.await;
-            let status = cx
-                .background_executor()
-                .spawn(async { maestro::status() })
-                .await;
+            let status = on_machine(cx.background_executor(), &machine, maestro::status).await;
             let _ = this.update(cx, |this, cx| {
                 this.maestro.job = None;
                 this.maestro.status = Some(status);
@@ -118,11 +114,10 @@ impl SettingsView {
         }
         self.maestro.job = Some("Testing the connection");
         self.maestro.note = None;
+        let machine = self.machine.clone();
         self.maestro.task = Some(cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async { maestro::test_connection() })
-                .await;
+            let result =
+                on_machine(cx.background_executor(), &machine, maestro::test_connection).await;
             let _ = this.update(cx, |this, cx| {
                 this.maestro.job = None;
                 this.maestro.note = Some(match result {
