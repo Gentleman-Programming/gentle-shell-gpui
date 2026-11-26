@@ -195,8 +195,8 @@ impl SettingsView {
                 "Saved models.json on {server}. Its agents pick the models up on their own."
             ),
             AgentDocument::McpGlobal | AgentDocument::McpProject => format!(
-                "Saved {} on {server}. Pi loads MCP servers when an agent starts: the session \
-                 Configuration reads reloads once idle, other agents with /reload.",
+                "Saved {} on {server}. Agents load MCP servers when they start. The session \
+                 Configuration uses reloads once it's idle; other agents need /reload.",
                 document.file_name()
             ),
         };
@@ -335,8 +335,8 @@ impl SettingsView {
             )
             .children(stale.then(|| {
                 notice(
-                    "It changed on the server since you opened it: Reload shows it \
-                             (your edits are dropped).",
+                    "It changed on the server since you opened it. Reload to see the new \
+                     version (this drops your edits).",
                     ui::warning(),
                 )
             }))

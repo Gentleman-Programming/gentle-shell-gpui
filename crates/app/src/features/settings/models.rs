@@ -181,7 +181,7 @@ impl SettingsView {
                     .text_xs()
                     .text_color(ui::faint())
                     .child(format!(
-                        "Saved in settings.json on {}; its new agents start with these.",
+                        "Saved in settings.json on {}. New agents there start with these.",
                         server.name
                     )),
             )
