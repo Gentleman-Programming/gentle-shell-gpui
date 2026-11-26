@@ -49,6 +49,10 @@ pub enum Status {
     Missing(String),
     Outdated(String),
     Failed(String),
+    /// Not looked at from here (on a Gentle Shell server, everything but
+    /// the server itself): neither ready nor missing, and it holds nothing
+    /// up.
+    Unchecked(String),
 }
 
 /// `Auto`: `install` does it unattended. `Terminal`: needs the user (sudo or

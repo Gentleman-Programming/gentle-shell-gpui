@@ -30,7 +30,8 @@ pub(super) fn refuse_server() -> Result<(), String> {
 
 /// Blocking: Setup's checks for a Gentle Shell server. Gentle Shell is the
 /// server answering this device's token; what its sessions need was set up
-/// there (`gentle-shell setup`), so the rest isn't checked from here.
+/// there (`gentle-shell setup`), so the rest isn't checked from here and
+/// says so ([`Status::Unchecked`]), never "Ready".
 pub(super) fn server_checks(choice: &Backend) -> Vec<Check> {
     let label = choice.label();
     let shell = match backend::server::info(choice) {
@@ -45,8 +46,8 @@ pub(super) fn server_checks(choice: &Backend) -> Vec<Check> {
         .map(|id| {
             let status = match id {
                 CheckId::GentleShell => shell.clone(),
-                CheckId::Go => Status::Ok("Not needed".into()),
-                _ => Status::Ok(format!("On {label}: not checked from here")),
+                CheckId::Go => Status::Unchecked("Not needed".into()),
+                _ => Status::Unchecked(format!("On {label}: not checked from here")),
             };
             let (title, summary, need) = meta(id);
             Check {

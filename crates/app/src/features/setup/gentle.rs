@@ -262,7 +262,13 @@ fn upgrade_gentle_shell(spec: &pi_rpc::LaunchSpec, log: &Log) -> Result<(), Stri
             log(format!("Now running {found}."));
             Ok(())
         }
-        (Status::Missing(why) | Status::Outdated(why) | Status::Failed(why), _) => Err(format!(
+        (
+            Status::Missing(why)
+            | Status::Outdated(why)
+            | Status::Failed(why)
+            | Status::Unchecked(why),
+            _,
+        ) => Err(format!(
             "gentle-shell upgrade finished, but the launcher the app runs still reports: {why}"
         )),
     }
@@ -435,7 +441,13 @@ pub fn run_setup(log: &Log) -> Result<(), String> {
     refresh_paths();
     match check_setup(&launcher()) {
         (Status::Ok(_), _) => Ok(()),
-        (Status::Missing(why) | Status::Outdated(why) | Status::Failed(why), _) => Err(format!(
+        (
+            Status::Missing(why)
+            | Status::Outdated(why)
+            | Status::Failed(why)
+            | Status::Unchecked(why),
+            _,
+        ) => Err(format!(
             "Setup finished, but it isn't recorded as done: {why}"
         )),
     }

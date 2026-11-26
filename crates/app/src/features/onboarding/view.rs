@@ -102,6 +102,7 @@ impl OnboardingView {
         let tone = tone(check);
         let color = match tone {
             Tone::Good => ui::success(),
+            Tone::Neutral => ui::faint(),
             Tone::Warn => ui::warning(),
             Tone::Bad => ui::danger(),
         };
@@ -110,6 +111,7 @@ impl OnboardingView {
         } else {
             Icon::new(match tone {
                 Tone::Good => IconName::CircleCheck,
+                Tone::Neutral => IconName::Circle,
                 Tone::Warn => IconName::TriangleAlert,
                 Tone::Bad => IconName::CircleX,
             })
@@ -566,5 +568,6 @@ pub(super) fn status_label(status: &Status, installing: bool) -> &'static str {
         (Status::Missing(_), _) => "Missing",
         (Status::Outdated(_), _) => "Outdated",
         (Status::Failed(_), _) => "Failed",
+        (Status::Unchecked(_), _) => "Not checked",
     }
 }
