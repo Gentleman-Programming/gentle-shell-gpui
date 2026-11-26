@@ -745,6 +745,17 @@ impl BrowserPanel {
         }
     }
 
+    /// The page's address as the header and the tray show it: without its
+    /// scheme, and without the single-use ticket a forwarded page's link
+    /// carries (its forward trades it for a cookie, answering with the
+    /// address without it).
+    pub fn address(&self) -> String {
+        let url = gentle_core::serve::without_ticket(&self.url);
+        url.trim_start_matches("http://")
+            .trim_start_matches("https://")
+            .to_string()
+    }
+
     fn reload(&mut self, cx: &mut Context<Self>) {
         self.surface.update(cx, |surface, cx| surface.reload(cx));
     }
@@ -789,13 +800,7 @@ impl BrowserPanel {
         } else {
             IconName::Globe
         };
-        // A forwarded page's link carries a single-use ticket its forward
-        // trades for a cookie, answering with the address without it.
-        let shown = gentle_core::serve::without_ticket(&self.url);
-        let address = shown
-            .trim_start_matches("http://")
-            .trim_start_matches("https://")
-            .to_string();
+        let address = self.address();
         let url = self.url.clone();
         let maximized = self.card.maximized();
         let docked = self.mode == Mode::Docked;

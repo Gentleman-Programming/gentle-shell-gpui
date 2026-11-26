@@ -60,15 +60,8 @@ impl Stage {
     /// What the tray shows for it: title and address.
     fn summary(panel: &Entity<BrowserPanel>, cx: &App) -> (String, String) {
         let panel = panel.read(cx);
-        (panel.title(), address(panel.url()))
+        (panel.title(), panel.address())
     }
-}
-
-/// A URL without its scheme, for status lines.
-fn address(url: &str) -> String {
-    url.trim_start_matches("http://")
-        .trim_start_matches("https://")
-        .to_string()
 }
 
 /// A page a tab asked for, as [`Workspace::open_session_page`] takes it.
@@ -1326,6 +1319,8 @@ mod tests {
             assert_eq!(panel.refusal(), None);
             assert_eq!(panel.url(), "http://pc:40001/?gs_ticket=b");
             assert_eq!(panel.source(), PAGE);
+            // The tray and the card show it without the spent ticket.
+            assert_eq!(panel.address(), "pc:40001/");
         });
     }
 
@@ -1358,6 +1353,7 @@ mod tests {
                 .map(|stage| stage.shown)
                 .collect();
             assert_eq!(shown, [true, false]);
+            assert_eq!(workspace.read(cx).stages[0].summary.1, "pc:40001/");
 
             workspace.update(cx, |w, cx| {
                 let asked = PageFrom::Agent {
