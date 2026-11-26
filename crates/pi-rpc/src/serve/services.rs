@@ -62,6 +62,20 @@ impl ServeClient {
         Forward::parse(&answer).ok_or_else(malformed)
     }
 
+    /// `DELETE /api/forwards/:id`: close one of this device's forwards,
+    /// a session's, the server's own or Tower's alike.
+    pub fn close_forward(&self, id: &str) -> Result<(), ServeError> {
+        if !gentle_core::serve::is_session_id(id) {
+            return Err(ServeError {
+                status: Some(404),
+                error: None,
+                message: "No such forward".into(),
+            });
+        }
+        self.call(&self.agent, "DELETE", &format!("/api/forwards/{id}"), None)
+            .map(drop)
+    }
+
     /// Visit `forward`'s link once for its cookie, reached as this client
     /// reaches its server (the forward's listener has the same certificate;
     /// through a relay, the relay is asked for the forward's port). Blocking.

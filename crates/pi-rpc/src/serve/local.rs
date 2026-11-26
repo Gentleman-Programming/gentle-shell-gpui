@@ -20,10 +20,12 @@
 //! (DNS rebinding).
 //!
 //! One proxy per forward, reused while it runs. It closes when the last
-//! web view showing it lets go ([`hold_local_page`]), when the forward
-//! closed (its listener, or the relay, says nothing is there), and after
-//! [`IDLE`] unheld with no connection and no request, as the server closes
-//! its forward.
+//! web view showing it lets go ([`hold_local_page`]), and then asks the
+//! server to close the forward too (`DELETE /api/forwards/:id`): nothing
+//! here shows the page any more. It also closes when the forward closed
+//! (its listener, or the relay, says nothing is there), and after [`IDLE`]
+//! unheld with no connection and no request, as the server closes its
+//! forward.
 
 use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -83,6 +85,8 @@ impl ServeClient {
             dial: relay.unwrap_or(authority).to_string(),
             authority: authority.to_string(),
             relayed: relay.is_some(),
+            api: self.clone(),
+            forward: forward.id.clone(),
         };
         let key = format!(
             "{}/{}",
@@ -97,7 +101,8 @@ impl ServeClient {
 }
 
 /// A web view showing a page through a proxy ([`hold_local_page`]): while
-/// one is held the proxy stays open; dropping the last closes it.
+/// one is held the proxy stays open; dropping the last closes it, and the
+/// server's forward with it.
 pub struct LocalHold(Arc<Proxy>);
 
 impl Drop for LocalHold {
@@ -107,8 +112,15 @@ impl Drop for LocalHold {
             state.holds = state.holds.saturating_sub(1);
             state.holds == 0
         };
-        if last {
-            self.0.close();
+        if last && self.0.close() {
+            let upstream = self.0.upstream();
+            // Off the caller's thread: a web view drops its hold while the
+            // window draws, and the server may be slow or gone.
+            let _ = std::thread::Builder::new()
+                .name("gs-local-page-close".into())
+                .spawn(move || {
+                    let _ = upstream.api.close_forward(&upstream.forward);
+                });
         }
     }
 }
@@ -149,6 +161,10 @@ struct Upstream {
     /// The forward link's `host:port`: every request's `Host`.
     authority: String,
     relayed: bool,
+    /// The server's API, as the client that opened the forward reaches it.
+    api: ServeClient,
+    /// The forward's id there (`fwd_…`).
+    forward: String,
 }
 
 struct Proxy {
@@ -190,11 +206,12 @@ impl Proxy {
     }
 
     /// Closes the listener and every connection, and forgets the proxy.
-    fn close(&self) {
+    /// False when it was closed already.
+    fn close(&self) -> bool {
         let connections = {
             let mut state = self.state();
             if state.closed {
-                return;
+                return false;
             }
             state.closed = true;
             std::mem::take(&mut state.connections)
@@ -214,6 +231,7 @@ impl Proxy {
         // Wakes the accepting thread, which sees it closed.
         let _ =
             TcpStream::connect_timeout(&([127, 0, 0, 1], self.port).into(), Duration::from_secs(1));
+        true
     }
 
     /// Takes a new connection's socket; `None` past the limit or closed.
@@ -929,14 +947,74 @@ mod tests {
     static REGISTRY: Mutex<()> = Mutex::new(());
 
     fn test_proxy(key: &str) -> u16 {
+        test_proxy_of(key, ServeClient::new("http://127.0.0.1:9", None))
+    }
+
+    /// A proxy for the forward `key` (`…/fwd_id`) of the server `api`.
+    fn test_proxy_of(key: &str, api: ServeClient) -> u16 {
         let link = Link::new(tls::Pin::Exact("fp".into()), None, None);
         let upstream = Upstream {
             link,
             dial: "127.0.0.1:9".into(),
             authority: "127.0.0.1:9".into(),
             relayed: false,
+            api,
+            forward: key.rsplit('/').next().unwrap_or_default().into(),
         };
         open(key.into(), upstream).unwrap()
+    }
+
+    /// A server API that answers every request `{}` and hands over each
+    /// request line.
+    fn api_server() -> (ServeClient, mpsc::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (seen, lines) = mpsc::channel();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut line = String::new();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                if reader.read_line(&mut line).is_err() {
+                    continue;
+                }
+                // The rest of the head (a DELETE has no body).
+                let mut header = String::from("-");
+                while !header.trim_end().is_empty() {
+                    header.clear();
+                    if reader.read_line(&mut header).unwrap_or(0) == 0 {
+                        break;
+                    }
+                }
+                let _ = seen.send(line.trim_end().to_string());
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                );
+            }
+        });
+        (ServeClient::new(&url, Some("gst_test".into())), lines)
+    }
+
+    /// The last web view showing a forwarded page lets go: the server is
+    /// asked to close the forward, once, and not while another one shows
+    /// it.
+    #[test]
+    fn the_last_holder_closes_the_servers_forward() {
+        let _one = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+        let (api, lines) = api_server();
+        let port = test_proxy_of("t/fwd_closed", api);
+        let url = format!("http://127.0.0.1:{port}/");
+        let first = hold_local_page(&url).unwrap();
+        let second = hold_local_page(&url).unwrap();
+        drop(first);
+        assert!(
+            lines.recv_timeout(Duration::from_millis(300)).is_err(),
+            "another card still shows it"
+        );
+        drop(second);
+        let line = lines.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(line, "DELETE /api/forwards/fwd_closed HTTP/1.1");
+        assert!(lines.recv_timeout(Duration::from_millis(300)).is_err());
     }
 
     fn listening(port: u16) -> bool {
