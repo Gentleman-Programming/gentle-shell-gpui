@@ -1404,12 +1404,21 @@ impl Render for FileView {
                 .child(Spinner::new().small().color(ui::muted()))
                 .into_any_element(),
             Body::Code(editor) => {
+                // On the pane's opaque ground, the same as the editor's
+                // gutter: in glass, text scrolled sideways never shows
+                // through the line numbers, and the two read as one.
                 let code = || {
-                    Editor::new(editor)
-                        .appearance(false)
-                        .font_family(ui::mono())
-                        .text_size(ui::code_rems(12.5))
+                    div()
                         .size_full()
+                        .rounded_b_xl()
+                        .bg(ui::pane_ground())
+                        .child(
+                            Editor::new(editor)
+                                .appearance(false)
+                                .font_family(ui::mono())
+                                .text_size(ui::code_rems(12.5))
+                                .size_full(),
+                        )
                 };
                 match self.markdown.as_ref() {
                     Some(md) if md.mode == MdMode::Preview => {

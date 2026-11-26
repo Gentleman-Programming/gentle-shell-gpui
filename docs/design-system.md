@@ -129,6 +129,7 @@ The chrome (title bar, gaps) is not held: it follows Transparency, so the title 
 | `title_bar`, `title_bar_border`, `tab_bar`, `tab`, `list`, `scrollbar` | transparent |
 | `radius` / `radius_lg` | 8 px / 12 px at 100 %, times the interface size |
 | `font_size` / `mono_font_size` | 16 px / 13 px at 100 %, times the interface size (see [Interface size](#interface-size)) |
+| `highlight_theme.style.editor_gutter_background` | `ui::pane_ground()`: `panel` over an opaque `window_bg`, so text scrolled sideways never shows through the line numbers (the kit's own gutter is translucent in dark mode). Editors with line numbers (the Files viewer, the server's `mcp.json`/`models.json` editor) sit on that same opaque ground, so in glass the gutter and the text read as one |
 
 ### Light and dark
 

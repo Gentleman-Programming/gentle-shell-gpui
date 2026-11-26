@@ -325,13 +325,17 @@ impl SettingsView {
                     )),
             )
             .child(
-                ui::well_box().h(rems(320. / 16.)).child(
-                    Editor::new(&open.editor)
-                        .appearance(false)
-                        .font_family(ui::mono())
-                        .text_size(ui::code_rems(12.))
-                        .size_full(),
-                ),
+                // The editor's opaque gutter is the pane's ground: so is the text's.
+                ui::well_box()
+                    .h(rems(320. / 16.))
+                    .bg(ui::pane_ground())
+                    .child(
+                        Editor::new(&open.editor)
+                            .appearance(false)
+                            .font_family(ui::mono())
+                            .text_size(ui::code_rems(12.))
+                            .size_full(),
+                    ),
             )
             .children(stale.then(|| {
                 notice(

@@ -82,6 +82,15 @@ fn with_hue(hex: u32, degrees: f32) -> Hsla {
 }
 
 impl Palette {
+    /// [`pane_ground`]: always opaque.
+    pub fn pane_ground(&self) -> Hsla {
+        Hsla {
+            a: 1.,
+            ..self.window_bg
+        }
+        .blend(self.panel)
+    }
+
     /// The theme's roles under `glass` (the Appearance sliders).
     ///
     /// Transparency fades the chrome (the window's ground: title bar, the
@@ -279,6 +288,13 @@ pub const INK_COVERAGE: f64 = 0.92;
 /// Panes, sidebars and screens.
 pub fn panel() -> Hsla {
     themes::palette(|p| p.panel)
+}
+/// A pane made opaque: its panel over the window's ground, over that
+/// ground's own color where glass would show the desktop. Code editors
+/// paint their line-number gutter with it ([`apply_theme`]): the kit's own
+/// gutter is translucent, so text scrolled sideways showed through it.
+pub fn pane_ground() -> Hsla {
+    themes::palette(|p| p.pane_ground())
 }
 /// Cards and fields.
 pub fn surface() -> Hsla {
@@ -577,6 +593,10 @@ pub fn apply_theme(cx: &mut App) {
         theme.mono_font_size = px(code_size * scale);
         theme.radius = px(8. * scale);
         theme.radius_lg = px(12. * scale);
+        // An opaque gutter the color of the pane the editor sits on.
+        let mut highlight = (*theme.highlight_theme).clone();
+        highlight.style.editor_gutter_background = Some(p.pane_ground());
+        theme.highlight_theme = std::sync::Arc::new(highlight);
     });
 }
 
@@ -1508,6 +1528,19 @@ mod tests {
         let latte = Palette::new(find("Catppuccin Latte"), clear_at(0.));
         assert!(latte.light);
         assert!(latte.fg.l < latte.window_bg.l);
+    }
+
+    #[test]
+    fn the_pane_ground_is_opaque_and_matches_a_solid_pane() {
+        let catalog = crate::shared::themes::load_catalog(Vec::new(), Vec::new());
+        let cute = catalog.iter().find(|t| t.name == "Gentleman-Cute").unwrap();
+        let clear = Palette::new(cute, clear_at(1.));
+        assert!(clear.panel.a < 1.);
+        assert_eq!(clear.pane_ground().a, 1.);
+        let solid = Palette::new(cute, clear_at(0.));
+        if solid.panel.a >= 1. {
+            assert_eq!(solid.pane_ground(), solid.panel);
+        }
     }
 
     #[test]
