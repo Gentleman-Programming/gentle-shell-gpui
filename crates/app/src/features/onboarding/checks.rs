@@ -120,14 +120,48 @@ pub(super) fn with_registry(checks: &mut [Check], answer: &Result<String, String
     }
 }
 
+/// Gentle Shell's setup just finished on the server `name` (`Run setup on
+/// <server>`): its companion setup is done there, which this computer can't
+/// check otherwise. What the setup doesn't report stays "Not checked".
+pub(super) fn with_server_setup(checks: &mut [Check], name: &str) {
+    for check in checks
+        .iter_mut()
+        .filter(|c| c.id == CheckId::Setup && matches!(c.status, Status::Unchecked(_)))
+    {
+        check.status = Status::Ok(format!("Setup finished on {name}"));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
 
     use super::{
         Check, CheckId, Fix, LOG_KEEP, Need, Status, Tone, all_set, install_plan, push_lines,
-        required_ok, status_text, tone, usable, with_registry,
+        required_ok, status_text, tone, usable, with_registry, with_server_setup,
     };
+
+    #[test]
+    fn a_finished_server_setup_marks_only_the_companion_setup() {
+        let unchecked = |id| {
+            check(
+                id,
+                Need::Required,
+                Status::Unchecked("On pc: not checked from here".into()),
+                Fix::None,
+            )
+        };
+        let mut checks = vec![
+            unchecked(CheckId::Node),
+            ok(CheckId::GentleShell, Need::Required),
+            unchecked(CheckId::Setup),
+            unchecked(CheckId::Engram),
+        ];
+        with_server_setup(&mut checks, "pc");
+        assert_eq!(checks[2].status, Status::Ok("Setup finished on pc".into()));
+        assert!(matches!(checks[0].status, Status::Unchecked(_)));
+        assert!(matches!(checks[3].status, Status::Unchecked(_)));
+    }
 
     /// The registry's answer replaces the files' guess for the provider
     /// check only.

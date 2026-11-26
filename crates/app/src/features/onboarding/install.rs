@@ -3,7 +3,7 @@
 
 use gpui_kit::*;
 
-use super::checks::{install_plan, is_ok, push_lines, with_registry};
+use super::checks::{install_plan, is_ok, push_lines, with_registry, with_server_setup};
 use super::{OnboardingEvent, OnboardingView, Probe};
 use crate::features::setup::{self, CheckId, Fix};
 
@@ -29,6 +29,11 @@ impl OnboardingView {
         let mut checks = probe.checks;
         if let Some(answer) = &self.registry_sign_in {
             with_registry(&mut checks, answer);
+        }
+        if self.server_setup.finished_on(&self.machine())
+            && let Some(name) = self.server()
+        {
+            with_server_setup(&mut checks, &name);
         }
         self.checks = Some(checks);
         if std::mem::take(&mut self.announce) {

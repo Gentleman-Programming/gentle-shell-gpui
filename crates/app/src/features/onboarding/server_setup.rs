@@ -1,8 +1,10 @@
 //! "Run setup on <server>": a paired device with the `admin` scope, on a
 //! server that offers `setup`, runs Gentle Shell's own companion setup for
 //! the server's home there (`POST /api/setup`) and follows its output
-//! (`GET /api/setup/:job/stream`); then Setup checks the server again.
-//! Nothing restarts, and nothing runs on this computer.
+//! (`GET /api/setup/:job/stream`); then Setup checks the server again and,
+//! when it ended well, shows the companion setup done there
+//! (`checks::with_server_setup`): nothing else on the server can be checked
+//! from here. Nothing restarts, and nothing runs on this computer.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -89,6 +91,8 @@ pub(super) struct ServerSetup {
     /// The server offers `setup` and this device has `admin`.
     allowed: bool,
     job: Option<SetupJob>,
+    /// The server [`Self::job`] runs (or ran) on.
+    ran_on: Option<Backend>,
     _ask: Option<Task<()>>,
     _follow: Option<Task<()>>,
     stop: Option<Arc<AtomicBool>>,
@@ -97,6 +101,17 @@ pub(super) struct ServerSetup {
 impl ServerSetup {
     pub(super) fn running(&self) -> bool {
         self.job.as_ref().is_some_and(SetupJob::running)
+    }
+
+    /// The setup ended well on `machine`.
+    pub(super) fn finished_on(&self, machine: &Backend) -> bool {
+        self.job
+            .as_ref()
+            .is_some_and(|job| job.phase == Phase::Done)
+            && self
+                .ran_on
+                .as_ref()
+                .is_some_and(|ran_on| gentle_core::machines::same(ran_on, machine))
     }
 }
 
@@ -198,6 +213,7 @@ impl OnboardingView {
         let stop = Arc::new(AtomicBool::new(false));
         self.server_setup.stop = Some(stop.clone());
         self.server_setup.job = Some(SetupJob::new());
+        self.server_setup.ran_on = Some(choice.clone());
         let (tx, rx) = async_channel::unbounded::<News>();
         let spawned = std::thread::Builder::new()
             .name("gentle-server-setup".into())
