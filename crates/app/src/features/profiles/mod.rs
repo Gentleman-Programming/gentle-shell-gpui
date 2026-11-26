@@ -216,7 +216,12 @@ pub struct ProfilesView {
     profiles_moved: bool,
     /// Background file jobs still running.
     io_jobs: usize,
+    /// The models the route pickers offer: the machine shown's, from the
+    /// session asked there ([`ControlSession`]; a server's own
+    /// `list_available_models` when no tab runs there), and the session's
+    /// [`SessionView::models_rev`] they were taken at.
     models: Rc<Vec<ModelChoice>>,
+    models_rev: Option<u64>,
     loading: bool,
     error: Option<String>,
     file: ProfilesFile,
@@ -262,7 +267,6 @@ impl ProfilesView {
     pub fn new(
         shown: gentle_core::machines::Shown,
         cwd: PathBuf,
-        models: Vec<ModelChoice>,
         session: Option<Entity<SessionView>>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -316,8 +320,13 @@ impl ProfilesView {
         if let Some(session) = &session {
             subscriptions.push(cx.observe(session, |this, _, cx| this.session_changed(cx)));
         }
+        // The session's binding is the open workspace's tab's; another
+        // machine's tab (asked for its models and config) is not "this
+        // session".
+        let ours = shown.project_target(&cwd).is_ok();
         let in_session = session
             .as_ref()
+            .filter(|_| ours)
             .and_then(|s| s.read(cx).session_profile().map(str::to_string));
         let mut this = Self {
             env: None,
@@ -332,7 +341,8 @@ impl ProfilesView {
             seeding: false,
             profiles_moved: false,
             io_jobs: 0,
-            models: Rc::new(models),
+            models: Rc::default(),
+            models_rev: None,
             loading: true,
             error: None,
             file: ProfilesFile::default(),
@@ -361,8 +371,35 @@ impl ProfilesView {
             _subscriptions: subscriptions,
             _deadline: Task::ready(()),
         };
+        if let Some(session) = this.session.clone() {
+            this.models_changed(&session, cx);
+        }
         this.reload(cx);
         this
+    }
+
+    /// Take `session`'s models (the machine shown's) when they changed
+    /// since last taken; the route pickers re-render with them.
+    fn models_changed(&mut self, session: &Entity<SessionView>, cx: &mut Context<Self>) {
+        let rev = session.read(cx).models_rev();
+        if self.models_rev == Some(rev) {
+            return;
+        }
+        self.models_rev = Some(rev);
+        self.models = Rc::new(
+            session
+                .read(cx)
+                .model_choices()
+                .into_iter()
+                .map(|(provider, id, name, reasoning)| ModelChoice {
+                    provider,
+                    id,
+                    name,
+                    reasoning,
+                })
+                .collect(),
+        );
+        cx.notify();
     }
 
     /// Run blocking file work off the UI thread, then apply its result. The
@@ -462,7 +499,12 @@ impl ProfilesView {
         let Some(session) = self.session.clone() else {
             return;
         };
-        let in_session = session.read(cx).session_profile().map(str::to_string);
+        self.models_changed(&session, cx);
+        let in_session = session
+            .read(cx)
+            .session_profile()
+            .filter(|_| self.project_target().is_ok())
+            .map(str::to_string);
         if in_session != self.in_session {
             self.in_session = in_session;
             cx.notify();

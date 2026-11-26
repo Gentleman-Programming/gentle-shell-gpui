@@ -172,6 +172,17 @@ pub(crate) fn control_for(screen: &Backend, tab: Option<&Backend>) -> Control {
     }
 }
 
+/// Which of the window's agent tabs a screen about `screen` asks (its
+/// models, config, usage): `tabs` are where each runs, the active tab
+/// first; the first on `screen` is taken, so This Mac's list comes from a
+/// tab here even while the active one runs on a server. `None`: no tab
+/// runs there ([`control_for`] then reads the files here, or a server's
+/// own Desktop RPC or a hidden session there).
+pub(crate) fn ask_tab(screen: &Backend, tabs: &[Backend]) -> Option<usize> {
+    tabs.iter()
+        .position(|tab| gentle_core::machines::same(tab, screen))
+}
+
 /// Whether a view that asked for it (`requested`, Configuration's control
 /// session) takes the server's session-less Desktop RPC: only when the
 /// server says it offers it (`info`, capability `desktop`). An older
@@ -311,7 +322,9 @@ impl ControlSession {
 mod tests {
     use gentle_core::backend::Backend;
 
-    use super::{Control, ServerPlace, commands, control_for, do_on, run_on, uses_server_desktop};
+    use super::{
+        Control, ServerPlace, ask_tab, commands, control_for, do_on, run_on, uses_server_desktop,
+    };
 
     fn info(capabilities: &[&str]) -> pi_rpc::serve::ServerInfo {
         pi_rpc::serve::ServerInfo {
@@ -350,6 +363,40 @@ mod tests {
             device: "dev_1".into(),
             name: name.into(),
         }
+    }
+
+    /// Where a screen's lists (Profiles' models, Usage) come from: the
+    /// tab picked by `ask_tab` (else the active one) through `control_for`.
+    fn source(screen: &Backend, tabs: &[Backend]) -> (Option<usize>, Control) {
+        let tab = ask_tab(screen, tabs).or((!tabs.is_empty()).then_some(0));
+        (tab, control_for(screen, tab.map(|i| &tabs[i])))
+    }
+
+    #[test]
+    fn a_screens_models_come_from_the_machine_shown() {
+        let pc = server("http://pc:8787", "pc");
+        let other = server("http://other:8787", "other");
+        // A server with a tab there, active or not: that tab.
+        assert_eq!(
+            source(&pc, std::slice::from_ref(&pc)),
+            (Some(0), Control::Reuse)
+        );
+        assert_eq!(
+            source(&pc, &[Backend::Local, pc.clone()]),
+            (Some(1), Control::Reuse)
+        );
+        // A server without one: its own Desktop RPC (or a hidden session),
+        // never the active tab's models from another machine.
+        assert_eq!(source(&pc, &[Backend::Local]).1, Control::Hidden);
+        assert_eq!(source(&pc, std::slice::from_ref(&other)).1, Control::Hidden);
+        assert_eq!(source(&pc, &[]).1, Control::Hidden);
+        // This Mac: a tab here, even while the active one is on a server.
+        assert_eq!(
+            source(&Backend::Local, &[pc.clone(), Backend::Local]),
+            (Some(1), Control::Local)
+        );
+        // This Mac with every tab on a server: the files here only.
+        assert_eq!(source(&Backend::Local, &[pc]).1, Control::Files);
     }
 
     #[test]

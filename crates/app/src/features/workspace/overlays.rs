@@ -443,6 +443,28 @@ impl Workspace {
         gentle_core::machines::Shown::new(machine, self.space().machine(), self.machines())
     }
 
+    /// The agent tab a screen about `machine` asks (`remote::ask_tab`): the
+    /// active one when it runs there, else another tab there (started if it
+    /// wasn't), else the active one, which the screen's control session
+    /// only asks on its own machine.
+    fn session_on(
+        &mut self,
+        machine: &gentle_core::backend::Backend,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<crate::features::session::SessionView>> {
+        self.start_active_session(window, cx);
+        let active = self.active_session();
+        let tabs: Vec<_> = active.iter().cloned().chain(self.sessions()).collect();
+        let runs_on: Vec<_> = tabs.iter().map(|tab| tab.read(cx).runs_on()).collect();
+        let Some(index) = crate::features::settings::remote::ask_tab(machine, &runs_on) else {
+            return active;
+        };
+        let tab = tabs[index].clone();
+        tab.update(cx, |s, cx| s.ensure_started(window, cx));
+        Some(tab)
+    }
+
     /// Profiles of `machine` (Configuration's "Settings for", the screen's
     /// picker; `None`: the shown workspace's).
     fn open_profiles_on(
@@ -451,23 +473,10 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.start_active_session(window, cx);
         let shown = self.shown_machine(machine);
         let cwd = self.folder_on(&shown.shows, cx);
-        let models = self
-            .active_session()
-            .map(|t| t.read(cx).model_choices())
-            .unwrap_or_default()
-            .into_iter()
-            .map(|(provider, id, name, reasoning)| ModelChoice {
-                provider,
-                id,
-                name,
-                reasoning,
-            })
-            .collect();
-        let session = self.active_session();
-        let view = cx.new(|cx| ProfilesView::new(shown, cwd, models, session, window, cx));
+        let session = self.session_on(&shown.shows, window, cx);
+        let view = cx.new(|cx| ProfilesView::new(shown, cwd, session, window, cx));
         let subscription = cx.subscribe_in(&view, window, |this, _, event: &ProfilesEvent, window, cx| {
             let tab = this.active_session();
             match event {
@@ -722,14 +731,14 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // The Subscription tab reads through the active agent's RPC slice, so
-        // its backend must be started (probe included) before it is opened.
-        // On a Gentle Shell server without a tab there, the screen starts
-        // its own control session there (see `settings::remote`).
-        self.start_active_session(window, cx);
-        let session = self.active_session();
+        // The Subscription tab reads through an agent's RPC slice on the
+        // machine shown, so its backend must be started (probe included)
+        // before it is opened. On a Gentle Shell server without a tab there,
+        // the screen starts its own control session there (see
+        // `settings::remote`).
         let shown = self.shown_machine(machine);
         let cwd = self.folder_on(&shown.shows, cx);
+        let session = self.session_on(&shown.shows, window, cx);
         let view = cx.new(|cx| UsageView::new(shown, &cwd, window, cx, session));
         let subscription = cx.subscribe_in(
             &view,
