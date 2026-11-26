@@ -100,6 +100,8 @@ pub struct FileView {
     focus: FocusHandle,
     /// The header's width in the last frame, for fitting its facts.
     header_width: Rc<Cell<f32>>,
+    /// The diff's size in the last frame (see the canvas beside it).
+    diff_size: Rc<Cell<Size<Pixels>>>,
     /// How a diff shows its two sides (Unified until the header's toggle or
     /// [`Self::set_diff_mode`] picks another).
     diff_mode: DiffMode,
@@ -239,6 +241,7 @@ impl FileView {
             markdown: None,
             focus: cx.focus_handle(),
             header_width: Rc::default(),
+            diff_size: Rc::default(),
             diff_mode: DiffMode::Unified,
             diff_wrap: None,
         };
@@ -447,6 +450,7 @@ impl FileView {
             markdown: None,
             focus: cx.focus_handle(),
             header_width: Rc::default(),
+            diff_size: Rc::default(),
             diff_mode: DiffMode::Unified,
             diff_wrap: None,
         };
@@ -577,6 +581,8 @@ impl FileView {
                 };
                 let mode = self.diff_mode;
                 self.body = Body::Diff(cx.new(|cx| DiffState::new([file], cx).with_mode(mode)));
+                // A new diff hasn't measured itself yet.
+                self.diff_size.set(Size::default());
             }
             Err(notice) => self.show_notice(notice),
         }
@@ -1426,15 +1432,43 @@ impl Render for FileView {
                     _ => code().into_any_element(),
                 }
             }
-            Body::Diff(state) => Diff::new(state)
-                .header_visible(false)
-                .hover_highlight(DiffHoverHighlight::Line)
-                // Side by side, each side wraps to its half of the pane:
-                // unwrapped, the widest line sets both columns and pushes
-                // the new side out of view.
-                .soft_wrap(self.diff_wraps())
-                .size_full()
-                .into_any_element(),
+            Body::Diff(state) => {
+                // The diff widens its rows to the size it records while
+                // painting and asks for a frame to apply it, but GPUI
+                // drops a request made mid-frame: rows stayed as wide as
+                // their text until something else redrew. Redraw once
+                // after the diff appears or changes size.
+                let size = self.diff_size.clone();
+                let view = cx.entity_id();
+                div()
+                    .relative()
+                    .size_full()
+                    .child(
+                        Diff::new(state)
+                            .header_visible(false)
+                            .hover_highlight(DiffHoverHighlight::Line)
+                            // Side by side, each side wraps to its half of the pane:
+                            // unwrapped, the widest line sets both columns and pushes
+                            // the new side out of view.
+                            .soft_wrap(self.diff_wraps())
+                            .size_full(),
+                    )
+                    // After the diff in prepaint order, so it has recorded
+                    // this frame's size.
+                    .child(
+                        canvas(
+                            move |bounds, _, cx| {
+                                if size.replace(bounds.size) != bounds.size {
+                                    cx.defer(move |cx| cx.notify(view));
+                                }
+                            },
+                            |_, _, _, _| {},
+                        )
+                        .absolute()
+                        .size_full(),
+                    )
+                    .into_any_element()
+            }
             Body::Notice {
                 icon,
                 title,
@@ -2119,7 +2153,11 @@ fn untracked_patch(path: &str, text: &str) -> String {
     if text.is_empty() {
         return patch;
     }
-    let lines: Vec<&str> = text.lines().collect();
+    // Each line keeps a CR before its LF, as git's own patches do.
+    let lines: Vec<&str> = text
+        .split_inclusive('\n')
+        .map(|line| line.strip_suffix('\n').unwrap_or(line))
+        .collect();
     patch.push_str(&format!("@@ -0,0 +1,{} @@\n", lines.len()));
     for line in &lines {
         patch.push('+');
@@ -2266,6 +2304,34 @@ index 3b18e51..a1c2d3e 100644
         assert_eq!(file.path().as_ref(), "notes/todo.md");
         assert_eq!((file.additions(), file.deletions()), (3, 0));
         assert_eq!(status_label(file.status()), "Added");
+    }
+
+    /// A line added after an unterminated last line, as `git diff` prints it
+    /// (a server's `POST /api/git` returns the same bytes): each marker
+    /// ends its side's source rather than being a line of its own.
+    #[test]
+    fn newline_markers_end_their_side() {
+        let patch = "diff --git a/hello.txt b/hello.txt
+index 0a1b2c3..4d5e6f7 100644
+--- a/hello.txt
++++ b/hello.txt
+@@ -1 +1,2 @@
+-hello from mac
+\\ No newline at end of file
++hello from mac
++second line
+\\ No newline at end of file
+";
+        let file = parse_patch(patch).expect("parses");
+        assert_eq!((file.additions(), file.deletions()), (2, 1));
+    }
+
+    #[test]
+    fn untracked_file_keeps_its_line_endings() {
+        let patch = untracked_patch("dos.txt", "one\r\ntwo\r\n");
+        assert!(patch.ends_with("@@ -0,0 +1,2 @@\n+one\r\n+two\r\n"));
+        let file = parse_patch(&patch).expect("parses");
+        assert_eq!((file.additions(), file.deletions()), (2, 0));
     }
 
     #[test]
