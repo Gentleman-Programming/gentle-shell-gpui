@@ -55,6 +55,40 @@ pub fn io_error(error: ServeError) -> io::Error {
     io::Error::new(kind, error.message)
 }
 
+/// A read-only pairing refused a file's contents on a server
+/// ([`content_error`]), in words naming the server.
+#[derive(Debug)]
+pub struct FilesRefused(String);
+
+impl std::fmt::Display for FilesRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for FilesRefused {}
+
+/// A server's error reading the contents of `path` (a file, a git diff):
+/// a `403 forbidden` is this device's read-only pairing
+/// ([`FilesRefused`]); anything else as [`io_error`].
+pub fn content_error(error: ServeError, path: &Path) -> io::Error {
+    if gentle_core::serve::files_refused(error.status, error.error.as_deref()) {
+        let server = super::for_tab(path).label();
+        return io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            FilesRefused(gentle_core::serve::files_refused_text(&server)),
+        );
+    }
+    io_error(error)
+}
+
+/// Whether `error` is a read-only pairing refused a file's contents.
+pub fn files_refused(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|inner| inner.is::<FilesRefused>())
+}
+
 /// What an entry is, as `stat` (links followed) tells.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Meta {
@@ -141,7 +175,7 @@ pub fn read(path: &Path) -> io::Result<Vec<u8>> {
         Fs::Server(client) => client
             .fs_read_all(&server_path(path), READ_LIMIT)
             .map(|chunk| chunk.bytes)
-            .map_err(io_error),
+            .map_err(|error| content_error(error, path)),
     }
 }
 

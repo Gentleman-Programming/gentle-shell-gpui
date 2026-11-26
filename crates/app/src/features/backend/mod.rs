@@ -509,7 +509,7 @@ impl Git {
                 .collect();
             let out = client
                 .git(&self.cwd.to_string_lossy(), &self.args, &env, None)
-                .map_err(fs::io_error)?;
+                .map_err(|error| fs::content_error(error, &self.cwd))?;
             return Ok(GitOutput {
                 success: out.success(),
                 stdout: out.stdout,

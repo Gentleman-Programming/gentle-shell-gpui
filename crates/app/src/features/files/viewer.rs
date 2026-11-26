@@ -1570,6 +1570,9 @@ impl Notice {
 /// `asked` reads it past its soft size limit. A server's file is read there.
 fn read_text(path: &Path, asked: bool) -> Result<(String, u64), Notice> {
     let unreadable = |e: std::io::Error| {
+        if backend::fs::files_refused(&e) {
+            return files_refused(&e);
+        }
         Notice::new(IconName::CircleAlert, "Can't read this file", e.to_string())
     };
     let meta = backend::fs::metadata(path).map_err(unreadable)?;
@@ -2057,7 +2060,7 @@ fn load_commit_patch(
         None => vec!["show", "--format=", "--no-color", "--no-ext-diff", commit],
     };
     args.extend(["--", target.as_ref()]);
-    let Some(patch) = git(root, &args) else {
+    let Some(patch) = git(root, &args)? else {
         return Err(Notice::new(
             IconName::GitBranch,
             "Commit not found",
@@ -2081,11 +2084,13 @@ fn load_patch(root: &Path, abs: &Path, rel: &str, asked: bool) -> Result<String,
         git(root, &args)
     };
     // A repository without commits has no HEAD: staged, else unstaged.
-    let tracked = diff(&["HEAD"]).or_else(|| {
-        diff(&["--cached"])
-            .filter(|p| !p.trim().is_empty())
-            .or_else(|| diff(&[]))
-    });
+    let tracked = match diff(&["HEAD"])? {
+        Some(patch) => Some(patch),
+        None => match diff(&["--cached"])?.filter(|p| !p.trim().is_empty()) {
+            Some(patch) => Some(patch),
+            None => diff(&[])?,
+        },
+    };
     let Some(patch) = tracked else {
         return Err(Notice::new(
             IconName::GitBranch,
@@ -2107,7 +2112,7 @@ fn load_patch(root: &Path, abs: &Path, rel: &str, asked: bool) -> Result<String,
             "--",
             target.as_ref(),
         ],
-    )
+    )?
     .is_some_and(|s| s.starts_with("??"));
     if !untracked {
         return Err(Notice::new(
@@ -2208,13 +2213,25 @@ fn status_tint(label: &str) -> Hsla {
     }
 }
 
-fn git(cwd: &Path, args: &[&str]) -> Option<String> {
-    let out = crate::features::backend::git(cwd, &[])
-        .args(args)
-        .output()
-        .ok()?;
-    out.success
-        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+/// git's output when it succeeds; `None` when it fails or can't run. A
+/// read-only pairing refused the contents on a server is its notice.
+fn git(cwd: &Path, args: &[&str]) -> Result<Option<String>, Notice> {
+    match crate::features::backend::git(cwd, &[]).args(args).output() {
+        Ok(out) => Ok(out
+            .success
+            .then(|| String::from_utf8_lossy(&out.stdout).into_owned())),
+        Err(error) if backend::fs::files_refused(&error) => Err(files_refused(&error)),
+        Err(_) => Ok(None),
+    }
+}
+
+/// What shows instead of a server's file a read-only pairing can't read.
+fn files_refused(error: &std::io::Error) -> Notice {
+    Notice::new(
+        IconName::Lock,
+        "Files need operate access",
+        error.to_string(),
+    )
 }
 
 #[cfg(test)]

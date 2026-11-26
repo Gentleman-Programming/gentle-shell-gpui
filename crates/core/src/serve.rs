@@ -1033,6 +1033,22 @@ pub fn error_text(status: u16, code: Option<&str>, message: Option<&str>) -> Str
     }
 }
 
+/// A server's `403 forbidden` on a file's contents (`/api/fs/read`, a
+/// download, a git diff or show), which need `sessions:operate`: this
+/// device's pairing may watch sessions but not read files.
+pub fn files_refused(status: Option<u16>, code: Option<&str>) -> bool {
+    status == Some(403) && code == Some("forbidden")
+}
+
+/// What the Files viewer and a diff say instead of a file on `server`
+/// ([`files_refused`]).
+pub fn files_refused_text(server: &str) -> String {
+    format!(
+        "This device can watch sessions but not read files on {server}. Pair again with \
+         operate access."
+    )
+}
+
 /// Whether `id` can be a server session id (`ses_…`), as the server's
 /// routes take it: a saved one that can't is never put in a URL.
 pub fn is_session_id(id: &str) -> bool {
@@ -1644,6 +1660,10 @@ mod tests {
         assert!(error_text(409, Some("too_many_devices"), None).contains("--revoke"));
         assert!(error_text(421, Some("bad_host"), None).contains("Host"));
         assert!(error_text(403, Some("forbidden_origin"), None).contains("origin"));
+        assert!(files_refused(Some(403), Some("forbidden")));
+        assert!(!files_refused(Some(403), Some("forbidden_origin")));
+        assert!(!files_refused(Some(404), Some("forbidden")));
+        assert!(files_refused_text("pc").contains("not read files on pc"));
         assert!(error_text(401, Some("unauthorized"), None).contains("Pair it again"));
         assert!(error_text(400, Some("invalid_cwd"), None).contains("path on the server"));
         assert_eq!(

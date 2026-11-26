@@ -403,7 +403,9 @@ fn stream(
         if cancel.load(Ordering::Acquire) {
             return Ok(false);
         }
-        let chunk = client.fs_read(from, offset, None).map_err(server_error)?;
+        let chunk = client
+            .fs_read(from, offset, None)
+            .map_err(|error| fs::content_error(error, Path::new(from)).to_string())?;
         file.write_all(&chunk.bytes).map_err(|e| e.to_string())?;
         offset += chunk.bytes.len() as u64;
         progress(offset, chunk.size);
