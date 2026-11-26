@@ -6,6 +6,7 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::{Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::*;
 
+use gentle_core::backend::Backend;
 use pi_rpc::desktop_rpc::ShellStatus;
 
 use super::super::{
@@ -25,6 +26,7 @@ pub(super) fn render(
     v_flex()
         .gap_3()
         .child(gentle_shell_section(
+            &view.machine,
             snapshot,
             view.shell_status.status.as_ref(),
         ))
@@ -33,15 +35,20 @@ pub(super) fn render(
         .child(section(IconName::CircleCheck, "Setup & requirements").child(view.setup.clone()))
 }
 
-/// The homes and launcher, then, when the active agent tab's Shell offers
-/// `get_status`, what `/gentle:status` reports and whether it warns. On a
-/// server, its home folder and version as it says them instead: none of
-/// this computer's homes or launcher is read for it.
-fn gentle_shell_section(snapshot: &Snapshot, status: Option<&ShellStatus>) -> Div {
+/// Where it runs, the homes, version and launcher, then, when the active
+/// agent tab's Shell offers `get_status`, what `/gentle:status` reports and
+/// whether it warns. On a server, its home folder and version as it says
+/// them instead: none of this computer's homes or launcher is read for it.
+fn gentle_shell_section(
+    machine: &Backend,
+    snapshot: &Snapshot,
+    status: Option<&ShellStatus>,
+) -> Div {
     if let Some(server) = &snapshot.server {
         return server_section(server, status);
     }
     section(IconName::SquareTerminal, "Gentle Shell")
+        .child(row("Runs on", gentle_core::machines::name(machine)))
         .child(row(
             "Home",
             if snapshot.home_mode.is_empty() {
@@ -49,6 +56,12 @@ fn gentle_shell_section(snapshot: &Snapshot, status: Option<&ShellStatus>) -> Di
             } else {
                 snapshot.home_mode.clone()
             },
+        ))
+        .child(row(
+            "Version",
+            gentle_core::version::current_from_versions(&snapshot.versions)
+                .unwrap_or("—")
+                .to_string(),
         ))
         .child(row("Agent dir", snapshot.agent.display().to_string()))
         .child(row("Config dir", snapshot.config.display().to_string()))
