@@ -599,6 +599,14 @@ impl ServeClient {
             .map(drop)
     }
 
+    /// `GET /api/checks` (capability `checks`): what the server found of
+    /// what its sessions run on (Node.js, Git, Engram, the companion
+    /// setup), the rows Setup's checklist shows for it.
+    pub fn checks(&self) -> Result<Vec<gentle_core::server_checks::ServerCheck>, ServeError> {
+        let answer = self.json("GET", "/api/checks", None)?;
+        Ok(gentle_core::server_checks::decode_checks(&answer))
+    }
+
     /// `DELETE /api/devices/self` (capability `unpair`): the server forgets
     /// this device; its token stops working there, its streams close.
     pub fn unpair(&self) -> Result<(), ServeError> {

@@ -37,6 +37,7 @@ pub mod prompt_history;
 pub mod screen;
 pub mod scroll;
 pub mod serve;
+pub mod server_checks;
 pub mod sessions;
 pub mod setup;
 pub mod sign_in;

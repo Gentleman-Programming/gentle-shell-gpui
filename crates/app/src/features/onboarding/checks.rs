@@ -121,8 +121,9 @@ pub(super) fn with_registry(checks: &mut [Check], answer: &Result<String, String
 }
 
 /// Gentle Shell's setup just finished on the server `name` (`Run setup on
-/// <server>`): its companion setup is done there, which this computer can't
-/// check otherwise. What the setup doesn't report stays "Not checked".
+/// <server>`) and the server doesn't report its checks (no `checks`
+/// capability): its companion setup is done there, which this computer
+/// can't check otherwise. A server with `checks` already says so.
 pub(super) fn with_server_setup(checks: &mut [Check], name: &str) {
     for check in checks
         .iter_mut()
