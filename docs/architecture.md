@@ -77,7 +77,7 @@ flowchart TD
 crates/
 ├── app/
 │   └── src/
-│       ├── main.rs              # startup: CLI, single instance, toolchain PATH, config adoption
+│       ├── main.rs              # startup: CLI, single instance, saved login PATH file, toolchain PATH, config adoption
 │       ├── app/                 # composition root (mod.rs): GPUI, themes, shortcuts, menus, window; integration.rs registers panels and sidebar
 │       ├── cli.rs               # arguments (`[FOLDER] [--cwd] [-p TEXT]`) and initial folder
 │       ├── features/            # one folder per feature; its entry point is mod.rs
