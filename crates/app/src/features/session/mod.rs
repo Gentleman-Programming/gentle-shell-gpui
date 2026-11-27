@@ -237,6 +237,9 @@ pub struct SessionView {
     drop_over: bool,
     focus_handle: FocusHandle,
     _io: Task<()>,
+    /// Reads the resumed session file while the backend starts; a restart
+    /// drops it with the read.
+    _preload: Task<()>,
     _subscriptions: Vec<Subscription>,
     /// View-only state: live timers, the prompt in flight, picker highlights.
     live: view::Live,
@@ -432,6 +435,7 @@ impl SessionView {
             chrome: None,
             focus_handle: cx.focus_handle(),
             _io: Task::ready(()),
+            _preload: Task::ready(()),
             _subscriptions: subscriptions,
             live: view::Live::default(),
             model_search,
