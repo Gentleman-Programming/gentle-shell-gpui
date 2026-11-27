@@ -184,6 +184,14 @@ impl CanvasView {
         self.agent.as_ref().map(|agent| agent.session.clone())
     }
 
+    /// A hidden canvas conversation must not present its Agents modal.
+    pub(crate) fn visible_agent_session(&self) -> Option<Entity<SessionView>> {
+        self.agent
+            .as_ref()
+            .filter(|agent| agent.shown)
+            .map(|agent| agent.session.clone())
+    }
+
     /// The conversation to resume when the agent opens (saved with the pane).
     pub fn resume_agent(&mut self, session: PathBuf) {
         self.agent_resume = Some(session);

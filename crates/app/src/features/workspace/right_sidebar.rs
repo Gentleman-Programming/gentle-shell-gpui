@@ -135,9 +135,23 @@ impl Workspace {
         })
     }
 
+    /// Keep the owning session, but only display panels from the visible tab.
+    pub(super) fn agents_overlay_session(&self, cx: &App) -> Option<Entity<SessionView>> {
+        let tab = self.tab()?;
+        let open_session = |id: PaneId| {
+            self.panes
+                .get(&id)
+                .and_then(|pane| pane.session.clone())
+                .or_else(|| self.canvas_view(id)?.read(cx).visible_agent_session())
+                .filter(|session| session.read(cx).agents_panel_open())
+        };
+        tab.focused()
+            .and_then(&open_session)
+            .or_else(|| tab.leaves().into_iter().find_map(open_session))
+    }
+
     fn agents_window_open(&self, cx: &App) -> bool {
-        self.active_session()
-            .is_some_and(|session| session.read(cx).agents_panel_open())
+        self.agents_overlay_session(cx).is_some()
     }
 
     fn toggle_rail_command(
@@ -153,7 +167,7 @@ impl Workspace {
         match action {
             PaletteAction::Devices => self.devices.update(cx, |panel, cx| panel.toggle(cx)),
             PaletteAction::Agents if self.agents_window_open(cx) => {
-                if let Some(session) = self.active_session() {
+                if let Some(session) = self.agents_overlay_session(cx) {
                     session.update(cx, |session, cx| session.close_agents_panel(cx));
                 }
             }
@@ -186,7 +200,7 @@ impl Workspace {
         if self.devices.read(cx).visible() {
             self.devices.update(cx, |panel, cx| panel.hide(cx));
         }
-        if let Some(session) = self.active_session() {
+        if let Some(session) = self.agents_overlay_session(cx) {
             session.update(cx, |session, cx| session.close_agents_panel(cx));
         }
         if self.sidebar_visible {
@@ -261,7 +275,7 @@ impl Workspace {
             if self.devices.read(cx).visible() {
                 self.devices.update(cx, |panel, cx| panel.hide(cx));
             }
-            if let Some(session) = self.active_session() {
+            if let Some(session) = self.agents_overlay_session(cx) {
                 session.update(cx, |session, cx| session.close_agents_panel(cx));
             }
         }
@@ -313,6 +327,11 @@ impl Workspace {
     }
 
     fn activate_shortcut(&mut self, tool: LayoutTool, window: &mut Window, cx: &mut Context<Self>) {
+        if tool != LayoutTool::Agents
+            && let Some(session) = self.agents_overlay_session(cx)
+        {
+            session.update(cx, |session, cx| session.close_agents_panel(cx));
+        }
         if tool.docked() {
             if self.overlay.is_some() {
                 self.close_overlay(window, cx);

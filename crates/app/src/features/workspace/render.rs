@@ -185,10 +185,17 @@ impl Render for Workspace {
         let original_controls = profile.original_controls;
         let profile_has_title = profile.has(ToolPlacement::Title);
         let navigation_visible = self.tabs_sidebar_visible();
+        // Agents is owned by a session but uses the same workspace modal layer.
+        let agents_session = if self.overlay.is_none() {
+            self.agents_overlay_session(cx)
+        } else {
+            None
+        };
         // First-run screens keep their original full-window presentation.
-        let workspace_modal = self.overlay.as_ref().is_some_and(|(overlay, _)| {
-            !matches!(overlay, Overlay::Onboarding(_) | Overlay::Welcome(_))
-        });
+        let workspace_modal = agents_session.is_some()
+            || self.overlay.as_ref().is_some_and(|(overlay, _)| {
+                !matches!(overlay, Overlay::Onboarding(_) | Overlay::Welcome(_))
+            });
         let window_px_at_100 =
             f32::from(window.viewport_size().width) / (f32::from(window.rem_size()) / 16.);
         let now = std::time::Instant::now();
@@ -208,6 +215,7 @@ impl Render for Workspace {
         // them, and swallow the pointer while a pane is dragged over them;
         // device cards stop capturing while covered.
         let covered = self.overlay.is_some()
+            || agents_session.is_some()
             || window.has_active_dialog(cx)
             || window.has_active_sheet(cx)
             || cx.has_active_drag()
@@ -640,6 +648,26 @@ impl Render for Workspace {
                     .bottom_0()
                     .child(view)
                     .into_any_element()
+            }))
+            .children(agents_session.and_then(|session| {
+                let view = session.update(cx, |session, cx| session.render_agents_panel(cx))?;
+                Some(
+                    div()
+                        .absolute()
+                        .top(rems(TITLE_BAR_HEIGHT / 16.))
+                        .left(rems(if left_rail {
+                            (right_sidebar::ACTIVITY_BAR_WIDTH + 6.) / 16.
+                        } else {
+                            0.
+                        }))
+                        .right(rems(if right_rail {
+                            (right_sidebar::ACTIVITY_BAR_WIDTH + 6.) / 16.
+                        } else {
+                            0.
+                        }))
+                        .bottom_0()
+                        .child(view),
+                )
             }))
             // Keep the same rail bounds as the row, above the continuous
             // scrim. No duplicated rail is mounted in the row in this state.

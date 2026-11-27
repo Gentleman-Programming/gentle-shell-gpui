@@ -133,9 +133,9 @@ impl Workspace {
             PaletteAction::SetTabLayout(layout) => self.set_tab_layout(layout, cx),
             PaletteAction::Agents => {
                 if let Some(session) = tab {
-                    // Agents is rendered inside its owning session, not as a
-                    // workspace overlay. Reveal that pane before opening it:
-                    // active_session can fall back to an agent in another tab.
+                    // Agents is presented by the workspace for its owning
+                    // session. Reveal that pane first: active_session can
+                    // fall back to an agent in another tab.
                     let pane = self
                         .panes
                         .iter()
