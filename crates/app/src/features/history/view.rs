@@ -636,12 +636,14 @@ impl HistoryView {
     }
 
     fn graph_cell(&self, graph: RowGraph) -> Div {
+        let layout = graph::LaneLayout::new(self.graph.width.max(1), self.width.get());
         div()
             .relative()
             .flex_none()
-            .w(px(graph::width(self.graph.width.max(1))))
+            .w(px(layout.width))
             .h_full()
-            .child(graph.element())
+            .overflow_hidden()
+            .child(graph.element(layout))
     }
 
     fn render_line(
@@ -669,8 +671,8 @@ impl HistoryView {
             .id(("history-row", ix))
             .w_full()
             .h(rems(ROW_HEIGHT / 16.))
-            .pr_3()
-            .gap_2()
+            .pr_2()
+            .gap_1()
             .rounded_lg();
         match line {
             Line::Uncommitted => {
@@ -881,16 +883,17 @@ impl HistoryView {
                 h_flex()
                     .flex_1()
                     .min_w_0()
-                    .gap_2()
-                    // Chips that don't fit are cut, leaving the subject at
-                    // least its minimum width.
+                    .gap_1()
+                    // Keep ref labels from consuming the entire subject column
+                    // in a narrow dock. The hover card still exposes the refs.
                     .when(!chips.is_empty(), |d| {
                         d.child(
                             h_flex()
                                 .flex_shrink(1.)
                                 .min_w_0()
+                                .when(fit != Fit::Wide, |d| d.max_w(relative(0.40)))
                                 .overflow_hidden()
-                                .gap_1p5()
+                                .gap_1()
                                 .children(chips.into_iter().map(|c| div().flex_none().child(c))),
                         )
                     })
