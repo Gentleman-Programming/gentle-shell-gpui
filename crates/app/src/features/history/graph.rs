@@ -50,6 +50,24 @@ impl LaneLayout {
     }
 }
 
+/// Keep the main line, visible commit lanes and the endpoints of visible
+/// forks/joins. Straight-through lanes without a node or junction in this
+/// viewport do not need a column. Sorting preserves lane order.
+pub(super) fn visible_lanes<'a>(rows: impl Iterator<Item = &'a GraphRow>) -> Vec<usize> {
+    let mut lanes = vec![0];
+    for row in rows {
+        lanes.push(row.lane);
+        for edge in row.top.iter().chain(&row.bottom) {
+            if edge.from != edge.to {
+                lanes.extend([edge.from, edge.to]);
+            }
+        }
+    }
+    lanes.sort_unstable();
+    lanes.dedup();
+    lanes
+}
+
 /// A lane's color: the tip's first-parent line in `info`, the others cycling
 /// through the semantic tones.
 pub(super) fn lane_color(color: usize) -> Hsla {
@@ -139,6 +157,24 @@ impl RowGraph {
             dashed_top: false,
             dashed_bottom: false,
         }
+    }
+
+    /// Project the same original lanes into the same compact columns in
+    /// every row of the viewport. Only irrelevant passing lines disappear.
+    pub fn compact(mut self, lanes: &[usize]) -> Self {
+        let remap = |lane| lanes.binary_search(&lane).ok();
+        self.lane = remap(self.lane).unwrap_or(0);
+        for edges in [&mut self.top, &mut self.bottom] {
+            edges.retain_mut(|edge| {
+                let (Some(from), Some(to)) = (remap(edge.from), remap(edge.to)) else {
+                    return false;
+                };
+                edge.from = from;
+                edge.to = to;
+                true
+            });
+        }
+        self
     }
 
     pub fn element(self, layout: LaneLayout) -> impl IntoElement {
@@ -253,7 +289,29 @@ fn circle(
 
 #[cfg(test)]
 mod tests {
-    use super::{LaneLayout, PAD};
+    use super::{LaneLayout, PAD, RowGraph, visible_lanes};
+    use gentle_core::git::log::{Edge, GraphRow};
+
+    #[test]
+    fn viewport_uses_only_commit_and_junction_lanes() {
+        let edge = |from, to| Edge { from, to, color: 1 };
+        let row = GraphRow {
+            lane: 8,
+            color: 1,
+            top: vec![edge(3, 3), edge(8, 8)],
+            bottom: vec![edge(8, 12), edge(3, 3)],
+            mainline: false,
+            branch: None,
+            lane_tip: false,
+        };
+        let lanes = visible_lanes(std::iter::once(&row));
+        assert_eq!(lanes, vec![0, 8, 12]);
+        let compact = RowGraph::commit(&row, false, false).compact(&lanes);
+        assert_eq!(compact.lane, 1);
+        assert_eq!(compact.top.len(), 1);
+        assert_eq!((compact.bottom[0].from, compact.bottom[0].to), (1, 2));
+        assert_eq!(visible_lanes(std::iter::empty()), vec![0]);
+    }
 
     #[test]
     fn dense_graph_preserves_every_lane_and_readable_nodes() {

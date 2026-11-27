@@ -673,32 +673,49 @@ impl HistoryView {
     }
 
     fn lane_layout(&self) -> graph::LaneLayout {
-        let lanes = if self.filtering() { 1 } else { self.graph.width.max(1) };
-        graph::LaneLayout::new(lanes, self.width.get())
+        graph::LaneLayout::new(self.visible_lanes.get(), self.width.get())
     }
 
-    fn graph_cell(&self, graph: RowGraph) -> Div {
-        let layout = self.lane_layout();
+    fn graph_cell(&self, graph: RowGraph, lanes: &[usize]) -> Div {
+        let layout = graph::LaneLayout::new(lanes.len(), self.width.get());
         div()
             .relative()
             .flex_none()
             .w(px(layout.width))
             .h_full()
             .overflow_hidden()
-            .child(graph.element(layout))
+            .child(graph.compact(lanes).element(layout))
     }
 
     fn render_line(
         &self,
         ix: usize,
         line: Line,
+        lanes: &[usize],
+        first: bool,
         window: &Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let measured = self.visible_lanes.clone();
+        let count = lanes.len();
+        let view = cx.entity_id();
         div()
+            .relative()
             .w_full()
             .px_2()
-            .child(self.render_row(ix, line, window, cx))
+            .child(self.render_row(ix, line, lanes, window, cx))
+            // UniformList also calls its processor to measure a single row.
+            // Publish the actual visible batch only when its first row paints.
+            .when(first, |d| d.child(
+                canvas(
+                    |_, _, _| (),
+                    move |_, _, _, cx| {
+                        if measured.replace(count) != count {
+                            cx.notify(view);
+                        }
+                    },
+                ).absolute().size_full()
+            ))
             .into_any_element()
     }
 
@@ -706,6 +723,7 @@ impl HistoryView {
         &self,
         ix: usize,
         line: Line,
+        lanes: &[usize],
         window: &Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -719,7 +737,7 @@ impl HistoryView {
         match line {
             Line::Uncommitted => {
                 let weak = cx.entity().downgrade();
-                row.child(self.graph_cell(RowGraph::uncommitted()))
+                row.child(self.graph_cell(RowGraph::uncommitted(), lanes))
                     .child(
                         div()
                             .flex_1()
@@ -748,7 +766,7 @@ impl HistoryView {
                 .hover(|s| s.bg(ui::surface_hover()))
                 .on_click(cx.listener(|this, _, _, cx| this.load_earlier(cx)))
                 .child(
-                    self.graph_cell(RowGraph::earlier()).child(
+                    self.graph_cell(RowGraph::earlier(), lanes).child(
                         div()
                             .absolute()
                             .top_0()
@@ -788,7 +806,7 @@ impl HistoryView {
                     d.child(Spinner::new().xsmall().color(ui::muted()))
                 })
                 .into_any_element(),
-            Line::Commit(i, graph_index) => self.render_commit(row, i, graph_index, window, cx),
+            Line::Commit(i, graph_index) => self.render_commit(row, i, graph_index, lanes, window, cx),
         }
     }
 
@@ -867,6 +885,7 @@ impl HistoryView {
         row: Stateful<Div>,
         i: usize,
         graph_index: usize,
+        lanes: &[usize],
         window: &Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -931,7 +950,7 @@ impl HistoryView {
             .on_click(cx.listener(move |this, _, _, cx| this.select(hash.clone(), cx)))
             .tooltip(move |_, cx| cx.new(|_| card.clone()).into())
             .context_menu(menu)
-            .child(self.graph_cell(graph))
+            .child(self.graph_cell(graph, lanes))
             .when_some(folded_count, |d, count| {
                 d.child(
                     Button::new(("git-fold-merge", i))
@@ -1204,8 +1223,17 @@ impl HistoryView {
                     self.lines.len(),
                     cx.processor(|this, range: std::ops::Range<usize>, window, cx| {
                         let lines = this.lines.clone();
+                        let lanes = if this.filtering() {
+                            vec![0]
+                        } else {
+                            graph::visible_lanes(range.clone().filter_map(|ix| match lines[ix] {
+                                Line::Commit(_, graph_index) => this.graph.rows.get(graph_index),
+                                _ => None,
+                            }))
+                        };
+                        let first = range.start;
                         range
-                            .map(|ix| this.render_line(ix, lines[ix], window, cx))
+                            .map(|ix| this.render_line(ix, lines[ix], &lanes, ix == first, window, cx))
                             .collect::<Vec<_>>()
                     }),
                 )

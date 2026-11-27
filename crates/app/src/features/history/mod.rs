@@ -107,6 +107,8 @@ pub struct HistoryView {
     scroll: UniformListScrollHandle,
     /// The pane's width in the last frame: narrow panes drop columns.
     width: Rc<Cell<f32>>,
+    /// Lane count measured from the last painted viewport, not the full log.
+    visible_lanes: Rc<Cell<usize>>,
     focus: FocusHandle,
     /// Narrows the loaded commits by subject, author, hash or ref.
     filter: Entity<InputState>,
@@ -173,7 +175,7 @@ impl HistoryView {
         let mut this = Self {
             toplevel: cwd.clone(),
             scope: Scope::Head,
-            mode: if docked { GraphMode::Smart } else { GraphMode::Full },
+            mode: GraphMode::Full,
             docked,
             expanded_merges: HashSet::new(),
             folded_counts: HashMap::new(),
@@ -189,6 +191,7 @@ impl HistoryView {
             now_ms: 0,
             scroll: UniformListScrollHandle::new(),
             width: Rc::default(),
+            visible_lanes: Rc::new(Cell::new(1)),
             focus: cx.focus_handle(),
             filter,
             query: String::new(),
