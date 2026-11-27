@@ -37,6 +37,8 @@ pub(super) struct Backend {
     pub(super) pending_session: Option<PathBuf>,
     /// A new Gentle Shell was installed mid-turn: restart on it once idle.
     pub(super) restart_pending: bool,
+    /// How far its last start got, for the diagnostics.
+    pub(super) startup: crate::features::diagnostics::StartupClock,
 }
 
 impl Backend {
@@ -49,6 +51,7 @@ impl Backend {
             pending_prompt: prompt,
             pending_session: None,
             restart_pending: false,
+            startup: Default::default(),
         }
     }
 
