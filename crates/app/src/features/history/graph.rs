@@ -247,7 +247,8 @@ fn circle(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    // Do not import GPUI's `test` attribute into these pure geometry tests.
+    use super::{LaneLayout, PAD};
 
     #[test]
     fn busy_graph_leaves_most_of_a_sidebar_for_commit_text() {
