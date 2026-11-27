@@ -11,6 +11,25 @@ mod accordion;
 mod compact;
 mod parts;
 
+actions!(
+    tab_list,
+    [TabListNext, TabListPrev, TabListActivate, TabListCancel]
+);
+
+/// Register the keyboard bindings for navigating the vertical tab sidebar.
+/// `app::bind_keys` calls it at startup and on every keymap reload.
+pub fn bind_keys(cx: &mut App) {
+    let ctx = Some("GentleTabList && !Input");
+    cx.bind_keys([
+        KeyBinding::new("up", TabListPrev, ctx),
+        KeyBinding::new("down", TabListNext, ctx),
+        KeyBinding::new("j", TabListNext, ctx),
+        KeyBinding::new("k", TabListPrev, ctx),
+        KeyBinding::new("enter", TabListActivate, ctx),
+        KeyBinding::new("escape", TabListCancel, ctx),
+    ]);
+}
+
 /// One tab as the sidebar draws it.
 #[derive(Clone)]
 pub(super) struct TabEntry {
@@ -305,6 +324,109 @@ impl Workspace {
         } else {
             row.into_any_element()
         }
+    }
+
+    /// Focus the vertical tab sidebar and highlight the active tab.
+    /// If tabs are currently horizontal, switch to vertical first so the
+    /// list is visible and navigable.
+    pub(super) fn focus_tab_list(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.tab_layout != TabLayout::Vertical {
+            self.set_tab_layout(TabLayout::Vertical, cx);
+        }
+        // A folded workspace would hide the highlighted tab: the list only
+        // walks rows of open sections. Open the shown one, as a chevron click
+        // does, so the keyboard never lands on a row that isn't on screen.
+        if !self.sidebar_space_open(self.current)
+            && let Some(space) = self.spaces.get_mut(self.current)
+        {
+            space.sidebar_expanded = true;
+            self.schedule_save(cx);
+        }
+        if self.tab_list_highlight.is_none() {
+            self.tab_list_highlight = Some((self.current, self.space().active));
+        }
+        self.tab_list_return_focus = window.focused(cx);
+        self.tab_list_focus.focus(window, cx);
+        cx.notify();
+    }
+
+    /// All tab rows currently visible in the sidebar, in render order.
+    fn tab_list_targets(&self, cx: &App) -> Vec<(usize, usize)> {
+        let searching = self.searching(cx);
+        self.sidebar_spaces()
+            .into_iter()
+            .filter(|space| searching || self.sidebar_space_open(space.index))
+            .flat_map(|space| {
+                self.visible_tabs(space.index, cx)
+                    .into_iter()
+                    .map(move |tab| (space.index, tab.index))
+            })
+            .collect()
+    }
+
+    fn move_tab_list_highlight(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let targets = self.tab_list_targets(cx);
+        if targets.is_empty() {
+            return;
+        }
+        let current = self
+            .tab_list_highlight
+            .unwrap_or((self.current, self.space().active));
+        let pos = targets.iter().position(|t| *t == current).unwrap_or(0);
+        let next = if delta.is_negative() {
+            pos.saturating_sub(delta.unsigned_abs())
+        } else {
+            (pos + delta.unsigned_abs()).min(targets.len() - 1)
+        };
+        self.tab_list_highlight = Some(targets[next]);
+        cx.notify();
+    }
+
+    pub(super) fn on_tab_list_next(
+        &mut self,
+        _: &TabListNext,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.move_tab_list_highlight(1, cx);
+    }
+
+    pub(super) fn on_tab_list_prev(
+        &mut self,
+        _: &TabListPrev,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.move_tab_list_highlight(-1, cx);
+    }
+
+    pub(super) fn on_tab_list_activate(
+        &mut self,
+        _: &TabListActivate,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((space, index)) = self.tab_list_highlight else {
+            return;
+        };
+        // Activation moves focus into the target pane; don't try to restore
+        // the pre-list focus afterwards.
+        self.tab_list_return_focus = None;
+        self.switch_workspace_to(space, Some(index), window, cx);
+        self.tab_list_highlight = Some((space, index));
+    }
+
+    pub(super) fn on_tab_list_cancel(
+        &mut self,
+        _: &TabListCancel,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.tab_list_highlight = None;
+        if let Some(focus) = self.tab_list_return_focus.take() {
+            focus.focus(window, cx);
+        }
+        cx.notify();
     }
 
     /// A tab's title, or the rename field while it is being renamed.

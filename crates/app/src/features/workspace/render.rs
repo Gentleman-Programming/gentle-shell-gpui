@@ -190,6 +190,19 @@ impl Render for Workspace {
             || window.has_active_sheet(cx)
             || cx.has_active_drag()
             || crate::features::browser::popovers_open(cx);
+        if self.leader.is_some()
+            && (covered || !window.is_window_active() || !self.pane_mode_focus.is_focused(window))
+        {
+            self.cancel_leader(window, cx);
+        }
+        if self.pane_mode && (covered || !window.is_window_active()) {
+            self.pane_mode = false;
+            // Focus still parked on the pane-mode handle goes back to the
+            // active pane; an overlay that already took it keeps it.
+            if self.pane_mode_focus.is_focused(window) {
+                self.focus_active(window, cx);
+            }
+        }
         self.set_stages_covered(covered, cx);
         self.sync_web_views(covered, cx);
         let (devices_docked, devices_floating) = {
@@ -250,14 +263,59 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_focus_next_pane))
             .on_action(cx.listener(Self::on_focus_prev_pane))
             .on_action(cx.listener(Self::on_toggle_sidebar))
+            .on_action(cx.listener(Self::on_go_to_tab))
+            .on_action(cx.listener(Self::on_open_workspaces))
+            .on_action(cx.listener(Self::on_create_workspace))
+            .on_action(cx.listener(Self::on_delete_workspace))
+            .on_action(cx.listener(Self::on_activate_tab1))
+            .on_action(cx.listener(Self::on_activate_tab2))
+            .on_action(cx.listener(Self::on_activate_tab3))
+            .on_action(cx.listener(Self::on_activate_tab4))
+            .on_action(cx.listener(Self::on_activate_tab5))
+            .on_action(cx.listener(Self::on_activate_tab6))
+            .on_action(cx.listener(Self::on_activate_tab7))
+            .on_action(cx.listener(Self::on_activate_tab8))
+            .on_action(cx.listener(Self::on_activate_tab9))
+            .on_action(cx.listener(Self::on_focus_composer))
+            .on_action(cx.listener(Self::on_focus_files))
+            .on_action(cx.listener(Self::on_focus_changes))
+            .on_action(cx.listener(Self::on_focus_pane_left))
+            .on_action(cx.listener(Self::on_focus_pane_right))
+            .on_action(cx.listener(Self::on_focus_pane_up))
+            .on_action(cx.listener(Self::on_focus_pane_down))
+            .on_action(cx.listener(Self::on_resize_pane_left))
+            .on_action(cx.listener(Self::on_resize_pane_right))
+            .on_action(cx.listener(Self::on_resize_pane_up))
+            .on_action(cx.listener(Self::on_resize_pane_down))
+            .on_action(cx.listener(Self::on_split_left))
+            .on_action(cx.listener(Self::on_split_up))
+            .on_action(cx.listener(Self::on_toggle_pane_mode))
+            .on_action(cx.listener(Self::on_exit_pane_mode))
+            .on_action(cx.listener(Self::on_focus_tab_list))
             .on_action(cx.listener(Self::on_open_providers))
             .on_action(cx.listener(Self::on_open_sessions))
             .on_action(cx.listener(Self::on_open_palette))
             .on_action(cx.listener(Self::on_open_settings))
+            .on_action(cx.listener(Self::on_open_shortcuts))
             .on_action(cx.listener(Self::on_open_workspaces))
             .on_action(cx.listener(Self::on_open_explorer))
             .on_action(cx.listener(Self::on_close_overlay))
-            .key_context("GentleWorkspace")
+            .key_context(if self.pane_mode {
+                "GentleWorkspace pane_mode"
+            } else {
+                "GentleWorkspace"
+            })
+            .when(self.leader.is_some(), |this| {
+                this.track_focus(&self.pane_mode_focus)
+            })
+            .when(self.pane_mode, |this| {
+                this.track_focus(&self.pane_mode_focus)
+                    .capture_key_down(cx.listener(|this, _: &KeyDownEvent, _, cx| {
+                        if this.pane_mode {
+                            cx.stop_propagation();
+                        }
+                    }))
+            })
             .relative()
             .left(px(shake_x))
             .top(px(shake_y))
@@ -324,6 +382,41 @@ impl Render for Workspace {
                                     // focused pane, each entry with its shortcut.
                                     .when(self.tab().is_some(), |d| {
                                         d.child(self.render_layout_menu(cx)).child(
+                                            div()
+                                                .w(px(1.))
+                                                .h(rems(14. / 16.))
+                                                .mx_1()
+                                                .bg(ui::border()),
+                                        )
+                                    })
+                                    .when(self.leader.is_some(), |this| {
+                                        this.track_focus(&self.pane_mode_focus)
+                                    })
+                                    .when(self.pane_mode, |d| {
+                                        d.child(
+                                            h_flex()
+                                                .gap_1()
+                                                .px_2()
+                                                .py(px(1.))
+                                                .rounded_md()
+                                                .bg(ui::petal().opacity(0.14))
+                                                .border_1()
+                                                .border_color(ui::petal().opacity(0.45))
+                                                .child(
+                                                    div()
+                                                        .text_xs()
+                                                        .font_weight(FontWeight::SEMIBOLD)
+                                                        .text_color(ui::petal())
+                                                        .child("PANE"),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .text_xs()
+                                                        .text_color(ui::faint())
+                                                        .child("esc"),
+                                                ),
+                                        )
+                                        .child(
                                             div()
                                                 .w(px(1.))
                                                 .h(rems(14. / 16.))
@@ -507,6 +600,19 @@ impl Render for Workspace {
             .children(self.render_badge_picker(window, cx))
             .children(self.render_context_menu(cx))
             .when(devices_floating, |root| root.child(self.devices.clone()))
+            // Which keys come next: while a sequence is pending, or in pane mode.
+            .children(
+                self.leader
+                    .as_ref()
+                    .and_then(|(_, selection)| selection.hint(cx))
+                    .or_else(|| self.which_key.clone())
+                    .or_else(|| {
+                        self.pane_mode
+                            .then(|| crate::features::shortcuts::pane_mode_hint(cx))
+                            .flatten()
+                    })
+                    .map(|hint| crate::features::shortcuts::panel(&hint, cx)),
+            )
             .children(browser_dock_drag)
             .children(self.overlay.as_ref().map(|(overlay, _)| {
                 let (view, full_window) = match overlay {
@@ -518,6 +624,7 @@ impl Render for Workspace {
                     Overlay::Memory(view) => (view.clone().into_any_element(), false),
                     Overlay::Docs(view) => (view.clone().into_any_element(), false),
                     Overlay::Settings(view) => (view.clone().into_any_element(), false),
+                    Overlay::Shortcuts(view) => (view.clone().into_any_element(), false),
                     Overlay::Profiles(view) => (view.clone().into_any_element(), false),
                     Overlay::Review(view) => (view.clone().into_any_element(), false),
                     // First-run screens still cover the whole window.

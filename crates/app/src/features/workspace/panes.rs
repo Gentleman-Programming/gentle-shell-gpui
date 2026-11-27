@@ -81,6 +81,16 @@ impl Workspace {
 
     /// Approximate on-screen size of each pane in the current tab.
     pub(super) fn pane_sizes(&self, window: &Window) -> Vec<(PaneId, f32, f32)> {
+        let (w, h) = self.pane_area(window);
+        let mut out = Vec::new();
+        if let Some(tree) = self.tab().and_then(|t| t.built_tree()) {
+            leaf_sizes(tree, w, h, &mut out);
+        }
+        out
+    }
+
+    /// Approximate size of the area the tab's pane tree fills.
+    pub(super) fn pane_area(&self, window: &Window) -> (f32, f32) {
         let viewport = window.viewport_size();
         let rem = |n: f32| f32::from(rems(n / 16.).to_pixels(window.rem_size()));
         // Vertical tabs and Files are separate columns. Keep pane hit-testing
@@ -96,11 +106,7 @@ impl Workspace {
             (f32::from(viewport.width) - rem(12.) - occupied(Side::Tabs) - occupied(Side::Files))
                 .max(0.);
         let h = f32::from(viewport.height) - rem(super::render::TITLE_BAR_HEIGHT + 6.);
-        let mut out = Vec::new();
-        if let Some(tree) = self.tab().and_then(|t| t.built_tree()) {
-            leaf_sizes(tree, w, h, &mut out);
-        }
-        out
+        (w, h)
     }
 
     // ── Workspaces ──────────────────────────────────────────────────────────
@@ -677,6 +683,91 @@ impl Workspace {
         }
         self.focus_pane(pane, window, cx);
         self.schedule_save(cx);
+    }
+
+    /// Split the focused pane, placing the new pane before it (left or above).
+    /// Falls back to a new tab when there is no focused pane or no room.
+    pub(super) fn split_before(
+        &mut self,
+        axis: SplitAxis,
+        what: Option<(PaneKind, PathBuf)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(focused) = self.focused_pane() else {
+            let root = self.space().root.clone();
+            self.open_tab(PaneKind::Agent, root, None, None, window, cx);
+            return;
+        };
+        let (kind, target) = match what {
+            Some(what) => what,
+            None => {
+                let pane = &self.panes[&focused];
+                let kind = pane.item.kind;
+                let target = match (kind, &pane.path) {
+                    (PaneKind::File, Some(path)) => path.clone(),
+                    _ => self.pane_cwd(pane, cx),
+                };
+                (kind, target)
+            }
+        };
+        let Some(pane) = self.new_pane(kind, target, None, None, window, cx) else {
+            return;
+        };
+        let room = self
+            .pane_sizes(window)
+            .into_iter()
+            .find(|(id, ..)| *id == focused)
+            .is_none_or(|(_, w, h)| fits_split(axis, w, h));
+        if !room {
+            self.push_pane_tab(pane, window, cx);
+            return;
+        }
+        if let Some(tree) = self.tab_mut().and_then(|t| t.built_tree_mut()) {
+            tree.insert(&focused, pane, axis, true);
+        }
+        self.focus_pane(pane, window, cx);
+        self.schedule_save(cx);
+    }
+
+    /// Move focus to the spatial neighbour of the focused pane.
+    pub(super) fn focus_neighbour(
+        &mut self,
+        direction: PaneDirection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(focused) = self.focused_pane() else {
+            return;
+        };
+        let Some(tree) = self.tab().and_then(|t| t.built_tree()) else {
+            return;
+        };
+        // `neighbour` wants the full size the tree fills, not the pane's.
+        let (w, h) = self.pane_area(window);
+        if let Some(next) = tree.neighbour(&focused, direction, w, h) {
+            self.focus_pane(next, window, cx);
+        }
+    }
+
+    /// Grow/shrink the focused pane in `direction` by one step.
+    pub(super) fn resize_pane(
+        &mut self,
+        direction: PaneDirection,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        const STEP: f32 = 0.05;
+        let Some(focused) = self.focused_pane() else {
+            return;
+        };
+        let Some(tree) = self.tab_mut().and_then(|t| t.built_tree_mut()) else {
+            return;
+        };
+        if tree.resize_toward(&focused, direction, STEP) {
+            self.schedule_save(cx);
+            cx.notify();
+        }
     }
 
     /// A new pane tiled like Hyprland's dwindle: the focused pane splits

@@ -20,6 +20,7 @@ pub(super) fn render(
         .gap_3()
         .child(view.interface_section(cx))
         .child(view.input_style_section(cx))
+        .child(view.keyboard_section(cx))
         .child(
             div()
                 .id("theme-drop")

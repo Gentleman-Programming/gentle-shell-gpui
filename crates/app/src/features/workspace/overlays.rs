@@ -15,21 +15,53 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.open_palette_internal(category, false, window, cx)
+    }
+
+    fn open_palette_internal(
+        &mut self,
+        category: Category,
+        deleting: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if let Some((Overlay::Palette(view), _)) = &self.overlay {
-            if view.read(cx).category() == category {
+            if view.read(cx).category() == category && !deleting {
                 self.close_overlay(window, cx);
             } else {
                 view.update(cx, |view, cx| view.set_category(category, window, cx));
+                if deleting {
+                    view.update(cx, |view, cx| view.show_workspace_deleter(window, cx));
+                }
             }
             return;
         }
-        self.start_active_session(window, cx);
+        if category != Category::Tabs {
+            self.start_active_session(window, cx);
+        }
         let commands = self
             .active_session()
             .map(|t| t.read(cx).commands())
             .unwrap_or_default();
         let workspaces = self.workspace_rows();
+        let tabs = self
+            .spaces
+            .iter()
+            .enumerate()
+            .flat_map(|(index, space)| {
+                self.sidebar_tabs(index)
+                    .into_iter()
+                    .map(|tab| crate::features::palette::TabRow {
+                        id: tab.id,
+                        title: tab.title.to_string(),
+                        workspace: space.name.clone(),
+                        icon: tab.kind.icon(),
+                        current: tab.shown,
+                    })
+            })
+            .collect();
         let input = PaletteInput {
+            tabs,
             commands,
             workspaces,
             root: self.space().root.clone(),
@@ -40,11 +72,29 @@ impl Workspace {
         let subscription = cx.subscribe_in(
             &view,
             window,
-            |this, _, event: &PaletteEvent, window, cx| match event {
+            |this, palette, event: &PaletteEvent, window, cx| match event {
                 PaletteEvent::Close => this.close_overlay(window, cx),
                 PaletteEvent::Run(PaletteAction::RenameWorkspace { index, name }) => {
                     // Renaming happens in place; the switcher stays open.
                     this.rename_workspace(*index, name.clone(), cx);
+                }
+                PaletteEvent::Run(PaletteAction::ActivateGlobalTab(id)) => {
+                    let target = super::spaces::resolve_tab(&this.spaces, *id);
+                    if let Some((space, tab)) = target {
+                        this.overlay = None;
+                        this.switch_workspace_to(space, Some(tab), window, cx);
+                    } else {
+                        this.close_overlay(window, cx);
+                    }
+                }
+                PaletteEvent::Run(PaletteAction::GoToTab) => {
+                    this.open_palette(Category::Tabs, window, cx)
+                }
+                PaletteEvent::Run(PaletteAction::OpenWorkspaces) => {
+                    palette.update(cx, |view, cx| view.show_workspace_picker(window, cx));
+                }
+                PaletteEvent::Run(PaletteAction::OpenDeleteWorkspace) => {
+                    palette.update(cx, |view, cx| view.show_workspace_deleter(window, cx));
                 }
                 PaletteEvent::Run(action) => {
                     this.close_overlay(window, cx);
@@ -52,8 +102,16 @@ impl Workspace {
                 }
             },
         );
+        if deleting {
+            view.update(cx, |view, cx| view.show_workspace_deleter(window, cx));
+        }
         self.overlay = Some((Overlay::Palette(view), subscription));
         cx.notify();
+    }
+
+    /// Open the workspace switcher in delete mode.
+    pub(super) fn open_workspace_deleter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_palette_internal(Category::Workspaces, true, window, cx);
     }
 
     /// Every workspace as the switcher lists it, with what its agents do.
@@ -69,6 +127,62 @@ impl Workspace {
                 activity: self.space_activity(space),
             })
             .collect()
+    }
+
+    /// Lists keymap file problems (one line each) among the notifications.
+    pub fn report_keymap(&mut self, messages: &[String], cx: &mut Context<Self>) {
+        self.keymap_notice(gentle_core::transcript::NoticeLevel::Warning, messages, cx);
+    }
+
+    fn keymap_notice(
+        &mut self,
+        level: gentle_core::transcript::NoticeLevel,
+        messages: &[String],
+        cx: &mut Context<Self>,
+    ) {
+        if messages.is_empty() {
+            return;
+        }
+        self.notices.update(cx, |store, cx| {
+            for message in messages {
+                store.push(
+                    level,
+                    message.clone(),
+                    "Keymap".into(),
+                    None,
+                    std::time::Instant::now(),
+                );
+            }
+            cx.notify();
+        });
+        cx.notify();
+    }
+
+    /// "Open keymap file": creates it from the template when missing (never
+    /// overwrites), then opens it in the file viewer.
+    fn open_keymap_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        use gentle_core::transcript::NoticeLevel;
+        let leader = crate::shared::keymap::load().leader;
+        match crate::shared::keymap::ensure(&leader) {
+            Ok(path) => {
+                if matches!(&self.overlay, Some((Overlay::Settings(_), _))) {
+                    self.close_overlay(window, cx);
+                }
+                self.open_file(path, window, cx);
+            }
+            Err(e) => self.keymap_notice(NoticeLevel::Error, &[e], cx),
+        }
+    }
+
+    /// "Reload keymap": rebinds every shortcut from the file without a restart.
+    fn reload_keymap(&mut self, cx: &mut Context<Self>) {
+        use gentle_core::transcript::NoticeLevel;
+        let messages = crate::app::bind_keys(cx);
+        if messages.is_empty() {
+            self.keymap_notice(NoticeLevel::Info, &["Keymap reloaded".into()], cx);
+        } else {
+            self.keymap_notice(NoticeLevel::Warning, &messages, cx);
+        }
     }
 
     pub(super) fn run_palette_action(
@@ -104,6 +218,9 @@ impl Workspace {
             }
             PaletteAction::Devices => self.devices.update(cx, |panel, cx| panel.show(cx)),
             PaletteAction::Settings => self.open_settings(window, cx),
+            PaletteAction::OpenKeymap => self.open_keymap_file(window, cx),
+            PaletteAction::ReloadKeymap => self.reload_keymap(cx),
+            PaletteAction::Shortcuts => self.open_shortcuts(window, cx),
             PaletteAction::Setup => self.open_onboarding(None, window, cx),
             PaletteAction::Welcome => self.open_welcome(None, window, cx),
             PaletteAction::InstallGsd => self.install_gsd(window, cx),
@@ -119,6 +236,34 @@ impl Workspace {
             PaletteAction::ClosePane => self.on_close_pane(&ClosePane, window, cx),
             PaletteAction::ReopenClosed => self.reopen_closed(window, cx),
             PaletteAction::ToggleSidebar => self.toggle_sidebar(cx),
+            PaletteAction::FocusComposer => self.on_focus_composer(&FocusComposer, window, cx),
+            PaletteAction::FocusFiles => self.on_focus_files(&FocusFiles, window, cx),
+            PaletteAction::FocusChanges => self.on_focus_changes(&FocusChanges, window, cx),
+            PaletteAction::NextTab => self.on_next_tab(&NextTab, window, cx),
+            PaletteAction::PrevTab => self.on_prev_tab(&PrevTab, window, cx),
+            PaletteAction::FocusNextPane => self.on_focus_next_pane(&FocusNextPane, window, cx),
+            PaletteAction::FocusPaneLeft => self.on_focus_pane_left(&FocusPaneLeft, window, cx),
+            PaletteAction::FocusPaneRight => self.on_focus_pane_right(&FocusPaneRight, window, cx),
+            PaletteAction::FocusPaneUp => self.on_focus_pane_up(&FocusPaneUp, window, cx),
+            PaletteAction::FocusPaneDown => self.on_focus_pane_down(&FocusPaneDown, window, cx),
+            PaletteAction::SplitLeft => self.on_split_left(&SplitLeft, window, cx),
+            PaletteAction::SplitUp => self.on_split_up(&SplitUp, window, cx),
+            PaletteAction::ResizePaneLeft => self.on_resize_pane_left(&ResizePaneLeft, window, cx),
+            PaletteAction::ResizePaneRight => {
+                self.on_resize_pane_right(&ResizePaneRight, window, cx)
+            }
+            PaletteAction::ResizePaneUp => self.on_resize_pane_up(&ResizePaneUp, window, cx),
+            PaletteAction::ResizePaneDown => self.on_resize_pane_down(&ResizePaneDown, window, cx),
+            PaletteAction::TogglePaneMode => self.on_toggle_pane_mode(&TogglePaneMode, window, cx),
+            PaletteAction::FocusPrevPane => self.on_focus_prev_pane(&FocusPrevPane, window, cx),
+            PaletteAction::ActivateTab(n) => {
+                let index = if n == 9 {
+                    self.space().tabs.len().saturating_sub(1)
+                } else {
+                    n.saturating_sub(1)
+                };
+                self.activate(index, window, cx);
+            }
             PaletteAction::SetTabLayout(layout) => self.set_tab_layout(layout, cx),
             PaletteAction::Agents => {
                 if let Some(tab) = tab {
@@ -136,6 +281,11 @@ impl Workspace {
                 }
             }
             PaletteAction::Screen(screen) => self.open_screen(screen, tab, window, cx),
+            PaletteAction::GoToTab => self.open_palette(Category::Tabs, window, cx),
+            PaletteAction::ActivateGlobalTab(_) => {}
+            PaletteAction::OpenWorkspaces => self.open_palette(Category::Workspaces, window, cx),
+            PaletteAction::OpenDeleteWorkspace => self.open_workspace_deleter(window, cx),
+            PaletteAction::CreateWorkspaceFromFolder => self.open_explorer(window, cx),
             PaletteAction::SwitchWorkspace(index) => self.switch_workspace(index, window, cx),
             PaletteAction::RenameWorkspace { index, name } => {
                 self.rename_workspace(index, name, cx)
@@ -143,23 +293,19 @@ impl Workspace {
             PaletteAction::DeleteWorkspace(index) => {
                 self.confirm_delete_workspace(index, window, cx)
             }
-            PaletteAction::CreateWorkspace {
-                name,
-                pick_folder: false,
-            } => {
+            PaletteAction::CreateWorkspace { name } => {
                 let root = self.active_cwd(cx);
                 self.create_workspace(Some(name), root, window, cx);
             }
-            PaletteAction::CreateWorkspace {
-                name,
-                pick_folder: true,
-            } => self.pick_workspace_folder(Some(name), window, cx),
             PaletteAction::OpenFile(path) => self.open_file(path, window, cx),
             PaletteAction::SwitchBranch(branch) => self.confirm_switch_branch(branch, window, cx),
         }
     }
 
-    /// The folder explorer (⌘O / Ctrl+O), from the focused pane's folder.
+    /// The folder explorer (⌘O / Ctrl+O), from the focused pane's folder. Its
+    /// "Open Gentle Shell here" (⌘↵, Ctrl+↵ off macOS) is also how "Create
+    /// workspace" picks the folder: `show_folder` creates or selects the
+    /// workspace rooted there, named after it.
     pub(super) fn open_explorer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some((Overlay::Explorer(_), _)) = &self.overlay {
             self.close_overlay(window, cx);
@@ -474,6 +620,8 @@ impl Workspace {
                     }
                 }
                 SettingsEvent::OpenProfiles => this.open_profiles(window, cx),
+                SettingsEvent::OpenKeymap => this.open_keymap_file(window, cx),
+                SettingsEvent::ReloadKeymap => this.reload_keymap(cx),
                 SettingsEvent::Changed => {
                     for tab in this.sessions() {
                         tab.update(cx, |session, cx| session.reload_models(window, cx));
@@ -560,6 +708,19 @@ impl Workspace {
             },
         );
         self.overlay = Some((Overlay::Docs(view), subscription));
+        cx.notify();
+    }
+
+    pub(super) fn open_shortcuts(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let view = cx.new(|cx| ShortcutsView::new(window, cx));
+        let subscription = cx.subscribe_in(
+            &view,
+            window,
+            |this, _, event: &ShortcutsEvent, window, cx| match event {
+                ShortcutsEvent::Close => this.close_overlay(window, cx),
+            },
+        );
+        self.overlay = Some((Overlay::Shortcuts(view), subscription));
         cx.notify();
     }
 

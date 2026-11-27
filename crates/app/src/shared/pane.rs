@@ -141,6 +141,15 @@ pub enum SplitAxis {
     Vertical,
 }
 
+/// Spatial direction for pane navigation and resize.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PaneDirection {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
 /// Binary split tree; `L` is a live [`PaneId`] or a saved pane description.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -154,6 +163,10 @@ pub enum PaneTree<L> {
         second: Box<PaneTree<L>>,
     },
 }
+
+/// Space a divider takes between two panes; kept here so the shared pane
+/// tree can compute geometry without depending on workspace layout.
+pub const DIVIDER: f32 = 6.;
 
 /// Dividers can't squeeze a pane below this share.
 pub const MIN_RATIO: f32 = 0.1;
@@ -325,6 +338,191 @@ impl<L: Clone + PartialEq> PaneTree<L> {
                 }
             }
             (PaneTree::Leaf(_), _) => false,
+        }
+    }
+
+    /// Every leaf's rectangle when the tree fills `x,y,w,h`. Coordinates are
+    /// window pixels: x grows right, y grows down.
+    pub fn leaf_rects(
+        &self,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        out: &mut Vec<(L, f32, f32, f32, f32)>,
+    ) {
+        match self {
+            PaneTree::Leaf(l) => out.push((l.clone(), x, y, w, h)),
+            PaneTree::Split {
+                axis,
+                ratio,
+                first,
+                second,
+            } => {
+                if *axis == SplitAxis::Horizontal {
+                    let inner = w - DIVIDER;
+                    let first_w = inner * ratio;
+                    let second_w = inner * (1. - ratio);
+                    first.leaf_rects(x, y, first_w, h, out);
+                    second.leaf_rects(x + first_w + DIVIDER, y, second_w, h, out);
+                } else {
+                    let inner = h - DIVIDER;
+                    let first_h = inner * ratio;
+                    let second_h = inner * (1. - ratio);
+                    first.leaf_rects(x, y, w, first_h, out);
+                    second.leaf_rects(x, y + first_h + DIVIDER, w, second_h, out);
+                }
+            }
+        }
+    }
+
+    /// The pane spatially adjacent to `target` in `direction`: the candidate
+    /// whose center lies in that direction and whose perpendicular overlap
+    /// with `target` is largest; ties favour the nearest along the primary axis.
+    /// `w` and `h` are the full size the tree fills, in pixels. `None` at the
+    /// edge or when `target` is missing.
+    pub fn neighbour(&self, target: &L, direction: PaneDirection, w: f32, h: f32) -> Option<L> {
+        let mut rects = Vec::new();
+        self.leaf_rects(0., 0., w, h, &mut rects);
+        let (fx, fy, fw, fh) = rects
+            .iter()
+            .find(|(l, _, _, _, _)| l == target)
+            .map(|(_, x, y, w, h)| (*x, *y, *w, *h))?;
+        let fcx = fx + fw / 2.;
+        let fcy = fy + fh / 2.;
+        let mut best: Option<(L, f32, f32)> = None;
+        for (l, cx, cy, cw, ch) in rects {
+            if &l == target {
+                continue;
+            }
+            let ccx = cx + cw / 2.;
+            let ccy = cy + ch / 2.;
+            let in_direction = match direction {
+                PaneDirection::Left => ccx < fcx,
+                PaneDirection::Right => ccx > fcx,
+                PaneDirection::Up => ccy < fcy,
+                PaneDirection::Down => ccy > fcy,
+            };
+            if !in_direction {
+                continue;
+            }
+            let overlap = match direction {
+                PaneDirection::Left | PaneDirection::Right => (fy + fh).min(cy + ch) - fy.max(cy),
+                PaneDirection::Up | PaneDirection::Down => (fx + fw).min(cx + cw) - fx.max(cx),
+            };
+            let overlap = overlap.max(0.)
+                / match direction {
+                    PaneDirection::Left | PaneDirection::Right => fh.min(ch),
+                    PaneDirection::Up | PaneDirection::Down => fw.min(cw),
+                };
+            let distance = match direction {
+                PaneDirection::Left => fcx - ccx,
+                PaneDirection::Right => ccx - fcx,
+                PaneDirection::Up => fcy - ccy,
+                PaneDirection::Down => ccy - fcy,
+            };
+            // Overlaps are normalized ratios: differences below EPSILON are
+            // float noise, so such ties fall to distance and then to reading
+            // order (the first candidate seen is kept).
+            const EPSILON: f32 = 1e-4;
+            let better = best.as_ref().is_none_or(|(_, best_overlap, best_dist)| {
+                overlap > *best_overlap + EPSILON
+                    || ((overlap - *best_overlap).abs() <= EPSILON
+                        && distance < *best_dist - EPSILON)
+            });
+            if better {
+                best = Some((l, overlap, distance));
+            }
+        }
+        best.map(|(l, _, _)| l)
+    }
+
+    /// Grow `target` in `direction` by `step` by adjusting the closest divider
+    /// that bounds it on that side. `true` when such a divider exists; the
+    /// ratio is clamped by [`set_ratio`].
+    pub fn resize_toward(&mut self, target: &L, direction: PaneDirection, step: f32) -> bool {
+        let path = self.path_to(target);
+        for depth in (0..path.len()).rev() {
+            let prefix = &path[..depth];
+            let side = path[depth];
+            let Some(axis) = self.axis_at(prefix) else {
+                continue;
+            };
+            let axis_matches = match direction {
+                PaneDirection::Left | PaneDirection::Right => axis == SplitAxis::Horizontal,
+                PaneDirection::Up | PaneDirection::Down => axis == SplitAxis::Vertical,
+            };
+            let on_far_side = match direction {
+                PaneDirection::Left | PaneDirection::Up => side,
+                PaneDirection::Right | PaneDirection::Down => !side,
+            };
+            if axis_matches && on_far_side {
+                let Some(ratio) = self.ratio_at(prefix) else {
+                    continue;
+                };
+                let new_ratio = match direction {
+                    PaneDirection::Left | PaneDirection::Up => ratio - step,
+                    PaneDirection::Right | PaneDirection::Down => ratio + step,
+                };
+                self.set_ratio(prefix, new_ratio);
+                return true;
+            }
+        }
+        false
+    }
+
+    fn axis_at(&self, path: &[bool]) -> Option<SplitAxis> {
+        match (self, path.split_first()) {
+            (PaneTree::Split { axis, .. }, None) => Some(*axis),
+            (PaneTree::Split { first, second, .. }, Some((side, rest))) => {
+                if *side {
+                    second.axis_at(rest)
+                } else {
+                    first.axis_at(rest)
+                }
+            }
+            (PaneTree::Leaf(_), _) => None,
+        }
+    }
+
+    fn ratio_at(&self, path: &[bool]) -> Option<f32> {
+        match (self, path.split_first()) {
+            (PaneTree::Split { ratio, .. }, None) => Some(*ratio),
+            (PaneTree::Split { first, second, .. }, Some((side, rest))) => {
+                if *side {
+                    second.ratio_at(rest)
+                } else {
+                    first.ratio_at(rest)
+                }
+            }
+            (PaneTree::Leaf(_), _) => None,
+        }
+    }
+
+    /// Path from the root to `target`: `false` for the first child, `true` for
+    /// the second, one entry per split on the way to the leaf.
+    fn path_to(&self, target: &L) -> Vec<bool> {
+        let mut path = Vec::new();
+        self.path_to_inner(target, &mut path);
+        path
+    }
+
+    fn path_to_inner(&self, target: &L, path: &mut Vec<bool>) -> bool {
+        match self {
+            PaneTree::Leaf(l) => l == target,
+            PaneTree::Split { first, second, .. } => {
+                path.push(false);
+                if first.path_to_inner(target, path) {
+                    return true;
+                }
+                path.pop();
+                path.push(true);
+                if second.path_to_inner(target, path) {
+                    return true;
+                }
+                path.pop();
+                false
+            }
         }
     }
 
@@ -505,5 +703,167 @@ mod tests {
         let mapped = tree.filter_map(&mut |l| (*l != 2).then(|| l * 10)).unwrap();
         assert_eq!(mapped, leaf(10));
         assert_eq!(tree.len(), 2);
+    }
+
+    use super::PaneDirection;
+
+    fn h(a: usize, b: usize) -> PaneTree<usize> {
+        let mut tree = leaf(a);
+        tree.split(&a, b, SplitAxis::Horizontal);
+        tree
+    }
+
+    fn v(a: usize, b: usize) -> PaneTree<usize> {
+        let mut tree = leaf(a);
+        tree.split(&a, b, SplitAxis::Vertical);
+        tree
+    }
+
+    const SIZE: f32 = 1000.;
+
+    #[test]
+    fn neighbour_picks_the_overlapping_pane_in_direction() {
+        // [1 | 2]: 1 left, 2 right.
+        let tree = h(1, 2);
+        assert_eq!(
+            tree.neighbour(&1, PaneDirection::Right, SIZE, SIZE),
+            Some(2)
+        );
+        assert_eq!(tree.neighbour(&2, PaneDirection::Left, SIZE, SIZE), Some(1));
+        assert_eq!(tree.neighbour(&1, PaneDirection::Left, SIZE, SIZE), None);
+        assert_eq!(tree.neighbour(&2, PaneDirection::Right, SIZE, SIZE), None);
+    }
+
+    #[test]
+    fn neighbour_finds_pane_above_or_below() {
+        // [1 / 2]: 1 top, 2 bottom.
+        let tree = v(1, 2);
+        assert_eq!(tree.neighbour(&1, PaneDirection::Down, SIZE, SIZE), Some(2));
+        assert_eq!(tree.neighbour(&2, PaneDirection::Up, SIZE, SIZE), Some(1));
+        assert_eq!(tree.neighbour(&1, PaneDirection::Up, SIZE, SIZE), None);
+    }
+
+    #[test]
+    fn nested_splits_pick_best_perpendicular_overlap() {
+        // [[1 | 2] / [3 | 4]]: two rows of two columns, sized in pixels so
+        // the 6 px divider leaves positive pane widths.
+        let tree = PaneTree::Split {
+            axis: SplitAxis::Vertical,
+            ratio: 0.5,
+            first: Box::new(h(1, 2)),
+            second: Box::new(h(3, 4)),
+        };
+        // 1 is top-left. Directly right is 2; below is 4? No — bottom-left 3
+        // sits under the left half, so it overlaps 1 fully; bottom-right 4 is
+        // under the right half and overlaps 2.
+        assert_eq!(
+            tree.neighbour(&1, PaneDirection::Right, SIZE, SIZE),
+            Some(2)
+        );
+        assert_eq!(tree.neighbour(&1, PaneDirection::Down, SIZE, SIZE), Some(3));
+        assert_eq!(tree.neighbour(&2, PaneDirection::Down, SIZE, SIZE), Some(4));
+        assert_eq!(
+            tree.neighbour(&3, PaneDirection::Right, SIZE, SIZE),
+            Some(4)
+        );
+        assert_eq!(tree.neighbour(&4, PaneDirection::Left, SIZE, SIZE), Some(3));
+    }
+
+    #[test]
+    fn resize_changes_the_closest_divider() {
+        // [1 | 2], grow 1 to the right -> ratio increases.
+        let mut tree = h(1, 2);
+        assert!(tree.resize_toward(&1, PaneDirection::Right, 0.05));
+        let PaneTree::Split { ratio, .. } = &tree else {
+            panic!("expected a split")
+        };
+        assert!((*ratio - 0.55).abs() < 0.001);
+
+        // [1 | 2], grow 2 to the left -> ratio decreases.
+        let mut tree = h(1, 2);
+        assert!(tree.resize_toward(&2, PaneDirection::Left, 0.05));
+        let PaneTree::Split { ratio, .. } = &tree else {
+            panic!("expected a split")
+        };
+        assert!((*ratio - 0.45).abs() < 0.001);
+    }
+
+    #[test]
+    fn neighbour_uneven_ratios_and_tie() {
+        // [1 | [2 / 3]]: both 2 and 3 are fully beside 1, so they tie on
+        // overlap whatever the ratios; reading order (2) must always win.
+        for outer in [0.3, 0.37, 0.5, 0.63, 0.7] {
+            for inner in [0.3, 0.37, 0.5, 0.63, 0.7] {
+                let mut tree = h(1, 2);
+                tree.split(&2, 3, SplitAxis::Vertical);
+                tree.set_ratio(&[], outer);
+                tree.set_ratio(&[true], inner);
+                assert_eq!(
+                    tree.neighbour(&1, PaneDirection::Right, SIZE, SIZE),
+                    Some(2),
+                    "outer {outer} inner {inner}"
+                );
+                assert_eq!(tree.neighbour(&3, PaneDirection::Left, SIZE, SIZE), Some(1));
+            }
+        }
+    }
+
+    #[test]
+    fn neighbour_single_pane_none() {
+        let tree = leaf(1);
+        for d in [
+            PaneDirection::Left,
+            PaneDirection::Right,
+            PaneDirection::Up,
+            PaneDirection::Down,
+        ] {
+            assert_eq!(tree.neighbour(&1, d, SIZE, SIZE), None);
+        }
+    }
+
+    #[test]
+    fn resize_nested_uses_closest_divider() {
+        // [1 | [2 / 3]]: growing 3 upward moves only the inner divider.
+        let mut tree = h(1, 2);
+        tree.split(&2, 3, SplitAxis::Vertical);
+        assert!(tree.resize_toward(&3, PaneDirection::Up, 0.05));
+        let PaneTree::Split { ratio, second, .. } = &tree else {
+            panic!("expected a split")
+        };
+        assert_eq!(*ratio, 0.5);
+        let PaneTree::Split { ratio: inner, .. } = &**second else {
+            panic!("expected a nested split")
+        };
+        assert!((*inner - 0.45).abs() < 0.001);
+    }
+
+    #[test]
+    fn resize_clamps_at_minimum_pane_size() {
+        // [1 | 2], grow 1 right repeatedly; ratio stops at 0.9 (1-MIN_RATIO).
+        let mut tree = h(1, 2);
+        assert!(tree.resize_toward(&1, PaneDirection::Right, 1.0));
+        let PaneTree::Split { ratio, .. } = &tree else {
+            panic!("expected a split")
+        };
+        assert_eq!(*ratio, 0.9);
+    }
+
+    #[test]
+    fn resize_at_edge_does_nothing() {
+        // [1 | 2], grow 1 left: no divider to the left.
+        let mut tree = h(1, 2);
+        assert!(!tree.resize_toward(&1, PaneDirection::Left, 0.05));
+    }
+
+    #[test]
+    fn cycle_next_and_prev_still_wrap() {
+        let mut tree = leaf(1);
+        tree.split(&1, 2, SplitAxis::Horizontal);
+        tree.split(&2, 3, SplitAxis::Vertical);
+        // [1 | [2 / 3]]: reading order is 1, 2, 3.
+        assert_eq!(tree.cycle(&1, true), Some(2));
+        assert_eq!(tree.cycle(&2, true), Some(3));
+        assert_eq!(tree.cycle(&3, true), Some(1));
+        assert_eq!(tree.cycle(&1, false), Some(3));
     }
 }

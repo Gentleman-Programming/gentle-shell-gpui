@@ -329,8 +329,7 @@ impl Workspace {
                 PopupMenuItem::new("New workspace")
                     .icon(Icon::new(IconName::FolderPlus))
                     .on_click(move |_, window, cx| {
-                        let _ = new_space
-                            .update(cx, |this, cx| this.pick_workspace_folder(None, window, cx));
+                        let _ = new_space.update(cx, |this, cx| this.open_explorer(window, cx));
                     }),
             )
             .separator();
@@ -1072,6 +1071,13 @@ mod tests {
                         browser_dock_room: Default::default(),
                         resume_welcome: None,
                         drop_hint: None,
+                        pane_mode: false,
+                        pane_mode_focus: cx.focus_handle(),
+                        which_key: None,
+                        leader: None,
+                        tab_list_focus: cx.focus_handle(),
+                        tab_list_highlight: None,
+                        tab_list_return_focus: None,
                         closed: Vec::new(),
                         music: cx.new(|cx| Music::new(window, cx)),
                         devices: cx.new(DevicePanel::new),

@@ -150,7 +150,7 @@ pub fn attach_sidebar(
     cx: &mut App,
 ) {
     use crate::features::files::{FileTreeEvent, FileTreeView};
-    use crate::features::workspace::WorkspaceEvent;
+    use crate::features::workspace::{SidebarFocus, WorkspaceEvent};
 
     /// A tree for `root` in the sidebar; the returned subscription keeps it
     /// following the sidebar's visibility.
@@ -197,11 +197,22 @@ pub fn attach_sidebar(
             })
             .detach();
         let visible = tree.downgrade();
-        let toggled = window.subscribe(workspace, cx, move |_, event: &WorkspaceEvent, _, cx| {
-            if let WorkspaceEvent::FilesVisibilityChanged(shown) = event {
-                let _ = visible.update(cx, |tree, cx| tree.set_visible(*shown, cx));
-            }
-        });
+        let toggled = window.subscribe(
+            workspace,
+            cx,
+            move |_, event: &WorkspaceEvent, window, cx| match event {
+                WorkspaceEvent::FilesVisibilityChanged(shown) => {
+                    let _ = visible.update(cx, |tree, cx| tree.set_visible(*shown, cx));
+                }
+                WorkspaceEvent::FocusSidebar(target) => {
+                    let _ = visible.update(cx, |tree, cx| match target {
+                        SidebarFocus::Files => tree.focus_files(window, cx),
+                        SidebarFocus::Changes => tree.focus_changes(window, cx),
+                    });
+                }
+                _ => {}
+            },
+        );
         workspace.update(cx, |workspace, cx| workspace.set_sidebar(tree.into(), cx));
         toggled
     }

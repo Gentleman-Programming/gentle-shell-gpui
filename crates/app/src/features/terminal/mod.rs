@@ -32,6 +32,13 @@ use crate::platform::shell_idle::ShellIdle;
 use crate::shared::ui;
 
 /// Font size and padding in px at 100 %; they follow the interface size.
+/// Registers the terminal's key bindings from the app's defaults (like every
+/// other feature's `bind_keys`), so a keymap reload rebinds them instead of
+/// the first terminal installing them once.
+pub(crate) fn bind_keys(cx: &mut App) {
+    keys::bind_keys(cx);
+}
+
 const FONT_SIZE: f32 = 13.;
 const LINE_HEIGHT: f32 = 1.3;
 const PADDING: f32 = 10.;
@@ -249,7 +256,6 @@ fn mono_font() -> Font {
 
 impl TerminalView {
     pub fn new(cwd: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        keys::install(cx);
         let (tx, rx) = async_channel::unbounded::<TermEvent>();
         let listener = Listener(tx);
         let dims = TermDims {
@@ -544,7 +550,10 @@ impl TerminalView {
             return;
         }
         // Composition in progress or plain text: the input handler delivers it.
-        if self.marked.is_some() || keys::is_text_input(ks) {
+        if self.marked.is_some()
+            || keys::is_text_input(ks)
+            || (cfg!(windows) && keys::altgr_composes(ks, event.prefer_character_input))
+        {
             return;
         }
         let app_cursor = self.term.lock().mode().contains(TermMode::APP_CURSOR);

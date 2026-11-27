@@ -2,6 +2,17 @@
 
 use super::*;
 
+pub(super) fn resolve_tab(spaces: &[Space], id: usize) -> Option<(usize, usize)> {
+    spaces
+        .iter()
+        .enumerate()
+        .find_map(|(space, entry)| Some((space, entry.tabs.iter().position(|tab| tab.id == id)?)))
+}
+
+fn tab_to_activate(space: &Space, requested: Option<usize>) -> Option<usize> {
+    (!space.tabs.is_empty()).then(|| requested.unwrap_or(space.active))
+}
+
 impl Workspace {
     pub(super) fn space(&self) -> &Space {
         &self.spaces[self.current]
@@ -24,6 +35,16 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.switch_workspace_to(index, None, window, cx);
+    }
+
+    pub(super) fn switch_workspace_to(
+        &mut self,
+        index: usize,
+        tab: Option<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if index >= self.spaces.len() {
             return;
         }
@@ -34,8 +55,7 @@ impl Workspace {
         self.finish_workspace_rename(true, window, cx);
         let changed = index != self.current;
         self.current = index;
-        if !self.space().tabs.is_empty() {
-            let active = self.space().active;
+        if let Some(active) = tab_to_activate(self.space(), tab) {
             self.activate(active, window, cx);
         } else {
             // An empty workspace has no pane to own the keyboard: keep the
@@ -107,7 +127,6 @@ impl Workspace {
         })
         .detach();
     }
-
     /// Point the shown workspace at another folder: the sidebar re-roots on
     /// [`WorkspaceEvent::RootChanged`] and new tabs open there. Open tabs
     /// keep their own folders.
@@ -398,4 +417,38 @@ impl Workspace {
     }
 
     // ── Panes ───────────────────────────────────────────────────────────────
+}
+
+#[cfg(test)]
+mod picker_tests {
+    use std::path::PathBuf;
+
+    use super::{PaneTree, Space, Tab, TabState, resolve_tab, tab_to_activate};
+
+    #[test]
+    fn global_tab_picker_resolves_only_the_target_and_preserves_plain_switch_selection() {
+        let space = |name: &str, ids: &[usize], active| {
+            let mut space = Space::new(name.into(), PathBuf::new());
+            space.active = active;
+            space.tabs = ids
+                .iter()
+                .map(|&id| Tab {
+                    id,
+                    pinned: false,
+                    state: TabState::Built {
+                        tree: PaneTree::Leaf(id),
+                        focused: id,
+                    },
+                })
+                .collect();
+            space
+        };
+        let spaces = [space("Alpha", &[17], 0), space("Beta", &[42, 43], 1)];
+        let (workspace, tab) = resolve_tab(&spaces, 42).unwrap();
+        assert_eq!((workspace, tab), (1, 0));
+        assert_eq!(tab_to_activate(&spaces[workspace], Some(tab)), Some(0));
+        assert_eq!(tab_to_activate(&spaces[workspace], None), Some(1));
+        assert_eq!(resolve_tab(&spaces, 99), None);
+        assert_eq!(tab_to_activate(&space("Empty", &[], 0), None), None);
+    }
 }

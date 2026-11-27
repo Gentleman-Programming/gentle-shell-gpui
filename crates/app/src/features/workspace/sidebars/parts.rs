@@ -149,6 +149,14 @@ impl Workspace {
             .when(!tab.shown && !selected, |d| {
                 d.hover(|s| s.bg(ui::surface_hover()))
             })
+            .when(
+                self.tab_list_highlight
+                    .is_some_and(|(s, i)| s == tab.space && i == tab.index),
+                |d| {
+                    d.bg(ui::petal().opacity(0.12))
+                        .border_color(ui::petal().opacity(0.45))
+                },
+            )
             .when(!self.popups_open(), |d| {
                 d.tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
             })

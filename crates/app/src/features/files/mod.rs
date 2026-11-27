@@ -82,10 +82,17 @@ impl Render for FileDrag {
     }
 }
 
-/// Key bindings and the diagram renderer's state.
+/// The tree's and the diagram renderer's state.
 pub fn init(cx: &mut App) {
     tree::init(cx);
     mermaid::init(cx);
+}
+
+/// Every key binding of this feature (the app rebinds them on keymap reload).
+pub fn bind_keys(cx: &mut App) {
+    tree::bind_keys(cx);
+    changes::bind_keys(cx);
+    FileView::bind_keys(cx);
 }
 
 /// The icon and tint for a file name in the tree, and in the composer's `@`

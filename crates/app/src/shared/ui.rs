@@ -657,30 +657,24 @@ pub fn provider_color(provider: &str) -> Hsla {
     palette[hash % palette.len()]
 }
 
-/// Prefix used by common Cmd shortcuts on macOS and Ctrl shortcuts elsewhere.
-///
-/// This matches the `key!()` bindings in `app/mod.rs`. Shortcuts that differ
-/// beyond their primary modifier should use [`platform_shortcut`] instead.
-pub const fn shortcut_prefix() -> &'static str {
-    if cfg!(target_os = "macos") {
-        "⌘"
-    } else {
-        "Ctrl+"
-    }
-}
-
 /// Display a Cmd/Ctrl shortcut, such as `⌘K` or `Ctrl+K`.
 pub fn shortcut(key: &str) -> String {
-    format!("{}{key}", shortcut_prefix())
+    let binding = if cfg!(target_os = "macos") {
+        format!("cmd-{key}")
+    } else {
+        format!("ctrl-{key}")
+    };
+    gentle_core::keyboard::format_binding(&binding, cfg!(target_os = "macos"))
 }
 
 /// Display a Cmd/Ctrl+Shift shortcut, such as `⌘⇧T` or `Ctrl+Shift+T`.
 pub fn shortcut_shift(key: &str) -> String {
-    if cfg!(target_os = "macos") {
-        format!("⌘⇧{key}")
+    let binding = if cfg!(target_os = "macos") {
+        format!("cmd-shift-{key}")
     } else {
-        format!("Ctrl+Shift+{key}")
-    }
+        format!("ctrl-shift-{key}")
+    };
+    gentle_core::keyboard::format_binding(&binding, cfg!(target_os = "macos"))
 }
 
 /// A shortcut with genuinely different bindings on each platform.
@@ -1455,15 +1449,14 @@ mod tests {
 
     #[test]
     fn shortcuts_follow_the_platform_key_bindings() {
-        let (simple, shifted, special, prefix) = if cfg!(target_os = "macos") {
-            ("⌘K", "⌘⇧T", "⌘D", "⌘")
+        let (simple, shifted, special) = if cfg!(target_os = "macos") {
+            ("⌘K", "⌘⇧T", "⌘D")
         } else {
-            ("Ctrl+K", "Ctrl+Shift+T", "Ctrl+Shift+D", "Ctrl+")
+            ("Ctrl+K", "Ctrl+Shift+T", "Ctrl+Shift+D")
         };
         assert_eq!(shortcut("K"), simple);
         assert_eq!(shortcut_shift("T"), shifted);
         assert_eq!(platform_shortcut("⌘D", "Ctrl+Shift+D"), special);
-        assert_eq!(shortcut_prefix(), prefix);
     }
 
     #[test]

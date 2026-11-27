@@ -33,6 +33,7 @@ use crate::features::review::{ReviewEvent, ReviewView};
 use crate::features::session::{AgentsTab, SessionEvent, SessionView};
 use crate::features::sessions::{SessionsEvent, SessionsView};
 use crate::features::settings::{SettingsEvent, SettingsView};
+use crate::features::shortcuts::{ShortcutsEvent, ShortcutsView, WhichKey};
 use crate::features::tower::TowerView;
 use crate::features::usage::{UsageEvent, UsageView};
 use crate::features::welcome::{WelcomeEvent, WelcomeView};
@@ -40,8 +41,8 @@ use crate::features::workspaces::{
     self, Badge, SavedPane, SavedState, SavedTab, SavedWorkspace, TabLayout,
 };
 use crate::shared::pane::{
-    AskAgent, CloseViewer, OpenCommitDiff, OpenTerminalAt, PaneFactories, PaneId, PaneItem,
-    PaneKind, PaneTree, ShowInPane, SplitAxis,
+    AskAgent, CloseViewer, OpenCommitDiff, OpenTerminalAt, PaneDirection, PaneFactories, PaneId,
+    PaneItem, PaneKind, PaneTree, ShowInPane, SplitAxis,
 };
 use crate::shared::ui;
 use gentle_core::commands::Screen;
@@ -57,9 +58,15 @@ mod panes;
 mod persistence;
 mod render;
 mod sidebar_motion;
-mod sidebars;
+pub mod sidebars;
 mod spaces;
 mod stages;
+#[cfg(test)]
+mod t10_tests;
+#[cfg(test)]
+mod t11_tests;
+#[cfg(test)]
+pub(crate) mod t8_verifier;
 mod tab_panel;
 mod tabs;
 mod view;
@@ -94,14 +101,50 @@ actions!(
         OpenSessions,
         OpenPalette,
         OpenWorkspaces,
+        GoToTab,
+        CreateWorkspace,
+        DeleteWorkspace,
         OpenSettings,
+        OpenShortcuts,
         OpenExplorer,
         CloseOverlay,
-        Quit
+        Quit,
+        ActivateTab1,
+        ActivateTab2,
+        ActivateTab3,
+        ActivateTab4,
+        ActivateTab5,
+        ActivateTab6,
+        ActivateTab7,
+        ActivateTab8,
+        ActivateTab9,
+        FocusComposer,
+        FocusFiles,
+        FocusChanges,
+        FocusPaneLeft,
+        FocusPaneRight,
+        FocusPaneUp,
+        FocusPaneDown,
+        ResizePaneLeft,
+        ResizePaneRight,
+        ResizePaneUp,
+        ResizePaneDown,
+        SplitLeft,
+        SplitUp,
+        TogglePaneMode,
+        ExitPaneMode,
+        FocusTabList,
     ]
 );
 
 const COMPACT_SIDEBAR_WIDTH: f32 = 48.;
+
+/// Which tab of the right Files sidebar should receive focus.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SidebarFocus {
+    Files,
+    Changes,
+}
 
 /// What the window tells whoever embeds things in it (the sidebar's owner).
 pub enum WorkspaceEvent {
@@ -109,6 +152,8 @@ pub enum WorkspaceEvent {
     RootChanged(PathBuf),
     /// Whether the right-side Files panel is shown.
     FilesVisibilityChanged(bool),
+    /// Ask the sidebar owner to show the panel and focus one of its tabs.
+    FocusSidebar(SidebarFocus),
 }
 
 /// A window-level screen drawn over the active tab.
@@ -121,6 +166,7 @@ enum Overlay {
     Memory(Entity<MemoryView>),
     Docs(Entity<DocsView>),
     Settings(Entity<SettingsView>),
+    Shortcuts(Entity<ShortcutsView>),
     Profiles(Entity<ProfilesView>),
     Review(Entity<ReviewView>),
     Onboarding(Entity<OnboardingView>),
@@ -472,6 +518,24 @@ pub struct Workspace {
     /// While a pane is dragged: the pane under the pointer and where it would
     /// land there.
     drop_hint: Option<(PaneId, DropZone)>,
+    /// Sticky pane mode: hjkl/HJKL/v/s/x act on panes and other keys are
+    /// swallowed until Esc or Enter.
+    pane_mode: bool,
+    /// Holds keyboard focus during pane mode: it has no input handler (no IME)
+    /// and no deeper key contexts, so the pane-mode keys and the swallow of
+    /// everything else apply wherever focus was before.
+    pane_mode_focus: FocusHandle,
+    /// The keys that can follow the key sequence pending in the window.
+    which_key: Option<WhichKey>,
+    /// The leader guide: pending until a choice, from whatever focus opened it.
+    leader: Option<(Option<FocusHandle>, LeaderSelection)>,
+    /// Keyboard focus for the vertical tab sidebar while it is being
+    /// navigated with the keyboard.
+    tab_list_focus: FocusHandle,
+    /// The tab highlighted in the sidebar, without activating it.
+    tab_list_highlight: Option<(usize, usize)>,
+    /// Where focus was before the tab list took it, so Esc can return there.
+    tab_list_return_focus: Option<FocusHandle>,
     /// Panes and tabs closed, most recent last, to reopen.
     closed: Vec<closed::Closed>,
     /// gentle-stream, behind the title bar's ♪ button.
@@ -485,6 +549,9 @@ pub struct Workspace {
     /// key bindings back in reach until a pane or an overlay takes over.
     focus: gpui_kit::FocusHandle,
 }
+
+mod composer_leader;
+use composer_leader::LeaderSelection;
 
 impl EventEmitter<WorkspaceEvent> for Workspace {}
 
@@ -563,6 +630,15 @@ impl Workspace {
                 },
             ),
         ];
+        lifecycle.push(composer_leader::watch_leader_keys(cx.weak_entity(), cx));
+        // The which-key hint follows the window's pending key sequence.
+        lifecycle.push(cx.observe_pending_input(window, |this, window, cx| {
+            let hint = crate::features::shortcuts::pending_hint(window, cx);
+            if this.which_key != hint {
+                this.which_key = hint;
+                cx.notify();
+            }
+        }));
         lifecycle.push(
             cx.subscribe_in(&tab_search, window, |_, _, _: &InputEvent, _, cx| {
                 cx.notify()
@@ -606,6 +682,13 @@ impl Workspace {
             browser_dock_room: Default::default(),
             resume_welcome: None,
             drop_hint: None,
+            pane_mode: false,
+            pane_mode_focus: cx.focus_handle(),
+            which_key: None,
+            leader: None,
+            tab_list_focus: cx.focus_handle(),
+            tab_list_highlight: None,
+            tab_list_return_focus: None,
             closed: Vec::new(),
             music,
             devices,

@@ -102,7 +102,7 @@ impl SettingsPage {
                 "home setup requirements agent directory configuration launcher path environment initial diagnostics performance cpu memory slow record recording report backend wsl linux distro remote vm orbstack lima docker container where agents run status doctor dev binary assets routing"
             }
             Self::Appearance => {
-                "theme color dark light import share transparency window opacity blur glass contrast readable readability accessibility interface zoom size font fonts family typeface nerd monospace code scene motion background picture animated library terminal banner rose text tabs vertical horizontal placement sidebar panels icon rail files expand compact hidden show hide visibility typing kisses hearts particles composer input style card bar prompt pill soft"
+                "theme color dark light import share transparency window opacity blur glass contrast readable readability accessibility interface zoom size font fonts family typeface nerd monospace code scene motion background picture animated library terminal banner rose text tabs vertical horizontal placement sidebar typing kisses hearts particles composer input style card bar prompt pill soft keyboard vim keys navigation lists files changes panels icon rail expand compact hidden show hide visibility"
             }
             Self::Agents => {
                 "background subagents gentle ai persona permissions helpers agent ui generative proactive when asked"

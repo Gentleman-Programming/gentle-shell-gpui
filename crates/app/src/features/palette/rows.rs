@@ -19,6 +19,32 @@ impl PaletteView {
         let typed = !self.needle.text.is_empty();
         let all = self.category == Category::All;
         let mut rows = Vec::new();
+        if self.category == Category::Tabs {
+            let mut tabs: Vec<_> = self
+                .tabs
+                .iter()
+                .filter_map(|tab| {
+                    let query = &self.needle.lower;
+                    let score = fuzzy_score(query, &tab.title)
+                        .or_else(|| fuzzy_score(query, &tab.workspace))
+                        .or_else(|| {
+                            fuzzy_score(query, &format!("{} {}", tab.workspace, tab.title))
+                        })?;
+                    Some((score, tab))
+                })
+                .collect();
+            tabs.sort_by_key(|(score, _)| *score);
+            rows.extend(tabs.into_iter().map(|(_, tab)| Row {
+                icon: tab.icon,
+                title: tab.title.clone(),
+                meta: tab.workspace.clone(),
+                detail: String::new(),
+                group: "Tabs",
+                action: PaletteAction::ActivateGlobalTab(tab.id),
+                workspace: None,
+                current: tab.current,
+            }));
+        }
         if matches!(self.category, Category::All | Category::Workspaces) {
             rows.extend(self.workspace_rows(all));
         }
@@ -46,6 +72,27 @@ impl PaletteView {
             .filter_map(|w| Some((fuzzy_score(&self.needle.lower, &w.name)?, w)))
             .collect();
         scored.sort_by_key(|(score, w)| (*score, w.index));
+        if self.deleting {
+            return scored
+                .into_iter()
+                .take(if all { 6 } else { usize::MAX })
+                .map(|(_, w)| Row {
+                    icon: IconName::Trash,
+                    title: w.name.clone(),
+                    meta: format!(
+                        "{} {}{}",
+                        w.tabs,
+                        if w.tabs == 1 { "tab" } else { "tabs" },
+                        if w.current { " · current" } else { "" }
+                    ),
+                    detail: "Press Enter to delete".into(),
+                    group: "Workspaces",
+                    action: PaletteAction::DeleteWorkspace(w.index),
+                    workspace: None,
+                    current: w.current,
+                })
+                .collect();
+        }
         let mut rows: Vec<Row> = scored
             .into_iter()
             .take(if all { 6 } else { usize::MAX })
@@ -87,7 +134,6 @@ impl PaletteView {
                     group: "Workspaces",
                     action: PaletteAction::CreateWorkspace {
                         name: query.to_string(),
-                        pick_folder: false,
                     },
                     workspace: None,
                     current: false,
@@ -95,33 +141,15 @@ impl PaletteView {
             );
         }
         rows.push(Row {
-            icon: IconName::Folder,
-            title: "Browse folders…".into(),
-            meta: String::new(),
-            detail: format!("Open Gentle Shell in any folder ({})", ui::shortcut("O")),
-            group: "Workspaces",
-            action: PaletteAction::OpenExplorer,
-            workspace: None,
-            current: false,
-        });
-        rows.push(Row {
             icon: IconName::FolderOpen,
-            title: "Create workspace from folder…".into(),
+            title: "Create workspace".into(),
             meta: String::new(),
-            detail: if query.is_empty() {
-                "Named after the folder".into()
-            } else {
-                format!("Named \u{201c}{query}\u{201d}")
-            },
+            detail: format!(
+                "Choose a folder in the explorer ({}); named after it",
+                ui::shortcut("O")
+            ),
             group: "Workspaces",
-            action: PaletteAction::CreateWorkspace {
-                name: if exists {
-                    String::new()
-                } else {
-                    query.to_string()
-                },
-                pick_folder: true,
-            },
+            action: PaletteAction::CreateWorkspaceFromFolder,
             workspace: None,
             current: false,
         });

@@ -17,6 +17,12 @@ impl Workspace {
             .px_2()
             .pb_2()
             .gap_px()
+            .track_focus(&self.tab_list_focus)
+            .key_context("GentleTabList")
+            .on_action(cx.listener(Self::on_tab_list_next))
+            .on_action(cx.listener(Self::on_tab_list_prev))
+            .on_action(cx.listener(Self::on_tab_list_activate))
+            .on_action(cx.listener(Self::on_tab_list_cancel))
             .child(self.workspace_section(cx));
         let query = self.tab_search.read(cx).value().trim().to_lowercase();
         let mut matches = 0;
