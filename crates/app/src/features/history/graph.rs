@@ -30,14 +30,14 @@ impl LaneLayout {
         let preferred = if pane_width < 640. { 9. } else { 14. };
         let intervals = lanes.saturating_sub(1) as f32;
         let budget = (pane_width * 0.30).max(PAD * 2.);
-        // Maintain usable spacing. Extremely dense graphs are clipped in
-        // the sidebar rather than reducing nodes to invisible pixels.
+        // Maintain usable spacing. The list scrolls horizontally if all
+        // lanes plus the message column cannot fit in the viewport.
         let step = if intervals > 0. {
             ((budget - PAD * 2.) / intervals).clamp(8., preferred)
         } else {
             preferred
         };
-        let width = (PAD * 2. + step * intervals).min(budget);
+        let width = PAD * 2. + step * intervals;
         Self { width, step }
     }
 
@@ -256,13 +256,14 @@ mod tests {
     use super::{LaneLayout, PAD};
 
     #[test]
-    fn busy_graph_leaves_most_of_a_sidebar_for_commit_text() {
+    fn dense_graph_preserves_every_lane_and_readable_nodes() {
         for width in [200., 320., 480., 800.] {
             let layout = LaneLayout::new(24, width);
-            assert!(layout.width <= width * 0.30);
+            assert!(layout.x(23) <= layout.width - PAD + 0.01);
             assert!(layout.x(1) - layout.x(0) >= 8.);
             assert!(layout.node_scale() >= 0.8);
         }
+        assert!(LaneLayout::new(8, 480.).width <= 480. * 0.30);
     }
 
     #[test]

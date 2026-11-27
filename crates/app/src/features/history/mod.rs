@@ -82,7 +82,7 @@ impl GraphMode {
     }
 }
 
-pub struct OpenFullHistory(pub PathBuf);
+pub struct OpenFullHistory(pub PathBuf, pub Scope);
 
 pub struct HistoryView {
     toplevel: PathBuf,
@@ -455,7 +455,7 @@ impl HistoryView {
         cx.notify();
     }
 
-    fn show(&mut self, scope: Scope, cx: &mut Context<Self>) {
+    pub(crate) fn show(&mut self, scope: Scope, cx: &mut Context<Self>) {
         if scope == Scope::All {
             self.mode = GraphMode::Full;
         }

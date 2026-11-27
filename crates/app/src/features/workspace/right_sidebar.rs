@@ -72,7 +72,18 @@ impl Workspace {
             &view,
             window,
             |this, _, event: &crate::features::history::OpenFullHistory, window, cx| {
-                this.open_tab(PaneKind::History, event.0.clone(), None, None, window, cx);
+                let Some(id) = this.new_factory_pane(PaneKind::History, event.0.clone(), window, cx) else {
+                    return;
+                };
+                if let Some(view) = this.panes.get(&id).and_then(|pane| {
+                    pane.item.view.clone().downcast::<crate::features::history::HistoryView>().ok()
+                }) {
+                    view.update(cx, |view, cx| view.show(event.1.clone(), cx));
+                }
+                this.push_pane_tab(id, window, cx);
+                if this.sidebar_visible && this.sidebar_history_active {
+                    this.toggle_sidebar(cx);
+                }
             },
         ).detach();
         self.sidebar_history = Some((cwd, view));

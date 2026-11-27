@@ -252,7 +252,7 @@ impl HistoryView {
                     .icon(Icon::new(IconName::Maximize2))
                     .tooltip("Open full Git history in a tab")
                     .on_click(cx.listener(|this, _, _, cx| {
-                        cx.emit(OpenFullHistory(this.toplevel.clone()));
+                        cx.emit(OpenFullHistory(this.toplevel.clone(), this.scope.clone()));
                     })),
             ))
     }
@@ -672,9 +672,13 @@ impl HistoryView {
         )
     }
 
-    fn graph_cell(&self, graph: RowGraph) -> Div {
+    fn lane_layout(&self) -> graph::LaneLayout {
         let lanes = if self.filtering() { 1 } else { self.graph.width.max(1) };
-        let layout = graph::LaneLayout::new(lanes, self.width.get());
+        graph::LaneLayout::new(lanes, self.width.get())
+    }
+
+    fn graph_cell(&self, graph: RowGraph) -> Div {
+        let layout = self.lane_layout();
         div()
             .relative()
             .flex_none()
@@ -911,9 +915,9 @@ impl HistoryView {
             .text_color(if graph_row.mainline || filtering { ui::fg() } else { ui::muted() })
             .child(commit.subject.clone());
         let refs = h_flex()
+            .id(("history-refs", i))
             .min_w_0()
             .overflow_x_scroll()
-            .id(("history-refs", i))
             .gap_1()
             .children(chips);
         let content = if fit == Fit::Wide {
@@ -1185,10 +1189,15 @@ impl HistoryView {
                 )
                 .into_any_element();
         }
-        div()
+        let graph_width = self.lane_layout().width;
+        let viewport = self.width.get().max(200.);
+        // Preserve a useful message area plus avatar, time, and row padding.
+        let row_width = viewport.max(graph_width + if viewport >= 640. { 440. } else { 180. });
+        let list = div()
             .relative()
-            .flex_1()
-            .min_h_0()
+            .w(px(row_width))
+            .h_full()
+            .flex_none()
             .child(
                 uniform_list(
                     "history-list",
@@ -1204,7 +1213,14 @@ impl HistoryView {
                 .py_2()
                 .track_scroll(&self.scroll),
             )
-            .vertical_scrollbar(&self.scroll)
+            .vertical_scrollbar(&self.scroll);
+        div()
+            .id("history-horizontal-scroll")
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .overflow_x_scroll()
+            .child(list)
             .into_any_element()
     }
 
@@ -1688,6 +1704,9 @@ impl HistoryView {
                 let shown = self.matched;
                 let text = if self.filtering() {
                     format!("{shown} of {} loaded commits match", self.commits.len())
+                } else if self.mode == GraphMode::Smart {
+                    format!("{shown} visible · {} folded · {} of {} loaded",
+                        self.commits.len().saturating_sub(shown), self.commits.len(), history.total)
                 } else {
                     format!(
                         "Showing {} of {} commits",
