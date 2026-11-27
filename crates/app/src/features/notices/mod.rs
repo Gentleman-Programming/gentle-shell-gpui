@@ -25,13 +25,44 @@ pub struct Notice {
     pub message: String,
     /// The tab it came from, as titled when it arrived.
     pub source: SharedString,
-    /// The pane it came from, to jump back to it.
-    pub origin: Option<usize>,
+    /// The session it came from, to jump back to it.
+    pub origin: Option<Origin>,
     /// When it last arrived.
     pub at: Instant,
     pub read: bool,
-    /// Further arrivals of the same message folded into this one.
+    /// Further arrivals of the same message from the same session folded
+    /// into this one.
     pub repeats: u32,
+}
+
+/// The session a notice came from: its pane, and the conversation that pane
+/// showed then (a pane outlives its conversations: ⌘N, a resumed session).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Origin {
+    pub pane: usize,
+    /// The pane's `SessionView::conversation` when the notice arrived.
+    pub conversation: u64,
+}
+
+/// Whether a notice's session can still be shown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Reach {
+    Open,
+    /// The pane now shows another conversation.
+    SessionGone,
+    PaneClosed,
+}
+
+impl Origin {
+    /// Where the origin stands, given the conversation its pane shows now
+    /// (`None`: the pane was closed).
+    pub fn reach(self, shown: Option<u64>) -> Reach {
+        match shown {
+            None => Reach::PaneClosed,
+            Some(conversation) if conversation != self.conversation => Reach::SessionGone,
+            Some(_) => Reach::Open,
+        }
+    }
 }
 
 /// Notices, newest first.
@@ -43,3 +74,6 @@ pub struct Notices {
 
 /// Jumps to the pane a notice came from.
 pub type OnSelect = Rc<dyn Fn(usize, &mut Window, &mut App)>;
+
+/// Where a notice's origin stands now (see [`Origin::reach`]).
+pub type ReachOf = Rc<dyn Fn(&Origin, &App) -> Reach>;

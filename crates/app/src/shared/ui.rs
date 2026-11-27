@@ -620,10 +620,33 @@ pub fn chip(text: impl Into<SharedString>, color: Hsla) -> Div {
         .child(text.into())
 }
 
+/// "Press ⌃C again to close" (`Ctrl+C` off macOS) for a double Ctrl+C's
+/// window (`gentle_core::double_interrupt::WINDOW`), placed by the pane that
+/// shows it: on the pane's own surface so it reads over its content, in the
+/// interface's `font` (a terminal's draws ⌃ as ^), fading in quickly and out
+/// as the window closes. `id`: a new one per hint, so each runs its own fade.
+pub fn close_hint(id: u64, font: SharedString) -> impl IntoElement {
+    let chord = if cfg!(target_os = "macos") {
+        "⌃C"
+    } else {
+        "Ctrl+C"
+    };
+    div()
+        .rounded_md()
+        .bg(panel())
+        .font_family(font)
+        .child(chip(format!("Press {chord} again to close"), muted()))
+        .with_animation(
+            ElementId::NamedInteger("close-hint".into(), id),
+            Animation::new(gentle_core::double_interrupt::WINDOW),
+            |el, t| el.opacity((t / 0.15).min((1. - t) / 0.35).clamp(0., 1.)),
+        )
+}
+
 /// A vertical resize handle for sidebar edges, as wide as the window body's
 /// `gap_1p5` (6 px at 100 %) so it fills the gap beside a sidebar. It shows no
-/// visible line until hover, when a 2×40 px pill lights up in the accent color.
-pub fn resize_handle(id: impl Into<ElementId>) -> Stateful<Div> {
+/// visible line until hover or an active resize, when a 2×40 px pill lights up.
+pub fn resize_handle(id: impl Into<ElementId>, active: bool, hover: bool) -> Stateful<Div> {
     div()
         .id(id.into())
         .group("resize-handle")
@@ -639,9 +662,11 @@ pub fn resize_handle(id: impl Into<ElementId>) -> Stateful<Div> {
                 .w(px(2.))
                 .h(px(40.))
                 .rounded_full()
-                .bg(border_strong())
-                .opacity(0.0)
-                .group_hover("resize-handle", |s| s.opacity(1.0).bg(petal())),
+                .bg(petal())
+                .opacity(if active { 1. } else { 0. })
+                .when(hover, |pill| {
+                    pill.group_hover("resize-handle", |s| s.opacity(1.))
+                }),
         )
 }
 
@@ -984,6 +1009,23 @@ pub fn scrim(id: impl Into<ElementId>) -> AnimationElement<Div> {
         Animation::new(Duration::from_millis(220)).with_easing(ease_out_quint()),
         |el, t| el.opacity(t),
     )
+}
+
+/// The veil an agent tab wears while files are dragged over it: the tab's own
+/// ground, [`popover_bg`] at 88 %, faded in with [`scrim`]'s curve and no
+/// travel. Not `backdrop()` (the scrim's black): this one keeps the pane's colour
+/// while it hides what is on it, and 88 % is as light as the words over it can
+/// go and still clear AA over a bright backdrop.
+pub fn veil(id: impl Into<ElementId>) -> AnimationElement<Div> {
+    div()
+        .absolute()
+        .inset_0()
+        .bg(popover_bg().opacity(0.88))
+        .with_animation(
+            id,
+            Animation::new(Duration::from_millis(220)).with_easing(ease_out_quint()),
+            |el, t| el.opacity(t),
+        )
 }
 
 // ── Live indicators ────────────────────────────────────────────────────────

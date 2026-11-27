@@ -51,7 +51,7 @@ impl NativeView {
         script: Option<&str>,
         sandbox: Option<&super::Sandbox>,
         profile: &Profile,
-        popups: Option<super::Popups>,
+        relays: super::Relays,
     ) -> Result<Self, String> {
         use wry::WebViewBuilderExtDarwin as _;
         let builder = wry::WebViewBuilder::new()
@@ -69,7 +69,7 @@ impl NativeView {
         } else {
             builder.with_data_store_identifier(profile.store_id())
         };
-        let builder = super::follow_popups(builder, popups);
+        let builder = super::relay(builder, relays);
         let webview = match sandbox {
             Some(sandbox) => super::isolate(builder, sandbox),
             None => builder,
@@ -155,6 +155,22 @@ impl NativeView {
         let _ = self.webview.set_visible(false);
         give_keyboard_to(self.host);
         self.placed = None;
+    }
+
+    /// The page has the keyboard: a click in it made it the window's first
+    /// responder.
+    pub(super) fn has_keyboard(&self) -> bool {
+        use wry::WebViewExtMacOS as _;
+        let view = self.webview.webview();
+        let Some(window) = view.window() else {
+            return false;
+        };
+        window.firstResponder().is_some_and(|responder| {
+            std::ptr::eq(
+                objc2::rc::Retained::as_ptr(&responder).cast::<std::ffi::c_void>(),
+                objc2::rc::Retained::as_ptr(&view).cast(),
+            )
+        })
     }
 }
 

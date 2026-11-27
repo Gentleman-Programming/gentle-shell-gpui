@@ -110,21 +110,49 @@ pub fn sandbox_url(path: &str) -> String {
 /// `window.open`) go: the card loads them itself.
 type Popups = async_channel::Sender<String>;
 
-/// `builder` handing new-window requests to `popups`, when given, instead
-/// of opening a window (a sandbox's own rule, set after, still denies them).
-fn follow_popups<'a>(
-    builder: wry::WebViewBuilder<'a>,
+/// Where Esc a page didn't use goes ([`ESCAPE_SCRIPT`]): its card.
+type Escapes = async_channel::Sender<()>;
+
+/// What a page tells its browser card, when the card listens.
+struct Relays {
     popups: Option<Popups>,
-) -> wry::WebViewBuilder<'a> {
-    let Some(popups) = popups else {
-        return builder;
+    escapes: Option<Escapes>,
+}
+
+/// The web view keeps the keyboard, so Esc inside a page never reaches the
+/// app (WebKit doesn't pass it on even when the page ignores it). This tells
+/// the card once the page's own handlers ran, unless one used it:
+/// `preventDefault`, or `stopPropagation` before it reached the window (to
+/// close its own menu, say). Esc ending an IME composition is the IME's.
+const ESCAPE_SCRIPT: &str = r#"addEventListener("keydown",function(e){if(e.key==="Escape"&&!e.isComposing)setTimeout(function(){if(!e.defaultPrevented&&window.ipc)window.ipc.postMessage("gentle:escape")})})"#;
+
+/// The message [`ESCAPE_SCRIPT`] posts.
+const ESCAPE_MESSAGE: &str = "gentle:escape";
+
+/// `builder` handing `relays` what the page asks for: new-window requests,
+/// instead of opening a window (a sandbox's own rule, set after, still
+/// denies them), and Esc the page didn't use. Any page could post that
+/// message itself; all it can do is restore its own card.
+fn relay<'a>(builder: wry::WebViewBuilder<'a>, relays: Relays) -> wry::WebViewBuilder<'a> {
+    let builder = match relays.popups {
+        Some(popups) => builder.with_new_window_req_handler(move |url, _| {
+            if url.starts_with("http://") || url.starts_with("https://") {
+                let _ = popups.try_send(url);
+            }
+            wry::NewWindowResponse::Deny
+        }),
+        None => builder,
     };
-    builder.with_new_window_req_handler(move |url, _| {
-        if url.starts_with("http://") || url.starts_with("https://") {
-            let _ = popups.try_send(url);
-        }
-        wry::NewWindowResponse::Deny
-    })
+    match relays.escapes {
+        Some(escapes) => builder
+            .with_initialization_script(ESCAPE_SCRIPT)
+            .with_ipc_handler(move |request| {
+                if request.body() == ESCAPE_MESSAGE {
+                    let _ = escapes.try_send(());
+                }
+            }),
+        None => builder,
+    }
 }
 
 /// `builder` locked down for `sandbox` (see [`Sandbox`]).
@@ -387,9 +415,16 @@ pub fn set_card_layout(layout: CardLayout, save: bool, cx: &mut App) {
 
 // ── The panel ───────────────────────────────────────────────────────────────
 
+/// The key context of a browser card that has the keyboard.
+pub const CONTEXT: &str = "BrowserCard";
+
+actions!(browser, [RestoreCard]);
+
 pub enum BrowserEvent {
-    /// The card's button: send it to the instance tray.
+    /// The card's − button: send it to the instance tray.
     Hide,
+    /// The card's X button: close it, page and all (as the tray's X).
+    Close,
     /// Docked or floated: the window lays its cards out again.
     Layout,
 }
@@ -462,16 +497,30 @@ pub struct BrowserPanel {
     card: CardState,
     /// The page itself.
     surface: Entity<WebSurface>,
+    /// The card's own keyboard focus (a click on it, maximizing it), where
+    /// Esc restores it.
+    focus: FocusHandle,
+    /// Esc the page didn't use: restores the card.
+    _escapes: Task<()>,
 }
 
 impl EventEmitter<BrowserEvent> for BrowserPanel {}
 
 impl BrowserPanel {
     pub fn new(url: String, label: Option<String>, cx: &mut Context<Self>) -> Self {
+        let (escapes, escaped) = async_channel::bounded(1);
         let surface = cx.new(|cx| {
             let mut surface = WebSurface::new(url.clone(), None);
             surface.follow_popups(cx);
+            surface.relay_escape(escapes);
             surface
+        });
+        let escaped = cx.spawn(async move |this, cx| {
+            while escaped.recv().await.is_ok() {
+                if this.update(cx, |this, cx| this.restore(cx)).is_err() {
+                    return;
+                }
+            }
         });
         Self {
             url,
@@ -488,6 +537,8 @@ impl BrowserPanel {
             },
             card: CardState::new(opening_frame(cx)),
             surface,
+            focus: cx.focus_handle(),
+            _escapes: escaped,
         }
     }
 
@@ -677,9 +728,47 @@ impl BrowserPanel {
         self.surface.update(cx, |surface, cx| surface.reload(cx));
     }
 
-    fn toggle_maximized(&mut self, cx: &mut Context<Self>) {
+    pub fn is_maximized(&self) -> bool {
+        self.card.maximized()
+    }
+
+    /// The keyboard is in this card: on the card itself, or in its page.
+    pub fn has_keyboard(&self, window: &Window, cx: &App) -> bool {
+        self.focus.contains_focused(window, cx) || self.surface.read(cx).has_keyboard()
+    }
+
+    /// Fill the window (a floating card; a docked one stays in its column).
+    /// The card takes the keyboard, so Esc restores it.
+    pub fn maximize(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.mode == Mode::Floating && !self.card.maximized() {
+            self.card.toggle_maximized();
+            window.focus(&self.focus, cx);
+            cx.notify();
+        }
+    }
+
+    /// Back to its size and place; false when it wasn't maximized.
+    pub fn restore(&mut self, cx: &mut Context<Self>) -> bool {
+        if !self.card.maximized() {
+            return false;
+        }
         self.card.toggle_maximized();
         cx.notify();
+        true
+    }
+
+    fn toggle_maximized(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.restore(cx) {
+            self.maximize(window, cx);
+        }
+    }
+
+    /// Esc with the keyboard on the card: restores it when maximized, and
+    /// otherwise goes on to the window (a screen's Esc).
+    fn on_restore(&mut self, _: &RestoreCard, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.restore(cx) {
+            cx.propagate();
+        }
     }
 
     fn start_drag(&mut self, kind: DragKind, start: Point<Pixels>, cx: &mut Context<Self>) {
@@ -737,9 +826,9 @@ impl BrowserPanel {
             .when(!docked, |header| {
                 header.cursor(CursorStyle::OpenHand).on_mouse_down(
                     MouseButton::Left,
-                    cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                    cx.listener(|this, event: &MouseDownEvent, window, cx| {
                         if event.click_count == 2 {
-                            this.toggle_maximized(cx);
+                            this.toggle_maximized(window, cx);
                         } else {
                             this.start_drag(DragKind::Move, event.position, cx);
                         }
@@ -834,26 +923,45 @@ impl BrowserPanel {
                             })),
                     )
                     .when(!docked, |row| {
+                        // Maximized, the way back is named: an icon among
+                        // the others is easy to miss with the page this big.
                         row.child(
-                            Button::new("browser-maximize")
-                                .ghost()
-                                .xsmall()
-                                .icon(Icon::new(if maximized {
-                                    IconName::Minimize2
-                                } else {
-                                    IconName::Maximize2
-                                }))
-                                .tooltip(if maximized { "Restore" } else { "Maximize" })
-                                .on_click(cx.listener(|this, _, _, cx| this.toggle_maximized(cx))),
+                            if maximized {
+                                Button::new("browser-maximize")
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(Icon::new(IconName::Minimize2))
+                                    .label("Restore")
+                                    .tooltip("Restore · Esc")
+                            } else {
+                                Button::new("browser-maximize")
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(Icon::new(IconName::Maximize2))
+                                    .tooltip("Maximize")
+                            }
+                            .on_click(
+                                cx.listener(|this, _, window, cx| {
+                                    this.toggle_maximized(window, cx)
+                                }),
+                            ),
                         )
                     })
                     .child(
-                        Button::new("browser-close")
+                        Button::new("browser-hide")
                             .ghost()
                             .xsmall()
                             .icon(Icon::new(IconName::Minus))
                             .tooltip("Hide · it stays in the top bar")
                             .on_click(cx.listener(|_, _, _, cx| cx.emit(BrowserEvent::Hide))),
+                    )
+                    .child(
+                        Button::new("browser-close")
+                            .ghost()
+                            .xsmall()
+                            .icon(Icon::new(IconName::X))
+                            .tooltip("Close")
+                            .on_click(cx.listener(|_, _, _, cx| cx.emit(BrowserEvent::Close))),
                     ),
             )
     }
@@ -1000,6 +1108,9 @@ impl Render for BrowserPanel {
             // The window puts it in its right column and sizes it; the
             // column's divider changes the width.
             return v_flex()
+                .track_focus(&self.focus)
+                .key_context(CONTEXT)
+                .on_action(cx.listener(Self::on_restore))
                 .size_full()
                 .rounded_xl()
                 .bg(ui::panel())
@@ -1010,6 +1121,9 @@ impl Render for BrowserPanel {
         }
         self.card.fit();
         let card = ui::island(cx)
+            .track_focus(&self.focus)
+            .key_context(CONTEXT)
+            .on_action(cx.listener(Self::on_restore))
             .absolute()
             .flex()
             .flex_col()
@@ -1038,7 +1152,36 @@ impl Render for BrowserPanel {
 
 #[cfg(test)]
 mod tests {
-    use super::{CanvasNotice, canvas_notice, design_slug, host_label};
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    use gpui_kit::{KeyBinding, TestAppContext};
+
+    use super::{
+        BrowserPanel, CONTEXT, CanvasNotice, RestoreCard, canvas_notice, design_slug, host_label,
+    };
+
+    /// Esc on a maximized card restores it and goes no further; on a card
+    /// at its size it goes on to the window (whose Esc closes a screen).
+    #[gpui::test]
+    fn escape_restores_a_maximized_card_and_nothing_else(cx: &mut TestAppContext) {
+        let passed_on = Rc::new(Cell::new(0));
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.bind_keys([KeyBinding::new("escape", RestoreCard, Some(CONTEXT))]);
+            let passed_on = passed_on.clone();
+            cx.on_action(move |_: &RestoreCard, _| passed_on.set(passed_on.get() + 1));
+        });
+        let (panel, cx) = cx
+            .add_window_view(|_, cx| BrowserPanel::new("http://localhost:5173/".into(), None, cx));
+        panel.update_in(cx, |panel, window, cx| panel.maximize(window, cx));
+        cx.simulate_keystrokes("escape");
+        assert!(!panel.read_with(cx, |panel, _| panel.is_maximized()));
+        assert_eq!(passed_on.get(), 0);
+        cx.simulate_keystrokes("escape");
+        assert!(!panel.read_with(cx, |panel, _| panel.is_maximized()));
+        assert_eq!(passed_on.get(), 1);
+    }
 
     #[test]
     fn canvas_notices_come_from_gentle_design_messages() {

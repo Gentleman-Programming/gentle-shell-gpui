@@ -89,8 +89,8 @@ impl Workspace {
             f32::from(window.viewport_size().width) / (f32::from(window.rem_size()) / 16.);
         let now = std::time::Instant::now();
         let occupied = |side| {
-            let (width, fraction) = self.sidebar_geometry(side, window_px, now);
-            rem((width + 6.) * fraction)
+            let (width, gap) = self.visible_sidebar_geometry(side, window_px, now);
+            rem(width + gap)
         };
         let w =
             (f32::from(viewport.width) - rem(12.) - occupied(Side::Tabs) - occupied(Side::Files))
@@ -152,6 +152,7 @@ impl Workspace {
             cwd,
             path: None,
             session_file: resume,
+            conversation: 0,
             title: SharedString::default(),
             running: false,
             needs_you: false,
@@ -176,11 +177,17 @@ impl Workspace {
             // Tab titles, running dots and the saved conversation follow
             // each session; its other changes don't touch the chrome.
             SessionEvent::ChromeChanged => {
-                let file = session.read(cx).session_file();
+                let (file, conversation) = {
+                    let session = session.read(cx);
+                    (session.session_file(), session.conversation())
+                };
                 let Some(pane) = self.panes.get_mut(&id) else {
                     return;
                 };
-                let changed = pane.sync_chrome(cx);
+                // A new conversation in the pane sets apart the notices of
+                // the last one.
+                let changed = pane.sync_chrome(cx) || pane.conversation != conversation;
+                pane.conversation = conversation;
                 if pane.session_file != file {
                     pane.session_file = file;
                     self.schedule_save(cx);
@@ -200,6 +207,8 @@ impl Workspace {
                 }
             }
             SessionEvent::OpenProviders => self.open_providers(window, cx),
+            // A double Ctrl+C on the idle agent closes its pane as ⌘W does.
+            SessionEvent::CloseRequested => self.close_pane(id, window, cx),
             SessionEvent::OpenScreen(screen) => {
                 self.open_screen(*screen, Some(session.clone()), window, cx)
             }
@@ -237,9 +246,14 @@ impl Workspace {
             }
             SessionEvent::Notice { level, message } => {
                 let source = self.pane_title(id);
+                let origin = notices::Origin {
+                    pane: id,
+                    conversation: session.read(cx).conversation(),
+                };
                 let (level, message) = (*level, message.clone());
                 self.notices.update(cx, |store, cx| {
-                    store.push(level, message, source, Some(id), std::time::Instant::now());
+                    let now = std::time::Instant::now();
+                    store.push(level, message, source, Some(origin), now);
                     cx.notify();
                 });
                 cx.notify();
@@ -347,6 +361,7 @@ impl Workspace {
             cwd,
             path,
             session_file: None,
+            conversation: 0,
             title: SharedString::default(),
             running: false,
             needs_you: false,
@@ -400,6 +415,7 @@ impl Workspace {
             cwd,
             path: Some(path),
             session_file: None,
+            conversation: 0,
             title: SharedString::default(),
             running: false,
             needs_you: false,
@@ -586,10 +602,14 @@ impl Workspace {
         }
     }
 
-    /// Focus the active tab's focused pane.
+    /// Focus the active tab's focused pane, or the workspace's own root
+    /// handle when there is no pane (an empty workspace): the root handle is
+    /// what keeps the window-level shortcuts reachable there.
     pub(super) fn focus_active(&self, window: &mut Window, cx: &mut App) {
         if let Some(pane) = self.focused_pane().and_then(|id| self.panes.get(&id)) {
             pane.item.focus.focus(window, cx);
+        } else {
+            self.focus.focus(window, cx);
         }
     }
 
@@ -601,6 +621,12 @@ impl Workspace {
         }
         self.focus_active(window, cx);
         cx.notify();
+    }
+
+    /// Whether a notice's pane is still open and still shows the session
+    /// that sent it.
+    pub(super) fn notice_reach(&self, origin: &notices::Origin) -> notices::Reach {
+        origin.reach(self.panes.get(&origin.pane).map(|p| p.conversation))
     }
 
     /// Show the pane wherever it lives: its workspace, its tab, then focus.
@@ -1004,6 +1030,12 @@ impl Workspace {
         if space == self.current && !self.space().tabs.is_empty() {
             self.activate(self.space().active, window, cx);
         } else {
+            // Closing the last tab leaves an empty workspace with no pane to
+            // own the keyboard: keep the root handle focused so the
+            // window-level shortcuts stay reachable there.
+            if space == self.current {
+                self.focus_active(window, cx);
+            }
             self.schedule_save(cx);
             cx.notify();
         }

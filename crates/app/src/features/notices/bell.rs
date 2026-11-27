@@ -11,11 +11,17 @@ use gpui_kit::*;
 use crate::shared::ui;
 
 use super::panel::panel;
-use super::{Notices, OnSelect};
+use super::{Notices, OnSelect, ReachOf};
 
 /// The bell: an icon button with an unread count that opens the list.
-/// `on_select` jumps to a notice's pane.
-pub fn bell(store: &Entity<Notices>, on_select: OnSelect, cx: &App) -> impl IntoElement {
+/// `on_select` jumps to a notice's pane; `reach` tells whether its session
+/// is still there.
+pub fn bell(
+    store: &Entity<Notices>,
+    on_select: OnSelect,
+    reach: ReachOf,
+    cx: &App,
+) -> impl IntoElement {
     let store = store.clone();
     let unread = store.read(cx).unread();
     Popover::new("notices")
@@ -32,7 +38,7 @@ pub fn bell(store: &Entity<Notices>, on_select: OnSelect, cx: &App) -> impl Into
         .content(move |_, _, cx| {
             ui::popover_in(
                 ElementId::Name("notices-in".into()),
-                panel(&store, on_select.clone(), cx),
+                panel(&store, on_select.clone(), reach.clone(), cx),
             )
             .into_any_element()
         })

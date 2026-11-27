@@ -11,7 +11,7 @@ use gentle_core::profiles::{
     PROFILE_EXPORT_FILE, PinRead, ProfileExport, ProfilesFile, Routing, create_profile,
     delete_profile, duplicate_profile, normalize_routing, parse_model_ref, parse_profile_export,
     parse_profiles, rename_profile, serialize_profile_export, serialize_profiles,
-    set_orchestrator_mode, update_profile,
+    set_controlled_engineering, set_orchestrator_mode, update_profile,
 };
 use gpui_kit::*;
 use pi_rpc::desktop_rpc::{
@@ -100,7 +100,8 @@ impl ProfilesView {
         );
     }
 
-    /// The draft (routing and orchestrator mode) as the store would hold it
+    /// The draft (routing, orchestrator mode and Controlled Engineering) as
+    /// the store would hold it
     /// (create or update), or `None` when it already matches.
     fn saved_draft(&self) -> Result<Option<ProfilesFile>, String> {
         let Some(name) = &self.selected else {
@@ -111,8 +112,9 @@ impl ProfilesView {
             .file
             .get(name)
             .map(|r| normalize_routing(&r.to_json()).unwrap_or_default());
-        let mode_saved = self.file.orchestrator_mode(name) == self.draft_mode;
-        if stored.as_ref() == Some(&normalized) && mode_saved {
+        let workflow_saved = self.file.orchestrator_mode(name) == self.draft_mode
+            && self.file.controlled_engineering(name) == self.draft_controlled;
+        if stored.as_ref() == Some(&normalized) && workflow_saved {
             return Ok(None);
         }
         let next = if self.file.has(name) {
@@ -120,7 +122,8 @@ impl ProfilesView {
         } else {
             create_profile(&self.file, name, self.draft.clone())?
         };
-        set_orchestrator_mode(&next, name, self.draft_mode).map(Some)
+        let next = set_orchestrator_mode(&next, name, self.draft_mode)?;
+        set_controlled_engineering(&next, name, self.draft_controlled).map(Some)
     }
 
     /// Save pending edits, then continue with `then` (told whether it saved).
@@ -135,6 +138,7 @@ impl ProfilesView {
             Ok(Some(next)) => self.write_store(next, cx, move |this, cx| {
                 this.stored = this.draft.clone();
                 this.stored_mode = this.draft_mode;
+                this.stored_controlled = this.draft_controlled;
                 then(this, true, cx);
             }),
         }

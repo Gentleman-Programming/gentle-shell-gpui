@@ -10,6 +10,7 @@ use gpui_kit::*;
 
 use super::rail::preview;
 use super::{BubbleText, CardSpec, follows_step, line_count};
+use crate::features::session::attachments;
 use crate::shared::ui;
 use gentle_core::scroll::{self, Estimate, RailMark};
 use gentle_core::transcript::{Block, Dirty, Item};
@@ -373,8 +374,12 @@ impl TranscriptList {
                     notices.iter().map(|(_, text)| line_count(text)).sum(),
                 )),
                 Item::User { text, .. } => {
-                    if !text.trim().is_empty() {
-                        self.marks.push((ix, preview(text)));
+                    // The rail and its tooltip show what was typed, never the
+                    // `Attached files:` block: a prompt of files only reads
+                    // as their names.
+                    let marks = attachments::summary(text);
+                    if !marks.trim().is_empty() {
+                        self.marks.push((ix, preview(&marks)));
                     }
                     Some(Prepared::Bubble(OnceCell::new()))
                 }
@@ -444,6 +449,19 @@ impl TranscriptList {
         self.heights.retain(|row, _| !rows.contains(row));
         self.stale |= self.heights.len() != before;
         self.state.remeasure_items(rows);
+    }
+
+    #[cfg(test)]
+    pub(in crate::features::session) fn weight(&self, ix: usize) -> Option<f32> {
+        self.weights.get(ix).copied()
+    }
+
+    /// Item `ix` is a confirmed live skill invocation: weigh it collapsed.
+    pub(super) fn confirm_skill(&mut self, ix: usize, item: &Item, command: &str) {
+        if let Some(weight) = self.weights.get_mut(ix) {
+            *weight = scroll::item_weight_confirmed(item, Some(command));
+            self.stale = true;
+        }
     }
 
     /// Whether item `ix` sits folded to its quiet one-line step row; a

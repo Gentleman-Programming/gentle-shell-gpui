@@ -4,8 +4,10 @@
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-/// Files under `root`, relative, honoring `.gitignore`; at most `cap`.
-pub(super) fn walk_files(root: &Path, cap: usize) -> Vec<String> {
+/// Files under `root`, relative, honoring `.gitignore`; at most `cap`. The
+/// switcher's file list and the composer's `@` search read the folder this
+/// way, so both name the same files.
+pub(crate) fn walk_files(root: &Path, cap: usize) -> Vec<String> {
     ignore::WalkBuilder::new(root)
         .build()
         .filter_map(Result::ok)

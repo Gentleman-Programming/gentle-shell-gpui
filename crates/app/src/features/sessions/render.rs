@@ -37,6 +37,14 @@ struct RowText {
     elsewhere: bool,
 }
 
+/// What a row's subtitle shows for the message that opened a session: its
+/// first line, trimmed and cut, without the `Attached files:` block the
+/// prompt carries (the files have no cards there, so a prompt of files reads
+/// as their names).
+pub(super) fn first_message_line(first: &str) -> String {
+    gentle_core::text::first_line(gentle_core::attachments::summary(first).trim(), 90)
+}
+
 impl SessionsView {
     fn row_text(&self, row: Row, now: i64) -> RowText {
         match row {
@@ -50,7 +58,7 @@ impl SessionsView {
                 if session.name.is_some()
                     && let Some(first) = &session.first_message
                 {
-                    subtitle.push(gentle_core::text::first_line(first.trim(), 90));
+                    subtitle.push(first_message_line(first));
                 }
                 let mut meta = Vec::new();
                 if let Some(model) = &session.model {
@@ -78,10 +86,7 @@ impl SessionsView {
                     subtitle.push(entry.project.clone());
                 }
                 if entry.name.is_some() {
-                    subtitle.push(gentle_core::text::first_line(
-                        entry.first_message.trim(),
-                        90,
-                    ));
+                    subtitle.push(first_message_line(&entry.first_message));
                 }
                 let mut meta = Vec::new();
                 if let Some(count) = entry.message_count {

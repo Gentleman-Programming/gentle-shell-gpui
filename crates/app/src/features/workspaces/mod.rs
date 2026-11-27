@@ -266,6 +266,7 @@ pub enum TabLayout {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(from = "SavedStateOnDisk")]
 pub struct SavedState {
     #[serde(default)]
     pub version: u32,
@@ -280,17 +281,62 @@ pub struct SavedState {
     /// Older workspaces.json files keep the familiar horizontal layout.
     #[serde(default)]
     pub tab_layout: TabLayout,
-    /// Whether the vertical tabs sidebar shows as its narrow icon rail.
-    #[serde(default)]
-    pub sidebar_compact: bool,
-    /// Width of the expanded vertical tabs sidebar (px at 100 % interface
-    /// size). Files written before the Files sidebar could be resized call it
-    /// `sidebar_width`.
-    #[serde(default = "default_sidebar_width", alias = "sidebar_width")]
+    /// Expanded navigator width (px at 100 % interface size).
+    #[serde(rename = "sidebar_width")]
     pub tabs_sidebar_width: f32,
     /// Width of the right Files sidebar (px at 100 % interface size).
     #[serde(default = "default_sidebar_width")]
     pub files_sidebar_width: f32,
+    /// Whether the vertical navigator uses its narrow icon rail.
+    #[serde(default)]
+    pub sidebar_compact: bool,
+    /// Whether the vertical navigator is hidden. Independent of the rail:
+    /// compacting stops at the rail, hiding removes the panel.
+    #[serde(default)]
+    pub tabs_sidebar_hidden: bool,
+}
+
+// Read both spellings independently so a mixed-version file is not rejected
+// as a duplicate field. Write the original key for older binaries.
+#[derive(Deserialize)]
+struct SavedStateOnDisk {
+    #[serde(default)]
+    version: u32,
+    #[serde(default)]
+    current: usize,
+    #[serde(default)]
+    workspaces: Vec<SavedWorkspace>,
+    #[serde(default = "shown")]
+    sidebar: bool,
+    #[serde(default)]
+    tab_layout: TabLayout,
+    sidebar_width: Option<f32>,
+    tabs_sidebar_width: Option<f32>,
+    #[serde(default = "default_sidebar_width")]
+    files_sidebar_width: f32,
+    #[serde(default)]
+    sidebar_compact: bool,
+    #[serde(default)]
+    tabs_sidebar_hidden: bool,
+}
+
+impl From<SavedStateOnDisk> for SavedState {
+    fn from(state: SavedStateOnDisk) -> Self {
+        Self {
+            version: state.version,
+            current: state.current,
+            workspaces: state.workspaces,
+            sidebar: state.sidebar,
+            tab_layout: state.tab_layout,
+            tabs_sidebar_width: state
+                .tabs_sidebar_width
+                .or(state.sidebar_width)
+                .unwrap_or_else(default_sidebar_width),
+            files_sidebar_width: state.files_sidebar_width,
+            sidebar_compact: state.sidebar_compact,
+            tabs_sidebar_hidden: state.tabs_sidebar_hidden,
+        }
+    }
 }
 
 fn shown() -> bool {
@@ -310,9 +356,10 @@ impl Default for SavedState {
             workspaces: Vec::new(),
             sidebar: true,
             tab_layout: TabLayout::Horizontal,
-            sidebar_compact: false,
             tabs_sidebar_width: default_sidebar_width(),
             files_sidebar_width: default_sidebar_width(),
+            sidebar_compact: false,
+            tabs_sidebar_hidden: false,
         }
     }
 }

@@ -50,8 +50,19 @@ use snapshot::Snapshot;
 
 pub struct SettingsView {
     cwd: PathBuf,
-    /// Tab placement is owned and persisted by the workspace.
+    /// Live tab placement, read from the workspace each frame; local changes
+    /// are forwarded immediately through events.
     tab_layout: TabLayout,
+    /// The vertical navigator's narrow icon rail, read from the workspace.
+    sidebar_compact: bool,
+    /// Whether the vertical navigator is hidden, read from the workspace.
+    tabs_sidebar_hidden: bool,
+    /// The right Files sidebar, read from the workspace.
+    files_sidebar: bool,
+    /// Re-reads the workspace's live panel state whenever it changes, so the
+    /// controls never show a stale copy (the observer itself holds no strong
+    /// reference back to the workspace).
+    _workspace_sub: Subscription,
     page: SettingsPage,
     body_scroll: ScrollHandle,
     settings_search: Entity<InputState>,
@@ -114,11 +125,19 @@ impl EventEmitter<SettingsEvent> for SettingsView {}
 impl SettingsView {
     pub fn new(
         cwd: PathBuf,
-        tab_layout: TabLayout,
+        workspace: Entity<crate::features::workspace::Workspace>,
+        initial: &crate::features::workspace::Workspace,
         session: Option<Entity<crate::features::session::SessionView>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        // The caller already holds the workspace lease while opening this overlay.
+        let (tab_layout, sidebar_compact, tabs_sidebar_hidden, files_sidebar) = (
+            initial.tab_layout(),
+            initial.sidebar_compact(),
+            initial.tabs_sidebar_hidden(),
+            initial.files_sidebar_visible(),
+        );
         let package = packages::PackageUiState::new(window, cx);
         let settings_search =
             cx.new(|cx| InputState::new(window, cx).placeholder("Find a setting…"));
@@ -146,10 +165,16 @@ impl SettingsView {
         let mut this = Self {
             cwd,
             tab_layout,
+            sidebar_compact,
+            tabs_sidebar_hidden,
+            files_sidebar,
             page: SettingsPage::default(),
             body_scroll: ScrollHandle::new(),
             settings_search,
             _settings_search: settings_search_subscription,
+            _workspace_sub: cx.observe(&workspace, |this, workspace, cx| {
+                this.sync_workspace(workspace, cx);
+            }),
             compact_categories_open: false,
             snapshot: None,
             package,
@@ -190,9 +215,56 @@ impl SettingsView {
         this
     }
 
+    /// The workspace changed underneath this screen (title-bar toggles, a
+    /// Files show/hide, a placement change): re-read its live panel state so
+    /// the controls never go stale.
+    fn sync_workspace(
+        &mut self,
+        workspace: Entity<crate::features::workspace::Workspace>,
+        cx: &mut Context<Self>,
+    ) {
+        let (tab_layout, sidebar_compact, tabs_sidebar_hidden, files_sidebar) =
+            workspace.update(cx, |this, _cx| {
+                (
+                    this.tab_layout(),
+                    this.sidebar_compact(),
+                    this.tabs_sidebar_hidden(),
+                    this.files_sidebar_visible(),
+                )
+            });
+        let changed = tab_layout != self.tab_layout
+            || sidebar_compact != self.sidebar_compact
+            || tabs_sidebar_hidden != self.tabs_sidebar_hidden
+            || files_sidebar != self.files_sidebar;
+        self.tab_layout = tab_layout;
+        self.sidebar_compact = sidebar_compact;
+        self.tabs_sidebar_hidden = tabs_sidebar_hidden;
+        self.files_sidebar = files_sidebar;
+        if changed {
+            cx.notify();
+        }
+    }
+
     /// gentle-shell can start, as of the Setup & requirements checklist.
     pub fn setup_usable(&self, cx: &App) -> bool {
         self.setup.read(cx).usable()
+    }
+
+    /// Live panel state, read from the workspace; used by tests to verify the
+    /// screen follows title-bar changes instead of caching a stale copy.
+    #[cfg(test)]
+    pub fn files_sidebar(&self) -> bool {
+        self.files_sidebar
+    }
+
+    #[cfg(test)]
+    pub fn sidebar_compact(&self) -> bool {
+        self.sidebar_compact
+    }
+
+    #[cfg(test)]
+    pub fn tabs_sidebar_hidden(&self) -> bool {
+        self.tabs_sidebar_hidden
     }
 
     /// Open on the Updates page, where this app's update is installed.

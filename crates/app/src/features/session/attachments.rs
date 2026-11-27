@@ -1,21 +1,30 @@
 //! What a prompt carries besides its typed text: images (validation, the RPC
-//! payload, and the decode cache conversation thumbnails draw from), long
-//! pasted texts, and the `[Image #N]` / `[Pasted text #N]` composer tokens
-//! that stand for them.
+//! payload, and the decode cache conversation thumbnails draw from) and the
+//! reading of a dropped or picked path. The rules that need neither GPUI nor
+//! the filesystem (files named by path in the prompt as the tab's backend
+//! reads them, the paths a prompt block can't carry, the warnings a refused
+//! or gone file gives, the long-paste limits and the `[Pasted text #N]`
+//! tokens that stand for them, the `[Image #N]` chips of older messages) live
+//! in [`gentle_core::attachments`] and are re-exported here for this
+//! feature's callers.
 
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
-use std::fmt;
-use std::ops::Range;
 use std::path::Path;
 use std::sync::Arc;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
-use gpui_kit::{App, Image, ImageFormat, SharedString};
+use gpui_kit::{App, Image, ImageFormat};
 use serde_json::{Value, json};
 
 use gentle_core::transcript::{UserImage, image_key};
+
+pub use gentle_core::attachments::{
+    AttachedFile, PastedText, Rejection, chip_text, expand, file_name, find_tokens, human_size,
+    is_long_paste, missing_files, needs_lead, present, rejection_warning, remove_token, renumber,
+    split_files, summary, token, unprintable, with_files,
+};
 
 /// Largest image accepted, before base64.
 pub const MAX_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
@@ -67,19 +76,44 @@ impl Attachment {
     }
 }
 
-/// Read an image file, checking its size before reading it.
-pub fn load_path(path: &Path) -> Result<Attachment, Rejection> {
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| path.display().to_string());
+/// What a dropped or picked path carried.
+#[derive(Debug)]
+pub enum Loaded {
+    Image(Attachment),
+    File(AttachedFile),
+}
+
+/// Read a path: an image attaches from its bytes ([`Attachment`]: sniffed,
+/// capped at [`MAX_IMAGE_BYTES`]); any other regular file attaches by path
+/// ([`AttachedFile`]); a folder is refused ([`Rejection::Folder`]), and so is
+/// a path the prompt could not name ([`unprintable`], which judges the line
+/// the prompt would carry: `cwd` as `backend` reads it) or one that can't be
+/// read ([`Rejection::Unreadable`]). Reading a path is disk work: the tab runs
+/// this off the UI thread, when the paths are dropped, pasted or picked.
+pub fn load_path(
+    path: &Path,
+    cwd: &Path,
+    backend: Option<&gentle_core::backend::Backend>,
+) -> Result<Loaded, Rejection> {
+    if let Some(rejection) = unprintable(path, cwd, backend) {
+        return Err(rejection);
+    }
+    let name = file_name(path);
     let unreadable = |error: std::io::Error| Rejection::Unreadable {
         name: name.clone(),
         error: error.to_string(),
     };
     let metadata = std::fs::metadata(path).map_err(unreadable)?;
-    if !metadata.is_file() {
-        return Err(Rejection::Unsupported { name });
+    if metadata.is_dir() {
+        return Err(Rejection::Folder { name });
+    }
+    if !is_image_file(path).map_err(unreadable)? {
+        return Ok(Loaded::File(AttachedFile {
+            name,
+            path: path.to_path_buf(),
+            canonical: canonical(path),
+            bytes: metadata.len(),
+        }));
     }
     if metadata.len() > MAX_IMAGE_BYTES {
         return Err(Rejection::TooLarge {
@@ -88,26 +122,34 @@ pub fn load_path(path: &Path) -> Result<Attachment, Rejection> {
         });
     }
     let bytes = std::fs::read(path).map_err(unreadable)?;
-    Attachment::from_bytes(&name, bytes)
+    Attachment::from_bytes(&name, bytes).map(Loaded::Image)
 }
 
-/// Whether a pasted path is an image, judged by its first bytes rather than
-/// its extension (a misnamed `shot.pnmg` still attaches; pasted non-images
-/// stay text).
-pub fn is_image_file(path: &Path) -> bool {
+/// `path` with links and `.`/`..` resolved, as far as the disk allows: the
+/// spelling two attachments of one file share ([`AttachedFile::canonical`]).
+/// Read here, off the UI thread, with the file; a path the disk can't resolve
+/// (the file is gone) keeps the spelling it came in with.
+fn canonical(path: &Path) -> std::path::PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Whether a path is an image, judged by its first bytes rather than its
+/// extension (a misnamed `shot.pnmg` still attaches as an image; a
+/// non-image attaches as a file). `Err` when its bytes can't be read.
+pub fn is_image_file(path: &Path) -> std::io::Result<bool> {
     use std::io::Read as _;
     let mut head = [0u8; 12];
-    let Ok(mut file) = std::fs::File::open(path) else {
-        return false;
-    };
+    let mut file = std::fs::File::open(path)?;
     let mut read = 0;
     while read < head.len() {
         match file.read(&mut head[read..]) {
-            Ok(0) | Err(_) => break,
+            Ok(0) => break,
             Ok(n) => read += n,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
         }
     }
-    is_image_header(&head[..read])
+    Ok(is_image_header(&head[..read]))
 }
 
 /// The formats [`Attachment::from_bytes`] takes: those [`sniff`] knows, plus
@@ -117,33 +159,6 @@ fn is_image_header(head: &[u8]) -> bool {
         || (head.starts_with(b"BM") && head.get(6..10) == Some(&[0; 4]))
         || head.starts_with(b"II*\0")
         || head.starts_with(b"MM\0*")
-}
-
-/// Why an image was not attached.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Rejection {
-    Unsupported { name: String },
-    TooLarge { name: String, bytes: u64 },
-    Unreadable { name: String, error: String },
-}
-
-impl fmt::Display for Rejection {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Unsupported { name } => {
-                write!(
-                    f,
-                    "{name} is not a PNG, JPEG, GIF, WebP, BMP or TIFF image."
-                )
-            }
-            Self::TooLarge { name, bytes } => write!(
-                f,
-                "{name} is {:.1} MB; images must be 20 MB or smaller.",
-                *bytes as f64 / (1024.0 * 1024.0)
-            ),
-            Self::Unreadable { name, error } => write!(f, "Could not read {name}: {error}"),
-        }
-    }
 }
 
 /// A BMP or TIFF re-encoded as PNG, the formats providers don't take but
@@ -192,229 +207,6 @@ pub fn prompt_command(text: &str, images: &[Attachment], steer: bool) -> Value {
         command["streamingBehavior"] = "steer".into();
     }
     command
-}
-
-// ── Tokens ─────────────────────────────────────────────────────────────────
-
-/// What a composer token stands for. Each kind is numbered on its own:
-/// `[Image #2]` is the second image, `[Pasted text #2]` the second paste.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Kind {
-    Image,
-    Pasted,
-}
-
-impl Kind {
-    const fn name(self) -> &'static str {
-        match self {
-            Self::Image => "Image",
-            Self::Pasted => "Pasted text",
-        }
-    }
-
-    /// `[` and the name: where a token of this kind starts.
-    const fn open(self) -> &'static str {
-        match self {
-            Self::Image => "[Image",
-            Self::Pasted => "[Pasted text",
-        }
-    }
-}
-
-/// The composer token for attachment `n` (1-based) of `kind`.
-pub fn token(kind: Kind, n: usize) -> String {
-    format!("[{} #{n}]", kind.name())
-}
-
-/// Whether a token inserted after `before` needs a space ahead of it.
-pub fn needs_lead(before: Option<char>) -> bool {
-    before.is_some_and(|c| !c.is_whitespace())
-}
-
-/// What to insert at the cursor for image `n`: the token, spaced from the
-/// character before it, with a trailing space to keep typing.
-pub fn insertion(before: Option<char>, n: usize) -> String {
-    let lead = if needs_lead(before) { " " } else { "" };
-    format!("{lead}{} ", token(Kind::Image, n))
-}
-
-/// Every token of `kind` in `text`, spelled `[Image #N]` or `[Image#N]`:
-/// byte range and number.
-pub fn find_tokens(text: &str, kind: Kind) -> Vec<(Range<usize>, usize)> {
-    let open = kind.open();
-    let mut found = Vec::new();
-    let mut from = 0;
-    while let Some(offset) = text[from..].find(open) {
-        let start = from + offset;
-        let mut rest = &text[start + open.len()..];
-        rest = rest.strip_prefix(' ').unwrap_or(rest);
-        let parsed = rest.strip_prefix('#').and_then(|rest| {
-            let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
-            let number = rest[..digits].parse::<usize>().ok()?;
-            rest[digits..].starts_with(']').then_some((number, digits))
-        });
-        match parsed {
-            Some((number, digits)) => {
-                let end = text.len() - rest.len() + 1 + digits + 1;
-                found.push((start..end, number));
-                from = end;
-            }
-            None => from = start + open.len(),
-        }
-    }
-    found
-}
-
-/// `text` after attachment `removed` of `kind` is dropped: its token goes
-/// (with one adjoining space) and later tokens of that kind shift down so
-/// `#N` stays the N-th one.
-pub fn remove_token(text: &str, kind: Kind, removed: usize) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut last = 0;
-    for (range, number) in find_tokens(text, kind) {
-        out.push_str(&text[last..range.start]);
-        last = range.end;
-        if number == removed {
-            if text[last..].starts_with(' ') {
-                last += 1;
-            } else if out.ends_with(' ') {
-                out.pop();
-            }
-        } else if number > removed {
-            out.push_str(&token(kind, number - 1));
-        } else {
-            out.push_str(&text[range]);
-        }
-    }
-    out.push_str(&text[last..]);
-    out
-}
-
-/// Which of the `count` attachments of `kind` still have a token in `text`:
-/// their numbers, ascending, each once.
-pub fn present(text: &str, kind: Kind, count: usize) -> Vec<usize> {
-    let mut numbers: Vec<usize> = find_tokens(text, kind)
-        .into_iter()
-        .map(|(_, number)| number)
-        .filter(|number| (1..=count).contains(number))
-        .collect();
-    numbers.sort_unstable();
-    numbers.dedup();
-    numbers
-}
-
-/// `text` once only the attachments `kept` (ascending, from [`present`])
-/// remain: the i-th kept one's tokens become `#i`. Numbers not kept (typed
-/// past the last attachment) stay as typed.
-pub fn renumber(text: &str, kind: Kind, kept: &[usize]) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut last = 0;
-    for (range, number) in find_tokens(text, kind) {
-        out.push_str(&text[last..range.start]);
-        match kept.binary_search(&number) {
-            Ok(ix) => out.push_str(&token(kind, ix + 1)),
-            Err(_) => out.push_str(&text[range.clone()]),
-        }
-        last = range.end;
-    }
-    out.push_str(&text[last..]);
-    out
-}
-
-/// User text with each image token shown as `🖼 #N`.
-pub fn chip_text(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut last = 0;
-    for (range, number) in find_tokens(text, Kind::Image) {
-        out.push_str(&text[last..range.start]);
-        out.push_str(&format!("🖼 #{number}"));
-        last = range.end;
-    }
-    out.push_str(&text[last..]);
-    out
-}
-
-// ── Pasted text ────────────────────────────────────────────────────────────
-
-/// A paste of at least this many lines, or this many characters, is kept
-/// as a `[Pasted text #N]` attachment instead of being inserted: below
-/// either, it pastes as text.
-pub const PASTE_LINES: usize = 6;
-pub const PASTE_CHARS: usize = 800;
-
-/// Lines and columns of a pasted text its card's tile shows.
-const PREVIEW_LINES: usize = 8;
-const PREVIEW_COLUMNS: usize = 24;
-
-/// A long paste waiting in the composer, sent in place of its token.
-#[derive(Clone, Debug)]
-pub struct PastedText {
-    /// Exactly what was pasted.
-    pub text: String,
-    /// [`line_count`] of `text`.
-    pub lines: usize,
-    /// The first lines, cut short, for the card's tile.
-    pub preview: SharedString,
-}
-
-impl PastedText {
-    pub fn new(text: String) -> Self {
-        Self {
-            lines: line_count(&text),
-            preview: preview(&text).into(),
-            text,
-        }
-    }
-}
-
-/// Lines in `text`: `\n` and `\r\n` both end one, and a final line break
-/// does not start another.
-pub fn line_count(text: &str) -> usize {
-    text.lines().count()
-}
-
-/// Whether a pasted `text` is long enough to become an attachment (see
-/// [`PASTE_LINES`]). Blank pastes never are.
-pub fn is_long_paste(text: &str) -> bool {
-    !text.trim().is_empty()
-        && (text.lines().nth(PASTE_LINES - 1).is_some()
-            || text.chars().nth(PASTE_CHARS - 1).is_some())
-}
-
-/// The first lines of `text`, each cut to a few columns, tabs as spaces.
-fn preview(text: &str) -> String {
-    text.lines()
-        .take(PREVIEW_LINES)
-        .map(|line| {
-            line.chars()
-                .take(PREVIEW_COLUMNS)
-                .collect::<String>()
-                .replace('\t', "  ")
-                .trim_end()
-                .to_string()
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-/// `text` with each `[Pasted text #N]` replaced by the N-th of `pasted`,
-/// verbatim. Tokens past the last paste stay as typed, and tokens inside a
-/// pasted text are its own content: they are not expanded again.
-pub fn expand(text: &str, pasted: &[PastedText]) -> String {
-    let tokens = find_tokens(text, Kind::Pasted);
-    let pasted_len: usize = pasted.iter().map(|p| p.text.len()).sum();
-    let mut out = String::with_capacity(text.len() + pasted_len);
-    let mut last = 0;
-    for (range, number) in tokens {
-        let Some(paste) = number.checked_sub(1).and_then(|ix| pasted.get(ix)) else {
-            continue;
-        };
-        out.push_str(&text[last..range.start]);
-        out.push_str(&paste.text);
-        last = range.end;
-    }
-    out.push_str(&text[last..]);
-    out
 }
 
 // ── Decode cache ───────────────────────────────────────────────────────────
@@ -529,6 +321,8 @@ fn decode(image: &UserImage) -> Option<Arc<Image>> {
 mod tests {
     use super::*;
 
+    use std::path::PathBuf;
+
     const PNG: &[u8] = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR";
     const JPEG: &[u8] = &[0xFF, 0xD8, 0xFF, 0xE0, 0, 0x10];
 
@@ -594,24 +388,87 @@ mod tests {
         assert!(Attachment::from_bytes("limit.png", limit).is_ok());
     }
 
+    /// A folder of this test's own, outside the repository.
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("gs-attach-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// S1: a file that is not an image attaches by path instead of being
+    /// refused for its format; images keep today's behavior.
+    #[test]
+    fn regular_files_attach_by_path() {
+        let dir = temp_dir("files");
+        let notes = dir.join("notes.txt");
+        std::fs::write(&notes, "hello").unwrap();
+        let pdf = dir.join("report.pdf");
+        std::fs::write(&pdf, b"%PDF-1.7\n").unwrap();
+
+        let Loaded::File(file) = load_path(&notes, &dir, None).unwrap() else {
+            panic!("notes.txt is a file");
+        };
+        assert_eq!(file.name, "notes.txt");
+        assert_eq!(file.path, notes);
+        assert_eq!(file.canonical, std::fs::canonicalize(&notes).unwrap());
+        assert_eq!(file.bytes, 5);
+        assert_eq!(human_size(file.bytes), "5 B");
+        assert!(matches!(
+            load_path(&pdf, &dir, None).unwrap(),
+            Loaded::File(_)
+        ));
+
+        let png = dir.join("shot.PNG");
+        std::fs::write(&png, PNG).unwrap();
+        let Loaded::Image(image) = load_path(&png, &dir, None).unwrap() else {
+            panic!("a PNG is still an image");
+        };
+        assert_eq!(image.mime_type(), "image/png");
+
+        assert_eq!(human_size(2048), "2.0 KB");
+        assert_eq!(human_size(3 * 1024 * 1024), "3.0 MB");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// S2: a folder is still refused, by name.
+    #[test]
+    fn folders_are_rejected_by_name() {
+        let dir = temp_dir("folder");
+        let folder = dir.join("shots");
+        std::fs::create_dir_all(&folder).unwrap();
+        let error = load_path(&folder, &dir, None).unwrap_err();
+        assert_eq!(
+            error,
+            Rejection::Folder {
+                name: "shots".into()
+            }
+        );
+        assert_eq!(
+            error.to_string(),
+            "shots is a folder; attach files instead."
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn loads_files_and_reports_failures() {
-        let dir = std::env::temp_dir().join(format!("gs-attach-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = temp_dir("loads");
         let png = dir.join("shot.PNG");
         std::fs::write(&png, PNG).unwrap();
         let text = dir.join("notes.txt");
         std::fs::write(&text, "hi").unwrap();
 
-        assert_eq!(load_path(&png).unwrap().mime_type(), "image/png");
-        assert_eq!(
-            load_path(&text).unwrap_err(),
-            Rejection::Unsupported {
-                name: "notes.txt".into()
-            }
-        );
+        let Loaded::Image(loaded) = load_path(&png, &dir, None).unwrap() else {
+            panic!("a PNG is an image");
+        };
+        assert_eq!(loaded.mime_type(), "image/png");
         assert!(matches!(
-            load_path(&dir.join("missing.png")),
+            load_path(&text, &dir, None).unwrap(),
+            Loaded::File(_)
+        ));
+        assert!(matches!(
+            load_path(&dir.join("missing.png"), &dir, None),
             Err(Rejection::Unreadable { .. })
         ));
         // Judged by content: a misnamed PNG attaches, a `.png` text doesn't.
@@ -619,179 +476,78 @@ mod tests {
         std::fs::write(&misnamed, PNG).unwrap();
         let fake = dir.join("fake.png");
         std::fs::write(&fake, "not an image").unwrap();
-        assert!(is_image_file(&png));
-        assert!(is_image_file(&misnamed));
-        assert_eq!(load_path(&misnamed).unwrap().mime_type(), "image/png");
-        assert!(!is_image_file(&fake));
-        assert!(!is_image_file(&text));
-        assert!(!is_image_file(&dir.join("missing.png")));
+        assert!(is_image_file(&png).unwrap());
+        assert!(is_image_file(&misnamed).unwrap());
+        let Loaded::Image(misnamed) = load_path(&misnamed, &dir, None).unwrap() else {
+            panic!("a misnamed PNG is still an image");
+        };
+        assert_eq!(misnamed.mime_type(), "image/png");
+        assert!(!is_image_file(&fake).unwrap());
+        assert!(!is_image_file(&text).unwrap());
+        assert!(is_image_file(&dir.join("missing.png")).is_err());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// S11: a path that can't be read is refused as unreadable, never
+    /// attached as a file as if it were something else.
+    #[cfg(unix)]
     #[test]
-    fn inserts_spaced_tokens() {
-        assert_eq!(insertion(None, 1), "[Image #1] ");
-        assert_eq!(insertion(Some(' '), 2), "[Image #2] ");
-        assert_eq!(insertion(Some('\n'), 2), "[Image #2] ");
-        assert_eq!(insertion(Some('x'), 3), " [Image #3] ");
-    }
-
-    #[test]
-    fn finds_both_token_spellings() {
-        let text = "a [Image #1] b [Image#22] [Image #] [Image #3 [Image #4]";
-        let found: Vec<_> = find_tokens(text, Kind::Image)
-            .into_iter()
-            .map(|(r, n)| (&text[r], n))
-            .collect();
-        assert_eq!(
-            found,
-            vec![("[Image #1]", 1), ("[Image#22]", 22), ("[Image #4]", 4)]
+    fn an_unreadable_path_is_rejected() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir("unreadable");
+        let shot = dir.join("shot.png");
+        std::fs::write(&shot, PNG).unwrap();
+        std::fs::set_permissions(&shot, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Running as root reads it anyway: there is nothing to prove then.
+        if std::fs::read(&shot).is_ok() {
+            std::fs::remove_dir_all(&dir).unwrap();
+            return;
+        }
+        let rejection = load_path(&shot, &dir, None).unwrap_err();
+        assert!(
+            matches!(rejection, Rejection::Unreadable { .. }),
+            "{rejection:?}"
         );
+        assert!(
+            rejection
+                .to_string()
+                .starts_with("Could not read shot.png: ")
+        );
+        assert!(is_image_file(&shot).is_err());
+        std::fs::set_permissions(&shot, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// S11, S14/R3-1: a path the prompt's block can't carry (one with a line
+    /// break) is refused when it is attached, by name, instead of breaking the
+    /// block; a printable file in a folder whose own name has one still
+    /// attaches, since the block names the file, not the folder.
+    #[cfg(unix)]
     #[test]
-    fn removal_renumbers_later_tokens() {
-        let text = "[Image #1] first [Image #2] second [Image#3] third";
-        let remove = |text: &str, n| remove_token(text, Kind::Image, n);
-        assert_eq!(remove(text, 2), "[Image #1] first second [Image #2] third");
-        assert_eq!(remove(text, 1), "first [Image #1] second [Image #2] third");
-        assert_eq!(remove("look [Image #1]", 1), "look");
-        assert_eq!(remove("no tokens", 1), "no tokens");
+    fn paths_with_a_line_break_are_refused() {
+        let dir = temp_dir("newline");
+        let odd = dir.join("a\nb.txt");
+        std::fs::write(&odd, "hi").unwrap();
+        assert_eq!(
+            load_path(&odd, &dir, None).unwrap_err(),
+            Rejection::LineBreak {
+                name: "a\nb.txt".to_string()
+            }
+        );
+        assert_eq!(
+            load_path(&odd, &dir, None).unwrap_err().to_string(),
+            "a\nb.txt has a line break in its path; rename it to attach it."
+        );
 
-        // Removing #1 then (the new) #1 leaves the third image as #1.
-        let once = remove(text, 1);
-        assert_eq!(remove(&once, 1), "first second [Image #1] third");
-        // The next attachment after removals is numbered by count again.
-        let count = find_tokens(&remove(&once, 1), Kind::Image).len();
-        assert_eq!(insertion(Some('d'), count + 1), " [Image #2] ");
-    }
-
-    #[test]
-    fn pasted_and_image_tokens_are_numbered_apart() {
-        let text = "[Pasted text #1] a [Image #1] b [Pasted text#2] [Image #2] [Pasted text #3]";
-        let numbers = |kind| {
-            find_tokens(text, kind)
-                .into_iter()
-                .map(|(r, n)| (&text[r], n))
-                .collect::<Vec<_>>()
+        let two_lines = dir.join("two\nlines");
+        std::fs::create_dir_all(&two_lines).unwrap();
+        let inside = two_lines.join("notes.txt");
+        std::fs::write(&inside, "hi").unwrap();
+        let Loaded::File(file) = load_path(&inside, &two_lines, None).unwrap() else {
+            panic!("a printable file in a folder with a line break in its name");
         };
-        assert_eq!(
-            numbers(Kind::Image),
-            vec![("[Image #1]", 1), ("[Image #2]", 2)]
-        );
-        assert_eq!(
-            numbers(Kind::Pasted),
-            vec![
-                ("[Pasted text #1]", 1),
-                ("[Pasted text#2]", 2),
-                ("[Pasted text #3]", 3)
-            ]
-        );
-        // Dropping a paste renumbers later pastes only; images keep theirs.
-        assert_eq!(
-            remove_token(text, Kind::Pasted, 2),
-            "[Pasted text #1] a [Image #1] b [Image #2] [Pasted text #2]"
-        );
-        // And dropping an image leaves every paste as it was.
-        assert_eq!(
-            remove_token(text, Kind::Image, 1),
-            "[Pasted text #1] a b [Pasted text#2] [Image #1] [Pasted text #3]"
-        );
-        assert_eq!(token(Kind::Pasted, 4), "[Pasted text #4]");
-        assert!(needs_lead(Some('x')) && !needs_lead(Some('\n')) && !needs_lead(None));
-    }
-
-    #[test]
-    fn deleted_pastes_are_pruned_and_the_rest_renumbered() {
-        // #2 of three was deleted from the text; #3 appears twice (copied),
-        // #0 and #7 were typed and match no paste.
-        let text = "[Pasted text #1] x [Pasted text #3] [Pasted text #0] [Pasted text #3] [Pasted text #7]";
-        let kept = present(text, Kind::Pasted, 3);
-        assert_eq!(kept, vec![1, 3]);
-        assert_eq!(
-            renumber(text, Kind::Pasted, &kept),
-            "[Pasted text #1] x [Pasted text #2] [Pasted text #0] [Pasted text #2] [Pasted text #7]"
-        );
-        // The first one deleted: the others all move down.
-        let text = "[Image #1] [Pasted text #2] [Pasted text #3]";
-        let kept = present(text, Kind::Pasted, 3);
-        assert_eq!(kept, vec![2, 3]);
-        assert_eq!(
-            renumber(text, Kind::Pasted, &kept),
-            "[Image #1] [Pasted text #1] [Pasted text #2]"
-        );
-        // Nothing deleted: nothing to prune.
-        assert_eq!(
-            present("[Pasted text #2] [Pasted text #1]", Kind::Pasted, 2),
-            vec![1, 2]
-        );
-        assert!(present("all gone", Kind::Pasted, 2).is_empty());
-    }
-
-    #[test]
-    fn expansion_puts_each_paste_verbatim_in_its_place() {
-        let pasted = [
-            PastedText::new("alpha\r\n  indented\n".into()),
-            PastedText::new("beta [Pasted text #1] [Image #1]".into()),
-        ];
-        // Out of order, repeated, next to an image token, glued to text.
-        let text = "B: [Pasted text #2] A:[Pasted text#1]! again [Pasted text #1] [Image #1]";
-        assert_eq!(
-            expand(text, &pasted),
-            "B: beta [Pasted text #1] [Image #1] A:alpha\r\n  indented\n! again alpha\r\n  indented\n [Image #1]"
-        );
-        // Numbers no paste has stay as typed.
-        assert_eq!(
-            expand("[Pasted text #0] [Pasted text #3]", &pasted),
-            "[Pasted text #0] [Pasted text #3]"
-        );
-        assert_eq!(expand("plain", &[]), "plain");
-    }
-
-    #[test]
-    fn counts_lines_with_any_line_ending() {
-        assert_eq!(line_count(""), 0);
-        assert_eq!(line_count("a"), 1);
-        assert_eq!(line_count("a\n"), 1);
-        assert_eq!(line_count("a\nb"), 2);
-        assert_eq!(line_count("a\r\nb\r\n"), 2);
-        assert_eq!(line_count("a\r\n\r\nb"), 3);
-        assert_eq!(line_count("a\n\n\n"), 3);
-    }
-
-    #[test]
-    fn long_pastes_start_at_the_thresholds() {
-        let lines = |n: usize, end: &str| (1..=n).map(|i| format!("{i}{end}")).collect::<String>();
-        assert!(!is_long_paste(&lines(PASTE_LINES - 1, "\n")));
-        assert!(is_long_paste(&lines(PASTE_LINES, "\n")));
-        assert!(is_long_paste(&lines(PASTE_LINES, "\r\n")));
-        // Without the last line break it is still six lines.
-        assert!(is_long_paste(lines(PASTE_LINES, "\n").trim_end()));
-        // Characters, not bytes: 799 two-byte letters are short.
-        assert!(!is_long_paste(&"é".repeat(PASTE_CHARS - 1)));
-        assert!(is_long_paste(&"é".repeat(PASTE_CHARS)));
-        assert!(!is_long_paste(&"\n".repeat(20)));
-        assert!(!is_long_paste(&" ".repeat(PASTE_CHARS * 2)));
-    }
-
-    #[test]
-    fn pasted_text_keeps_its_text_and_previews_its_start() {
-        let text = format!("\tfn main() {{\r\n{}\n}}\n", "x".repeat(60));
-        let pasted = PastedText::new(text.clone());
-        assert_eq!(pasted.text, text);
-        assert_eq!(pasted.lines, 3);
-        assert_eq!(
-            pasted.preview.as_ref(),
-            format!("  fn main() {{\n{}\n}}", "x".repeat(PREVIEW_COLUMNS))
-        );
-        let long = (0..40).map(|i| format!("{i}\n")).collect::<String>();
-        assert_eq!(PastedText::new(long).preview.lines().count(), PREVIEW_LINES);
-    }
-
-    #[test]
-    fn chips_replace_tokens() {
-        let text = chip_text("see [Image #1] and [Image#2]");
-        assert_eq!(text, "see 🖼 #1 and 🖼 #2");
+        assert_eq!(file.path, inside);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -799,10 +555,10 @@ mod tests {
         let image = Attachment::from_bytes("a.png", PNG.to_vec()).unwrap();
         let data = STANDARD.encode(PNG);
         assert_eq!(
-            prompt_command("what is [Image #1]", std::slice::from_ref(&image), false),
+            prompt_command("what is this", std::slice::from_ref(&image), false),
             json!({
                 "type": "prompt",
-                "message": "what is [Image #1]",
+                "message": "what is this",
                 "images": [{"type": "image", "data": data, "mimeType": "image/png"}],
             })
         );

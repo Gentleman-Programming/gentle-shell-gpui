@@ -53,10 +53,9 @@ impl Workspace {
         if searching && matches == 0 {
             list = list.child(Self::quiet_row("No matching workspaces or sessions", 0.));
         }
-        let actions = self.header_actions(cx);
         v_flex()
             .size_full()
-            .child(self.sidebar_header(actions, cx))
+            .pt_2()
             .child(self.sidebar_search())
             .child(list)
             .child(self.global_activity_row())

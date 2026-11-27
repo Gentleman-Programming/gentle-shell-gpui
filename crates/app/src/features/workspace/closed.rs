@@ -338,9 +338,10 @@ mod tests {
                     tab_layout: TabLayout::Horizontal,
                     tabs_sidebar_motion: Default::default(),
                     files_sidebar_motion: Default::default(),
-                    sidebar_compact: false,
                     tabs_sidebar_width: gentle_core::workspaces::SIDEBAR_DEFAULT_WIDTH,
                     files_sidebar_width: gentle_core::workspaces::SIDEBAR_DEFAULT_WIDTH,
+                    sidebar_compact: false,
+                    tabs_sidebar_hidden: false,
                     badge_picker: None,
                     open_menu: None,
                     workspace_rename: None,
@@ -365,6 +366,7 @@ mod tests {
                     closed: vec![closed],
                     music: cx.new(|cx| Music::new(window, cx)),
                     devices: cx.new(DevicePanel::new),
+                    focus: cx.focus_handle(),
                 });
                 workspace.update(cx, |workspace, cx| workspace.reopen_closed(window, cx));
                 let workspace = workspace.read(cx);

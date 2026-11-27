@@ -75,6 +75,8 @@ pub struct WebSurface {
     /// New-window requests (`target="_blank"`) load here; see
     /// [`Self::follow_popups`].
     popups: Option<(super::Popups, Task<()>)>,
+    /// Where Esc the page didn't use goes; see [`Self::relay_escape`].
+    escapes: Option<super::Escapes>,
 }
 
 /// The size a page out of sight is laid out at (an agent's parked page).
@@ -96,6 +98,7 @@ impl WebSurface {
             _pump: None,
             _window_moves: None,
             popups: None,
+            escapes: None,
         }
     }
 
@@ -113,6 +116,18 @@ impl WebSurface {
             }
         });
         self.popups = Some((tx, task));
+    }
+
+    /// Send Esc the page didn't use to `escapes` (the browser card restores
+    /// itself): the web view keeps the keyboard, so it never reaches the
+    /// app otherwise. Takes effect on the next native view.
+    pub fn relay_escape(&mut self, escapes: super::Escapes) {
+        self.escapes = Some(escapes);
+    }
+
+    /// The page has the keyboard (it was clicked).
+    pub fn has_keyboard(&self) -> bool {
+        self.view.as_ref().is_some_and(|view| view.has_keyboard())
     }
 
     /// An isolated page served by `sandbox`, starting at `url` (one of its
@@ -315,7 +330,10 @@ impl WebSurface {
         let script = self.script.clone();
         let sandbox = self.sandbox.clone();
         let profile = self.profile.clone();
-        let popups = self.popups.as_ref().map(|(tx, _)| tx.clone());
+        let relays = super::Relays {
+            popups: self.popups.as_ref().map(|(tx, _)| tx.clone()),
+            escapes: self.escapes.clone(),
+        };
         let background = page_background();
         let handle = window.window_handle();
         cx.spawn(async move |this, cx| {
@@ -326,7 +344,7 @@ impl WebSurface {
                 script.as_deref(),
                 sandbox.as_ref(),
                 &profile,
-                popups,
+                relays,
             );
             // A surface dropped meanwhile drops the view, and its popup with
             // it; one hidden meanwhile (and not driven) drops it right here.

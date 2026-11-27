@@ -1,18 +1,20 @@
 //! The notification list inside the bell's popover: header actions (mark all
-//! read, clear) and one row per notice, which jumps to its pane.
+//! read, clear) and one row per notice, which jumps to its session, or says
+//! why it can't (its pane closed, or shows another session now).
 
 use std::time::{Duration, Instant};
 
 use gpui_kit::assets::IconName;
+use gpui_kit::component::notification::Notification;
 use gpui_kit::component::popover::PopoverState;
-use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::shared::ui;
 use gentle_core::transcript::NoticeLevel;
 
-use super::{Notices, OnSelect};
+use super::{Notices, OnSelect, Reach, ReachOf};
 
 /// "now", "42s", "5m", "3h", "2d".
 fn ago(elapsed: Duration) -> String {
@@ -34,9 +36,25 @@ fn level_style(level: NoticeLevel) -> (IconName, Hsla) {
     }
 }
 
+/// What a row says, and a click explains, when its session can't be shown.
+fn gone_texts(reach: Reach) -> Option<(&'static str, &'static str)> {
+    match reach {
+        Reach::Open => None,
+        Reach::SessionGone => Some((
+            "session no longer open",
+            "The session that sent this is no longer open: its pane shows another one now.",
+        )),
+        Reach::PaneClosed => Some((
+            "pane closed",
+            "The pane that sent this notification was closed.",
+        )),
+    }
+}
+
 pub(super) fn panel(
     store: &Entity<Notices>,
     on_select: OnSelect,
+    reach: ReachOf,
     cx: &mut Context<PopoverState>,
 ) -> Div {
     let notices = store.read(cx);
@@ -116,10 +134,20 @@ pub(super) fn panel(
         let rows = notices.iter().map(|notice| {
             let (icon, color) = level_style(notice.level);
             let id = notice.id;
-            let origin = notice.origin;
+            let gone = notice
+                .origin
+                .as_ref()
+                .and_then(|origin| gone_texts(reach(origin, cx)));
             let store = store.clone();
             let on_select = on_select.clone();
+            let reach = reach.clone();
             let mut meta = notice.source.to_string();
+            if let Some((marker, _)) = gone {
+                if !meta.is_empty() {
+                    meta.push_str("  ·  ");
+                }
+                meta.push_str(marker);
+            }
             if !meta.is_empty() {
                 meta.push_str("  ·  ");
             }
@@ -142,9 +170,19 @@ pub(super) fn panel(
                         s.mark_read(id);
                         cx.notify();
                     });
-                    if let Some(origin) = origin {
+                    // Asked again: the pane may have moved on since the list drew.
+                    let target = store
+                        .read(cx)
+                        .iter()
+                        .find(|n| n.id == id)
+                        .and_then(|n| n.origin.as_ref())
+                        .map(|origin| (origin.pane, reach(origin, cx)));
+                    if let Some((pane, reach)) = target {
                         state.dismiss(window, cx);
-                        on_select(origin, window, cx);
+                        match gone_texts(reach) {
+                            None => on_select(pane, window, cx),
+                            Some((_, why)) => window.push_notification(Notification::info(why), cx),
+                        }
                     }
                     cx.notify();
                 }))

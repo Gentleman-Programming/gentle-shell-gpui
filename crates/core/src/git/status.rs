@@ -183,8 +183,10 @@ impl ChangeGroup {
     }
 }
 
-/// The non-empty groups in display order, each with its entries as
-/// `(index into entries, badge)` in status order.
+/// The groups in display order, each with its entries as `(index into
+/// entries, badge)` in status order. Staged is always there, empty when
+/// nothing is staged, so its header doesn't come and go as files move in
+/// and out of it; Unstaged and Untracked only when they have entries.
 pub fn change_groups(entries: &[StatusEntry]) -> Vec<(ChangeGroup, Vec<(usize, char)>)> {
     [
         ChangeGroup::Staged,
@@ -198,7 +200,7 @@ pub fn change_groups(entries: &[StatusEntry]) -> Vec<(ChangeGroup, Vec<(usize, c
             .enumerate()
             .filter_map(|(i, entry)| group.badge(entry).map(|badge| (i, badge)))
             .collect();
-        (!members.is_empty()).then_some((group, members))
+        (group == ChangeGroup::Staged || !members.is_empty()).then_some((group, members))
     })
     .collect()
 }
@@ -450,12 +452,23 @@ mod tests {
     }
 
     #[test]
-    fn change_groups_leave_out_empty_groups() {
-        assert!(change_groups(&[]).is_empty());
+    fn change_groups_keep_an_empty_staged_and_leave_out_other_empty_groups() {
+        assert_eq!(change_groups(&[]), vec![(ChangeGroup::Staged, vec![])]);
         let tree = parse_status_v2("? a.txt\0");
         assert_eq!(
             change_groups(&tree.entries),
-            vec![(ChangeGroup::Untracked, vec![(0, '?')])]
+            vec![
+                (ChangeGroup::Staged, vec![]),
+                (ChangeGroup::Untracked, vec![(0, '?')])
+            ]
+        );
+        let tree = parse_status_v2("1 .M N... 100644 100644 100644 aaaa bbbb a.rs\0");
+        assert_eq!(
+            change_groups(&tree.entries),
+            vec![
+                (ChangeGroup::Staged, vec![]),
+                (ChangeGroup::Unstaged, vec![(0, 'M')])
+            ]
         );
         let tree = parse_status_v2("1 M. N... 100644 100644 100644 aaaa bbbb a.rs\0");
         assert_eq!(

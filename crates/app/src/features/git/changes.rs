@@ -108,6 +108,15 @@ pub fn discard(toplevel: &Path, entry: &StatusEntry, staged: bool) -> Result<(),
     }
 }
 
+/// How many stashes the repository keeps.
+pub fn stash_count(toplevel: &Path) -> usize {
+    git(
+        toplevel,
+        &["--no-optional-locks", "stash", "list", "--format=%gd"],
+    )
+    .map_or(0, |out| out.lines().count())
+}
+
 /// Stash every change, untracked files included.
 pub fn stash_push(toplevel: &Path, message: &str) -> Result<(), String> {
     let mut args = vec!["stash", "push", "--include-untracked"];
@@ -207,6 +216,33 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         run(&dir, &["init", "-q", "-b", "main"]).unwrap();
         Some(dir)
+    }
+
+    /// The clean Changes view offers the stashes only while some exist.
+    #[test]
+    fn stash_count_follows_pushes() {
+        let Some(dir) = repo("stash-count") else {
+            return;
+        };
+        run(&dir, &["config", "user.name", "Test"]).unwrap();
+        run(&dir, &["config", "user.email", "test@example.com"]).unwrap();
+        std::fs::write(dir.join("a.txt"), "one\n").unwrap();
+        run(&dir, &["add", "a.txt"]).unwrap();
+        run(
+            &dir,
+            &["-c", "commit.gpgsign=false", "commit", "-q", "-m", "init"],
+        )
+        .unwrap();
+        assert_eq!(stash_count(&dir), 0);
+
+        for text in ["two\n", "three\n"] {
+            std::fs::write(dir.join("a.txt"), text).unwrap();
+            stash_push(&dir, "").unwrap();
+        }
+
+        let count = stash_count(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(count, 2);
     }
 
     /// A file name is a name, not a pattern: discarding `notes[1].txt`

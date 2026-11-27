@@ -9,7 +9,7 @@ These principles come from the current code. They are not aspirations.
 | Principle | How it applies |
 | --- | --- |
 | **Translucent glass** | The window requests `WindowBackgroundAppearance::Blurred` and a transparent title bar (`crates/app/src/app/mod.rs`). Surfaces (`panel`, `surface`, `well`…) are the theme background, tinted and with alpha, so the blurred desktop shows through. What floats on top (menus, screens, palette) is opaque: `popover_bg` and `screen_bg` have alpha 1 at any transparency. |
-| **No lines in the chrome** | The title bar has no border (`title_bar_border = clear` in `ui::apply_theme`). Panels and the sidebar have a transparent `border_1()`; only the focused panel of a split shows a `petal().opacity(0.45)` border (`features/workspace/view.rs`). Dividers between panels are a 6 px gap (`DIVIDER`) with a 2×40 px handle that appears in `petal()` only on hover (`floating::divider_handle`): the splits, the docked browser column's left edge (`floating::dock_divider`) and the straight edges of a floating card. The sidebars’ inner edges use `ui::resize_handle` with the same hover treatment. Inside, zones are separated by space and by the change of surface (`panel` → `surface` → `well`). |
+| **No lines in the chrome** | The title bar has no border (`title_bar_border = clear` in `ui::apply_theme`). Panels and the sidebar have a transparent `border_1()`; only the focused panel of a split shows a `petal().opacity(0.45)` border (`features/workspace/view.rs`). Dividers between panels are a 6 px gap (`DIVIDER`) with a 2×40 px handle that appears in `petal()` only on hover (`floating::divider_handle`): the splits, the docked browser column's left edge (`floating::dock_divider`) and the straight edges of a floating card. The sidebars’ inner edges use `ui::resize_handle` with the same hover treatment; dragging only resizes (both edges clamp), while each panel's own controls compact or hide it — compacting stops at the 48 px icon rail and hiding removes the panel, both independent and persisted. Inside, zones are separated by space and by the change of surface (`panel` → `surface` → `well`). |
 | **Thin lines only in screens** | Inside an overlay screen there is a `ui::border()` line between header, body and footer (`screen_header` uses `border_b_1`, footers use `border_t_1`), and Settings rows use `border().opacity(0.5)`. No more are added. |
 | **Petal as accent** | The brand pink (the theme's `accent`) is reserved for what is live and primary: the dot that pulses while the agent works, the `✿ phase…` text, the focused panel, primary buttons and the welcome glow. It is not used as a background fill. |
 | **Dense but calm** | `text_xs` is the most used size and `muted` the most used color (more than `fg`). Semantic color goes on icons, chips and card borders, not on large blocks. Animations last 220–420 ms and overshoot by no more than ~3 %. |
@@ -261,6 +261,7 @@ Presentation utilities in the same module: `split_path` (prefix `~/a/b/` and lea
 | `pop_in(id, el)` | 340 ms | `spring` | Opacity and relative `top` from 12 px | Screens, dialogs, palette. |
 | `popover_in(id, el)` | 300 ms | `spring` | Opacity only, without changing the measured size | Content inside an `island` or a popover. |
 | `scrim(id)` | 220 ms | `ease_out_quint` | `backdrop()` veil fading in | Behind a panel (`screen` already adds it). |
+| `veil(id)` | 220 ms | `ease_out_quint` | `popover_bg()` at 88 % fading in, no travel | The drop target: the agent tab while files are dragged over it. |
 | `pulse(el)` | 1400 ms, repeating at ~30 fps | `pulsating_between(0.35, 1.0)` | Breathes the opacity | Live indicators: the `✿` of `Working…`/`Thinking…` (on the agent's live layer), running agents and tabs. |
 | `spinner(size, color)` | 800 ms a turn, ~30 fps | linear | The `Loader` icon turning | Loads that stay on screen: running jobs, generative UI and Tower. |
 | `shimmer(text, base, highlight)` | 2000 ms sweep, ~30 fps | smoothstep band | A highlight crossing the text | "Working…", "Thinking…", "Starting gentle-shell…". |
@@ -351,6 +352,17 @@ backdrop.occlude().child(ui::pop_in(
 - Banner at scale 2.6, blooming and writing itself over `banner::WRITE` (2600 ms, as long as `INTRO` + `AFTER_INTRO`); when ready it switches to `Palette::Green` with `pop_in`. Heading (34 px `BOLD`) and footer enter with `appear_after` at `AFTER_INTRO` (1100 ms). If the screen is shown again, `intro_done` draws everything in place without animating.
 - Content centered with `max_w(px(680.))`; 88 px footer with `px_10`; ↵ runs the primary button.
 
+### Drop target
+
+While files are dragged over an agent tab — from Finder or from the sidebar's file tree — the whole tab is the target: no card, no border, no separate composer zone.
+
+- One `ui::veil("drop-veil")` over the conversation and the composer (`popover_bg()` at 88 %; it keeps the pane's colour, unlike the scrim's `backdrop()`), with `ui::pop_in` for the copy: `IconName::Inbox` at 44 px in `petal`, then "Drop files here" (`text_size` 20, `SEMIBOLD`, `fg`) and "Files and images · folders aren’t attached" (13, `muted`), centred with 8 px less bottom padding so the words sit above the middle of the tab.
+- Entrance: the veil fades in over 220 ms, `ease_out_quint`, without travel; the icon and words pop in over 340 ms with the app's ~3 % overshoot. With reduced motion both are simply there.
+- The layer takes no mouse (no hitbox, no `occlude()`): a drop anywhere on the tab still reaches its `on_drop`. The `pop_in` is wrapped in an absolute box, never passed an `.absolute()` element (see the motion rules).
+- The live layer is covered: the composer's orbit and the conversation's indicators don't show through it (`.child(self.live_slots.cover())`).
+- GPUI has no drag-leave hook: `SessionView::drop_over` follows every `on_drag_move` of a file drag (its bounds against the pointer), and the veil is only drawn while `cx.has_active_drag()` as well, so a drop, a release elsewhere, `FileDropEvent::Ended` and a drag that leaves the tab all take it down.
+- `files::FileDrag` is the payload a tree row carries (its path, name and whether it is a folder); the tab takes it with the same `attach_paths` route, so a folder is refused and a duplicate keeps one card.
+
 ### Session status chips
 
 `features/session/view/activity.rs` draws the activity line above the composer. On the left, while the agent works: the clock in `ui::mono()` and `muted` (counting each second), a 1×10 px separator in `border_strong`, `✿ phase…` in `petal` and the current tool, truncated, in `muted`. On the right, the status chips and permission mode chip form the composer's status row. Context usage appears separately as a ring in the composer, with compact-now and auto-compaction in its card. A turn shows two moving things only, the `orbit` round the composer's action button (`action_ring`) and the `✿ Working…` row: the model picker keeps its provider dot, a running step its still icon and an answer being written its petal line, with no dot after the text.
@@ -366,6 +378,8 @@ The composer's bottom bar inside the box reads `📎 · model · effort · NN% �
 ### Terminal pane chips
 
 A terminal pane (`features/terminal/mod.rs`) states what happens to it in a chip at its bottom-right corner, 10 px in from the edges, over the grid: `Process exited` (`faint`) once the shell ends, and `Press ⌃C again to close` (`Ctrl+C` off macOS; `muted`, on a `panel` backing so it reads over the text) after a first Ctrl+C at an idle prompt. That hint lives exactly as long as the double press's window (`gentle_core::double_interrupt::WINDOW`, 700 ms): one `with_animation` over the window (`NamedInteger("close-hint", n)`, a new id per hint) fades it in over its first 15 % and out over its last 35 %, and the view drops it when the window ends, so it shows exactly while a second press would close the pane.
+
+The same hint (`ui::close_hint`) shows in an agent pane after a first Ctrl+C on the idle agent, 12 px above the bottom of the conversation (just over the composer) and 16 px in from its right edge, clear of the scroll rail; with a generative UI surface expanded it sits in the same corner of the surface.
 
 ### Canvas style panel
 

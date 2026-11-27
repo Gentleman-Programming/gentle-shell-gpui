@@ -249,6 +249,7 @@ fn mono_font() -> Font {
 
 impl TerminalView {
     pub fn new(cwd: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        keys::install(cx);
         let (tx, rx) = async_channel::unbounded::<TermEvent>();
         let listener = Listener(tx);
         let dims = TermDims {
@@ -485,6 +486,29 @@ impl TerminalView {
             text.replace("\r\n", "\r").replace('\n', "\r").into_bytes()
         };
         self.input(bytes, cx);
+    }
+
+    /// Plain Tab is the shell's completion. The window's Root binds Tab to
+    /// focus traversal, but the terminal's own binding outranks it (a deeper
+    /// key context), so the key arrives here with the focus still in the pane.
+    fn complete(&mut self, _: &keys::Complete, _: &mut Window, cx: &mut Context<Self>) {
+        self.shell_key(keys::TAB, cx);
+    }
+
+    /// Shift+Tab is the shell's back-tab, the same way: menus and completion
+    /// paging inside the shell, not reverse focus traversal.
+    fn back_tab(&mut self, _: &keys::BackTab, _: &mut Window, cx: &mut Context<Self>) {
+        self.shell_key(keys::BACK_TAB, cx);
+    }
+
+    /// A key the shell owns, sent once. A composition in progress keeps it,
+    /// as it keeps every other key in `on_key_down`.
+    fn shell_key(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
+        if self.marked.is_some() {
+            cx.propagate();
+            return;
+        }
+        self.input(bytes.to_vec(), cx);
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
@@ -1103,13 +1127,15 @@ impl Render for TerminalView {
 
         div()
             .id("terminal")
-            .key_context("Terminal")
+            .key_context(keys::CONTEXT)
             .track_focus(&self.focus_handle)
             .relative()
             .size_full()
             .p(rems(PADDING / 16.))
             .font_family(ui::terminal_mono())
             .cursor(CursorStyle::IBeam)
+            .on_action(cx.listener(Self::complete))
+            .on_action(cx.listener(Self::back_tab))
             .on_key_down(cx.listener(Self::on_key_down))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
@@ -1142,37 +1168,19 @@ impl Render for TerminalView {
                 )
             })
             .when(self.double_interrupt.armed().is_some(), |this| {
-                this.child(close_hint(self.close_hints, cx.theme().font_family.clone()))
+                // In the interface's font: the terminal's draws ⌃ as ^.
+                this.child(
+                    div()
+                        .absolute()
+                        .bottom(rems(PADDING / 16.))
+                        .right(rems(PADDING / 16.))
+                        .child(ui::close_hint(
+                            self.close_hints,
+                            cx.theme().font_family.clone(),
+                        )),
+                )
             })
     }
-}
-
-/// "Press ⌃C again to close" in the pane's corner for the double Ctrl+C
-/// window: on the pane's own surface so it reads over the text, in the
-/// interface's font (not the terminal's, where ⌃ draws as ^), fading in
-/// quickly and out as the window closes.
-fn close_hint(id: u64, font: SharedString) -> impl IntoElement {
-    let chord = if cfg!(target_os = "macos") {
-        "⌃C"
-    } else {
-        "Ctrl+C"
-    };
-    div()
-        .absolute()
-        .bottom(rems(PADDING / 16.))
-        .right(rems(PADDING / 16.))
-        .rounded_md()
-        .bg(ui::panel())
-        .font_family(font)
-        .child(ui::chip(
-            format!("Press {chord} again to close"),
-            ui::muted(),
-        ))
-        .with_animation(
-            ElementId::NamedInteger("close-hint".into(), id),
-            Animation::new(double_interrupt::WINDOW),
-            |el, t| el.opacity((t / 0.15).min((1. - t) / 0.35).clamp(0., 1.)),
-        )
 }
 
 #[cfg(test)]

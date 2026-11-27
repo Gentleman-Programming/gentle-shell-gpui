@@ -21,7 +21,6 @@ pub(super) struct OpenMenu {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum WorkspaceMenuSource {
     Chip,
-    Header,
     SidebarRow,
 }
 
@@ -331,6 +330,44 @@ impl Workspace {
         }
     }
 
+    /// Primary workspace menu stays available in either placement.
+    pub(super) fn open_workspace_selector(
+        &mut self,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let workspace = cx.entity().downgrade();
+        let layout = self.tab_layout;
+        let current = self.current;
+        let compact = self.sidebar_compact;
+        let names: Vec<_> = self.spaces.iter().map(|s| s.name.clone()).collect();
+        self.open_owned_menu(
+            "workspace-selector",
+            position,
+            move |mut menu, _, _| {
+                for (index, name) in names.into_iter().enumerate() {
+                    let weak = workspace.clone();
+                    menu = menu.item(PopupMenuItem::new(name).checked(index == current).on_click(
+                        move |_, window, cx| {
+                            let _ =
+                                weak.update(cx, |ws, cx| ws.switch_workspace(index, window, cx));
+                        },
+                    ));
+                }
+                let weak = workspace.clone();
+                menu = menu.item(PopupMenuItem::new("Search workspaces…").on_click(
+                    move |_, window, cx| {
+                        let _ = weak.update(cx, |ws, cx| ws.open_workspace_switcher(window, cx));
+                    },
+                ));
+                Self::tab_placement_menu(menu.separator(), layout, compact, workspace)
+            },
+            window,
+            cx,
+        );
+    }
+
     /// Right-click on empty space of the tab area opens this menu.
     pub(super) fn open_empty_area_menu(
         &mut self,
@@ -340,10 +377,11 @@ impl Workspace {
     ) {
         let weak = cx.entity().downgrade();
         let layout = self.tab_layout;
+        let compact = self.sidebar_compact;
         self.open_owned_menu(
             "workspace-empty-area",
             position,
-            move |menu, _, _cx| Self::empty_area_menu(menu, weak, layout),
+            move |menu, _, _cx| Self::empty_area_menu(menu, weak, layout, compact),
             window,
             cx,
         );

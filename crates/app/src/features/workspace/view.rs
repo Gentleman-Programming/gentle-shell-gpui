@@ -94,8 +94,8 @@ impl Workspace {
             // stopping the mouse-down keeps TitleBar from starting a move.
             .occlude()
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .on_click(cx.listener(|this, _, window, cx| {
-                this.open_palette(Category::Workspaces, window, cx)
+            .on_click(cx.listener(|this, event: &ClickEvent, window, cx| {
+                this.open_workspace_selector(event.position(), window, cx)
             }))
             .on_mouse_down(
                 MouseButton::Right,
@@ -970,4 +970,118 @@ fn drop_overlay(zone: DropZone) -> impl IntoElement {
         DropZone::Center => area.inset_0(),
     };
     ui::popover_in(("pane-drop", zone as usize), area)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use gpui_kit::component::input::InputState;
+    use gpui_kit::{AppContext as _, TestAppContext, WindowOptions};
+
+    use super::super::{DevicePanel, Music, Notices, PaneFactories, Space, TabLayout, Workspace};
+
+    /// The workspace's own root focus handle keeps the window-level
+    /// shortcuts (⌘T / ⌘⇧T / ⌘O) reachable when there is no pane to own the
+    /// keyboard. Before the fix, an empty workspace renders only a button and
+    /// a message, nothing registers a focusable element, and the window has
+    /// no focused element, so the dispatch path starts at the actionless
+    /// root and none of those bindings reaches the workspace's listeners.
+    #[gpui::test]
+    fn empty_workspace_shortcuts_reach_the_root_focus_handle(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| {
+            // Register every global the workspace render reads, with the
+            // inert defaults a test window can't obtain from the real startup.
+            crate::shared::themes::init(cx);
+            crate::shared::backdrop::init(cx);
+            crate::features::browser::init(cx);
+            crate::features::app_update::init(cx);
+            crate::features::hydration::init(cx);
+            cx.set_global(PaneFactories::default());
+        });
+        let (window_handle, workspace) = cx
+            .update(|cx| {
+                gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                    cx.new(|cx| Workspace {
+                        spaces: vec![
+                            Space::new("A".into(), std::env::temp_dir()),
+                            Space::new("B".into(), std::env::temp_dir()),
+                        ],
+                        current: 0,
+                        panes: HashMap::new(),
+                        next_id: 0,
+                        overlay: None,
+                        web_shown: Default::default(),
+                        sidebar: None,
+                        sidebar_visible: false,
+                        tab_layout: TabLayout::Horizontal,
+                        tabs_sidebar_motion: Default::default(),
+                        files_sidebar_motion: Default::default(),
+                        sidebar_compact: false,
+                        tabs_sidebar_hidden: false,
+                        tabs_sidebar_width: gentle_core::workspaces::SIDEBAR_DEFAULT_WIDTH,
+                        files_sidebar_width: gentle_core::workspaces::SIDEBAR_DEFAULT_WIDTH,
+                        badge_picker: None,
+                        open_menu: None,
+                        workspace_rename: None,
+                        tab_selection: None,
+                        tab_search: cx.new(|cx| InputState::new(window, cx)),
+                        save_task: Some(gpui_kit::Task::ready(())),
+                        _title_poll: gpui_kit::Task::ready(()),
+                        _lifecycle: Vec::new(),
+                        notices: cx.new(|_| Notices::default()),
+                        renaming: None,
+                        surge: None,
+                        surge_runs: 0,
+                        _surge_end: None,
+                        stages: Vec::new(),
+                        next_stage: 1,
+                        opened_outside: Default::default(),
+                        canvas_outside: Default::default(),
+                        browser_dock_drag: None,
+                        browser_dock_room: Default::default(),
+                        resume_welcome: None,
+                        drop_hint: None,
+                        closed: Vec::new(),
+                        music: cx.new(|cx| Music::new(window, cx)),
+                        devices: cx.new(DevicePanel::new),
+                        focus: cx.focus_handle(),
+                    })
+                })
+            })
+            .unwrap();
+        let mut cx = gpui_kit::VisualTestContext::from_window(window_handle, cx);
+        cx.run_until_parked();
+        // Draw the empty workspace A so the rendered dispatch tree is current.
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        // Nothing has focused the root handle before the switch.
+        let focus = workspace.read_with(&cx, |workspace, _| workspace.focus.clone());
+        cx.update(|window, _| assert!(!focus.is_focused(window)));
+
+        // Switch to the empty workspace B through the real entry path: no
+        // manual `focus_active` call, exactly what the app does.
+        cx.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                workspace.switch_workspace(1, window, cx)
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        // The switch focused the root handle, so each of the three reported
+        // shortcuts resolves to the workspace's action listeners.
+        cx.update(|window, cx| {
+            let focus = workspace.read(cx).focus.clone();
+            assert!(focus.is_focused(window));
+            assert!(window.is_action_available_in(&super::super::NewTab, &focus));
+            assert!(window.is_action_available_in(&super::super::NewTerminalTab, &focus));
+            assert!(window.is_action_available_in(&super::super::OpenExplorer, &focus));
+        });
+    }
 }

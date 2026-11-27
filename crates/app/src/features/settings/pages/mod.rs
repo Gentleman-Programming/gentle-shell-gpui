@@ -4,6 +4,7 @@
 //! Interactive state, subscriptions and persistence continue to be handled by
 //! the existing feature modules until their ownership can be migrated safely.
 
+mod about;
 mod agents;
 mod appearance;
 mod devices;
@@ -38,6 +39,7 @@ impl SettingsView {
             SettingsPage::Notifications => notifications::render(self, cx),
             SettingsPage::Updates => updates::render(self, snapshot, cx),
             SettingsPage::Extensions => extensions::render(self, snapshot, cx),
+            SettingsPage::About => about::render(),
         };
         ui::appear("settings-content", sections.p_4()).into_any_element()
     }

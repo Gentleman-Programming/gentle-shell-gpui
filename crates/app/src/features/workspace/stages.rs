@@ -9,6 +9,7 @@ use super::*;
 use crate::features::browser::{
     BrowserEvent, BrowserPanel, CanvasNotice, card_layout, external, set_card_layout,
 };
+use crate::features::palette::{BrowserCard, CardCommand};
 use crate::shared::floating;
 use gentle_core::browser::CardLayout;
 use gentle_core::web::same_page;
@@ -205,14 +206,15 @@ impl Workspace {
     ) {
         let id = self.next_stage;
         self.next_stage += 1;
-        // The card's own button only hides it; the tray closes it. Docking
-        // or floating a card lays the others out again.
+        // The card's − hides it in the tray, its X closes it (as the tray's
+        // X). Docking or floating a card lays the others out again.
         let subscriptions = [
             cx.subscribe_in(
                 &panel,
                 window,
                 move |this, _, event: &BrowserEvent, window, cx| match event {
                     BrowserEvent::Hide => this.set_stage_shown(id, false, window, cx),
+                    BrowserEvent::Close => this.remove_stage(id, window, cx),
                     BrowserEvent::Layout => {
                         this.tile_stages(window, cx);
                         cx.notify();
@@ -287,6 +289,48 @@ impl Workspace {
             self.tile_stages(window, cx);
         }
         cx.notify();
+    }
+
+    /// The shown card with the keyboard (on the card or in its page), for
+    /// the switcher's card commands.
+    pub(super) fn focused_card(&self, window: &Window, cx: &App) -> Option<BrowserCard> {
+        let stage = self
+            .stages
+            .iter()
+            .find(|stage| stage.shown && stage.panel.read(cx).has_keyboard(window, cx))?;
+        let panel = stage.panel.read(cx);
+        Some(BrowserCard {
+            stage: stage.id,
+            title: panel.title(),
+            maximized: panel.is_maximized(),
+            docked: stage.docked(cx),
+        })
+    }
+
+    /// A switcher command for the card it was opened on.
+    pub(super) fn run_card_command(
+        &mut self,
+        id: u64,
+        command: CardCommand,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(panel) = self
+            .stages
+            .iter()
+            .find(|stage| stage.id == id && stage.shown)
+            .map(|stage| stage.panel.clone())
+        else {
+            return;
+        };
+        match command {
+            CardCommand::Maximize => panel.update(cx, |panel, cx| panel.maximize(window, cx)),
+            CardCommand::Restore => {
+                panel.update(cx, |panel, cx| panel.restore(cx));
+            }
+            CardCommand::Hide => self.set_stage_shown(id, false, window, cx),
+            CardCommand::Close => self.remove_stage(id, window, cx),
+        }
     }
 
     // ── Agents driving pages (`gentle-browser`) ─────────────────────────────
@@ -1004,6 +1048,7 @@ mod tests {
                     tabs_sidebar_motion: Default::default(),
                     files_sidebar_motion: Default::default(),
                     sidebar_compact: false,
+                    tabs_sidebar_hidden: false,
                     tabs_sidebar_width: gentle_core::workspaces::SIDEBAR_DEFAULT_WIDTH,
                     files_sidebar_width: gentle_core::workspaces::SIDEBAR_DEFAULT_WIDTH,
                     badge_picker: None,
@@ -1030,6 +1075,7 @@ mod tests {
                     closed: Vec::new(),
                     music: cx.new(|cx| Music::new(window, cx)),
                     devices: cx.new(DevicePanel::new),
+                    focus: cx.focus_handle(),
                 });
                 test(&workspace, window, cx);
             })

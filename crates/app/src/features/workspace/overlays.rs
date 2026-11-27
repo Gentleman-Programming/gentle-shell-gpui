@@ -23,6 +23,8 @@ impl Workspace {
             }
             return;
         }
+        // Before the switcher takes the keyboard from the card.
+        let browser_card = self.focused_card(window, cx);
         self.start_active_session(window, cx);
         let commands = self
             .active_session()
@@ -35,6 +37,7 @@ impl Workspace {
             root: self.space().root.clone(),
             category,
             tab_layout: self.tab_layout,
+            browser_card,
         };
         let view = cx.new(|cx| PaletteView::new(input, window, cx));
         let subscription = cx.subscribe_in(
@@ -156,6 +159,9 @@ impl Workspace {
             } => self.pick_workspace_folder(Some(name), window, cx),
             PaletteAction::OpenFile(path) => self.open_file(path, window, cx),
             PaletteAction::SwitchBranch(branch) => self.confirm_switch_branch(branch, window, cx),
+            PaletteAction::BrowserCard { stage, command } => {
+                self.run_card_command(stage, command, window, cx)
+            }
         }
     }
 
@@ -454,14 +460,25 @@ impl Workspace {
         self.start_active_session(window, cx);
         let cwd = self.active_cwd(cx);
         let session = self.active_session();
-        let tab_layout = self.tab_layout;
-        let view = cx.new(|cx| SettingsView::new(cwd, tab_layout, session, window, cx));
+        let workspace = cx.entity();
+        let view = cx.new(|cx| SettingsView::new(cwd, workspace, self, session, window, cx));
         let subscription = cx.subscribe_in(
             &view,
             window,
             |this, view, event: &SettingsEvent, window, cx| match event {
                 SettingsEvent::Close => this.close_overlay(window, cx),
                 SettingsEvent::TabLayoutChanged(layout) => this.set_tab_layout(*layout, cx),
+                SettingsEvent::SidebarCompactChanged(compact) => {
+                    this.set_sidebar_compact(*compact, cx);
+                }
+                SettingsEvent::TabsSidebarHidden(hidden) => {
+                    this.set_tabs_sidebar_hidden(*hidden, cx);
+                }
+                SettingsEvent::FilesSidebarShown(shown) => {
+                    if this.sidebar_visible != *shown {
+                        this.toggle_sidebar(cx);
+                    }
+                }
                 SettingsEvent::OpenProfiles => this.open_profiles(window, cx),
                 SettingsEvent::Changed => {
                     for tab in this.sessions() {

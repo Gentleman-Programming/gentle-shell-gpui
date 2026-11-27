@@ -6,43 +6,46 @@ use std::time::Instant;
 use gentle_core::transcript::NoticeLevel;
 use gpui_kit::SharedString;
 
-use super::{CAP, Notice, Notices};
+use super::{CAP, Notice, Notices, Origin};
 
 impl Notices {
-    /// Record a notice. A message already listed at the same level is moved to
-    /// the top and counted instead of listed twice; it keeps its read state so
-    /// startup chatter repeated by every new tab does not light the bell again.
+    /// Record a notice. A message already listed at the same level from the
+    /// same session is moved to the top and counted instead of listed twice;
+    /// another session's keeps its own entry, so each opens its own session.
+    /// A repeat keeps its read state, and a new entry for a message already
+    /// read from another session starts read, so startup chatter repeated by
+    /// every new tab does not light the bell again.
     pub fn push(
         &mut self,
         level: NoticeLevel,
         message: String,
         source: SharedString,
-        origin: Option<usize>,
+        origin: Option<Origin>,
         at: Instant,
     ) {
+        let same = |n: &Notice| n.level == level && n.message == message;
         let notice = match self
             .items
             .iter()
-            .position(|n| n.level == level && n.message == message)
+            .position(|n| same(n) && n.origin == origin)
             .and_then(|ix| self.items.remove(ix))
         {
             Some(mut old) => {
                 old.repeats += 1;
                 old.at = at;
                 old.source = source;
-                old.origin = origin;
                 old
             }
             None => {
                 self.next_id += 1;
                 Notice {
                     id: self.next_id,
+                    read: self.items.iter().any(|n| same(n) && n.read),
                     level,
                     message,
                     source,
                     origin,
                     at,
-                    read: false,
                     repeats: 0,
                 }
             }
@@ -84,17 +87,25 @@ impl Notices {
 mod tests {
     use std::time::{Duration, Instant};
 
-    use crate::features::notices::{CAP, Notices};
+    use crate::features::notices::{CAP, Notices, Origin};
     use gentle_core::transcript::NoticeLevel;
 
-    fn push(store: &mut Notices, message: &str, at: Instant) {
+    fn origin(pane: usize, conversation: u64) -> Option<Origin> {
+        Some(Origin { pane, conversation })
+    }
+
+    fn push_from(store: &mut Notices, message: &str, from: Option<Origin>, at: Instant) {
         store.push(
             NoticeLevel::Info,
             message.to_string(),
             "tab".into(),
-            Some(1),
+            from,
             at,
         );
+    }
+
+    fn push(store: &mut Notices, message: &str, at: Instant) {
+        push_from(store, message, origin(1, 0), at);
     }
 
     #[test]
@@ -151,5 +162,42 @@ mod tests {
         );
         assert_eq!(store.iter().last().unwrap().message, "n25");
         assert_eq!(store.unread(), CAP);
+    }
+
+    #[test]
+    fn equal_messages_from_two_sessions_stay_apart() {
+        let mut store = Notices::default();
+        let t0 = Instant::now();
+        push_from(&mut store, "done", origin(1, 0), t0);
+        push_from(&mut store, "done", origin(2, 0), t0);
+        // Same pane, after ⌘N: another session too.
+        push_from(&mut store, "done", origin(1, 1), t0);
+        let origins: Vec<_> = store.iter().map(|n| n.origin).collect();
+        assert_eq!(origins, [origin(1, 1), origin(2, 0), origin(1, 0)]);
+        // A repeat from the same session still folds, into its own entry.
+        push_from(&mut store, "done", origin(2, 0), t0);
+        assert_eq!(store.iter().count(), 3);
+        let first = store.iter().next().unwrap();
+        assert_eq!((first.origin, first.repeats), (origin(2, 0), 1));
+        let id = first.id;
+
+        // Opening one entry leaves the others unread.
+        store.mark_read(id);
+        assert_eq!(store.unread(), 2);
+    }
+
+    #[test]
+    fn a_message_read_elsewhere_arrives_read() {
+        let mut store = Notices::default();
+        let t0 = Instant::now();
+        push_from(&mut store, "started", origin(1, 0), t0);
+        store.mark_all_read();
+        push_from(&mut store, "started", origin(2, 0), t0);
+        assert_eq!(store.iter().count(), 2);
+        assert_eq!(store.unread(), 0);
+        // Unread elsewhere: the new entry is unread too.
+        push_from(&mut store, "failed", origin(1, 0), t0);
+        push_from(&mut store, "failed", origin(2, 0), t0);
+        assert_eq!(store.unread(), 2);
     }
 }

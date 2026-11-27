@@ -68,6 +68,8 @@ impl ReviewView {
                     // The header counts the files.
                     cx.notify();
                 }
+                // The review's list leaves `offers_stashes` off.
+                ChangesEvent::ShowStashes => {}
             },
         );
         changes.update(cx, |changes, cx| changes.open_diff(cx));

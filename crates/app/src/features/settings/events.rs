@@ -9,6 +9,12 @@ pub enum SettingsEvent {
     Close,
     /// Switch the current window's persisted tab placement.
     TabLayoutChanged(TabLayout),
+    /// Toggle the left navigator's narrow icon rail.
+    SidebarCompactChanged(bool),
+    /// Show or hide the left navigator (vertical tabs only).
+    TabsSidebarHidden(bool),
+    /// Show or hide the right Files sidebar.
+    FilesSidebarShown(bool),
     /// Open the application's full profile-routing editor.
     OpenProfiles,
     /// Packages or sign-ins changed: tabs should reload their backend.

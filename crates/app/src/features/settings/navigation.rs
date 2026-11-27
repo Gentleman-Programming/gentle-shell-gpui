@@ -23,10 +23,11 @@ pub(super) enum SettingsPage {
     Notifications,
     Extensions,
     Updates,
+    About,
 }
 
 impl SettingsPage {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::General,
         Self::Appearance,
         Self::Agents,
@@ -36,6 +37,7 @@ impl SettingsPage {
         Self::Notifications,
         Self::Extensions,
         Self::Updates,
+        Self::About,
     ];
 
     pub fn id(self) -> &'static str {
@@ -49,6 +51,7 @@ impl SettingsPage {
             Self::Notifications => "settings-nav-notifications",
             Self::Updates => "settings-nav-updates",
             Self::Extensions => "settings-nav-extensions",
+            Self::About => "settings-nav-about",
         }
     }
 
@@ -63,6 +66,7 @@ impl SettingsPage {
             Self::Notifications => "Notifications",
             Self::Updates => "Updates",
             Self::Extensions => "Extensions",
+            Self::About => "About",
         }
     }
 
@@ -77,6 +81,7 @@ impl SettingsPage {
             Self::Notifications => "Alerts and notification preferences",
             Self::Updates => "Application and tool updates",
             Self::Extensions => "Packages and extension management",
+            Self::About => "Version, license and credits",
         }
     }
 
@@ -91,6 +96,7 @@ impl SettingsPage {
             Self::Notifications => IconName::Bell,
             Self::Updates => IconName::RefreshCw,
             Self::Extensions => IconName::Layers,
+            Self::About => IconName::Info,
         }
     }
 
@@ -102,7 +108,7 @@ impl SettingsPage {
                 "home setup requirements agent directory configuration launcher path environment initial diagnostics performance cpu memory slow record recording report backend wsl linux distro remote vm orbstack lima docker container where agents run status doctor dev binary assets routing"
             }
             Self::Appearance => {
-                "theme color dark light import share transparency window opacity blur glass contrast readable readability accessibility interface zoom size font fonts family typeface nerd monospace code scene motion background picture animated library terminal banner rose text tabs vertical horizontal placement sidebar typing kisses hearts particles composer input style card bar prompt pill soft"
+                "theme color dark light import share transparency window opacity blur glass contrast readable readability accessibility interface zoom size font fonts family typeface nerd monospace code scene motion background picture animated library terminal banner rose text tabs vertical horizontal placement sidebar panels icon rail files expand compact hidden show hide visibility typing kisses hearts particles composer input style card bar prompt pill soft"
             }
             Self::Agents => {
                 "background subagents gentle ai persona permissions helpers agent ui generative proactive when asked"
@@ -124,6 +130,9 @@ impl SettingsPage {
             }
             Self::Extensions => {
                 "package packages extension extensions install remove npm git local updates version management advanced"
+            }
+            Self::About => {
+                "about credits authors contributors thanks people license licenses mit third-party third party open source repository repo github issues bug feedback"
             }
         }
     }
@@ -322,9 +331,20 @@ mod tests {
                 "settings page without description"
             );
         }
-        assert_eq!(ids.len(), 9);
+        assert_eq!(ids.len(), 10);
         assert_eq!(SettingsPage::ALL[7], SettingsPage::Extensions);
         assert_eq!(SettingsPage::ALL[8], SettingsPage::Updates);
+        assert_eq!(SettingsPage::ALL[9], SettingsPage::About);
+    }
+
+    #[test]
+    fn searching_for_credits_or_licenses_lands_on_about() {
+        for query in ["about", "credits", "contributors", "license", "third-party"] {
+            let first = SettingsPage::ALL
+                .into_iter()
+                .find(|page| page.matches_query(query));
+            assert_eq!(first, Some(SettingsPage::About), "{query:?}");
+        }
     }
 
     #[test]
@@ -392,6 +412,9 @@ mod tests {
     #[test]
     fn search_finds_options_by_category_and_setting_name() {
         for term in ["tabs", "vertical", "horizontal", "placement"] {
+            assert!(SettingsPage::Appearance.matches_query(term));
+        }
+        for term in ["panels", "sidebar", "files", "icon rail", "compact"] {
             assert!(SettingsPage::Appearance.matches_query(term));
         }
         assert!(SettingsPage::Appearance.matches_query("window transparency"));

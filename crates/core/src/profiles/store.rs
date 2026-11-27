@@ -57,13 +57,40 @@ impl OrchestratorMode {
     }
 }
 
+/// One profile's `workflow` entry (`ProfileWorkflow` in gentle-pi
+/// `lib/agent-profiles.ts`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Workflow {
+    mode: OrchestratorMode,
+    /// Controlled Engineering: authoring rules against unrequested
+    /// machinery, added to the prompt by Gentle Shell. Off by default and
+    /// never written while off.
+    controlled_engineering: bool,
+}
+
+impl Workflow {
+    /// `isMeaningfulWorkflow`: an entry that differs from the defaults.
+    fn is_meaningful(self) -> bool {
+        self.mode != OrchestratorMode::Organic || self.controlled_engineering
+    }
+
+    /// `persistedWorkflow`: the mode always, the option only while on.
+    fn to_json(self) -> Value {
+        if self.controlled_engineering {
+            json!({"orchestratorMode": self.mode.as_str(), "controlledEngineering": true})
+        } else {
+            json!({"orchestratorMode": self.mode.as_str()})
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ProfilesFile {
     pub active: Option<String>,
     pub profiles: Vec<(String, Routing)>,
-    /// Profiles whose mode is not the default; an all-organic file has no
-    /// `workflow` key at all.
-    workflow: Vec<(String, OrchestratorMode)>,
+    /// Profiles whose workflow is not the default; an all-default file has
+    /// no `workflow` key at all.
+    workflow: Vec<(String, Workflow)>,
     /// Top-level keys this version does not know, written back unchanged.
     extra: Map<String, Value>,
 }
@@ -87,17 +114,29 @@ impl ProfilesFile {
     /// `readProfileWorkflow`: the profile's mode, the default when it has
     /// none (or does not exist).
     pub fn orchestrator_mode(&self, name: &str) -> OrchestratorMode {
+        self.workflow_of(name).mode
+    }
+
+    /// Whether the profile turns Controlled Engineering on; off when it has
+    /// no entry (or does not exist).
+    pub fn controlled_engineering(&self, name: &str) -> bool {
+        self.workflow_of(name).controlled_engineering
+    }
+
+    fn workflow_of(&self, name: &str) -> Workflow {
         self.workflow
             .iter()
             .find(|(n, _)| n == name)
-            .map_or_else(OrchestratorMode::default, |(_, mode)| *mode)
+            .map_or_else(Workflow::default, |(_, entry)| *entry)
     }
 
-    /// Set `name`'s mode in place; the default removes its entry.
-    fn put_mode(&mut self, name: &str, mode: OrchestratorMode) {
-        self.workflow.retain(|(n, _)| n != name);
-        if mode != OrchestratorMode::Organic {
-            self.workflow.push((name.to_string(), mode));
+    /// Set `name`'s workflow in place; the defaults remove its entry.
+    fn put_workflow(&mut self, name: &str, entry: Workflow) {
+        match self.workflow.iter_mut().find(|(n, _)| n == name) {
+            Some(slot) if entry.is_meaningful() => slot.1 = entry,
+            Some(_) => self.workflow.retain(|(n, _)| n != name),
+            None if entry.is_meaningful() => self.workflow.push((name.to_string(), entry)),
+            None => {}
         }
     }
 }
@@ -180,12 +219,14 @@ pub fn parse_profiles(text: &str) -> Option<(ProfilesFile, Drops)> {
 }
 
 /// `normalizeWorkflowMap`: keeps opt-ins that name a surviving profile and a
-/// known mode, reports the rest, and forgets default (organic) entries.
+/// known mode, reports the rest, and forgets all-default entries. Only exactly
+/// `true` turns Controlled Engineering on; any other value reads as off and
+/// drops nothing.
 fn normalize_workflow(
     value: Option<&Value>,
     profiles: &[(String, Routing)],
     drops: &mut Drops,
-) -> Vec<(String, OrchestratorMode)> {
+) -> Vec<(String, Workflow)> {
     let Some(map) = value.and_then(Value::as_object) else {
         return Vec::new();
     };
@@ -197,8 +238,13 @@ fn normalize_workflow(
             .and_then(OrchestratorMode::parse);
         match mode {
             Some(mode) if profiles.iter().any(|(n, _)| n == name) => {
-                if mode != OrchestratorMode::Organic {
-                    workflow.push((name.clone(), mode));
+                let entry = Workflow {
+                    mode,
+                    controlled_engineering: entry.get("controlledEngineering")
+                        == Some(&Value::Bool(true)),
+                };
+                if entry.is_meaningful() {
+                    workflow.push((name.clone(), entry));
                 }
             }
             _ => drops.workflow.push((
@@ -238,7 +284,7 @@ pub fn serialize_profiles(file: &ProfilesFile) -> String {
             Value::Object(
                 file.workflow
                     .iter()
-                    .map(|(n, mode)| (n.clone(), json!({"orchestratorMode": mode.as_str()})))
+                    .map(|(n, entry)| (n.clone(), entry.to_json()))
                     .collect(),
             ),
         );
@@ -279,7 +325,7 @@ pub fn update_profile(
     Ok(next)
 }
 
-/// `duplicateProfile`: the copy carries the source's mode too.
+/// `duplicateProfile`: the copy carries the source's workflow too.
 pub fn duplicate_profile(
     file: &ProfilesFile,
     from: &str,
@@ -291,7 +337,7 @@ pub fn duplicate_profile(
         .cloned()
         .ok_or_else(|| format!("Profile does not exist: {from}."))?;
     let mut next = create_profile(file, to, config)?;
-    next.put_mode(to, file.orchestrator_mode(from));
+    next.put_workflow(to, file.workflow_of(from));
     Ok(next)
 }
 
@@ -305,7 +351,7 @@ pub fn rename_profile(file: &ProfilesFile, from: &str, to: &str) -> Result<Profi
         return Err(format!("Profile already exists: {to}."));
     }
     let mut next = file.clone();
-    // `renameProfile`: the mode follows the profile to its new name.
+    // `renameProfile`: the workflow follows the profile to its new name.
     let names = next.profiles.iter_mut().map(|(n, _)| n);
     for name in names.chain(next.workflow.iter_mut().map(|(n, _)| n)) {
         if name == from {
@@ -346,7 +392,32 @@ pub fn set_orchestrator_mode(
         return Err(format!("Profile does not exist: {name}."));
     }
     let mut next = file.clone();
-    next.put_mode(name, mode);
+    let entry = next.workflow_of(name);
+    next.put_workflow(name, Workflow { mode, ..entry });
+    Ok(next)
+}
+
+/// `setProfileControlledEngineering`: turn the option on or off for one
+/// existing profile, keeping its mode; off with the default mode removes its
+/// entry.
+pub fn set_controlled_engineering(
+    file: &ProfilesFile,
+    name: &str,
+    enabled: bool,
+) -> Result<ProfilesFile, String> {
+    require_valid_name(name)?;
+    if !file.has(name) {
+        return Err(format!("Profile does not exist: {name}."));
+    }
+    let mut next = file.clone();
+    let entry = next.workflow_of(name);
+    next.put_workflow(
+        name,
+        Workflow {
+            controlled_engineering: enabled,
+            ..entry
+        },
+    );
     Ok(next)
 }
 
@@ -630,5 +701,86 @@ mod tests {
         );
 
         assert!(set_orchestrator_mode(&file, "missing", OrchestratorMode::FullDelegation).is_err());
+    }
+
+    const CONTROLLED: &str = r#"{
+      "kind": "gentle-pi.agent_model_profiles", "version": 1,
+      "profiles": {"careful": {}, "both": {}, "loose": {}, "plain": {}},
+      "workflow": {
+        "careful": {"orchestratorMode": "organic", "controlledEngineering": true},
+        "both": {"orchestratorMode": "full-delegation", "controlledEngineering": true},
+        "loose": {"orchestratorMode": "full-delegation", "controlledEngineering": "yes"},
+        "plain": {"orchestratorMode": "organic", "controlledEngineering": false}
+      }
+    }"#;
+
+    #[test]
+    fn reads_controlled_engineering_only_when_exactly_true() {
+        let (file, drops) = parse_profiles(CONTROLLED).unwrap();
+        assert!(file.controlled_engineering("careful"));
+        assert!(file.controlled_engineering("both"));
+        assert!(!file.controlled_engineering("loose"));
+        assert!(!file.controlled_engineering("plain"));
+        assert!(!file.controlled_engineering("missing"));
+        // Another value drops nothing: the entry keeps its mode.
+        assert_eq!(
+            file.orchestrator_mode("loose"),
+            OrchestratorMode::FullDelegation
+        );
+        assert!(drops.workflow.is_empty());
+        // The mode is always written beside the option; off is never written.
+        let value: Value = serde_json::from_str(&serialize_profiles(&file)).unwrap();
+        assert_eq!(
+            value["workflow"],
+            json!({
+                "careful": {"orchestratorMode": "organic", "controlledEngineering": true},
+                "both": {"orchestratorMode": "full-delegation", "controlledEngineering": true},
+                "loose": {"orchestratorMode": "full-delegation"}
+            })
+        );
+    }
+
+    #[test]
+    fn controlled_engineering_follows_its_profile_through_every_edit() {
+        let (file, _) = parse_profiles(CONTROLLED).unwrap();
+        let renamed = rename_profile(&file, "careful", "strict").unwrap();
+        assert!(renamed.controlled_engineering("strict"));
+        assert!(!renamed.controlled_engineering("careful"));
+
+        let copied = duplicate_profile(&renamed, "both", "copy").unwrap();
+        assert!(copied.controlled_engineering("copy"));
+        assert_eq!(
+            copied.orchestrator_mode("copy"),
+            OrchestratorMode::FullDelegation
+        );
+
+        // Changing the mode keeps the option, and the option keeps the mode.
+        let organic = set_orchestrator_mode(&copied, "copy", OrchestratorMode::Organic).unwrap();
+        assert!(organic.controlled_engineering("copy"));
+        let on = set_controlled_engineering(&organic, "plain", true).unwrap();
+        assert!(on.controlled_engineering("plain"));
+        let off = set_controlled_engineering(&on, "both", false).unwrap();
+        assert_eq!(
+            off.orchestrator_mode("both"),
+            OrchestratorMode::FullDelegation
+        );
+
+        let deleted = delete_profile(&off, "strict").unwrap();
+        assert!(!deleted.controlled_engineering("strict"));
+
+        let mut cleared = deleted;
+        for name in ["both", "loose"] {
+            cleared = set_orchestrator_mode(&cleared, name, OrchestratorMode::Organic).unwrap();
+        }
+        for name in ["copy", "plain"] {
+            cleared = set_controlled_engineering(&cleared, name, false).unwrap();
+        }
+        let value: Value = serde_json::from_str(&serialize_profiles(&cleared)).unwrap();
+        assert!(
+            value.get("workflow").is_none(),
+            "an all-default file has no map"
+        );
+
+        assert!(set_controlled_engineering(&file, "missing", true).is_err());
     }
 }

@@ -22,7 +22,7 @@ use super::changes::{ChangesEvent, ChangesView};
 use super::listing::{Entry, list_dir};
 use super::ops::{self, ClipMode};
 use super::refs::{RefsEvent, RefsView};
-use super::{file_icon, status_color};
+use super::{FileDrag, file_icon, status_color};
 use crate::features::git::GitSnapshot;
 use crate::platform::ides;
 use crate::shared::{themes, ui};
@@ -228,18 +228,31 @@ impl FileTreeView {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| root.display().to_string())
             .into();
-        let changes = cx.new(|cx| ChangesView::new(root.clone(), window, cx));
+        let changes = cx.new(|cx| {
+            let mut changes = ChangesView::new(root.clone(), window, cx);
+            changes.offers_stashes = true;
+            changes
+        });
         let refs = cx.new(|cx| RefsView::new(root.clone(), window, cx));
         let subscriptions = vec![
             cx.observe_global::<ShowIgnored>(|this, cx| {
                 let value = cx.global::<ShowIgnored>().value;
                 this.apply_show_ignored(value, cx);
             }),
-            cx.subscribe(&changes, |_, _, event: &ChangesEvent, cx| match event {
-                ChangesEvent::OpenDiff(path) => cx.emit(FileTreeEvent::OpenDiff(path.clone())),
-                ChangesEvent::OpenFile(path) => cx.emit(FileTreeEvent::Open(path.clone())),
-                ChangesEvent::Changed => cx.notify(),
-            }),
+            cx.subscribe_in(
+                &changes,
+                window,
+                |this, _, event: &ChangesEvent, window, cx| match event {
+                    ChangesEvent::OpenDiff(path) => cx.emit(FileTreeEvent::OpenDiff(path.clone())),
+                    ChangesEvent::OpenFile(path) => cx.emit(FileTreeEvent::Open(path.clone())),
+                    ChangesEvent::Changed => cx.notify(),
+                    ChangesEvent::ShowStashes => {
+                        this.set_tab(Tab::Branches, window, cx);
+                        this.refs
+                            .update(cx, |refs, cx| refs.show_stashes(window, cx));
+                    }
+                },
+            ),
             cx.subscribe(&refs, |_, _, event: &RefsEvent, cx| match event {
                 RefsEvent::OpenAgent(path) => cx.emit(FileTreeEvent::OpenAgent(path.clone())),
                 RefsEvent::OpenHistory(path) => cx.emit(FileTreeEvent::OpenHistory(path.clone())),
@@ -1112,6 +1125,10 @@ impl FileTreeView {
         };
         let id = SharedString::from(entry.path.to_string_lossy().into_owned());
         let shell = row_shell(id, row.depth, selected || renaming)
+            .debug_selector({
+                let name = entry.name.clone();
+                move || format!("file-tree-row-{name}")
+            })
             .child(
                 div()
                     .w(rems(14. / 16.))
@@ -1170,6 +1187,13 @@ impl FileTreeView {
                 )
             })
             .cursor_pointer()
+            // Dragged onto an agent tab, the row attaches there, as a path
+            // dropped from Finder does (S12). A click that doesn't travel
+            // still opens or toggles it.
+            .on_drag(
+                FileDrag::new(entry.path.clone(), entry.name.clone(), entry.is_dir),
+                |drag, _, _, cx| cx.new(|_| drag.clone()),
+            )
             // Bubbles before the context menu opens, so it acts on this row.
             .on_mouse_down(
                 MouseButton::Right,
@@ -1867,5 +1891,172 @@ mod click_tests {
     fn the_second_press_of_a_double_click_opens_nothing_more() {
         assert!(matches!(click_outcome(false, 2), ClickOutcome::Nothing));
         assert!(matches!(click_outcome(true, 2), ClickOutcome::Toggle));
+    }
+}
+
+#[cfg(test)]
+mod drag_tests {
+    use std::cell::RefCell;
+    use std::path::PathBuf;
+    use std::rc::Rc;
+
+    use gpui_kit::AppContext as _;
+    use gpui_kit::{
+        Entity, InteractiveElement as _, IntoElement, Modifiers, MouseButton, ParentElement as _,
+        Render, Styled as _, TestAppContext, VisualTestContext, Window, component::h_flex, div,
+        point, px,
+    };
+
+    use super::{FileTreeEvent, FileTreeView};
+    use crate::features::files::FileDrag;
+
+    /// A scratch folder holding `report.pdf` and a `notes` folder, its own
+    /// even when both tests run at once.
+    fn folder() -> PathBuf {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("gs-tree-drag-src-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(dir.join("notes")).unwrap();
+        std::fs::write(dir.join("report.pdf"), b"%PDF-1.7\n").unwrap();
+        dir
+    }
+
+    /// The tree beside a target that keeps what is dropped on it.
+    struct Host {
+        tree: Entity<FileTreeView>,
+        dropped: Rc<RefCell<Vec<FileDrag>>>,
+        opened: Rc<RefCell<Vec<PathBuf>>>,
+    }
+
+    impl Render for Host {
+        fn render(&mut self, _: &mut Window, _: &mut gpui_kit::Context<Self>) -> impl IntoElement {
+            let dropped = self.dropped.clone();
+            h_flex()
+                .size_full()
+                .child(div().w(px(240.)).h_full().child(self.tree.clone()))
+                .child(
+                    div()
+                        .id("drop-receiver")
+                        .flex_1()
+                        .h_full()
+                        .debug_selector(|| "drop-receiver".into())
+                        .on_drop(move |drag: &FileDrag, _, _| {
+                            dropped.borrow_mut().push(drag.clone())
+                        }),
+                )
+        }
+    }
+
+    fn host(cx: &mut TestAppContext, root: PathBuf) -> (Entity<Host>, &mut VisualTestContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_reduce_motion(true);
+            cx.set_global(super::ShowIgnored {
+                value: false,
+                path: None,
+            });
+        });
+        cx.add_window_view(|window, cx| {
+            let tree = cx.new(|cx| FileTreeView::new(root, window, cx));
+            let dropped = Rc::new(RefCell::new(Vec::new()));
+            let opened = Rc::new(RefCell::new(Vec::new()));
+            let seen = opened.clone();
+            cx.subscribe(&tree, move |_, _, event: &FileTreeEvent, _| {
+                if let FileTreeEvent::Open(path) = event {
+                    seen.borrow_mut().push(path.clone());
+                }
+            })
+            .detach();
+            Host {
+                tree,
+                dropped,
+                opened,
+            }
+        })
+    }
+
+    fn bounds(
+        cx: &mut VisualTestContext,
+        selector: &'static str,
+    ) -> gpui_kit::Bounds<gpui_kit::Pixels> {
+        cx.run_until_parked();
+        cx.debug_bounds(selector)
+            .unwrap_or_else(|| panic!("nothing drawn as {selector}"))
+    }
+
+    /// Drag from the row drawn as `from` onto the receiver, in steps, and let
+    /// go there.
+    fn drag(cx: &mut VisualTestContext, from: &'static str) {
+        let start = bounds(cx, from).center();
+        let to = bounds(cx, "drop-receiver").center();
+        cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::none());
+        for step in 1..=6 {
+            let t = step as f32 / 6.;
+            let at = point(
+                start.x + (to.x - start.x) * t,
+                start.y + (to.y - start.y) * t,
+            );
+            cx.simulate_mouse_move(at, Some(MouseButton::Left), Modifiers::none());
+            cx.run_until_parked();
+        }
+        cx.simulate_mouse_up(to, MouseButton::Left, Modifiers::none());
+        cx.run_until_parked();
+    }
+
+    /// What the tree handed the target so far: each drag's path, name and
+    /// whether it is a folder.
+    fn dropped(host: &Entity<Host>, cx: &mut VisualTestContext) -> Vec<(PathBuf, String, bool)> {
+        host.read_with(cx, |host, _| {
+            host.dropped
+                .borrow()
+                .iter()
+                .map(|drag| (drag.path.clone(), drag.name.to_string(), drag.is_dir))
+                .collect()
+        })
+    }
+
+    /// S12: a row dragged out of the tree carries its path, file or folder, so
+    /// an agent tab can take it as a drop.
+    #[gpui::test]
+    fn a_dragged_row_carries_its_path(cx: &mut TestAppContext) {
+        let dir = folder();
+        let (host, cx) = host(cx, dir.clone());
+
+        drag(cx, "file-tree-row-report.pdf");
+        let carried = dropped(&host, cx);
+        assert_eq!(
+            carried,
+            vec![(dir.join("report.pdf"), "report.pdf".to_string(), false)],
+            "the file row dragged its path"
+        );
+
+        drag(cx, "file-tree-row-notes");
+        let carried = dropped(&host, cx);
+        assert_eq!(
+            carried,
+            vec![
+                (dir.join("report.pdf"), "report.pdf".to_string(), false),
+                (dir.join("notes"), "notes".to_string(), true),
+            ],
+            "a folder row drags too, for the tab to refuse"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The tree's own gesture still works beside the drag: a click opens the
+    /// file, without moving the pointer so no drag starts.
+    #[gpui::test]
+    fn clicking_a_file_row_still_opens_it(cx: &mut TestAppContext) {
+        let dir = folder();
+        let (host, cx) = host(cx, dir.clone());
+        let at = bounds(cx, "file-tree-row-report.pdf").center();
+        cx.simulate_click(at, Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(
+            host.read_with(cx, |host, _| host.opened.borrow().clone()),
+            vec![dir.join("report.pdf")],
+            "a click on the row still opens the file"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -7,7 +7,7 @@ use std::rc::Rc;
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::popover::Popover;
+use gpui_kit::component::popover::{Popover, PopoverState};
 use gpui_kit::component::{ActiveTheme as _, Disableable as _, Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -124,6 +124,10 @@ pub(super) fn review_chip(
                     .px_2()
                     .py_2()
                     .rounded(rems(ui::ISLAND_ROW / 16.))
+                    // The row under the pointer is marked, as other menu
+                    // rows; only its button changes anything, so no pointer
+                    // cursor and no pressed look.
+                    .hover(|s| s.bg(ui::surface_hover()))
                     .child(
                         v_flex()
                             .flex_1()
@@ -149,7 +153,14 @@ pub(super) fn review_chip(
                             .label(if target { "Turn on" } else { "Turn off" })
                             .disabled(changing || !known)
                             .debug_selector(move || format!("review-{id}"))
-                            .on_click(move |_, window, cx| on_pick(target, scope, window, cx)),
+                            .on_click(cx.listener(
+                                move |state: &mut PopoverState, _, window, cx| {
+                                    if !target {
+                                        state.dismiss(window, cx);
+                                    }
+                                    on_pick(target, scope, window, cx);
+                                },
+                            )),
                     )
             });
             let content = v_flex()
@@ -540,6 +551,8 @@ mod tests {
         });
 
         click(cx, "review-clone");
+        assert!(cx.debug_bounds("review-clone").is_none());
+        assert!(cx.debug_bounds("review-global").is_none());
         let asked = sent(&host, cx).last().unwrap().clone();
         assert_eq!(asked["method"], "set_review_mode");
         assert_eq!(asked["params"], json!({"enabled": false, "scope": "clone"}));
@@ -551,6 +564,7 @@ mod tests {
         });
         cx.run_until_parked();
         assert!(cx.debug_bounds("review-confirm").is_some());
+        assert!(cx.debug_bounds("review-clone").is_none());
         let before = sent(&host, cx).len();
         click(cx, "review-cancel");
         assert_eq!(sent(&host, cx).len(), before);
@@ -591,5 +605,51 @@ mod tests {
                 ReviewEffective::Disabled
             );
         });
+
+        // The global off action also closes the card before confirmation.
+        click(cx, "review-mode-chip");
+        host.update(cx, |host, cx| {
+            host.pump();
+            host.answer(json!({
+                "effective": "disabled", "source": "clone",
+                "scopes": {"global": "unset", "clone": "disabled"},
+            }));
+            cx.notify();
+        });
+        click(cx, "review-global");
+        assert!(cx.debug_bounds("review-global").is_none());
+        assert_eq!(
+            sent(&host, cx).last().unwrap()["params"],
+            json!({"enabled": false, "scope": "global"})
+        );
+        host.update(cx, |host, cx| {
+            let mut response = confirmation("global");
+            response["scope"] = json!("global");
+            host.answer(response);
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("review-confirm").is_some());
+        assert!(cx.debug_bounds("review-global").is_none());
+        let before = sent(&host, cx).len();
+        click(cx, "review-cancel");
+        assert_eq!(sent(&host, cx).len(), before);
+
+        // Turning on retains the existing open-popover behavior.
+        click(cx, "review-mode-chip");
+        host.update(cx, |host, cx| {
+            host.pump();
+            host.answer(json!({
+                "effective": "disabled", "source": "clone",
+                "scopes": {"global": "unset", "clone": "disabled"},
+            }));
+            cx.notify();
+        });
+        click(cx, "review-clone");
+        assert_eq!(
+            sent(&host, cx).last().unwrap()["params"],
+            json!({"enabled": true, "scope": "clone"})
+        );
+        assert!(cx.debug_bounds("review-clone").is_some());
     }
 }

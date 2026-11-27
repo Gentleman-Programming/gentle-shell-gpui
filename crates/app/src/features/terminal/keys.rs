@@ -4,9 +4,42 @@
 //! dead keys and IMEs compose); everything else — named keys, Ctrl chords and
 //! Alt-as-Meta — is encoded here.
 
-use gpui_kit::Keystroke;
+use gpui_kit::{App, Global, KeyBinding, Keystroke, actions};
 
 const ESC: u8 = 0x1b;
+
+/// Plain Tab: the shell's own completion.
+pub(crate) const TAB: &[u8] = b"\t";
+/// Shift+Tab: xterm's back-tab (completion paging, menu navigation).
+pub(crate) const BACK_TAB: &[u8] = b"\x1b[Z";
+
+/// The terminal's key context. Plain Tab and Shift+Tab belong to the shell
+/// here; the window's Root binds them to focus traversal.
+pub(crate) const CONTEXT: &str = "Terminal";
+
+actions!(terminal, [Complete, BackTab]);
+
+/// The terminal's key bindings: the two keys the Root would otherwise use to
+/// move focus away from the shell.
+pub(crate) fn bindings() -> [KeyBinding; 2] {
+    [
+        KeyBinding::new("tab", Complete, Some(CONTEXT)),
+        KeyBinding::new("shift-tab", BackTab, Some(CONTEXT)),
+    ]
+}
+
+/// Registers [`bindings`] the first time a terminal opens. The app's key map
+/// is built before any terminal exists, so the terminal adds its own there.
+pub(crate) fn install(cx: &mut App) {
+    if cx.has_global::<KeysInstalled>() {
+        return;
+    }
+    cx.set_global(KeysInstalled);
+    cx.bind_keys(bindings());
+}
+
+struct KeysInstalled;
+impl Global for KeysInstalled {}
 
 /// Whether this keystroke is ordinary text that the platform input handler
 /// will deliver (and compose) for us.
@@ -123,9 +156,9 @@ pub(crate) fn key_to_bytes(ks: &Keystroke, app_cursor: bool) -> Option<Vec<u8>> 
             with_meta(m.alt, vec![0x7f])
         }),
         "tab" => Some(if m.shift {
-            b"\x1b[Z".to_vec()
+            BACK_TAB.to_vec()
         } else {
-            with_meta(m.alt, b"\t".to_vec())
+            with_meta(m.alt, TAB.to_vec())
         }),
         "escape" => Some(vec![ESC]),
         "space" => Some(if m.control {
@@ -195,7 +228,65 @@ pub(crate) fn is_interrupt(ks: &Keystroke) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{is_interrupt, is_text_input, key_to_bytes};
-    use gpui_kit::{Keystroke, Modifiers};
+    use gpui_kit::{KeyContext, Keystroke, Modifiers, TestAppContext};
+
+    /// The action the app's key map routes `key` to while `contexts` (the
+    /// window's Root, then the focused view's) apply.
+    fn routed_action(
+        cx: &mut TestAppContext,
+        key: &'static str,
+        contexts: &[&str],
+    ) -> &'static str {
+        let contexts: Vec<KeyContext> = contexts
+            .iter()
+            .map(|context| KeyContext::parse(context).unwrap())
+            .collect();
+        let keymap = cx.update(|cx| cx.key_bindings());
+        let (route, pending) = keymap
+            .borrow()
+            .bindings_for_input(&[Keystroke::parse(key).unwrap()], &contexts);
+        assert!(!pending, "{key} starts a longer binding sequence");
+        assert!(!route.is_empty(), "{key} is not bound in {contexts:?}");
+        route[0].action().name()
+    }
+
+    /// Plain Tab in a focused terminal is the shell's: it resolves to the
+    /// terminal's own action, not to gpui-base's Root focus traversal.
+    #[gpui::test]
+    fn plain_tab_in_a_focused_terminal_reaches_the_shell(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(super::install);
+        assert_eq!(
+            routed_action(cx, "tab", &["Root", "Terminal"]),
+            "terminal::Complete",
+            "plain Tab in a terminal must reach the shell, not move focus"
+        );
+    }
+
+    /// Shift+Tab is the shell's back-tab (menus, completion paging), not the
+    /// Root's reverse focus traversal.
+    #[gpui::test]
+    fn shift_tab_in_a_focused_terminal_reaches_the_shell(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(super::install);
+        assert_eq!(
+            routed_action(cx, "shift-tab", &["Root", "Terminal"]),
+            "terminal::BackTab",
+            "Shift+Tab in a terminal must reach the shell, not move focus"
+        );
+    }
+
+    /// Everywhere else Tab keeps moving focus: the terminal's bindings only
+    /// apply inside its own key context.
+    #[gpui::test]
+    fn tab_outside_a_terminal_still_moves_focus(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        assert_eq!(routed_action(cx, "tab", &["Root", "Session"]), "root::Tab");
+        assert_eq!(
+            routed_action(cx, "shift-tab", &["Root", "Session"]),
+            "root::TabPrev"
+        );
+    }
 
     fn ks(key: &str, key_char: Option<&str>, mods: Modifiers) -> Keystroke {
         Keystroke {

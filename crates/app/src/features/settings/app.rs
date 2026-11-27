@@ -15,14 +15,18 @@ fn mb(bytes: u64) -> String {
     format!("{:.1} MB", bytes as f64 / (1024. * 1024.))
 }
 
-/// This app's own version and its updates from GitHub releases.
-pub(super) fn app_section(cx: &App) -> Div {
-    let status = app_update::status(cx).clone();
-    let version = if app_update::is_dev(app_update::CURRENT) {
+/// This app's version, flagged when it is a development build.
+pub(super) fn version() -> String {
+    if app_update::is_dev(app_update::CURRENT) {
         format!("{} (development build)", app_update::CURRENT)
     } else {
         app_update::CURRENT.to_string()
-    };
+    }
+}
+
+/// This app's own version and its updates from GitHub releases.
+pub(super) fn app_section(cx: &App) -> Div {
+    let status = app_update::status(cx).clone();
     let line = |icon: Option<IconName>, color: Hsla, text: String| {
         h_flex()
             .pt_2()
@@ -270,7 +274,7 @@ pub(super) fn app_section(cx: &App) -> Div {
             .into_any_element(),
     };
     section(IconName::Info, "App")
-        .child(row("Version", version))
+        .child(row("Version", version()))
         .child(state)
         .child(
             h_flex().pt_2().child(

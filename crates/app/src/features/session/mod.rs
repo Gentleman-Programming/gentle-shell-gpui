@@ -12,6 +12,7 @@ use pi_rpc::desktop_rpc::DesktopMethod;
 use pi_rpc::{UiAnswer, UiMethod};
 
 use crate::shared::ui;
+use gentle_core::double_interrupt::{self, Outcome};
 use gentle_core::transcript::{NoticeLevel, Transcript};
 
 mod agents;
@@ -53,7 +54,8 @@ pub enum SessionEvent {
     },
     /// Something the window chrome shows may have changed: [`SessionView::title`],
     /// [`SessionView::is_running`], [`SessionView::session_file`],
-    /// [`SessionView::cwd`] or [`SessionView::model_choices`]. Streaming
+    /// [`SessionView::conversation`], [`SessionView::cwd`] or
+    /// [`SessionView::model_choices`]. Streaming
     /// output does not emit it, so the window need not redraw per token.
     ChromeChanged,
     /// A Gentle Shell command whose UI is terminal-only was run (typed or
@@ -85,6 +87,9 @@ pub enum SessionEvent {
         path: std::path::PathBuf,
         line: Option<u32>,
     },
+    /// A second Ctrl+C on the idle agent: close its pane, as ⌘W does (its
+    /// confirmations included).
+    CloseRequested,
 }
 
 /// What the window reads from a tab, to emit [`SessionEvent::ChromeChanged`]
@@ -95,6 +100,7 @@ struct Chrome {
     running: bool,
     needs_you: bool,
     session_file: Option<PathBuf>,
+    conversation: u64,
     models: u64,
     skills: usize,
 }
@@ -150,8 +156,24 @@ pub struct SessionView {
     kisses_blown: usize,
     /// The composer's text length last time, to tell typing from deleting.
     composer_len: usize,
-    /// Images waiting to go with the next prompt; `[Image #N]` is the N-th.
+    /// The `@` file menu's files and highlight (see `view::path_menu`):
+    /// references are inline text, so nothing here becomes a tile.
+    path_menu: view::PathMenu,
+    /// Images waiting to go with the next prompt, shown as the numbered
+    /// thumbnails of its strip and sent in that order.
     attachments: Vec<attachments::Attachment>,
+    /// Regular files waiting to go with the next prompt, shown as cards in
+    /// the same strip and sent as paths in the prompt's `message`.
+    files: Vec<attachments::AttachedFile>,
+    /// The attached files are being checked against the disk, off the UI
+    /// thread, before the prompt is sent (see `submit`): a second Enter while
+    /// one runs starts nothing, so a press sends once. Every answer clears it
+    /// before it decides, whatever it decides (a composer the user changed
+    /// while the check was out included), so it can never keep the next Enter
+    /// from asking the disk again. It is a field of this view, so a view
+    /// dropped while its check is out takes the flag with it: nothing else
+    /// holds or inherits it.
+    checking_files: bool,
     /// Long pastes waiting to go with the next prompt, each sent in place
     /// of its `[Pasted text #N]` token: the N-th is `pasted[N - 1]`.
     pasted: Vec<attachments::PastedText>,
@@ -183,6 +205,10 @@ pub struct SessionView {
     skill_dirs: Vec<(String, PathBuf)>,
     session_name: Option<String>,
     session_file: Option<PathBuf>,
+    /// Which conversation the tab shows, counting each time another one
+    /// replaces it on this backend (⌘N, `/new`, `/clone`, switching to
+    /// another session); a restart or resume on the same one keeps it.
+    conversation: u64,
     title: Option<String>,
     active_shell: Option<usize>,
     banner: crate::shared::banner::BannerConfig,
@@ -198,6 +224,12 @@ pub struct SessionView {
     chrome: Option<Chrome>,
     /// The pane's own width, measured each frame; narrow layouts adapt to it.
     pane_width: std::rc::Rc<std::cell::Cell<f32>>,
+    /// Files are being dragged over this tab: it wears its drop veil. Written
+    /// in two places: [`SessionView::follow_file_drag`], from every drag move
+    /// of a file drag, and the frame itself, which clears it once no drag is
+    /// live any more (a drop, a release elsewhere, a cancelled drag, a drag
+    /// that left the window), since GPUI has no drag-leave hook.
+    drop_over: bool,
     focus_handle: FocusHandle,
     _io: Task<()>,
     _subscriptions: Vec<Subscription>,
@@ -297,12 +329,17 @@ impl SessionView {
                     this.model_query_changed(cx);
                 }
             }),
-            // The model picker's and the `/` menu's ↑/↓/Enter must beat the
-            // focused search field and composer.
+            // Ctrl+C must beat Copy (Ctrl+C off macOS) unless text is
+            // selected, and every other key drops its pending first press.
+            // The model picker's, the `@` file menu's and the `/` menu's
+            // ↑/↓/Enter must beat the focused search field and composer (and
+            // the `@` menu's arrows beat ↑/↓ prompt history).
             cx.intercept_keystrokes(move |event, window, cx| {
                 let consumed = weak
                     .update(cx, |this, cx| {
-                        this.model_picker_key(&event.keystroke, window, cx)
+                        this.interrupt_key(&event.keystroke, window, cx)
+                            || this.model_picker_key(&event.keystroke, window, cx)
+                            || this.path_menu_key(&event.keystroke, window, cx)
                             || this.history_key(&event.keystroke, window, cx)
                             || this.slash_menu_key(&event.keystroke, window, cx)
                     })
@@ -348,7 +385,10 @@ impl SessionView {
             kisses: Vec::new(),
             kisses_blown: 0,
             composer_len: 0,
+            path_menu: view::PathMenu::default(),
             attachments: Vec::new(),
+            files: Vec::new(),
+            checking_files: false,
             pasted: Vec::new(),
             image_cache: attachments::ImageCache::default(),
             extension: state::ExtensionUi::default(),
@@ -366,11 +406,13 @@ impl SessionView {
             models: state::Models::default(),
             usage: state::Usage::default(),
             pane_width: std::rc::Rc::new(std::cell::Cell::new(10_000.)),
+            drop_over: false,
             commands: Vec::new(),
             prompt_history: Default::default(),
             skill_dirs: Vec::new(),
             session_name: None,
             session_file: None,
+            conversation: 0,
             title: None,
             active_shell: None,
             credentials_reload: None,
@@ -488,6 +530,12 @@ impl SessionView {
             .or_else(|| self.session_file.clone())
     }
 
+    /// See the field: which conversation the tab shows, so the window can
+    /// tell a notice from an earlier one in the same pane.
+    pub fn conversation(&self) -> u64 {
+        self.conversation
+    }
+
     /// Current model, then the reported default, then by provider, keeping catalog order.
     fn ordered_models(&self) -> Vec<state::ModelInfo> {
         let mut models = self.models.available.clone();
@@ -539,6 +587,7 @@ impl SessionView {
             running: self.is_running(),
             needs_you: self.needs_you(),
             session_file: self.session_file(),
+            conversation: self.conversation,
             models: self.models.rev,
             skills: self.skill_dirs.len(),
         };
@@ -647,6 +696,80 @@ impl SessionView {
         } else {
             cx.propagate();
         }
+    }
+
+    /// Ctrl+C in this tab, ahead of the key bindings. While a turn or
+    /// `!command` runs it only stops it, as Esc does, and never arms the
+    /// close; on the idle agent the first press shows the close hint for
+    /// [`double_interrupt::WINDOW`] and a second within it asks the window to
+    /// close the pane, as ⌘W does. Nothing reaches the agent. Off macOS
+    /// Ctrl+C is also Copy, which wins while text is selected. Any other key
+    /// starts over, and a held key never counts. A canvas's agent has no pane
+    /// of its own: there Ctrl+C only stops.
+    fn interrupt_key(
+        &mut self,
+        keystroke: &Keystroke,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let m = &keystroke.modifiers;
+        let interrupt =
+            keystroke.key == "c" && m.control && !(m.platform || m.alt || m.shift || m.function);
+        if !interrupt {
+            self.live.interrupt_held = false;
+            if self.live.double_interrupt.reset() {
+                cx.notify();
+            }
+            return false;
+        }
+        if !self.focus_handle.contains_focused(window, cx)
+            || (cfg!(not(target_os = "macos")) && self.has_selected_text(window, cx))
+        {
+            return false;
+        }
+        let held = std::mem::replace(&mut self.live.interrupt_held, true);
+        let busy = self.stoppable();
+        if busy && !held {
+            self.stop(cx);
+        }
+        let now = std::time::Instant::now();
+        let idle = !busy && self.canvas.is_none();
+        match self.live.double_interrupt.press(now, idle, held) {
+            Outcome::Interrupt => {}
+            Outcome::Hint => {
+                self.live.close_hints += 1;
+                cx.spawn(async move |this, cx| {
+                    cx.background_executor()
+                        .timer(double_interrupt::WINDOW)
+                        .await;
+                    let _ = this.update(cx, |this, cx| {
+                        if this.live.double_interrupt.armed() == Some(now) {
+                            this.live.double_interrupt.reset();
+                            cx.notify();
+                        }
+                    });
+                })
+                .detach();
+            }
+            Outcome::Close => cx.emit(SessionEvent::CloseRequested),
+        }
+        cx.notify();
+        true
+    }
+
+    /// Text selected in the composer, a dialog's field or the conversation:
+    /// what Ctrl+C copies off macOS.
+    fn has_selected_text(&self, window: &mut Window, cx: &mut App) -> bool {
+        self.composer.read(cx).is_copyable()
+            || self.dialog_input.read(cx).is_copyable()
+            || !gpui_kit::base::TextSelection::selected_text(window, cx)
+                .trim()
+                .is_empty()
+    }
+
+    /// A key came up: a Ctrl+C after it is a new press, not a key repeat.
+    fn on_key_up(&mut self, _: &KeyUpEvent, _: &mut Window, _: &mut Context<Self>) {
+        self.live.interrupt_held = false;
     }
 }
 

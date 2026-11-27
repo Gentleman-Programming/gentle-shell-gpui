@@ -7,7 +7,7 @@ use gentle_core::commands::{self, SlashCommand};
 
 use crate::shared::ui;
 
-use super::{PaletteAction, Row, TabLayout};
+use super::{BrowserCard, CardCommand, PaletteAction, Row, TabLayout};
 
 pub(super) fn screen_rows(tab_layout: TabLayout) -> Vec<Row> {
     let row = |icon, title: &str, detail: &str, action| Row {
@@ -224,6 +224,57 @@ pub(super) fn screen_rows(tab_layout: TabLayout) -> Vec<Row> {
     ]
 }
 
+/// The rows of the browser card that had the keyboard: what it can do now.
+/// A maximized card restores, a floating one maximizes (a docked one stays
+/// in its column); any hides or closes.
+pub(super) fn card_rows(card: BrowserCard) -> Vec<Row> {
+    let BrowserCard {
+        stage,
+        title,
+        maximized,
+        docked,
+    } = card;
+    let row = |icon, name: &str, detail: String, command| Row {
+        icon,
+        title: name.into(),
+        meta: String::new(),
+        detail,
+        group: "Browser card",
+        action: PaletteAction::BrowserCard { stage, command },
+        workspace: None,
+        current: false,
+    };
+    let mut rows = Vec::new();
+    if maximized {
+        rows.push(row(
+            IconName::Minimize2,
+            "Restore browser card",
+            format!("{title} back to its size and place (Esc)"),
+            CardCommand::Restore,
+        ));
+    } else if !docked {
+        rows.push(row(
+            IconName::Maximize2,
+            "Maximize browser card",
+            format!("{title} fills the window (or double-click its header)"),
+            CardCommand::Maximize,
+        ));
+    }
+    rows.push(row(
+        IconName::Minus,
+        "Hide browser card",
+        format!("{title} waits in the instance tray"),
+        CardCommand::Hide,
+    ));
+    rows.push(row(
+        IconName::X,
+        "Close browser card",
+        format!("{title} closes, page and all"),
+        CardCommand::Close,
+    ));
+    rows
+}
+
 /// The row of a slash command: `None` for commands that do nothing over RPC;
 /// terminal-only Gentle Shell ones open their native screen instead of
 /// running, and Pi built-ins that only work in the terminal say so.
@@ -267,8 +318,8 @@ pub(super) fn command_row(command: SlashCommand) -> Option<Row> {
 mod tests {
     use gentle_core::commands::{Screen, SlashCommand};
 
-    use super::super::{PaletteAction, TabLayout};
-    use super::{command_row, screen_rows};
+    use super::super::{BrowserCard, CardCommand, PaletteAction, TabLayout};
+    use super::{card_rows, command_row, screen_rows};
 
     fn command(name: &str, detail: &str, terminal: bool) -> SlashCommand {
         SlashCommand {
@@ -328,6 +379,32 @@ mod tests {
             (row.title.as_str(), row.detail.as_str(), row.meta.as_str()),
             ("/gentle:stats", "Local stats", "")
         );
+    }
+
+    #[test]
+    fn browser_card_offers_what_it_can_do_now() {
+        let actions = |maximized, docked| {
+            card_rows(BrowserCard {
+                stage: 3,
+                title: "localhost:5173".into(),
+                maximized,
+                docked,
+            })
+            .into_iter()
+            .map(|row| row.action)
+            .collect::<Vec<_>>()
+        };
+        let card = |command| PaletteAction::BrowserCard { stage: 3, command };
+        let (hide, close) = (card(CardCommand::Hide), card(CardCommand::Close));
+        assert_eq!(
+            actions(false, false),
+            [card(CardCommand::Maximize), hide.clone(), close.clone()]
+        );
+        assert_eq!(
+            actions(true, false),
+            [card(CardCommand::Restore), hide.clone(), close.clone()]
+        );
+        assert_eq!(actions(false, true), [hide, close]);
     }
 
     #[test]

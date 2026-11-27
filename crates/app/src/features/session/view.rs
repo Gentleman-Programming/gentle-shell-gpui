@@ -32,6 +32,7 @@ mod dialogs;
 mod effort;
 mod live;
 mod model_picker;
+mod path_menu;
 mod paths;
 mod permissions;
 mod plan_limits;
@@ -43,8 +44,9 @@ mod transcript_list;
 
 pub(super) use activity::parse_rate_limit;
 pub(super) use cards::markdown_custom;
+use live::{ConfirmedSkill, Span, TICK, label_stamp, ticker_needed, track};
 pub(super) use live::{Live, RateLimit};
-use live::{Span, TICK, label_stamp, ticker_needed, track};
+pub(super) use path_menu::PathMenu;
 pub(super) use paths::PathLookup;
 pub(super) use transcript_list::TranscriptList;
 use transcript_list::{GroupRow, HeaderKey, Prepared, Row, Tail};
@@ -61,6 +63,13 @@ const STEP: usize = 3;
 
 fn fold_key(ix: usize, sub: usize, slot: usize) -> usize {
     (ix << 16) | (sub << 2) | slot
+}
+
+/// The fold key of the skill row of the message you sent at item `ix`: sub 1
+/// keeps it apart from the message's own "more lines" fold (sub 0), which a
+/// user item never gives another use.
+pub(in crate::features::session) fn skill_key(ix: usize) -> usize {
+    fold_key(ix, 1, OUTPUT)
 }
 
 /// The fold key of the run of finished steps that starts at item `start`
@@ -81,6 +90,12 @@ const USER_SLACK: usize = 2;
 /// Pane widths below which the composer sheds secondary chrome.
 const NARROW: f32 = 520.;
 const TINY: f32 = 420.;
+
+/// The agent tab as one drop target: files dropped anywhere on it attach
+/// (S10), whoever dragged them.
+pub(super) const DROP_TARGET: &str = "session-drop-target";
+/// The veil the tab wears while files are dragged over it.
+pub(super) const DROP_VEIL: &str = "drop-veil";
 
 /// Bring the Markdown rendered for `key` up to `shown` (the text as the
 /// conversation shows it, with `drawn` Mermaid diagrams as images),
@@ -204,11 +219,26 @@ impl SessionView {
                 self.live.open_spans = 0;
                 self.live.answer_done.clear();
                 self.live.rail_hover = None;
+                // Keyed by item index: a rebuilt transcript has other items.
+                self.live.skills.clear();
             }
             let from = dirty.from.min(self.transcript.items.len());
             self.sync_markdown(from, cx);
             self.track_live(from);
             self.list.prepare(&self.transcript.items, from);
+            // Items from `from` on were re-weighed as ordinary text: a
+            // confirmed skill row stays weighed collapsed (same `original`
+            // the first confirmation used), and a confirmation whose item
+            // changed or went away is dropped.
+            let items = &self.transcript.items;
+            self.live.skills.retain(|&ix, skill| {
+                let same =
+                    matches!(items.get(ix), Some(Item::User { text, .. }) if *text == skill.echo);
+                if same && ix >= from {
+                    self.list.confirm_skill(ix, &items[ix], &skill.original);
+                }
+                same || ix < from
+            });
             // Steps fold to their quiet line by default; keep the list's
             // estimate weights in step (a running step that fails opens).
             let items = self.transcript.items.get(from..).unwrap_or_default();
@@ -523,8 +553,32 @@ impl SessionView {
         let ready = self.backend.is_ready();
         let items = &self.transcript.items;
         let dialogs = !self.extension.dialogs.is_empty();
-        if let Some(pending) = &mut self.live.pending {
+        let live = &mut self.live;
+        if let Some(pending) = &mut live.pending {
             pending.started |= running;
+            // Confirm the echo of a skill command sent while idle. The parse
+            // runs before any bubble is built, so a pending prompt that is not
+            // a skill invocation costs one prefix check per pass.
+            if pending.idle
+                && let Some(item @ Item::User { text, images }) = items.get(pending.base)
+                && !live
+                    .skills
+                    .get(&pending.base)
+                    .is_some_and(|s| s.echo == *text)
+            {
+                let shown = gentle_core::attachments::mixed_attachment_text(text, images.len());
+                if gentle_core::attachments::parse_skill_block(shown, &pending.text).is_some() {
+                    self.list.confirm_skill(pending.base, item, &pending.text);
+                    live.skills.insert(
+                        pending.base,
+                        ConfirmedSkill {
+                            echo: text.clone(),
+                            original: pending.text.clone(),
+                            bubble: BubbleText::from_prompt(shown, &pending.text),
+                        },
+                    );
+                }
+            }
             let answered = items
                 .get(pending.base..)
                 .is_some_and(|rest| rest.iter().any(|i| matches!(i, Item::Assistant { .. })));
@@ -899,20 +953,30 @@ impl SessionView {
     ) -> AnyElement {
         match item {
             Item::User { text, images } => {
-                let images = images.iter().map(|i| self.image_cache.get(i)).collect();
+                let images: Vec<_> = images.iter().map(|i| self.image_cache.get(i)).collect();
                 let computed;
-                let shown = match self.list.prepared(ix) {
-                    Some(Prepared::Bubble(cell)) => cell.get_or_init(|| BubbleText::new(text)),
+                let shown = match (self.live.confirmed(ix, item), self.list.prepared(ix)) {
+                    (Some(skill), _) => &skill.bubble,
+                    (_, Some(Prepared::Bubble(cell))) => cell.get_or_init(|| {
+                        BubbleText::new(gentle_core::attachments::mixed_attachment_text(
+                            text,
+                            images.len(),
+                        ))
+                    }),
                     _ => {
-                        computed = BubbleText::new(text);
+                        computed = BubbleText::new(
+                            gentle_core::attachments::mixed_attachment_text(text, images.len()),
+                        );
                         &computed
                     }
                 };
                 let key = fold_key(ix, 0, OUTPUT);
                 let open = self.expanded.contains(&key);
                 let toggle = self.bubble_toggle(shown, key, open, cx);
-                let bubble = user_bubble(ix, shown, images, open, toggle, &self.bubble_images);
-                if text.trim().is_empty() {
+                let skill = self.skill_row(ix, shown, cx);
+                let bubble =
+                    user_bubble(ix, shown, images, open, toggle, skill, &self.bubble_images);
+                if shown.markdown.trim().is_empty() && shown.skill.is_none() {
                     return bubble.into_any_element();
                 }
                 v_flex()
@@ -1321,17 +1385,33 @@ impl SessionView {
             .invisible()
             .group_hover("user", |s| s.visible())
             .child(
-                Button::new(("copy-message", ix))
-                    .ghost()
-                    .xsmall()
-                    .text_color(ui::faint())
-                    .icon(Icon::new(IconName::Copy))
-                    .tooltip("Copy message")
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        if let Some(Item::User { text, .. }) = this.transcript.items.get(ix) {
-                            this.copy_text(text.trim().to_string(), cx);
-                        }
-                    })),
+                div()
+                    .debug_selector(move || format!("copy-message-{ix}"))
+                    .child(
+                        Button::new(("copy-message", ix))
+                            .ghost()
+                            .xsmall()
+                            .text_color(ui::faint())
+                            .icon(Icon::new(IconName::Copy))
+                            .tooltip("Copy message")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                let Some(item @ Item::User { text, images }) =
+                                    this.transcript.items.get(ix)
+                                else {
+                                    return;
+                                };
+                                let copied = match this.live.confirmed(ix, item) {
+                                    Some(skill) => message_body(&skill.original),
+                                    None => message_body(
+                                        gentle_core::attachments::mixed_attachment_text(
+                                            text,
+                                            images.len(),
+                                        ),
+                                    ),
+                                };
+                                this.copy_text(copied.to_string(), cx);
+                            })),
+                    ),
             )
     }
 
@@ -1777,6 +1857,24 @@ impl SessionView {
         Some(self.fold_toggle(key, label, open, cx))
     }
 
+    /// The row of a skill's expansion in a message you sent: the skill's
+    /// name and a chevron, and whether its body is open. `None` for a
+    /// message that is not one.
+    fn skill_row(
+        &self,
+        ix: usize,
+        shown: &BubbleText,
+        cx: &mut Context<Self>,
+    ) -> Option<(bool, Stateful<Div>)> {
+        let skill = shown.skill.as_ref()?;
+        let key = skill_key(ix);
+        let open = self.expanded.contains(&key);
+        Some((
+            open,
+            self.fold_toggle(key, skill.name.to_string(), open, cx),
+        ))
+    }
+
     fn fold_toggle(
         &self,
         key: usize,
@@ -1954,12 +2052,14 @@ impl SessionView {
                 let key = fold_key(base, 0, OUTPUT);
                 let open = self.expanded.contains(&key);
                 let toggle = self.bubble_toggle(shown, key, open, cx);
+                let skill = self.skill_row(base, shown, cx);
                 let bubble = user_bubble(
                     base,
                     shown,
                     pending.images.iter().cloned().map(Some).collect(),
                     open,
                     toggle,
+                    skill,
                     &self.bubble_images,
                 );
                 self.list
@@ -2040,6 +2140,9 @@ impl Render for SessionView {
         // A tab starts its backend once shown.
         self.ensure_started(window, cx);
         self.sync_view(cx);
+        // An `@` reference searches this tab's folder: its files are read once
+        // the composer holds one (see `path_menu`).
+        self.ensure_path_files(cx);
         self.watch_surfaces(window, cx);
         self.step_glide(window);
         // Timed effects (the composer's, answers fading) ask for each next
@@ -2063,15 +2166,44 @@ impl Render for SessionView {
             let obscured = !self.web_shown || self.slash_menu_open(cx);
             self.genui.set_obscured(obscured, cx);
         }
+        // Files over the tab: the veil while the drag is still live. GPUI has
+        // no drag-leave hook, so `drop_over` follows every drag move of a file
+        // drag (`follow_file_drag`) and this frame is its other writer: it
+        // clears the flag once no drag is live at all, so a drop, a release
+        // elsewhere, a cancelled drag and a drag that left the window all take
+        // the veil down.
+        let veil = self.drop_over && cx.has_active_drag();
+        if !veil {
+            self.drop_over = false;
+        }
         let main = v_flex()
             .relative()
             .flex_1()
             .min_w_0()
             .h_full()
-            .drag_over::<ExternalPaths>(|style, _, _, _| style.bg(ui::surface_hover()))
+            .debug_selector(|| DROP_TARGET.into())
+            // The whole tab is the target, for a drag from Finder and one
+            // from the file tree alike (S10, S12).
+            .on_drag_move::<ExternalPaths>(cx.listener(
+                |this, event: &DragMoveEvent<ExternalPaths>, _, cx| {
+                    this.follow_file_drag(event.bounds.contains(&event.event.position), cx);
+                },
+            ))
+            .on_drag_move::<crate::features::files::FileDrag>(cx.listener(
+                |this, event: &DragMoveEvent<crate::features::files::FileDrag>, _, cx| {
+                    this.follow_file_drag(event.bounds.contains(&event.event.position), cx);
+                },
+            ))
             .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
                 this.attach_paths(paths.paths().to_vec(), window, cx);
             }))
+            // A row dragged out of the file tree attaches by the same route,
+            // with the same rules (a folder is refused, S12).
+            .on_drop(cx.listener(
+                |this, drag: &crate::features::files::FileDrag, window, cx| {
+                    this.attach_paths(vec![drag.path.clone()], window, cx);
+                },
+            ))
             .child(
                 canvas(
                     move |bounds, _, cx| {
@@ -2089,6 +2221,7 @@ impl Render for SessionView {
             .map(|main| match expanded {
                 Some(surface) => main.child(
                     div()
+                        .relative()
                         .flex_1()
                         .min_h_0()
                         .w_full()
@@ -2099,7 +2232,8 @@ impl Render for SessionView {
                             surface
                                 .view()
                                 .cached(StyleRefinement::default().size_full()),
-                        ),
+                        )
+                        .children(self.render_close_hint(cx)),
                 ),
                 None => main.child(
                     div()
@@ -2142,7 +2276,8 @@ impl Render for SessionView {
                                     )),
                             )
                         })
-                        .children(self.render_jump_down(cx)),
+                        .children(self.render_jump_down(cx))
+                        .children(self.render_close_hint(cx)),
                 ),
             })
             .map(|main| {
@@ -2164,7 +2299,16 @@ impl Render for SessionView {
                                 .rounded_b_xl()
                         })
                         .pb_2()
-                        .child(composer),
+                        .child(
+                            // The `@` menu opens over the composer, above it.
+                            v_flex()
+                                .flex_1()
+                                .min_w_0()
+                                .max_w(rems(720. / 16.))
+                                .gap_1p5()
+                                .children(self.render_path_menu(cx))
+                                .child(composer),
+                        ),
                 )
                 .children(strip)
             })
@@ -2177,7 +2321,10 @@ impl Render for SessionView {
                     .flatten(),
                 |this, island| this.child(island),
             )
-            .children(self.genui.render_templates(self.live_slots.cover(), cx));
+            .children(self.genui.render_templates(self.live_slots.cover(), cx))
+            // Last, so it lies over the conversation and the composer both.
+            // No `occlude()`: a drop anywhere on the tab must still reach it.
+            .children(veil.then(|| self.render_drop_veil()));
 
         h_flex()
             .key_context(CONTEXT)
@@ -2187,11 +2334,102 @@ impl Render for SessionView {
             .on_action(cx.listener(Self::toggle_agents))
             .on_action(cx.listener(Self::on_new_session))
             .capture_key_down(cx.listener(Self::on_dialog_key))
+            .capture_key_up(cx.listener(Self::on_key_up))
             .relative()
             .size_full()
             .child(main)
             .children(self.render_agents_panel(cx))
             .children(self.genui.render_pinned(cx))
+    }
+}
+
+// ── The drop target ────────────────────────────────────────────────────────
+
+impl SessionView {
+    /// "Press ⌃C again to close" in the conversation's corner, above the
+    /// composer, while a second Ctrl+C would close the pane.
+    fn render_close_hint(&self, cx: &App) -> Option<AnyElement> {
+        self.live.double_interrupt.armed()?;
+        Some(
+            div()
+                .absolute()
+                .bottom(rems(12. / 16.))
+                .right(rems(1.))
+                .child(ui::close_hint(
+                    self.live.close_hints,
+                    cx.theme().font_family.clone(),
+                ))
+                .into_any_element(),
+        )
+    }
+
+    /// Follow a drag of files over the tab: `over` says whether the pointer is
+    /// inside it. GPUI has no drag-leave hook, so every drag move of a file
+    /// drag writes `drop_over` here, and the frame's other writer clears it
+    /// once no drag is live: a drop, a release elsewhere, a cancelled drag and
+    /// a drag that leaves the tab all take the veil down.
+    fn follow_file_drag(&mut self, over: bool, cx: &mut Context<Self>) {
+        if self.drop_over != over {
+            self.drop_over = over;
+            cx.notify();
+        }
+    }
+
+    /// The tab itself as the target (S10), in place of the `surface_hover` tint
+    /// that reads as a card: one veil over the conversation and the composer,
+    /// no card and no border, the inbox tray and two lines of words centred.
+    /// The same layer serves a drag from Finder and one from the file tree
+    /// (S12).
+    fn render_drop_veil(&self) -> AnyElement {
+        // The veil fades in (`ui::veil`: no travel); the icon and the words
+        // pop in over it, and with reduced motion both are just there.
+        let veil = ui::veil(DROP_VEIL).map_element(|veil| veil.debug_selector(|| DROP_VEIL.into()));
+        let words = ui::pop_in(
+            "drop-veil-words",
+            v_flex()
+                .items_center()
+                .child(
+                    Icon::new(IconName::Inbox)
+                        .with_size(px(44.))
+                        .text_color(ui::petal()),
+                )
+                .child(
+                    div()
+                        .mt(rems(14. / 16.))
+                        .text_size(rems(20. / 16.))
+                        .line_height(rems(28. / 16.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(ui::fg())
+                        .child("Drop files here"),
+                )
+                .child(
+                    div()
+                        .mt(rems(5. / 16.))
+                        .text_size(rems(13. / 16.))
+                        .line_height(rems(19. / 16.))
+                        .text_color(ui::muted())
+                        .child("Files and images · folders aren’t attached"),
+                ),
+        );
+        div()
+            .absolute()
+            .inset_0()
+            .child(veil)
+            .child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .pb(rems(8. / 16.))
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .child(words),
+            )
+            // The composer's orbit and the conversation's indicators draw on
+            // their own layer over this view: hidden while the veil is up.
+            .child(self.live_slots.cover())
+            .into_any_element()
     }
 }
 
@@ -2275,20 +2513,46 @@ impl CodeLine {
 }
 
 /// A message as its bubble shows it: the Markdown it renders
-/// ([`gentle_core::markdown::sent_message`], image tokens as `🖼 #N`) and a
-/// long one's folded start. Made once per message: every frame hands the
-/// text view the same strings, which it recognizes without parsing again.
-struct BubbleText {
+/// ([`gentle_core::markdown::sent_message`]; images are the numbered tiles
+/// above it, and the files it attached are cards beside them) and a long
+/// one's folded start. Made once per message: every frame hands the text view
+/// the same strings, which it recognizes without parsing again.
+pub(super) struct BubbleText {
     markdown: SharedString,
+    /// The paths of the files the prompt attached, as the agent was told
+    /// them: their block is out of `markdown` and they show as cards.
+    files: Vec<SharedString>,
     /// The first [`USER_LINES`] lines of `markdown` and how many more it
     /// has, when it is long enough to fold. Cut from the whole message's
     /// Markdown, so HTML closed past the fold still shows literally.
     folded: Option<(SharedString, usize)>,
+    /// The skill the harness expanded in this message: `markdown` is then
+    /// only the args the user typed after it.
+    skill: Option<SkillText>,
+}
+
+/// A skill's expansion in a sent message: shown as its name, with the loaded
+/// content behind a fold.
+struct SkillText {
+    name: SharedString,
+    /// The loaded content, as Markdown that shows it as written.
+    body: SharedString,
 }
 
 impl BubbleText {
     fn new(text: &str) -> Self {
-        let markdown = gentle_core::markdown::sent_message(&attachments::chip_text(text));
+        Self::from_prompt(text, "")
+    }
+
+    fn from_prompt(text: &str, original: &str) -> Self {
+        let block = gentle_core::attachments::parse_skill_block(text, original);
+        let skill = block.as_ref().map(|block| SkillText {
+            name: block.name.to_string().into(),
+            body: gentle_core::markdown::sent_message(block.body).into(),
+        });
+        let text = block.map_or(text, |block| block.args.unwrap_or_default());
+        let (body, files) = attachments::split_files(text);
+        let markdown = gentle_core::markdown::sent_message(&attachments::chip_text(body));
         let lines = line_count(&markdown);
         let folded = (lines > USER_LINES + USER_SLACK).then(|| {
             let (head, _) = head_slice(&markdown, lines, USER_LINES);
@@ -2301,7 +2565,9 @@ impl BubbleText {
         });
         Self {
             markdown: markdown.into(),
+            files: files.into_iter().map(SharedString::from).collect(),
             folded,
+            skill,
         }
     }
 
@@ -2704,22 +2970,38 @@ fn status_footer(status: ToolStatus, duration: Option<Duration>) -> Div {
         })
 }
 
-/// A user message: its images (numbered like their `[Image #N]` tokens)
-/// over the text, tokens shown as `🖼 #N`, a long text folded unless
-/// `open`, with its `toggle`. `None` is an image that could not be decoded.
-/// The text is selectable and copies with the platform shortcut, like an
-/// answer's; `ix` keys its selection. Images its Markdown shows load only
-/// from `data:` URLs (decoded into `embedded`) and local files: one linked
-/// on the network shows nothing, so a message fetches nothing.
+/// The text of a user message without the `Attached files:` block its prompt
+/// carried. For a confirmed live skill the caller passes the original
+/// `/skill:name args` command, so the loaded body is never copied.
+fn message_body(text: &str) -> &str {
+    gentle_core::attachments::typed(text).trim()
+}
+
+/// A user message: its images (numbered in the order they were sent) over
+/// the text, the files it attached as the same tiles beside them, a long text
+/// folded unless `open`, with its `toggle`; a skill's expansion is its `skill`
+/// row (open or not, and the row), the loaded body below it when open. `None` is an image that could not
+/// be decoded. The text is selectable and copies with the platform
+/// shortcut, like an answer's; `ix` keys its selection. Images its Markdown
+/// shows load only from `data:` URLs (decoded into `embedded`) and local
+/// files: one linked on the network shows nothing, so a message fetches
+/// nothing.
 fn user_bubble(
     ix: usize,
     shown: &BubbleText,
     images: Vec<Option<Arc<Image>>>,
     open: bool,
     toggle: Option<Stateful<Div>>,
+    skill: Option<(bool, Stateful<Div>)>,
     embedded: &Arc<crate::features::files::EmbeddedImages>,
 ) -> Div {
     let markdown = shown.visible(open);
+    let files = &shown.files;
+    let skill_body = skill
+        .as_ref()
+        .filter(|(open, _)| *open)
+        .and(shown.skill.as_ref())
+        .map(|skill| skill.body.clone());
     // min_w_0 on both levels: without it the bubble's minimum width is its
     // unwrapped text, so in a narrow pane it overflows (clipped on the left).
     h_flex().w_full().min_w_0().justify_end().child(
@@ -2733,13 +3015,34 @@ fn user_bubble(
             .bg(ui::raised())
             .text_size(rems(14. / 16.))
             .text_color(ui::fg())
-            .when(!images.is_empty(), |this| {
-                this.child(h_flex().flex_wrap().gap_2().children(
-                    images.into_iter().enumerate().map(|(ix, image)| {
-                        image_tile(image, rems(160. / 16.), rems(120. / 16.))
-                            .child(number_badge(ix + 1))
-                    }),
-                ))
+            .when_some(skill.map(|(_, row)| row), |this, row| {
+                this.child(
+                    // The row's own padding, undone so its label lines up
+                    // with the text.
+                    div().ml(rems(-12. / 16.)).child(row),
+                )
+            })
+            .when(!images.is_empty() || !files.is_empty(), |this| {
+                this.child(
+                    h_flex()
+                        .flex_wrap()
+                        .items_center()
+                        .gap_2()
+                        .children(images.into_iter().enumerate().map(|(n, image)| {
+                            image_tile(image, rems(160. / 16.), rems(120. / 16.))
+                                .debug_selector(move || format!("user-image-{ix}-{n}"))
+                                .child(number_badge(n + 1))
+                        }))
+                        .children(files.iter().enumerate().map(|(n, path)| {
+                            let (_, name) = ui::split_path(std::path::Path::new(&path[..]));
+                            // Named by what it names, so no count of files
+                            // can make one message's tile an id the next
+                            // message's file has too (S14/R2).
+                            let id = format!("user-file-{ix}-{n}");
+                            file_tile(id.clone(), &name, path.clone(), FileStrip::Bubble)
+                                .debug_selector(move || id.clone())
+                        })),
+                )
             })
             .when(!markdown.trim().is_empty(), |this| {
                 this.child(
@@ -2765,8 +3068,138 @@ fn user_bubble(
             // The toggle's own padding, undone so its label lines up with the text.
             .children(
                 toggle.map(|toggle| div().ml(rems(-12. / 16.)).mt(rems(-4. / 16.)).child(toggle)),
-            ),
+            )
+            .when_some(skill_body, |this, body| {
+                this.child(
+                    div()
+                        .debug_selector(move || format!("skill-body-{ix}"))
+                        .child(
+                            TextView::markdown(("skill-body", ix), body)
+                                .selectable(true)
+                                .style(ui::prose_style())
+                                .list_style(ui::prose_list_style()),
+                        ),
+                )
+            }),
     )
+}
+
+/// The strip a file tile is drawn in: a sent bubble's, whose tiles are its
+/// image thumbnails' size, or the composer's squares.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum FileStrip {
+    Bubble,
+    Composer,
+}
+
+impl FileStrip {
+    /// The strip's tile size, which is its image tile's own.
+    fn bounds(self) -> (Rems, Rems) {
+        match self {
+            Self::Bubble => (rems(160. / 16.), rems(120. / 16.)),
+            Self::Composer => (rems(64. / 16.), rems(64. / 16.)),
+        }
+    }
+
+    /// What a tile in the strip says, sized for it: the glyph, the extension in
+    /// short caps and the name, with the tile's own padding.
+    fn text(self) -> TileText {
+        match self {
+            Self::Bubble => TileText {
+                glyph: rems(30. / 16.),
+                pad: rems(8. / 16.),
+                caps: rems(11. / 16.),
+                name: rems(11. / 16.),
+            },
+            Self::Composer => TileText {
+                glyph: rems(18. / 16.),
+                pad: rems(3. / 16.),
+                caps: rems(8. / 16.),
+                name: rems(10. / 16.),
+            },
+        }
+    }
+}
+
+/// A file tile's type scale ([`FileStrip::text`]).
+struct TileText {
+    /// The page glyph in the middle.
+    glyph: Rems,
+    /// Space around the name.
+    pad: Rems,
+    /// The extension's short caps, under the glyph.
+    caps: Rems,
+    /// The name along the bottom.
+    name: Rems,
+}
+
+/// A file in an attachment strip: a tile the size of the strip's image
+/// thumbnails, its glyph and its extension in short caps in the middle and its
+/// name on one line at the bottom (a long one is cut in the middle, so the
+/// extension stays readable), with `tip` in a tooltip. Images keep their `#N`
+/// badge; a file has none.
+pub(super) fn file_tile(
+    id: impl Into<ElementId>,
+    name: &str,
+    tip: SharedString,
+    strip: FileStrip,
+) -> Stateful<Div> {
+    let (width, height) = strip.bounds();
+    let text = strip.text();
+    v_flex()
+        .id(id)
+        .relative()
+        .flex_shrink_0()
+        .w(width)
+        .h(height)
+        .overflow_hidden()
+        .rounded_lg()
+        .border_1()
+        .border_color(ui::border_strong())
+        .bg(ui::well())
+        .tooltip(move |window, cx| ui::tooltip(tip.clone()).build(window, cx))
+        .child(
+            v_flex()
+                .flex_1()
+                .items_center()
+                .justify_center()
+                .gap_1()
+                .child(
+                    Icon::new(IconName::File)
+                        .size(text.glyph)
+                        .text_color(ui::muted()),
+                )
+                .children(extension_caps(name).map(|ext| {
+                    div()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_size(text.caps)
+                        .text_color(ui::faint())
+                        .child(ext)
+                })),
+        )
+        .child(
+            div()
+                .w_full()
+                .px(text.pad)
+                .pb(text.pad)
+                .text_size(text.name)
+                .text_color(ui::fg())
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .text_ellipsis_middle()
+                .child(name.to_string()),
+        )
+}
+
+/// A file's extension in short caps (`PDF`, `TXT`) for its tile: what follows
+/// the name's last dot, when the name has a stem before it and the extension
+/// is short enough to read as one. `None` for a file with none (a dotfile, a
+/// name without a dot, a dotted version number), whose tile shows only its
+/// glyph.
+fn extension_caps(name: &str) -> Option<String> {
+    let (stem, ext) = name.rsplit_once('.')?;
+    let short = !ext.is_empty() && ext.chars().count() <= 6;
+    (short && !stem.is_empty()).then(|| ext.to_uppercase())
 }
 
 /// An image source that fails at once, without loading anything: the
@@ -2804,7 +3237,7 @@ fn image_tile(image: Option<Arc<Image>>, width: Rems, height: Rems) -> Div {
         })
 }
 
-/// `#N` in an image's lower-left corner, matching its `[Image #N]` token.
+/// `#N` in an image's lower-left corner: the image's place in what was sent.
 fn number_badge(n: usize) -> Div {
     div()
         .absolute()
@@ -2983,11 +3416,31 @@ fn working_indicator(
 #[cfg(test)]
 mod tests {
     use super::{
-        BubbleText, USER_LINES, USER_SLACK, command_language, follows_step, head_slice,
-        language_for_path, line_count, parse_diff_line, tail_slice,
+        BubbleText, USER_LINES, USER_SLACK, command_language, extension_caps, follows_step,
+        head_slice, language_for_path, line_count, parse_diff_line, tail_slice,
     };
     use gentle_core::transcript::{Block, Item, ToolStatus};
     use gpui_kit::AppContext as _;
+
+    /// S13: a tile names a file's kind in short caps, and shows only the glyph
+    /// for a file whose name has no extension to name.
+    #[test]
+    fn a_file_tile_names_its_extension_in_short_caps() {
+        assert_eq!(extension_caps("report.pdf").as_deref(), Some("PDF"));
+        assert_eq!(extension_caps("test.txt").as_deref(), Some("TXT"));
+        assert_eq!(extension_caps("notes.md").as_deref(), Some("MD"));
+        assert_eq!(extension_caps("Makefile"), None, "no dot, no caps");
+        assert_eq!(
+            extension_caps(".gitignore"),
+            None,
+            "a dotfile has no extension"
+        );
+        assert_eq!(
+            extension_caps("backup.2024-01-02"),
+            None,
+            "a long tail is not a kind"
+        );
+    }
 
     struct CardWrapFixture(gpui_kit::Entity<super::SessionView>);
 
@@ -3147,6 +3600,7 @@ mod tests {
                         Vec::new(),
                         true,
                         None,
+                        None,
                         &Default::default(),
                     ))
             }
@@ -3254,6 +3708,7 @@ mod tests {
                         Vec::new(),
                         true,
                         None,
+                        None,
                         &Default::default(),
                     )))
             }
@@ -3309,6 +3764,7 @@ mod tests {
                         &super::BubbleText::new("hello `café` world"),
                         Vec::new(),
                         true,
+                        None,
                         None,
                         &Default::default(),
                     ))
@@ -3524,6 +3980,100 @@ mod tests {
         let (head, hidden) = BubbleText::new(&gap).folded.unwrap();
         assert!(head.ends_with("line 6"), "{head}");
         assert_eq!(hidden, USER_SLACK + 4);
+    }
+
+    const SKILL_MESSAGE: &str = "<skill name=\"docs\" location=\"/x/SKILL.md\">\nLoaded body.\n</skill>\n\nsummarize the ADRs";
+
+    /// S1: a skill's expansion shows as its name and the args the user typed;
+    /// the loaded body waits behind the fold, and Copy message yields the
+    /// command. A message that only looks like a skill block is plain text.
+    #[test]
+    fn impeccable_skill_bubble_shows_only_its_name_and_test() {
+        let block = "<skill name=\"impeccable\" location=\"/x/SKILL.md\">\n# Impeccable\n\nDesign polished interfaces.\n</skill>";
+        for separator in ["\n", "\n\n"] {
+            let echo = format!("{block}{separator}test");
+            let bubble = BubbleText::from_prompt(&echo, "/skill:impeccable test");
+            assert_eq!(bubble.skill.as_ref().unwrap().name, "impeccable");
+            assert_eq!(bubble.visible(false), "test");
+        }
+    }
+
+    #[test]
+    fn a_skill_message_collapses_to_its_name_and_args() {
+        let bubble = BubbleText::from_prompt(SKILL_MESSAGE, "/skill:docs summarize the ADRs");
+        assert!(BubbleText::new(SKILL_MESSAGE).skill.is_none());
+        let skill = bubble.skill.as_ref().unwrap();
+        assert_eq!(skill.name, "docs");
+        assert!(skill.body.contains("Loaded body."));
+        assert_eq!(bubble.markdown, "summarize the ADRs");
+        assert_eq!(super::message_body(SKILL_MESSAGE), SKILL_MESSAGE);
+
+        let bare = BubbleText::from_prompt(
+            "<skill name=\"docs\" location=\"/x/SKILL.md\">\nLoaded body.\n</skill>",
+            "/skill:docs",
+        );
+        assert!(bare.skill.is_some());
+        assert!(bare.markdown.trim().is_empty());
+        assert_eq!(
+            super::message_body(
+                "<skill name=\"docs\" location=\"/x/SKILL.md\">\nLoaded body.\n</skill>"
+            ),
+            "<skill name=\"docs\" location=\"/x/SKILL.md\">\nLoaded body.\n</skill>"
+        );
+
+        let lookalike = BubbleText::new("see <skill name=\"a\" location=\"b\">\nx\n</skill>");
+        assert!(lookalike.skill.is_none());
+        assert!(lookalike.markdown.contains("skill name"));
+        assert_eq!(
+            super::message_body("plain\n\nAttached files:\n- a.pdf"),
+            "plain"
+        );
+    }
+
+    /// S1: the body is drawn only once the skill row is open.
+    #[gpui::test]
+    fn a_skill_bubble_shows_its_body_only_when_open(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::{InteractiveElement as _, ParentElement as _, Render, Styled as _};
+        struct Bubble(bool);
+        impl Render for Bubble {
+            fn render(
+                &mut self,
+                _: &mut gpui_kit::Window,
+                _: &mut gpui_kit::Context<Self>,
+            ) -> impl gpui_kit::IntoElement {
+                gpui_kit::div().size_full().child(super::user_bubble(
+                    0,
+                    &BubbleText::from_prompt(SKILL_MESSAGE, "/skill:docs summarize the ADRs"),
+                    Vec::new(),
+                    false,
+                    None,
+                    Some((self.0, gpui_kit::div().id("skill-toggle").child("docs"))),
+                    &Default::default(),
+                ))
+            }
+        }
+        cx.update(gpui_kit::init);
+        let (view, cx) = cx.add_window_view(|_, _| Bubble(false));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("user-text-0").is_some(), "the args show");
+        assert!(
+            cx.debug_bounds("skill-body-0").is_none(),
+            "the body is folded"
+        );
+        view.update(cx, |view, cx| {
+            view.0 = true;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("skill-body-0").is_some(),
+            "open shows the body"
+        );
+        assert!(
+            cx.debug_bounds("user-text-0").unwrap().origin.y
+                < cx.debug_bounds("skill-body-0").unwrap().origin.y,
+            "the typed args stay above the loaded body"
+        );
     }
 
     #[test]

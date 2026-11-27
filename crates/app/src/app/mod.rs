@@ -200,6 +200,12 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new(key!("b"), ToggleSidebar, None),
         KeyBinding::new(key!("q"), Quit, None),
         KeyBinding::new("escape", workspace::CloseOverlay, Some("GentleWorkspace")),
+        // A maximized browser card first; otherwise Esc goes on to the window.
+        KeyBinding::new(
+            "escape",
+            crate::features::browser::RestoreCard,
+            Some(crate::features::browser::CONTEXT),
+        ),
         KeyBinding::new("escape", session::Abort, Some(session::CONTEXT)),
         KeyBinding::new(key!("."), session::Stop, Some(session::CONTEXT)),
         KeyBinding::new(

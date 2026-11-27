@@ -8,6 +8,7 @@ use std::time::Instant;
 pub(super) struct SidebarMotion {
     slide: Option<(Instant, SidebarSlide)>,
     pub(super) revision: u64,
+    pub(super) active_drag: std::rc::Weak<std::cell::Cell<u64>>,
 }
 
 impl SidebarMotion {
@@ -16,6 +17,10 @@ impl SidebarMotion {
         let now = Instant::now();
         let from = self.fraction(was_open, now);
         self.slide = (!reduce_motion).then(|| (now, SidebarSlide::new(from, !was_open)));
+    }
+
+    fn allocation(&self, width: f32, fraction: f32) -> f32 {
+        width * fraction
     }
 
     fn fraction(&self, open: bool, now: Instant) -> f32 {
@@ -38,14 +43,59 @@ impl SidebarMotion {
 }
 
 impl Workspace {
+    /// The visible panel and inner gap, shared by layout and painting.
+    pub(super) fn visible_sidebar_geometry(
+        &self,
+        side: Side,
+        window: f32,
+        now: Instant,
+    ) -> (f32, f32) {
+        let (width, fraction) = self.sidebar_geometry(side, window, now);
+        (
+            self.sidebar_allocation(side, width, fraction, now),
+            6. * fraction,
+        )
+    }
+
+    pub(super) fn sidebar_allocation(
+        &self,
+        side: Side,
+        width: f32,
+        fraction: f32,
+        _now: Instant,
+    ) -> f32 {
+        match side {
+            Side::Tabs => &self.tabs_sidebar_motion,
+            Side::Files => &self.files_sidebar_motion,
+        }
+        .allocation(width, fraction)
+    }
+
+    pub(super) fn sidebar_motion_mut(&mut self, side: Side) -> &mut SidebarMotion {
+        match side {
+            Side::Tabs => &mut self.tabs_sidebar_motion,
+            Side::Files => &mut self.files_sidebar_motion,
+        }
+    }
+
+    pub(super) fn sidebar_drag_active(&self, side: Side, cx: &App) -> bool {
+        let motion = match side {
+            Side::Tabs => &self.tabs_sidebar_motion,
+            Side::Files => &self.files_sidebar_motion,
+        };
+        cx.has_active_drag()
+            && motion
+                .active_drag
+                .upgrade()
+                .is_some_and(|revision| revision.get() == motion.revision)
+    }
+
     /// The full content width and the fraction allocated to it in the row.
-    /// The icon rail keeps its fixed width; an expanded sidebar shows its
-    /// saved width within the window's share.
     pub(super) fn sidebar_geometry(&self, side: Side, window: f32, now: Instant) -> (f32, f32) {
         let (saved, open, motion) = match side {
             Side::Tabs => (
                 self.tabs_sidebar_width,
-                self.tab_layout == TabLayout::Vertical,
+                self.tabs_sidebar_visible(),
                 &self.tabs_sidebar_motion,
             ),
             Side::Files => (

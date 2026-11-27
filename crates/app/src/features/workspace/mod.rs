@@ -101,8 +101,6 @@ actions!(
     ]
 );
 
-/// The vertical tabs sidebar's width (px at 100 % interface size) as an
-/// icon rail; it has no resize handle.
 const COMPACT_SIDEBAR_WIDTH: f32 = 48.;
 
 /// What the window tells whoever embeds things in it (the sidebar's owner).
@@ -139,6 +137,9 @@ struct Pane {
     path: Option<PathBuf>,
     /// Last conversation file seen, to save when it changes.
     session_file: Option<PathBuf>,
+    /// Which conversation its agent shows (`SessionView::conversation`), so
+    /// a notice from an earlier one doesn't open this one.
+    conversation: u64,
     /// What the tab bar shows for this pane, kept here so drawing the chrome
     /// never reads the views of tabs that aren't shown (reading an entity
     /// while drawing makes its every notify redraw the window). Agents
@@ -320,7 +321,7 @@ enum Side {
 struct SidebarDrag {
     side: Side,
     owner: gpui::EntityId,
-    revision: std::cell::Cell<u64>,
+    revision: std::rc::Rc<std::cell::Cell<u64>>,
     gesture: std::cell::RefCell<gentle_core::workspaces::SidebarGesture>,
 }
 
@@ -329,7 +330,7 @@ impl SidebarDrag {
         Self {
             side,
             owner,
-            revision: std::cell::Cell::new(revision),
+            revision: std::rc::Rc::new(std::cell::Cell::new(revision)),
             gesture: Default::default(),
         }
     }
@@ -421,9 +422,10 @@ pub struct Workspace {
     tabs_sidebar_motion: sidebar_motion::SidebarMotion,
     files_sidebar_motion: sidebar_motion::SidebarMotion,
     tab_layout: TabLayout,
-    /// The vertical tabs sidebar shows as the narrow icon rail.
     sidebar_compact: bool,
-    /// Width of the expanded vertical tabs sidebar (px at 100 % interface size).
+    /// Whether the vertical navigator is hidden (independent of the rail).
+    tabs_sidebar_hidden: bool,
+    /// Width of the vertical tabs sidebar (px at 100 % interface size).
     tabs_sidebar_width: f32,
     /// Width of the right Files sidebar (px at 100 % interface size).
     files_sidebar_width: f32,
@@ -479,6 +481,12 @@ pub struct Workspace {
     music: Entity<Music>,
     /// Simulators and emulators, docked at the right or floating.
     devices: Entity<DevicePanel>,
+    /// The window's keyboard focus when no pane owns it: an empty workspace
+    /// shows only chrome (a button and a message), so nothing registers a
+    /// focusable element and ⌘T / ⌘⇧T / ⌘O fall back to the root node, which
+    /// has no actions. Focusing this handle on the root puts the window-level
+    /// key bindings back in reach until a pane or an overlay takes over.
+    focus: gpui_kit::FocusHandle,
 }
 
 impl EventEmitter<WorkspaceEvent> for Workspace {}
@@ -576,6 +584,7 @@ impl Workspace {
             files_sidebar_motion: Default::default(),
             tab_layout: saved.tab_layout,
             sidebar_compact: saved.sidebar_compact,
+            tabs_sidebar_hidden: saved.tabs_sidebar_hidden,
             tabs_sidebar_width: gentle_core::workspaces::saved_sidebar_width(
                 saved.tabs_sidebar_width,
             ),
@@ -603,6 +612,7 @@ impl Workspace {
             closed: Vec::new(),
             music,
             devices,
+            focus: cx.focus_handle(),
             _surge_end: None,
             _title_poll: cx.spawn(async move |this, cx| {
                 loop {

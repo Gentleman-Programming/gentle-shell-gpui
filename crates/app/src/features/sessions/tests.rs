@@ -16,6 +16,7 @@ use pi_rpc::desktop_rpc::{DesktopErrorCode, SessionEntry, SessionsScope};
 use pi_rpc::file_cache::FileCache;
 
 use super::discovery::{find_session, list_sessions};
+use super::render::first_message_line;
 use super::summary::{cached_summary_in, summarize};
 use super::view::{Row, choose_source, current_rows, opens_elsewhere, switch_scope};
 use super::{Scope, SessionsEvent, SessionsView, Source};
@@ -25,6 +26,19 @@ fn read_summary(path: &Path) -> Option<SessionSummary> {
     summarize(std::fs::File::open(path).ok()?, path)
         .ok()
         .flatten()
+}
+
+/// T9: a row's subtitle is the message's first line, trimmed as it always
+/// was: leading blanks and a leading empty line never reach the row.
+#[test]
+fn a_row_subtitle_trims_the_message_it_shows() {
+    assert_eq!(first_message_line("  leading"), "leading");
+    assert_eq!(first_message_line("\nfirst\nsecond"), "first …");
+    assert_eq!(first_message_line("plain"), "plain");
+    // S9: the sent block never shows; a prompt of files reads as their names.
+    assert_eq!(first_message_line("hi\n\nAttached files:\n- a.pdf"), "hi");
+    assert_eq!(first_message_line("Attached files:\n- a.pdf"), "a.pdf");
+    assert_eq!(first_message_line(""), "");
 }
 
 #[test]

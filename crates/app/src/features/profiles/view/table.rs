@@ -104,24 +104,42 @@ impl ProfilesView {
         ui::appear(SharedString::from(format!("route-{key}")), row).into_any_element()
     }
 
+    /// One choice of a workflow setting: outlined when chosen, in `warning`
+    /// when the chosen one is not saved yet.
+    fn workflow_option(
+        &self,
+        id: String,
+        label: &'static str,
+        tooltip: &'static str,
+        on: bool,
+        edited: bool,
+    ) -> Button {
+        Button::new(SharedString::from(id))
+            .xsmall()
+            .when(on, |b| b.outline().selected(true))
+            .when(!on, |b| b.ghost())
+            .when(on && edited, |b| b.text_color(ui::warning()))
+            .label(label)
+            .tooltip(tooltip)
+            .disabled(self.busy)
+    }
+
     /// The shown profile's orchestrator mode (gentle-pi's per-profile
     /// `workflow`), edited in the draft like a route.
     fn render_mode(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let edited = self.draft_mode != self.stored_mode;
         let option = |mode: OrchestratorMode, label: &'static str, tooltip: &'static str| {
-            let on = self.draft_mode == mode;
-            Button::new(SharedString::from(format!("mode-{}", mode.as_str())))
-                .xsmall()
-                .when(on, |b| b.outline().selected(true))
-                .when(!on, |b| b.ghost())
-                .when(on && edited, |b| b.text_color(ui::warning()))
-                .label(label)
-                .tooltip(tooltip)
-                .disabled(self.busy)
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.draft_mode = mode;
-                    cx.notify();
-                }))
+            self.workflow_option(
+                format!("mode-{}", mode.as_str()),
+                label,
+                tooltip,
+                self.draft_mode == mode,
+                edited,
+            )
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.draft_mode = mode;
+                cx.notify();
+            }))
         };
         let organic = option(
             OrchestratorMode::Organic,
@@ -140,6 +158,38 @@ impl ProfilesView {
             .child("Orchestrator")
             .child(organic)
             .child(delegation)
+    }
+
+    /// The shown profile's Controlled Engineering option (stored beside the
+    /// mode in its `workflow` entry), edited in the draft like the mode.
+    fn render_controlled(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let edited = self.draft_controlled != self.stored_controlled;
+        let option = |enabled: bool, label: &'static str, tooltip: &'static str| {
+            self.workflow_option(
+                format!("controlled-{label}"),
+                label,
+                tooltip,
+                self.draft_controlled == enabled,
+                edited,
+            )
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.draft_controlled = enabled;
+                cx.notify();
+            }))
+        };
+        let off = option(false, "Off", "No extra authoring rules");
+        let on = option(
+            true,
+            "On",
+            "Adds rules against unrequested machinery: to the orchestrator in Organic mode, and to writer and verify agents",
+        );
+        h_flex()
+            .gap_2()
+            .text_xs()
+            .text_color(ui::muted())
+            .child("Controlled Engineering")
+            .child(off)
+            .child(on)
     }
 
     fn render_scope(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -210,6 +260,7 @@ impl ProfilesView {
                     .child(pin_line),
             )
             .child(self.render_mode(cx))
+            .child(self.render_controlled(cx))
     }
 
     pub(super) fn render_table(&self, cx: &mut Context<Self>) -> impl IntoElement {

@@ -27,12 +27,15 @@ pub struct SessionSummary {
 }
 
 impl SessionSummary {
+    /// The title: the session's name, or what the first prompt said, without
+    /// the `Attached files:` block it carried (a prompt of files only is
+    /// titled by their names).
     pub fn title(&self) -> String {
-        let text = self
-            .name
-            .as_deref()
-            .or(self.first_message.as_deref())
-            .unwrap_or("(no messages)");
+        let text = match (self.name.as_deref(), self.first_message.as_deref()) {
+            (Some(name), _) => name.to_string(),
+            (None, Some(first)) => crate::attachments::summary(first),
+            (None, None) => "(no messages)".to_string(),
+        };
         crate::text::first_line(text.trim(), 120)
     }
 
@@ -159,9 +162,14 @@ pub fn relative_time(now_ms: i64, then_ms: i64) -> String {
 }
 
 /// The title of a session from Pi's own listing (Gentle Shell's
-/// `list_sessions`): its name, else its first message, on one line.
+/// `list_sessions`): its name, else its first message, on one line and
+/// without the `Attached files:` block the prompt carried.
 pub fn listed_title(name: Option<&str>, first_message: &str) -> String {
-    crate::text::first_line(name.unwrap_or(first_message).trim(), 120)
+    let text = name.map_or_else(
+        || crate::attachments::summary(first_message),
+        str::to_string,
+    );
+    crate::text::first_line(text.trim(), 120)
 }
 
 /// Whether a session from Pi's own listing matches a lowercase query: by
@@ -196,12 +204,56 @@ pub fn file_session_id(path: &Path) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     use super::{
-        file_session_id, listed_matches, listed_title, parse_iso_ms, project_name, relative_time,
-        session_dir_name,
+        SessionSummary, file_session_id, listed_matches, listed_title, parse_iso_ms, project_name,
+        relative_time, session_dir_name,
     };
+
+    /// A session whose only content is its first message.
+    fn session(first_message: Option<&str>) -> SessionSummary {
+        SessionSummary {
+            path: PathBuf::from("/s/--w--/a.jsonl"),
+            id: "a".to_string(),
+            cwd: PathBuf::from("/w"),
+            name: None,
+            first_message: first_message.map(str::to_string),
+            modified_ms: 0,
+            message_count: 1,
+            truncated: false,
+            model: None,
+        }
+    }
+
+    /// S9: a session's title is what the person typed, never the
+    /// `Attached files:` block its prompt carried; a prompt that was only
+    /// files is titled by their names (Pi's own listing too).
+    #[test]
+    fn session_titles_hide_the_attached_files_block() {
+        let block = "\n\nAttached files:\n- src/main.rs\n- /work/report.pdf";
+        assert_eq!(
+            session(Some(&format!("Fix the build{block}"))).title(),
+            "Fix the build"
+        );
+        assert_eq!(
+            session(Some("Attached files:\n- report.pdf\n- /work/notes.txt")).title(),
+            "report.pdf, notes.txt"
+        );
+        assert_eq!(session(None).title(), "(no messages)");
+        assert_eq!(
+            listed_title(None, &format!("Fix the build{block}")),
+            "Fix the build"
+        );
+        assert_eq!(
+            listed_title(None, "Attached files:\n- report.pdf"),
+            "report.pdf"
+        );
+        assert_eq!(
+            listed_title(Some("Release prep"), "Attached files:\n- a.pdf"),
+            "Release prep"
+        );
+    }
 
     #[test]
     fn listed_sessions_title_and_match_without_paths() {

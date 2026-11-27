@@ -104,7 +104,7 @@ impl NativeView {
         script: Option<&str>,
         sandbox: Option<&super::Sandbox>,
         profile: &Profile,
-        popups: Option<super::Popups>,
+        relays: super::Relays,
     ) -> Result<Self, String> {
         let owner = host.0;
         register_class();
@@ -154,7 +154,7 @@ impl NativeView {
             position: wry::dpi::PhysicalPosition::new(0, 0).into(),
             size: wry::dpi::PhysicalSize::new(1u32, 1u32).into(),
         });
-        let builder = super::follow_popups(builder, popups);
+        let builder = super::relay(builder, relays);
         let webview = match sandbox {
             Some(sandbox) => super::isolate(builder, sandbox),
             None => builder,
@@ -235,6 +235,12 @@ impl NativeView {
         if let Some(webview) = &self.webview {
             let _ = webview.evaluate_script(script);
         }
+    }
+
+    /// The page's popup takes the keyboard from the app's window, so GPUI
+    /// never asks while the page has it.
+    pub(super) fn has_keyboard(&self) -> bool {
+        false
     }
 
     /// Run `script`; `done` gets its value as JSON (nothing if it never ran).

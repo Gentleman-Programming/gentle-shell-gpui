@@ -66,6 +66,7 @@ impl SessionView {
     /// included, so resume-on-restart follows the new session.
     pub(super) fn apply_reads(&mut self, applied: Applied, cx: &mut Context<Self>) {
         if applied.switched {
+            self.conversation += 1;
             self.reset_conversation();
             self.reset_desktop_channel();
             self.refresh_state(cx);

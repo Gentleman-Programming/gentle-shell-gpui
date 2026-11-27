@@ -17,8 +17,8 @@ mod refs;
 mod snapshot;
 
 pub use changes::{
-    commit, discard, last_commit_message, push, stage, stage_tracked, staged_diff, stash_push,
-    unstage, unstage_all, work_tree,
+    commit, discard, last_commit_message, push, stage, stage_tracked, staged_diff, stash_count,
+    stash_push, unstage, unstage_all, work_tree,
 };
 pub use gentle_core::git::log::{Commit, Graph};
 pub use gentle_core::git::refs::{RefEntry, RefsSnapshot, Worktree};

@@ -29,6 +29,7 @@ impl ProfilesView {
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.draft = this.stored.clone();
                                 this.draft_mode = this.stored_mode;
+                                this.draft_controlled = this.stored_controlled;
                                 this.proceed(discard_leave.clone(), window, cx);
                             }))
                             .into_any_element(),

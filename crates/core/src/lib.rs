@@ -4,11 +4,13 @@
 
 pub mod activity;
 pub mod alert_timing;
+pub mod attachments;
 pub mod backend;
 pub mod browser;
 pub mod canvas;
 pub mod commands;
 pub mod contrast;
+pub mod credits;
 pub mod devices;
 pub mod diagnostics;
 pub mod docs;

@@ -304,12 +304,13 @@ Workflow steps:
 
 ### Cutting a release
 
-1. On an up-to-date `main`, change `version` in `[workspace.package]` of the root `Cargo.toml` and run `cargo check` so `Cargo.lock` updates.
-2. Commit only those two files: `release: X.Y.Z`. Push to `main`.
-3. Wait for CI on `main` to pass (and Cache warm, which triggers because `Cargo.lock` changed, so the tag reuses the cache).
-4. Optional: dry run from Actions → Release → Run workflow.
-5. `git tag vX.Y.Z && git push origin vX.Y.Z`.
-6. Check that the release has all eight files.
+1. On an up-to-date `main` (a full clone, not shallow), run `scripts/credits.sh`. It regenerates `CREDITS.md`, the list Configuration › About shows, from the git history. If someone appears without an `@login` (or twice), add a line for their address to `.mailmap` and run it again. If the file changed, commit it on its own (`docs(credits): update contributors`).
+2. Change `version` in `[workspace.package]` of the root `Cargo.toml` and run `cargo check` so `Cargo.lock` updates.
+3. Commit only those two files: `release: X.Y.Z`. Push to `main`.
+4. Wait for CI on `main` to pass (and Cache warm, which triggers because `Cargo.lock` changed, so the tag reuses the cache).
+5. Optional: dry run from Actions → Release → Run workflow.
+6. `git tag vX.Y.Z && git push origin vX.Y.Z`.
+7. Check that the release has all eight files.
 
 ### How the updater consumes them
 
@@ -390,6 +391,7 @@ It runs `generate.py` (SVG), `render.swift` (PNG in several sizes), `iconutil` (
 ### Release
 
 - [ ] `main` green in CI.
+- [ ] `scripts/credits.sh` run; `CREDITS.md` committed if it changed.
 - [ ] `version` changed in `[workspace.package]`, `cargo check` run, `release: X.Y.Z` commit with `Cargo.toml` and `Cargo.lock`.
 - [ ] CI for that commit green (and Cache warm finished).
 - [ ] Optional: Release dry run.

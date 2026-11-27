@@ -73,7 +73,7 @@ impl NativeView {
         script: Option<&str>,
         sandbox: Option<&super::Sandbox>,
         profile: &Profile,
-        popups: Option<super::Popups>,
+        relays: super::Relays,
     ) -> Result<Self, String> {
         GTK.clone()?;
         // Each profile is a WebKit context with a data folder of its own;
@@ -91,7 +91,7 @@ impl NativeView {
         .with_initialization_script(script.unwrap_or_default())
         .with_background_color(background)
         .with_visible(false);
-        let builder = super::follow_popups(builder, popups);
+        let builder = super::relay(builder, relays);
         let webview = match sandbox {
             Some(sandbox) => super::isolate(builder, sandbox),
             None => builder,
@@ -154,6 +154,12 @@ impl NativeView {
 
     pub(super) fn evaluate(&self, script: &str) {
         let _ = self.webview.evaluate_script(script);
+    }
+
+    /// The page lives in its own native window here, which takes the
+    /// keyboard from the app's window, so GPUI never asks while it has it.
+    pub(super) fn has_keyboard(&self) -> bool {
+        false
     }
 
     /// Run `script`; `done` gets its value as JSON (nothing if it never ran).

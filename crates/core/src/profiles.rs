@@ -29,7 +29,7 @@ pub use store::{
     Drops, OrchestratorMode, PROFILE_EXPORT_FILE, ProfileExport, ProfilesFile, bootstrap_profiles,
     create_profile, delete_profile, duplicate_profile, is_valid_profile_name, parse_profile_export,
     parse_profiles, rename_profile, serialize_profile_export, serialize_profiles, set_active,
-    set_orchestrator_mode, update_profile,
+    set_controlled_engineering, set_orchestrator_mode, update_profile,
 };
 
 pub fn pretty(value: &Value) -> String {

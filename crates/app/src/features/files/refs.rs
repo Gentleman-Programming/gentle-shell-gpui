@@ -94,6 +94,8 @@ pub struct RefsView {
     collapsed: HashSet<Section>,
     /// The list's rows, rebuilt when the refs, filter or collapsed sections change.
     lines: Rc<Vec<Line>>,
+    /// [`Self::show_stashes`] asked: scroll to the Stashes header once listed.
+    reveal_stashes: bool,
     scroll: UniformListScrollHandle,
     busy: bool,
     error: Option<String>,
@@ -119,6 +121,7 @@ impl RefsView {
             filter,
             collapsed: HashSet::new(),
             lines: Rc::new(Vec::new()),
+            reveal_stashes: false,
             scroll: UniformListScrollHandle::new(),
             busy: false,
             error: None,
@@ -203,8 +206,9 @@ impl RefsView {
     }
 
     /// Rebuild the flat row model: each section with a match gets a header
-    /// (with its match count) and, unless collapsed, its matching refs. A
-    /// filter that could be a new branch's name first offers a worktree on it.
+    /// (with its match count) and, unless collapsed, its matching refs;
+    /// Stashes keeps its header with no stashes and no filter. A filter that
+    /// could be a new branch's name first offers a worktree on it.
     fn relayout(&mut self, cx: &App) {
         let mut lines = Vec::new();
         if let Some(repo) = self.snapshot() {
@@ -239,7 +243,10 @@ impl RefsView {
                 ),
             ];
             for (section, items) in sections {
-                if items.is_empty() {
+                // Stashes stays with its zero while nothing is filtered, so
+                // it doesn't vanish after the last pop or drop.
+                let keep_empty = section == Section::Stashes && query.is_empty();
+                if items.is_empty() && !keep_empty {
                     continue;
                 }
                 let collapsed = self.collapsed.contains(&section);
@@ -253,7 +260,35 @@ impl RefsView {
                 }
             }
         }
+        if self.reveal_stashes && self.snapshot().is_some() {
+            self.reveal_stashes = false;
+            let header = lines.iter().position(|line| {
+                matches!(
+                    line,
+                    Line::Header {
+                        section: Section::Stashes,
+                        ..
+                    }
+                )
+            });
+            if let Some(ix) = header {
+                self.scroll.scroll_to_item(ix, ScrollStrategy::Top);
+            }
+        }
         self.lines = Rc::new(lines);
+    }
+
+    /// Show every stash: clear a filter that would hide some, unfold the
+    /// Stashes section and scroll to it (once the refs are read).
+    pub fn show_stashes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.filter.read(cx).value().trim().is_empty() {
+            self.filter
+                .update(cx, |state, cx| state.set_value("", window, cx));
+        }
+        self.collapsed.remove(&Section::Stashes);
+        self.reveal_stashes = true;
+        self.relayout(cx);
+        cx.notify();
     }
 
     /// Run a git operation in the background, then re-read the refs.
@@ -712,15 +747,11 @@ impl RefsView {
             Some(None) => return note("Not a git repository").into_any_element(),
             Some(Some(_)) => {}
         }
+        // Unfiltered, Stashes always has a header: only a filter empties the list.
         if self.lines.is_empty() {
             let value = self.filter.read(cx).value();
-            let query = value.trim();
-            return if query.is_empty() {
-                note("No branches, remotes, tags, stashes, worktrees or submodules")
-            } else {
-                note(format!("No refs match \u{201c}{query}\u{201d}"))
-            }
-            .into_any_element();
+            return note(format!("No refs match \u{201c}{}\u{201d}", value.trim()))
+                .into_any_element();
         }
         div()
             .relative()

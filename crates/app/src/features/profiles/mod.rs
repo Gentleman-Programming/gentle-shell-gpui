@@ -220,6 +220,10 @@ pub struct ProfilesView {
     /// The shown profile's orchestrator mode as saved, and as edited.
     stored_mode: OrchestratorMode,
     draft_mode: OrchestratorMode,
+    /// The shown profile's Controlled Engineering option as saved, and as
+    /// edited.
+    stored_controlled: bool,
+    draft_controlled: bool,
     status: Option<(String, Tone)>,
     busy: bool,
     name_mode: Option<NameMode>,
@@ -324,6 +328,8 @@ impl ProfilesView {
             draft: Routing::default(),
             stored_mode: OrchestratorMode::default(),
             draft_mode: OrchestratorMode::default(),
+            stored_controlled: false,
+            draft_controlled: false,
             status: None,
             busy: false,
             name_mode: None,
@@ -882,9 +888,13 @@ impl ProfilesView {
             .as_deref()
             .map(|n| self.file.orchestrator_mode(n))
             .unwrap_or_default();
+        self.stored_controlled = name
+            .as_deref()
+            .is_some_and(|n| self.file.controlled_engineering(n));
         if !keep_draft {
             self.draft = self.stored.clone();
             self.draft_mode = self.stored_mode;
+            self.draft_controlled = self.stored_controlled;
         }
         self.selected = name;
         self.custom_target = None;
@@ -937,7 +947,9 @@ impl ProfilesView {
                     + usize::from(field(|e| &e.tier))
             })
             .sum();
-        routes + usize::from(self.draft_mode != self.stored_mode)
+        routes
+            + usize::from(self.draft_mode != self.stored_mode)
+            + usize::from(self.draft_controlled != self.stored_controlled)
     }
 
     fn target_keys(&self, key: &str) -> Vec<String> {

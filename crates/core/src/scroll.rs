@@ -21,6 +21,9 @@ const CARD_LINES: usize = 6;
 /// `USER_SLACK`).
 const BUBBLE_FOLD: usize = 10;
 const BUBBLE_LINES: usize = 8;
+/// A sent message's attachment strip: one row of 120 px tiles, images and
+/// files alike, at [`DEFAULT_SCALE`].
+const STRIP: f32 = 7.;
 
 /// The wrapped lines `text` takes, roughly.
 fn text_lines(text: &str) -> f32 {
@@ -34,19 +37,65 @@ fn wrapped_lines<'a>(lines: impl Iterator<Item = &'a str>) -> f32 {
         .max(1) as f32
 }
 
+/// The lines a message's own text weighs, folded past [`BUBBLE_FOLD`] as the
+/// bubble draws it: blank text is the one line [`text_lines`] counts, and
+/// trailing blank lines count as they are.
+fn user_text(text: &str) -> f32 {
+    if text.trim_end().lines().nth(BUBBLE_FOLD).is_some() {
+        wrapped_lines(text.lines().take(BUBBLE_LINES)) + 1.
+    } else {
+        text_lines(text)
+    }
+}
+
+/// What a confirmed skill invocation weighs for its collapsed skill row.
+pub const SKILL_ROW: f32 = 1.5;
+
 /// A row's size in "lines", from its content alone. Only its proportion to
 /// other rows matters: [`estimate`] scales it by what measured rows show.
 pub fn item_weight(item: &Item) -> f32 {
+    item_weight_confirmed(item, None)
+}
+
+/// [`item_weight`] for a row the app confirmed as the live invocation of
+/// `skill` (the command it sent): its body is collapsed, so only the skill
+/// row and the typed args weigh. Without a matching confirmation the text is
+/// ordinary.
+pub fn item_weight_confirmed(item: &Item, skill: Option<&str>) -> f32 {
     match item {
-        // The bubble's padding and the row gap, then its text (and image
-        // strip).
+        // The bubble's padding and the row gap, then its text (and the
+        // strip of image and file tiles above it). The paths' block the
+        // prompt carries weighs nothing: the bubble shows cards, not the
+        // block. A message with no block weighs what it always did, blank
+        // text included; one that is only a block has no text to weigh.
         Item::User { text, images } => {
-            let text = if text.trim_end().lines().nth(BUBBLE_FOLD).is_some() {
-                wrapped_lines(text.lines().take(BUBBLE_LINES)) + 1.
+            let visible = crate::attachments::mixed_attachment_text(text, images.len());
+            let block = skill.and_then(|c| crate::attachments::parse_skill_block(visible, c));
+            let visible = block
+                .as_ref()
+                .map_or(visible, |b| b.args.unwrap_or_default());
+            let (body, files) = crate::attachments::split_files(visible);
+            let text = if block.is_some() {
+                // Only the skill row and the typed args show by default.
+                SKILL_ROW
+                    + if body.trim().is_empty() {
+                        0.
+                    } else {
+                        user_text(body)
+                    }
+            } else if files.is_empty() {
+                user_text(text)
+            } else if body.trim().is_empty() {
+                0.
             } else {
-                text_lines(text)
+                user_text(body)
             };
-            3.8 + text + if images.is_empty() { 0. } else { 7. }
+            3.8 + text
+                + if images.is_empty() && files.is_empty() {
+                    0.
+                } else {
+                    STRIP
+                }
         }
         Item::Assistant { .. } if !crate::transcript::assistant_visible(item) => 0.,
         Item::Assistant {
@@ -338,6 +387,44 @@ mod tests {
         assert_eq!(e.tops, vec![0., 40., 240.]);
     }
 
+    /// S1: a confirmed live invocation weighs its collapsed row and args,
+    /// whatever the hidden body; the same wrapper unconfirmed is ordinary text.
+    #[test]
+    fn confirmed_skill_weight_ignores_body_but_unconfirmed_does_not() {
+        let wrap = |body: &str| Item::User {
+            text: format!("<skill name=\"docs\" location=\"/x\">\n{body}\n</skill>\n\ntest"),
+            images: vec![],
+        };
+        let (small, big) = (wrap("short"), wrap(&"long body\n".repeat(80)));
+        let weight = |item: &Item, cmd| item_weight_confirmed(item, cmd);
+        assert_eq!(
+            weight(&small, Some("/skill:docs test")),
+            3.8 + SKILL_ROW + 1.
+        );
+        assert_eq!(weight(&big, Some("/skill:docs test")), 3.8 + SKILL_ROW + 1.);
+        assert_eq!(weight(&big, Some("/skill:docs other")), item_weight(&big));
+        assert_eq!(weight(&big, None), item_weight(&big));
+        assert!(item_weight(&big) > item_weight(&small));
+    }
+
+    #[test]
+    fn unconfirmed_skill_weight_includes_loaded_body() {
+        for separator in ["\n", "\n\n"] {
+            for body in ["short".to_string(), "long body\n".repeat(80)] {
+                let item = Item::User {
+                    text: format!(
+                        "<skill name=\"impeccable\" location=\"/x\">\n{body}\n</skill>{separator}test"
+                    ),
+                    images: vec![],
+                };
+                let Item::User { text, .. } = &item else {
+                    unreachable!()
+                };
+                assert_eq!(item_weight(&item), 3.8 + user_text(text));
+            }
+        }
+    }
+
     #[test]
     fn weights_follow_content() {
         let user = |text: &str| Item::User {
@@ -364,6 +451,77 @@ mod tests {
         assert_eq!(item_weight(&user(BUBBLE_FOLD + 1)), item_weight(&user(500)));
         assert!(item_weight(&user(500)) < item_weight(&user(BUBBLE_FOLD)));
         assert!(item_weight(&user(BUBBLE_FOLD - 1)) < item_weight(&user(BUBBLE_FOLD)));
+    }
+
+    /// S9, S13: a prompt's files weigh their tile row, and the `Attached
+    /// files:` block the prompt carries weighs nothing — the bubble shows
+    /// tiles, not the paths — even with thirty of them. Images and file
+    /// tiles share one row, so having both weighs one row.
+    #[test]
+    fn a_prompt_with_files_weighs_its_tiles_not_the_block() {
+        let user = |text: &str| Item::User {
+            text: text.into(),
+            images: Vec::new(),
+        };
+        let block: String = (0..30).map(|i| format!("- /work/file-{i}.pdf\n")).collect();
+        let plain = user("look");
+        let with_files = user(&format!("look\n\nAttached files:\n{block}"));
+        assert_eq!(item_weight(&with_files), item_weight(&plain) + STRIP);
+        let with_image = |text: &str| match user(text) {
+            Item::User { text, .. } => Item::User {
+                text,
+                images: vec![crate::transcript::UserImage::new(
+                    "image/png",
+                    "aGk=".into(),
+                )],
+            },
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            item_weight(&with_image(&format!("look\n\nAttached files:\n{block}"))),
+            item_weight(&with_image("look")),
+            "images and file tiles share one row"
+        );
+        // A prompt of files only is its tiles: no line of text under them,
+        // though a message with no text at all still weighs its blank line.
+        let only = user(&format!("Attached files:\n{block}"));
+        assert_eq!(item_weight(&only), 3.8 + STRIP);
+        assert_eq!(item_weight(&user("")), item_weight(&plain));
+        // The block's lines never count: thirty paths weigh one card, not
+        // thirty lines of text.
+        assert!(item_weight(&only) < item_weight(&user(&block)));
+    }
+
+    /// T9: a message that carries no `Attached files:` block weighs what it
+    /// always did: blank text is the one line `text_lines` counts, and
+    /// trailing blank lines count as they are; images keep their strip.
+    #[test]
+    fn a_message_without_a_block_weighs_what_it_always_did() {
+        let user = |text: &str| Item::User {
+            text: text.into(),
+            images: Vec::new(),
+        };
+        // Weights are estimates in lines, good to a tenth.
+        let weigh = |weight: f32, expected: f32| {
+            assert!(
+                (weight - expected).abs() < 0.05,
+                "{weight} lines, want {expected}"
+            );
+        };
+        // The bubble's 3.8 lines plus the one line a blank message counts.
+        weigh(item_weight(&user("")), 4.8);
+        weigh(item_weight(&user("   ")), 4.8);
+        // Three lines: the text and the two blank lines its breaks draw.
+        weigh(item_weight(&user("trailing\n\n\n")), 6.8);
+        // An image-only message adds its strip above the same blank line.
+        let image_only = Item::User {
+            text: String::new(),
+            images: vec![crate::transcript::UserImage::new(
+                "image/png",
+                "aGk=".into(),
+            )],
+        };
+        weigh(item_weight(&image_only), 11.8);
     }
 
     #[test]

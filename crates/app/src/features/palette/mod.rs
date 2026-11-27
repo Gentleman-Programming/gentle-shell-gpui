@@ -20,9 +20,10 @@ mod rows;
 mod sources;
 mod view;
 
-use commands::{command_row, screen_rows};
+use commands::{card_rows, command_row, screen_rows};
+use sources::list_branches;
 pub use sources::switch_branch;
-use sources::{list_branches, walk_files};
+pub(crate) use sources::walk_files;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PaletteAction {
@@ -79,6 +80,31 @@ pub enum PaletteAction {
     OpenFile(PathBuf),
     /// Asks for confirmation before running `git switch`.
     SwitchBranch(String),
+    /// Maximize, restore, hide or close the browser card that had the keyboard
+    /// (the workspace's id for it).
+    BrowserCard {
+        stage: u64,
+        command: CardCommand,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CardCommand {
+    Maximize,
+    Restore,
+    Hide,
+    Close,
+}
+
+/// The browser card that had the keyboard when the switcher opened (on the
+/// card or in its page), for its commands.
+pub struct BrowserCard {
+    /// The workspace's id for it.
+    pub stage: u64,
+    pub title: String,
+    pub maximized: bool,
+    /// In the window's right column, where cards don't maximize.
+    pub docked: bool,
 }
 
 pub enum PaletteEvent {
@@ -143,6 +169,8 @@ pub struct PaletteInput {
     pub category: Category,
     /// Current window tab placement; determines the available view command.
     pub tab_layout: TabLayout,
+    /// The browser card with the keyboard: its commands come first.
+    pub browser_card: Option<BrowserCard>,
 }
 
 #[derive(Clone)]
@@ -163,7 +191,7 @@ enum Line {
     Row(usize),
 }
 
-const MAX_FILES: usize = 20_000;
+pub(crate) const MAX_FILES: usize = 20_000;
 
 pub struct PaletteView {
     query: Entity<InputState>,
@@ -201,7 +229,8 @@ impl PaletteView {
                 cx.notify();
             }
         });
-        let mut commands = screen_rows(input.tab_layout);
+        let mut commands = input.browser_card.map(card_rows).unwrap_or_default();
+        commands.extend(screen_rows(input.tab_layout));
         commands.extend(input.commands.into_iter().filter_map(command_row));
 
         let root = input.root.clone();
