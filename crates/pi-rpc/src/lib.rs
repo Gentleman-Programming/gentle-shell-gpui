@@ -23,10 +23,10 @@ pub use job::contain;
 #[cfg(windows)]
 pub use launch::neutral_dir;
 pub use launch::{
-    BundledInstall, LaunchSpec, backend_version, child_path, command, find_program, forget_cached,
-    forget_versions, managed_install_root, output_within, remote_backend, resolve_backend,
-    resolve_node, set_extensions, set_extra_path, set_login_path_file, set_system_prompt,
-    split_args, version_output, version_stderr,
+    BundledInstall, LaunchSpec, PathProbe, backend_version, child_path, command, find_program,
+    forget_cached, forget_versions, managed_install_root, output_within, path_probe,
+    remote_backend, resolve_backend, resolve_node, set_extensions, set_extra_path,
+    set_login_path_file, set_system_prompt, split_args, version_output, version_stderr,
 };
 pub use record::{Record, Response, UiMethod, UiRequest, parse_record};
 
@@ -68,11 +68,12 @@ pub struct PiProcess {
 }
 
 /// What a backend has sent so far, for the app's diagnostics: two relaxed
-/// counters per stdout line.
+/// counters per stdout line, and when the first line came.
 #[derive(Debug, Default)]
 struct Traffic {
     records: AtomicU64,
     bytes: AtomicU64,
+    first: std::sync::OnceLock<Instant>,
 }
 
 impl PiProcess {
@@ -164,6 +165,11 @@ impl PiProcess {
             self.traffic.records.load(Ordering::Relaxed),
             self.traffic.bytes.load(Ordering::Relaxed),
         )
+    }
+
+    /// When the backend's first stdout record arrived; `None` before it.
+    pub fn first_record(&self) -> Option<Instant> {
+        self.traffic.first.get().copied()
     }
 
     /// Send a command; the future resolves to its correlated response.
@@ -313,7 +319,9 @@ fn read_records(
         match reader.read_until(b'\n', &mut line) {
             Ok(0) | Err(_) => return,
             Ok(n) => {
-                traffic.records.fetch_add(1, Ordering::Relaxed);
+                if traffic.records.fetch_add(1, Ordering::Relaxed) == 0 {
+                    let _ = traffic.first.set(Instant::now());
+                }
                 traffic.bytes.fetch_add(n as u64, Ordering::Relaxed);
             }
         }
@@ -393,4 +401,39 @@ fn signal(signal: &str, target: &str) -> Option<Child> {
         .stderr(Stdio::null())
         .spawn()
         .ok()
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    /// The first record's time is when the backend first wrote, not when
+    /// it was spawned: a backend that only answers once spoken to has none
+    /// until then.
+    #[test]
+    fn the_first_record_is_stamped_when_the_backend_first_writes() {
+        let spec = LaunchSpec {
+            program: "/bin/sh".into(),
+            args: vec![
+                "-c".into(),
+                r#"read -r line; echo '{"type":"agent_start"}'; exec cat > /dev/null"#.into(),
+            ],
+            cwd: std::env::temp_dir(),
+            env: Vec::new(),
+            launcher: "/bin/sh".into(),
+            bundled: None,
+        };
+        let (process, _rx) = PiProcess::spawn(&spec).unwrap();
+        assert_eq!(process.first_record(), None);
+        let sent = Instant::now();
+        drop(process.request(json!({"type": "get_state"})));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while process.first_record().is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let first = process.first_record().expect("no record arrived");
+        assert!(first >= sent);
+        assert_eq!(process.traffic().0, 1);
+        process.shutdown(Duration::from_secs(1));
+    }
 }

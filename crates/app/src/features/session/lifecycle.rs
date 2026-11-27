@@ -324,6 +324,7 @@ impl SessionView {
         self.shutdown_backend();
         self.backend.started = true;
         self.backend.status = BackendStatus::Starting;
+        self.backend.startup = crate::features::diagnostics::StartupClock::start();
         self.models.loaded = false;
         // This tab now has a backend of its own to ask: the previous one's
         // Desktop answers and event numbering are gone.
@@ -386,6 +387,7 @@ impl SessionView {
                         .collect();
                     let mut spec =
                         crate::features::backend::launch_spec(&runs_on, &cwd, &env, &files)?;
+                    let resolved = std::time::Instant::now();
                     if let Some(path) = &resume {
                         // A conversation listed from this computer's view of the
                         // backend's home reads there as the backend's path.
@@ -395,11 +397,12 @@ impl SessionView {
                             .push(runs_on.path(&path).unwrap_or_else(|| path.into_owned()));
                     }
                     let (process, rx) = PiProcess::spawn(&spec)?;
-                    anyhow::Ok((process, rx, spec, runs_on))
+                    let steps = (resolved, std::time::Instant::now());
+                    anyhow::Ok((process, rx, spec, runs_on, steps))
                 })
                 .await;
             let (rx, probe) = match spawned {
-                Ok((process, rx, spec, runs_on)) => {
+                Ok((process, rx, spec, runs_on, (resolved, spawned_at))) => {
                     // The version is only shown: asked while the backend
                     // boots, not before (`--version` is a cold Node start).
                     let probe = {
@@ -410,6 +413,7 @@ impl SessionView {
                     };
                     let ok = this.update(cx, |this, cx| {
                         this.backend.status = BackendStatus::Ready(process);
+                        this.backend.startup.spawned(resolved, spawned_at);
                         this.runs_on = Some(runs_on);
                         this.genui_mode = genui_mode;
                         this.sync_genui_mode(cx);
@@ -771,6 +775,19 @@ mod tests {
         view.read_with(cx, |view, _| {
             assert!(matches!(view.backend.status, BackendStatus::Ready(_)));
             assert_eq!(view.backend.version.as_deref(), Some("9.9.9"));
+            // The diagnostics see the spawn; the fake backend never wrote
+            // or answered.
+            let startup = view.resources().startup.expect("no startup steps");
+            let (resolved, spawned) = (startup.resolved_ms.unwrap(), startup.spawned_ms.unwrap());
+            assert!(resolved <= spawned);
+            assert_eq!(
+                (
+                    startup.first_record_ms,
+                    startup.state_ms,
+                    startup.messages_ms
+                ),
+                (None, None, None)
+            );
         });
         assert_eq!(log(&dir), ["rpc", "talked", "version"]);
 

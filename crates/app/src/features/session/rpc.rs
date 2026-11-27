@@ -811,6 +811,8 @@ impl SessionView {
         self.set_model_default(None, cx);
         self.request(json!({"type": "get_state"}), cx, |this, result, _| {
             if let Some(state) = this.report(result) {
+                let first_record = this.process().and_then(|p| p.first_record());
+                this.backend.startup.state_answered(first_record);
                 this.models.current = ModelInfo::parse(&state["model"]);
                 this.models.thinking = state["thinkingLevel"].as_str().unwrap_or("off").to_string();
                 this.session_name = state["sessionName"].as_str().map(str::to_string);
@@ -822,10 +824,11 @@ impl SessionView {
         self.refresh_thinking_levels(cx);
         self.refresh_commands(cx);
         self.request(json!({"type": "get_messages"}), cx, |this, result, _| {
-            if let Some(data) = this.report(result)
-                && let Some(messages) = data["messages"].as_array()
-            {
-                this.apply_messages(messages);
+            if let Some(data) = this.report(result) {
+                if let Some(messages) = data["messages"].as_array() {
+                    this.apply_messages(messages);
+                }
+                this.backend.startup.messages_answered();
             }
         });
         self.refresh_stats(cx);

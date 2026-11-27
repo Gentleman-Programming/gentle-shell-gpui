@@ -11,6 +11,8 @@ use features::setup;
 use platform::instance;
 
 fn main() {
+    // What the diagnostics' startup steps count from.
+    shared::diagnostics::mark_launch();
     // `gentle-device …`, `gentle-browser …` and `gentle-screen …` (the
     // agents' commands) and `--diagnostics-report` run here and exit.
     let mut args = std::env::args().skip(1);

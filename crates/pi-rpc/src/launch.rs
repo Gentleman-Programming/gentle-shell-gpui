@@ -1169,16 +1169,46 @@ fn login_source() -> String {
     }
 }
 
+/// Longest a login PATH read (the login shell, or each `reg query`) may run.
+const LOGIN_PATH_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The last login PATH read, for the app's diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PathProbe {
+    pub started: std::time::Instant,
+    pub took: Duration,
+    /// It gave a PATH; otherwise the inherited one is used for the run.
+    pub found: bool,
+    /// It ran into [`LOGIN_PATH_TIMEOUT`] without a PATH.
+    pub timed_out: bool,
+}
+
+static PATH_PROBE: Mutex<Option<PathProbe>> = Mutex::new(None);
+
+/// How the last login PATH read went; `None` before the first one.
+pub fn path_probe() -> Option<PathProbe> {
+    *PATH_PROBE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// The PATH a session started now would get, which the inherited one may
 /// lack: on Unix the login shell's (a GUI launch inherits a minimal PATH);
 /// on Windows the one saved in the registry (an install since this app,
 /// or what launched it, started).
 fn login_path(source: &str) -> Option<OsString> {
-    if cfg!(windows) {
+    let started = std::time::Instant::now();
+    let path = if cfg!(windows) {
         registry_path()
     } else {
         login_shell_path(source)
-    }
+    };
+    let took = started.elapsed();
+    *PATH_PROBE.lock().unwrap_or_else(|e| e.into_inner()) = Some(PathProbe {
+        started,
+        took,
+        found: path.is_some(),
+        timed_out: path.is_none() && took >= LOGIN_PATH_TIMEOUT,
+    });
+    path
 }
 
 fn login_shell_path(shell: &str) -> Option<OsString> {
@@ -1196,7 +1226,7 @@ fn login_shell_path(shell: &str) -> Option<OsString> {
         ])
         .stdin(Stdio::null())
         .stderr(Stdio::null());
-    let (_, out) = output_within(&mut command, Duration::from_secs(5))?;
+    let (_, out) = output_within(&mut command, LOGIN_PATH_TIMEOUT)?;
     let start = out.find(START)? + START.len();
     let end = out[start..].find(END)? + start;
     Some(OsString::from(&out[start..end]))
@@ -1222,7 +1252,7 @@ fn registry_path() -> Option<OsString> {
                 .args(["query", key, "/v", "Path"])
                 .stdin(Stdio::null())
                 .stderr(Stdio::null());
-            let (ok, out) = output_within(&mut command, Duration::from_secs(5))?;
+            let (ok, out) = output_within(&mut command, LOGIN_PATH_TIMEOUT)?;
             if !ok {
                 return None;
             }

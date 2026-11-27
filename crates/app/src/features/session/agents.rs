@@ -312,8 +312,9 @@ impl SessionView {
     pub fn resources(&self) -> crate::features::diagnostics::TabResources {
         let helpers = self.helpers();
         let jobs = self.job_rows();
+        let process = self.process();
         crate::features::diagnostics::TabResources {
-            backend: self.process().map(|p| {
+            backend: process.as_ref().map(|p| {
                 let (records, bytes) = p.traffic();
                 (p.pid(), records, bytes)
             }),
@@ -322,6 +323,10 @@ impl SessionView {
             jobs: jobs.len(),
             jobs_running: jobs.iter().filter(|j| j.is_running()).count(),
             items: self.transcript.items.len(),
+            startup: self
+                .backend
+                .startup
+                .sample(process.and_then(|p| p.first_record())),
         }
     }
 
