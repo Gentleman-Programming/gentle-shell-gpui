@@ -798,7 +798,16 @@ impl SessionView {
         self.send_prompt(text, cx);
     }
 
-    pub(crate) fn render_agents_panel(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    /// Render the session-owned panel at the host's modal layer. Reading the
+    /// owner here also makes its notifications invalidate the host render.
+    pub(crate) fn agents_overlay(session: &Entity<Self>, cx: &mut App) -> Option<AnyElement> {
+        if !session.read(cx).agents_panel_open() {
+            return None;
+        }
+        session.update(cx, |session, cx| session.render_agents_panel(cx))
+    }
+
+    fn render_agents_panel(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         if !self.agents_panel.open {
             return None;
         }
@@ -1119,6 +1128,7 @@ impl SessionView {
         Some(
             backdrop
                 .id("agents-overlay")
+                .debug_selector(|| "agents-overlay".into())
                 .occlude()
                 .child(ui::pop_in(
                     "agents-screen",

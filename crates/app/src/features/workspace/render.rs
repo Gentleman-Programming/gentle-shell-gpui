@@ -650,7 +650,7 @@ impl Render for Workspace {
                     .into_any_element()
             }))
             .children(agents_session.and_then(|session| {
-                let view = session.update(cx, |session, cx| session.render_agents_panel(cx))?;
+                let view = SessionView::agents_overlay(&session, cx)?;
                 Some(
                     div()
                         .absolute()
