@@ -212,6 +212,7 @@ impl SessionView {
         if let Some(dirty) = dirty {
             if dirty.reset {
                 self.markdown.clear();
+                self.expanded_code.clear();
                 self.list.forget_items();
                 // Keyed by item index: they would time or fade other items.
                 self.live.tools.clear();
@@ -412,12 +413,35 @@ impl SessionView {
             {
                 for segment in segments {
                     let code = segment.kind == gentle_core::markdown::SegmentKind::Code;
-                    let source = text[segment.range.clone()].to_string();
+                    let key = (segment_key.0, segment_key.1, segment.range.start);
+                    let block = if code {
+                        use gpui_kit::base::text::editor_host::{BlockNode, parse_markdown};
+                        parse_markdown(&text[segment.range.clone()], Arc::default())
+                            .ok()
+                            .and_then(|nodes| {
+                                nodes.into_iter().find_map(|node| match node {
+                                    BlockNode::CodeBlock(block) => Some(block),
+                                    _ => None,
+                                })
+                            })
+                    } else {
+                        None
+                    };
+                    let open = self.expanded_code.contains(&key);
+                    let preview = block
+                        .as_ref()
+                        .and_then(|block| code_preview(&block.code(), block.lang().as_deref()));
+                    let source = if !open {
+                        preview.as_ref().map(|(source, _)| source.clone())
+                    } else {
+                        None
+                    }
+                    .unwrap_or_else(|| text[segment.range.clone()].to_string());
                     let diagrams = diagrams.clone();
                     let view = TextView::markdown(
                         SharedString::from(format!(
-                            "answer-segment-{}-{}-{}",
-                            segment_key.0, segment_key.1, segment.range.start
+                            "answer-segment-{}-{}-{}-{}",
+                            segment_key.0, segment_key.1, segment.range.start, open
                         )),
                         source,
                     )
@@ -432,15 +456,6 @@ impl SessionView {
                         view: cx.entity().downgrade(),
                     });
                     column = if code {
-                        use gpui_kit::base::text::editor_host::{BlockNode, parse_markdown};
-                        let block = parse_markdown(&text[segment.range.clone()], Arc::default())
-                            .ok()
-                            .and_then(|nodes| {
-                                nodes.into_iter().find_map(|node| match node {
-                                    BlockNode::CodeBlock(block) => Some(block),
-                                    _ => None,
-                                })
-                            });
                         if let Some(block) = block {
                             column.child(
                                 div()
@@ -457,19 +472,110 @@ impl SessionView {
                                     .bg(ui::surface())
                                     .child(code_block_header(&block, cx))
                                     .child(
-                                        view.style(
-                                            ui::prose_style().code_block(
-                                                StyleRefinement::default()
-                                                    .rounded_md()
-                                                    .bg(ui::well())
-                                                    .border_1()
-                                                    .border_color(ui::border())
-                                                    .pt(rems(14. / 16.))
-                                                    .line_height(relative(1.7)),
+                                        div()
+                                            .debug_selector(move || {
+                                                format!(
+                                                    "answer-code-body-{}-{}-{}",
+                                                    key.0, key.1, key.2
+                                                )
+                                            })
+                                            .child(
+                                                view.style(
+                                                    ui::prose_style().code_block(
+                                                        StyleRefinement::default()
+                                                            .rounded_md()
+                                                            .bg(ui::well())
+                                                            .border_1()
+                                                            .border_color(ui::border())
+                                                            .pt(rems(14. / 16.))
+                                                            .line_height(relative(1.7)),
+                                                    ),
+                                                )
+                                                .code_block_actions(|_, _, _| div()),
                                             ),
+                                    )
+                                    .when_some(preview, |card, (_, count)| {
+                                        let count_label = if open {
+                                            format!("{count} lines")
+                                        } else {
+                                            format!("12 of {count} lines")
+                                        };
+                                        let count_selector = format!(
+                                            "answer-code-count-{}-{}-{}-{}",
+                                            key.0,
+                                            key.1,
+                                            key.2,
+                                            count_label.replace(' ', "-")
+                                        );
+                                        let selector = format!(
+                                            "answer-code-{}-{}-{}-{}",
+                                            if open { "collapse" } else { "expand" },
+                                            key.0,
+                                            key.1,
+                                            key.2
+                                        );
+                                        let label = if open { "Show less" } else { "Show more" };
+                                        let tip = if open {
+                                            "Click to collapse"
+                                        } else {
+                                            "Click to expand"
+                                        };
+                                        card.child(
+                                            h_flex()
+                                                .w_full()
+                                                .justify_between()
+                                                .pt_2()
+                                                .text_size(rems(12. / 16.))
+                                                .text_color(ui::muted())
+                                                .child(
+                                                    h_flex()
+                                                        .id(SharedString::from(selector.clone()))
+                                                        .debug_selector(move || selector.clone())
+                                                        .cursor_pointer()
+                                                        .gap_1()
+                                                        .hover(|s| s.text_color(ui::fg()))
+                                                        .tooltip(move |window, cx| {
+                                                            ui::tooltip(tip).build(window, cx)
+                                                        })
+                                                        .child(
+                                                            Icon::new(if open {
+                                                                IconName::ChevronUp
+                                                            } else {
+                                                                IconName::ChevronDown
+                                                            })
+                                                            .xsmall(),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .debug_selector(move || {
+                                                                    format!(
+                                                                        "answer-code-label-{label}"
+                                                                    )
+                                                                })
+                                                                .child(label),
+                                                        )
+                                                        .on_click(cx.listener(
+                                                            move |this, _, _, cx| {
+                                                                if !this.expanded_code.remove(&key)
+                                                                {
+                                                                    this.expanded_code.insert(key);
+                                                                }
+                                                                this.list.remeasure_items(
+                                                                    key.0..key.0 + 1,
+                                                                );
+                                                                cx.notify();
+                                                            },
+                                                        )),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .debug_selector(move || {
+                                                            count_selector.clone()
+                                                        })
+                                                        .child(count_label),
+                                                ),
                                         )
-                                        .code_block_actions(|_, _, _| div()),
-                                    ),
+                                    }),
                             )
                         } else {
                             column.child(
@@ -3315,6 +3421,39 @@ fn native_code_header(block: &gpui_kit::base::text::CodeBlock, cx: &App) -> Div 
                     );
                 }),
         )
+}
+
+/// A display-only Markdown block with the first twelve logical code lines and
+/// the total line count. The original parsed block remains the copy source.
+fn code_preview(code: &str, language: Option<&str>) -> Option<(String, usize)> {
+    const LIMIT: usize = 12;
+    // The Markdown parser removes the separator before the closing fence,
+    // so a remaining final newline represents a real trailing blank line.
+    let lines: Vec<_> = code
+        .split('\n')
+        .map(|line| line.strip_suffix('\r').unwrap_or(line))
+        .collect();
+    if lines.len() <= LIMIT {
+        return None;
+    }
+    // A tilde fence permits backticks in the language info. Choose one
+    // longer than any run in the content so it cannot close early.
+    let fence_len = code
+        .split(|c| c != '~')
+        .map(str::len)
+        .max()
+        .unwrap_or(0)
+        .max(2)
+        + 1;
+    let fence = "~".repeat(fence_len);
+    Some((
+        format!(
+            "{fence} {}\n{}\n{fence}",
+            language.unwrap_or(""),
+            lines[..LIMIT].join("\n")
+        ),
+        lines.len(),
+    ))
 }
 
 /// Along the top of a fenced block in an answer, after Tern's: its

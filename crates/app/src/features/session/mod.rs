@@ -129,6 +129,8 @@ pub struct SessionView {
     /// The `data:` images messages you sent show, decoded once.
     bubble_images: std::sync::Arc<crate::features::files::EmbeddedImages>,
     expanded: HashSet<usize>,
+    /// Expanded answer code cards, keyed by item, text block and source offset.
+    expanded_code: HashSet<(usize, usize, usize)>,
     /// Generative UI surfaces the agent showed (`gentle_ui`), rebuilt
     /// from the transcript.
     genui: crate::features::genui::GenUi,
@@ -374,6 +376,7 @@ impl SessionView {
             diagrams: Default::default(),
             bubble_images: Default::default(),
             expanded: HashSet::new(),
+            expanded_code: HashSet::new(),
             genui: Default::default(),
             genui_mode: crate::features::genui::mode::mode(cx),
             canvas: None,

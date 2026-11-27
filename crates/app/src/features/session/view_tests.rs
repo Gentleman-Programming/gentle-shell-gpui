@@ -423,6 +423,426 @@ fn assistant_code_header_shows_language_and_copy_icon(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn long_answer_code_card_can_expand_and_collapse(cx: &mut TestAppContext) {
+    use gentle_core::transcript::{Block, Item};
+
+    let (view, cx) = tab(cx);
+    view.update(cx, |view, cx| {
+        view.transcript.items.push(Item::Assistant {
+            blocks: vec![Block::Text(format!(
+                "```text\n{}\n```",
+                (1..=13)
+                    .map(|n| format!("line {n}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ))],
+            streaming: false,
+            error: None,
+        });
+        view.sync_view(cx);
+        cx.notify();
+    });
+    assert!(drawn(cx, "copy-code"));
+    assert!(drawn(cx, "answer-code-expand-0-0-0"));
+    assert!(drawn(cx, "answer-code-label-Show more"));
+    assert!(drawn(cx, "answer-code-count-0-0-0-12-of-13-lines"));
+    click(cx, "answer-code-expand-0-0-0");
+    assert!(drawn(cx, "answer-code-collapse-0-0-0"));
+    assert!(drawn(cx, "answer-code-label-Show less"));
+    assert!(drawn(cx, "answer-code-count-0-0-0-13-lines"));
+    click(cx, "answer-code-collapse-0-0-0");
+    assert!(drawn(cx, "answer-code-expand-0-0-0"));
+}
+
+#[gpui::test]
+fn folded_code_card_copies_full_code_and_selects_only_visible_lines(cx: &mut TestAppContext) {
+    use gentle_core::transcript::{Block, Item};
+    use gpui_kit::{AppContext as _, MouseButton, base::TextSelection, point, px};
+
+    cx.update(|cx| {
+        gpui_kit::init(cx);
+        cx.set_reduce_motion(true);
+    });
+    let lines = [
+        "  alpha",
+        "",
+        "```",
+        "  delta  ",
+        "five",
+        "six",
+        "seven",
+        "eight",
+        "nine",
+        "ten",
+        "eleven",
+        "twelve",
+        "thirteen",
+    ];
+    let source = format!("````text\n{}\n````", lines.join("\n"));
+    let (_, cx) = cx.add_window_view(|window, cx| {
+        let session = cx.new(|cx| {
+            let mut view = SessionView::new(std::env::temp_dir(), None, window, cx, false);
+            view.backend.started = true;
+            view.transcript.items.push(Item::Assistant {
+                blocks: vec![Block::Text(source)],
+                streaming: false,
+                error: None,
+            });
+            view.sync_view(cx);
+            view
+        });
+        let selectable = cx.new(|_| Selectable(session));
+        gpui_kit::base::Root::new(selectable, window, cx)
+    });
+    cx.run_until_parked();
+    assert!(drawn(cx, "answer-code-expand-0-0-0"));
+    click(cx, "copy-code");
+    let copied = cx
+        .update(|_, cx| cx.read_from_clipboard().and_then(|item| item.text()))
+        .unwrap();
+    // The existing code header copies the parser's full code; the parser
+    // excludes the newline immediately before the closing fence.
+    assert_eq!(copied, lines.join("\n"));
+    let bounds = cx.debug_bounds("answer-code-body-0-0-0").unwrap();
+    let end = point(bounds.left() + px(120.), bounds.bottom() - px(15.));
+    let selected = (10..160)
+        .find_map(|x| {
+            let start = point(bounds.left() + px(x as f32), bounds.top() + px(22.));
+            cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::none());
+            cx.simulate_mouse_move(end, Some(MouseButton::Left), Modifiers::none());
+            cx.simulate_mouse_up(end, MouseButton::Left, Modifiers::none());
+            let selected = cx.update(|window, cx| {
+                let _ = window.draw(cx);
+                TextSelection::selected_text(window, cx)
+            });
+            selected.contains("twelve").then_some(selected)
+        })
+        .expect("gesture must select through the last visible line");
+    assert!(!selected.contains("thirteen"), "{selected:?}");
+    click(cx, "answer-code-expand-0-0-0");
+    click(cx, "copy-code");
+    let copied = cx
+        .update(|_, cx| cx.read_from_clipboard().and_then(|item| item.text()))
+        .unwrap();
+    assert_eq!(copied, lines.join("\n"));
+    let bounds = cx.debug_bounds("answer-code-body-0-0-0").unwrap();
+    let end = point(bounds.left() + px(120.), bounds.bottom() - px(15.));
+    let selected = (10..160)
+        .find_map(|x| {
+            let start = point(bounds.left() + px(x as f32), bounds.top() + px(22.));
+            cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::none());
+            cx.simulate_mouse_move(end, Some(MouseButton::Left), Modifiers::none());
+            cx.simulate_mouse_up(end, MouseButton::Left, Modifiers::none());
+            let selected = cx.update(|window, cx| {
+                let _ = window.draw(cx);
+                TextSelection::selected_text(window, cx)
+            });
+            selected.contains("thirteen").then_some(selected)
+        })
+        .expect("expanded gesture must select the final line");
+    assert!(selected.contains("twelve"), "{selected:?}");
+}
+
+#[gpui::test]
+fn code_cards_fold_independently_and_remeasure_row(cx: &mut TestAppContext) {
+    use gentle_core::transcript::{Block, Item};
+    let (view, cx) = tab(cx);
+    let code = format!(
+        "```text\n{}\n```",
+        (1..=16)
+            .map(|n| format!("line {n}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    view.update(cx, |view, cx| {
+        view.transcript.items.push(Item::Assistant {
+            blocks: vec![Block::Text(code.clone()), Block::Text(code)],
+            streaming: false,
+            error: None,
+        });
+        view.sync_view(cx);
+        cx.notify();
+    });
+    assert!(drawn(cx, "answer-code-expand-0-0-0"));
+    let before = view.read_with(cx, |view, _| {
+        view.list.state().bounds_for_item(1).unwrap().size.height
+    });
+    click(cx, "answer-code-expand-0-0-0");
+    let after = view.read_with(cx, |view, _| {
+        view.list.state().bounds_for_item(1).unwrap().size.height
+    });
+    assert!(after > before, "row height: {before:?} -> {after:?}");
+    assert!(drawn(cx, "answer-code-collapse-0-0-0"));
+    assert!(drawn(cx, "answer-code-expand-0-1-0"));
+    assert!(!drawn(cx, "answer-code-collapse-0-1-0"));
+    assert!(drawn(cx, "answer-code-count-0-0-0-16-lines"));
+    assert!(drawn(cx, "answer-code-count-0-1-0-12-of-16-lines"));
+    click(cx, "answer-code-collapse-0-0-0");
+    let collapsed = view.read_with(cx, |view, _| {
+        view.list.state().bounds_for_item(1).unwrap().size.height
+    });
+    assert!(collapsed < after, "row height: {after:?} -> {collapsed:?}");
+}
+
+#[gpui::test]
+fn tilde_code_card_with_backtick_in_language_keeps_code_selectable(cx: &mut TestAppContext) {
+    use gentle_core::transcript::{Block, Item};
+    use gpui_kit::{AppContext as _, MouseButton, base::TextSelection, point, px};
+    cx.update(|cx| {
+        gpui_kit::init(cx);
+        cx.set_reduce_motion(true);
+    });
+    let source = format!(
+        "~~~text`literal\n{}\n~~~",
+        (1..=13)
+            .map(|n| format!("line {n}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    let (_, cx) = cx.add_window_view(|window, cx| {
+        let session = cx.new(|cx| {
+            let mut view = SessionView::new(std::env::temp_dir(), None, window, cx, false);
+            view.backend.started = true;
+            view.transcript.items.push(Item::Assistant {
+                blocks: vec![Block::Text(source)],
+                streaming: false,
+                error: None,
+            });
+            view.sync_view(cx);
+            view
+        });
+        let selectable = cx.new(|_| Selectable(session));
+        gpui_kit::base::Root::new(selectable, window, cx)
+    });
+    cx.run_until_parked();
+    assert!(drawn(cx, "answer-code-expand-0-0-0"));
+    let bounds = cx.debug_bounds("answer-code-body-0-0-0").unwrap();
+    let end = point(bounds.left() + px(120.), bounds.bottom() - px(15.));
+    let selected = (10..160)
+        .find_map(|x| {
+            let start = point(bounds.left() + px(x as f32), bounds.top() + px(22.));
+            cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::none());
+            cx.simulate_mouse_move(end, Some(MouseButton::Left), Modifiers::none());
+            cx.simulate_mouse_up(end, MouseButton::Left, Modifiers::none());
+            let selected = cx.update(|window, cx| {
+                let _ = window.draw(cx);
+                TextSelection::selected_text(window, cx)
+            });
+            selected.contains("line 12").then_some(selected)
+        })
+        .expect("folded code must render through line 12");
+    assert!(!selected.contains("line 13"));
+    assert!(!selected.contains("text`literal"), "{selected:?}");
+}
+
+#[gpui::test]
+fn code_card_tilde_language_preview_is_literal_and_copies_full_code(cx: &mut TestAppContext) {
+    use gentle_core::transcript::{Block, Item};
+    use gpui_kit::base::TextSelection;
+
+    cx.update(|cx| {
+        gpui_kit::init(cx);
+        cx.set_reduce_motion(true);
+    });
+    let code = (1..=13)
+        .map(|n| format!("line {n}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let source = format!("```~literal\n{code}\n```");
+    let (_, cx) = cx.add_window_view(|window, cx| {
+        let session = cx.new(|cx| {
+            let mut view = SessionView::new(std::env::temp_dir(), None, window, cx, false);
+            view.backend.started = true;
+            view.transcript.items.push(Item::Assistant {
+                blocks: vec![Block::Text(source)],
+                streaming: false,
+                error: None,
+            });
+            view.sync_view(cx);
+            view
+        });
+        let selectable = cx.new(|_| Selectable(session));
+        gpui_kit::base::Root::new(selectable, window, cx)
+    });
+    cx.run_until_parked();
+    assert!(drawn(cx, "answer-code-expand-0-0-0"));
+    click(cx, "copy-code");
+    assert_eq!(
+        cx.update(|_, cx| cx.read_from_clipboard().and_then(|item| item.text()))
+            .unwrap(),
+        code
+    );
+    let bounds = cx.debug_bounds("answer-code-body-0-0-0").unwrap();
+    let end = point(bounds.left() + px(120.), bounds.bottom() - px(15.));
+    let selected = (10..160)
+        .find_map(|x| {
+            let start = point(bounds.left() + px(x as f32), bounds.top() + px(22.));
+            cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::none());
+            cx.simulate_mouse_move(end, Some(MouseButton::Left), Modifiers::none());
+            cx.simulate_mouse_up(end, MouseButton::Left, Modifiers::none());
+            let selected = cx.update(|window, cx| {
+                let _ = window.draw(cx);
+                TextSelection::selected_text(window, cx)
+            });
+            selected.contains("line 12").then_some(selected)
+        })
+        .expect("folded code must render through line 12");
+    assert!(!selected.contains("line 13"), "{selected:?}");
+    assert!(!selected.contains('~'), "{selected:?}");
+}
+
+#[gpui::test]
+fn code_card_folding_follows_streamed_line_boundary(cx: &mut TestAppContext) {
+    use gentle_core::transcript::{Block, Item};
+    use gpui_kit::base::TextSelection;
+
+    cx.update(|cx| {
+        gpui_kit::init(cx);
+        cx.set_reduce_motion(true);
+    });
+    let mut session = None;
+    let (_, cx) = cx.add_window_view(|window, cx| {
+        let view = cx.new(|cx| {
+            let mut view = SessionView::new(std::env::temp_dir(), None, window, cx, false);
+            view.backend.started = true;
+            view
+        });
+        session = Some(view.clone());
+        let selectable = cx.new(|_| Selectable(view));
+        gpui_kit::base::Root::new(selectable, window, cx)
+    });
+    let view = session.unwrap();
+    let lines = (1..=12)
+        .map(|n| format!("line {n}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    view.update(cx, |view, cx| {
+        view.transcript.items.push(Item::Assistant {
+            blocks: vec![Block::Text(format!("```text\n{lines}"))],
+            streaming: true,
+            error: None,
+        });
+        view.sync_view(cx);
+        cx.notify();
+    });
+    assert!(drawn(cx, "copy-code"));
+    assert!(!drawn(cx, "answer-code-expand-0-0-0"));
+    assert!(!drawn(cx, "answer-code-count-0-0-0-12-lines"));
+    view.update(cx, |view, cx| {
+        let Item::Assistant { blocks, .. } = view.transcript.items.last_mut().unwrap() else {
+            unreachable!()
+        };
+        blocks[0] = Block::Text(format!("```text\n{lines}\nline 13"));
+        view.sync_view(cx);
+        cx.notify();
+    });
+    assert!(drawn(cx, "answer-code-expand-0-0-0"));
+    click(cx, "answer-code-expand-0-0-0");
+    view.update(cx, |view, cx| {
+        let Item::Assistant { blocks, .. } = view.transcript.items.last_mut().unwrap() else {
+            unreachable!()
+        };
+        blocks[0] = Block::Text(format!("```text\n{lines}\nline 13\nline 14"));
+        view.sync_view(cx);
+        cx.notify();
+    });
+    assert!(drawn(cx, "answer-code-collapse-0-0-0"));
+    assert!(drawn(cx, "answer-code-count-0-0-0-14-lines"));
+    let bounds = cx.debug_bounds("answer-code-body-0-0-0").unwrap();
+    let end = point(bounds.left() + px(120.), bounds.bottom() - px(15.));
+    let selected = (10..160).find_map(|x| {
+        let start = point(bounds.left() + px(x as f32), bounds.top() + px(22.));
+        cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_move(end, Some(MouseButton::Left), Modifiers::none());
+        cx.simulate_mouse_up(end, MouseButton::Left, Modifiers::none());
+        let selected = cx.update(|window, cx| {
+            let _ = window.draw(cx);
+            TextSelection::selected_text(window, cx)
+        });
+        selected.contains("line 14").then_some(selected)
+    });
+    assert!(
+        selected.is_some(),
+        "streamed line 14 must be visible and selectable"
+    );
+}
+
+#[gpui::test]
+fn code_card_counts_a_final_blank_thirteenth_source_line(cx: &mut TestAppContext) {
+    use gentle_core::transcript::{Block, Item};
+
+    let (view, cx) = tab(cx);
+    let lines = (1..=12)
+        .map(|n| format!("line {n}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    view.update(cx, |view, cx| {
+        view.transcript.items.push(Item::Assistant {
+            blocks: vec![Block::Text(format!("```text\n{lines}\n\n```"))],
+            streaming: false,
+            error: None,
+        });
+        view.sync_view(cx);
+        cx.notify();
+    });
+    assert!(drawn(cx, "answer-code-expand-0-0-0"));
+    assert!(drawn(cx, "answer-code-count-0-0-0-12-of-13-lines"));
+    click(cx, "answer-code-expand-0-0-0");
+    assert!(drawn(cx, "answer-code-collapse-0-0-0"));
+    assert!(drawn(cx, "answer-code-count-0-0-0-13-lines"));
+}
+
+#[gpui::test]
+fn code_card_counts_crlf_and_trailing_blank_lines(cx: &mut TestAppContext) {
+    use gentle_core::transcript::{Block, Item};
+
+    let (view, cx) = tab(cx);
+    let lines = (1..=12)
+        .map(|n| format!("line {n}"))
+        .collect::<Vec<_>>()
+        .join("\r\n");
+    view.update(cx, |view, cx| {
+        view.transcript.items.push(Item::Assistant {
+            blocks: vec![Block::Text(format!("```text\r\n{lines}\r\n\r\n```"))],
+            streaming: false,
+            error: None,
+        });
+        view.sync_view(cx);
+        cx.notify();
+    });
+    assert!(drawn(cx, "answer-code-count-0-0-0-12-of-13-lines"));
+    click(cx, "answer-code-expand-0-0-0");
+    assert!(drawn(cx, "answer-code-count-0-0-0-13-lines"));
+}
+
+#[gpui::test]
+fn short_code_card_never_offers_folding_for_wrapped_or_blank_lines(cx: &mut TestAppContext) {
+    use gentle_core::transcript::{Block, Item};
+
+    let (view, cx) = tab(cx);
+    for code in [
+        "x".repeat(4000),
+        ["x", "", "x", "", "x", "", "x", "", "x", "", "x", ""].join("\n"),
+    ] {
+        view.update(cx, |view, cx| {
+            view.transcript.items.clear();
+            view.transcript.items.push(Item::Assistant {
+                blocks: vec![Block::Text(format!("```text\n{code}\n```"))],
+                streaming: false,
+                error: None,
+            });
+            view.sync_view(cx);
+            cx.notify();
+        });
+        assert!(drawn(cx, "copy-code"));
+        assert!(!drawn(cx, "answer-code-expand-0-0-0"));
+        assert!(!drawn(cx, "answer-code-collapse-0-0-0"));
+        assert!(!drawn(cx, "answer-code-count-0-0-0-12-lines"));
+        assert!(!drawn(cx, "answer-code-count-0-0-0-12-of-13-lines"));
+    }
+}
+
+#[gpui::test]
 fn incoming_assistant_stream_updates_the_rendered_card(cx: &mut TestAppContext) {
     use gentle_core::transcript::{Block, Item};
     use pi_rpc::Incoming;
