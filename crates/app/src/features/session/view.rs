@@ -54,6 +54,11 @@ use transcript_list::{GroupRow, HeaderKey, Prepared, Row, Tail};
 /// How long a finished answer's petal line takes to draw back and fade.
 const ANSWER_FADE: Duration = Duration::from_millis(500);
 
+#[cfg(test)]
+thread_local! {
+    pub(super) static SEGMENT_PLANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 // Keys into `SessionView::expanded`: one per foldable region.
 const OUTPUT: usize = 0;
 const INPUT: usize = 1;
@@ -211,6 +216,7 @@ impl SessionView {
         let dirty = self.transcript.take_dirty();
         if let Some(dirty) = dirty {
             if dirty.reset {
+                self.segment_plans.get_mut().clear();
                 self.markdown.clear();
                 self.expanded_code.clear();
                 self.list.forget_items();
@@ -224,6 +230,7 @@ impl SessionView {
                 self.live.skills.clear();
             }
             let from = dirty.from.min(self.transcript.items.len());
+            self.segment_plans.get_mut().retain(|&(ix, _), _| ix < from);
             self.sync_markdown(from, cx);
             self.track_live(from);
             self.list.prepare(&self.transcript.items, from);
@@ -402,7 +409,18 @@ impl SessionView {
         let plan = if has_mermaid(text) {
             gentle_core::markdown::MarkdownPlan::Native
         } else {
-            gentle_core::markdown::segment_source(text)
+            let mut plans = self.segment_plans.borrow_mut();
+            let entry = plans.entry(segment_key).or_insert_with(|| {
+                #[cfg(test)]
+                SEGMENT_PLANS.with(|count| count.set(count.get() + 1));
+                (text.to_owned(), gentle_core::markdown::segment_source(text))
+            });
+            if entry.0 != text {
+                #[cfg(test)]
+                SEGMENT_PLANS.with(|count| count.set(count.get() + 1));
+                *entry = (text.to_owned(), gentle_core::markdown::segment_source(text));
+            }
+            entry.1.clone()
         };
         let mut column = v_flex().gap_2();
         match plan {

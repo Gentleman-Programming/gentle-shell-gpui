@@ -121,6 +121,9 @@ pub struct SessionView {
     /// the shown text already pushed and how many Mermaid diagrams it showed
     /// drawn (a new drawing replaces source, so the text is set again).
     markdown: HashMap<(usize, usize), (Entity<TextViewState>, usize, usize)>,
+    /// Source and segmentation plan for rendered blocks, discarded on transcript changes.
+    segment_plans:
+        std::cell::RefCell<HashMap<(usize, usize), (String, gentle_core::markdown::MarkdownPlan)>>,
     /// Which code spans in the answers name a file under `cwd` (see
     /// `view::paths`); remade with `cwd`.
     paths: std::sync::Arc<view::PathLookup>,
@@ -372,6 +375,7 @@ impl SessionView {
             permission: state::desktop::permission::Permission::default(),
             transcript: Transcript::default(),
             markdown: HashMap::new(),
+            segment_plans: Default::default(),
             paths,
             diagrams: Default::default(),
             bubble_images: Default::default(),
