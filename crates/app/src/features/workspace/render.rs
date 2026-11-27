@@ -119,7 +119,8 @@ impl Workspace {
         }
         // The row's horizontal padding is 6 px at 100% interface scale.
         let rail = if (matches!(drag.side, Side::Files) && right_rail)
-            || (matches!(drag.side, Side::Tabs) && left_rail) {
+            || (matches!(drag.side, Side::Tabs) && left_rail)
+        {
             right_sidebar::ACTIVITY_BAR_WIDTH + 6.
         } else {
             0.
@@ -183,7 +184,7 @@ impl Render for Workspace {
         let title_utilities = profile.title_utilities;
         let original_controls = profile.original_controls;
         let profile_has_title = profile.has(ToolPlacement::Title);
-        let navigation_visible = self.navigation_visible();
+        let navigation_visible = self.tabs_sidebar_visible();
         // First-run screens keep their original full-window presentation.
         let workspace_modal = self.overlay.as_ref().is_some_and(|(overlay, _)| {
             !matches!(overlay, Overlay::Onboarding(_) | Overlay::Welcome(_))
@@ -322,7 +323,12 @@ impl Render for Workspace {
                                         row.child(self.new_tab_button("title-new-tab", None, cx))
                                     })
                                     .when(!tabs_visible && !navigation_visible, |row| {
-                                        row.child(div().text_sm().text_color(ui::muted()).child("Gentle Shell"))
+                                        row.child(
+                                            div()
+                                                .text_sm()
+                                                .text_color(ui::muted())
+                                                .child("Gentle Shell"),
+                                        )
                                     })
                                     .when(tabs_visible && !vertical_tabs, |row| {
                                         row.child(
@@ -379,56 +385,67 @@ impl Render for Workspace {
                                         },
                                     )
                                     .when(title_utilities, |d| {
-                                        d.children(crate::features::music::title_button(&self.music, cx))
-                                            .when(original_controls, |d| d.children(self.render_devices_button(cx)))
-                                            .children(self.render_tray(cx))
+                                        d.children(crate::features::music::title_button(
+                                            &self.music,
+                                            cx,
+                                        ))
+                                        .when(original_controls, |d| {
+                                            d.children(self.render_devices_button(cx))
+                                        })
+                                        .children(self.render_tray(cx))
                                     })
-                                    .when(title_utilities, |d| d.child({
-                                        let weak = cx.entity().downgrade();
-                                        div()
-                                            .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                                                cx.stop_propagation()
-                                            })
-                                            .child(notices::bell(
-                                                &self.notices,
-                                                Rc::new({
-                                                    let weak = weak.clone();
-                                                    move |pane, window, cx| {
-                                                        let _ = weak.update(cx, |this, cx| {
-                                                            this.reveal_pane(pane, window, cx)
-                                                        });
-                                                    }
-                                                }),
-                                                Rc::new(move |origin, cx| {
-                                                    weak.upgrade()
-                                                        .map_or(notices::Reach::Open, |this| {
-                                                            this.read(cx).notice_reach(origin)
-                                                        })
-                                                }),
-                                                cx,
-                                            ))
-                                    }))
-                                    .when(original_controls, |d| d.child(
-                                        Button::new("toggle-tab-sidebar")
-                                            .ghost()
-                                            .xsmall()
-                                            .icon(Icon::new(
-                                                if vertical_tabs && !self.sidebar_compact {
+                                    .when(title_utilities, |d| {
+                                        d.child({
+                                            let weak = cx.entity().downgrade();
+                                            div()
+                                                .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                                    cx.stop_propagation()
+                                                })
+                                                .child(notices::bell(
+                                                    &self.notices,
+                                                    Rc::new({
+                                                        let weak = weak.clone();
+                                                        move |pane, window, cx| {
+                                                            let _ = weak.update(cx, |this, cx| {
+                                                                this.reveal_pane(pane, window, cx)
+                                                            });
+                                                        }
+                                                    }),
+                                                    Rc::new(move |origin, cx| {
+                                                        weak.upgrade().map_or(
+                                                            notices::Reach::Open,
+                                                            |this| {
+                                                                this.read(cx).notice_reach(origin)
+                                                            },
+                                                        )
+                                                    }),
+                                                    cx,
+                                                ))
+                                        })
+                                    })
+                                    .when(original_controls && vertical_tabs, |d| {
+                                        d.child(
+                                            Button::new("toggle-tab-sidebar")
+                                                .ghost()
+                                                .xsmall()
+                                                .icon(Icon::new(if self.tabs_sidebar_visible() {
                                                     IconName::PanelLeftClose
                                                 } else {
                                                     IconName::PanelLeftOpen
-                                                },
-                                            ))
-                                            .tooltip(if vertical_tabs && !self.sidebar_compact {
-                                                "Collapse workspace sidebar"
-                                            } else {
-                                                "Expand workspace sidebar"
-                                            })
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.toggle_sidebar_compact(cx)
-                                            })),
-                                    ))
-                                    .when(profile_has_title, |d| d.child(self.render_title_shortcuts(cx)))
+                                                }))
+                                                .tooltip(if self.tabs_sidebar_visible() {
+                                                    "Hide workspace sidebar"
+                                                } else {
+                                                    "Show workspace sidebar"
+                                                })
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.toggle_tabs_sidebar(cx)
+                                                })),
+                                        )
+                                    })
+                                    .when(profile_has_title, |d| {
+                                        d.child(self.render_title_shortcuts(cx))
+                                    })
                                     .child(
                                         Button::new("open-palette")
                                             .ghost()
@@ -441,7 +458,9 @@ impl Render for Workspace {
                                     )
                                     // The screens behind one menu; it's lit while
                                     // one of them is open.
-                                    .when(original_controls, |d| d.child(self.render_screens_menu(cx)))
+                                    .when(original_controls, |d| {
+                                        d.child(self.render_screens_menu(cx))
+                                    })
                                     .when(original_controls && has_files_sidebar, |d| {
                                         d.child(
                                             Button::new("toggle-sidebar")
@@ -483,7 +502,11 @@ impl Render for Workspace {
                     ))
                     .when(left_rail, |row| {
                         if workspace_modal {
-                            row.child(div().w(rems(right_sidebar::ACTIVITY_BAR_WIDTH / 16.)).flex_none())
+                            row.child(
+                                div()
+                                    .w(rems(right_sidebar::ACTIVITY_BAR_WIDTH / 16.))
+                                    .flex_none(),
+                            )
                         } else {
                             row.child(self.render_activity_bar(ToolPlacement::Left, cx))
                         }
@@ -509,7 +532,9 @@ impl Render for Workspace {
                                 .child(sidebar_surface(Side::Tabs, self.render_tab_sidebar(cx)))
                                 .when(
                                     tabs_resizing
-                                        || (navigation_visible && !self.sidebar_compact && !tabs_moving),
+                                        || (navigation_visible
+                                            && !self.sidebar_compact
+                                            && !tabs_moving),
                                     |column| column.child(self.sidebar_handle(Side::Tabs, cx)),
                                 ),
                         )
@@ -549,7 +574,11 @@ impl Render for Workspace {
                     })
                     .when(right_rail, |row| {
                         if workspace_modal {
-                            row.child(div().w(rems(right_sidebar::ACTIVITY_BAR_WIDTH / 16.)).flex_none())
+                            row.child(
+                                div()
+                                    .w(rems(right_sidebar::ACTIVITY_BAR_WIDTH / 16.))
+                                    .flex_none(),
+                            )
                         } else {
                             row.child(self.render_activity_bar(ToolPlacement::Right, cx))
                         }
@@ -598,7 +627,11 @@ impl Render for Workspace {
                 div()
                     .absolute()
                     .top(rems(TITLE_BAR_HEIGHT / 16.))
-                    .left(rems(if left_rail { (right_sidebar::ACTIVITY_BAR_WIDTH + 6.) / 16. } else { 0. }))
+                    .left(rems(if left_rail {
+                        (right_sidebar::ACTIVITY_BAR_WIDTH + 6.) / 16.
+                    } else {
+                        0.
+                    }))
                     .right(rems(if right_rail {
                         (right_sidebar::ACTIVITY_BAR_WIDTH + 6.) / 16.
                     } else {

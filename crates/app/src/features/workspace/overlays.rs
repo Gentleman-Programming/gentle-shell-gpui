@@ -507,7 +507,9 @@ impl Workspace {
                         this.toggle_sidebar(cx);
                     }
                 }
-                SettingsEvent::PresentationChanged(profiles) => this.apply_presentation(profiles.clone(), window, cx),
+                SettingsEvent::PresentationChanged(profiles) => {
+                    this.apply_presentation(profiles.clone(), window, cx)
+                }
                 SettingsEvent::OpenProfiles => this.open_profiles(window, cx),
                 SettingsEvent::Changed => {
                     for tab in this.sessions() {

@@ -7,7 +7,10 @@ use std::path::PathBuf;
 use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::*;
 
-use crate::{features::app_update, features::workspaces::{LayoutProfiles, TabLayout}};
+use crate::{
+    features::app_update,
+    features::workspaces::{LayoutProfiles, TabLayout},
+};
 
 mod agent_ui;
 mod app;

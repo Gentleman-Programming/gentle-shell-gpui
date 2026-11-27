@@ -132,7 +132,11 @@ fn preview_icon(icon: IconName) -> Icon {
 
 /// Render the shortcuts in the order they will actually appear. Bound the
 /// thumbnails so even a profile with every shortcut in one rail fits.
-fn preview_shortcuts(profile: &LayoutProfile, placement: ToolPlacement, limit: usize) -> Vec<AnyElement> {
+fn preview_shortcuts(
+    profile: &LayoutProfile,
+    placement: ToolPlacement,
+    limit: usize,
+) -> Vec<AnyElement> {
     let icons: Vec<_> = profile
         .shortcuts
         .iter()
@@ -212,11 +216,22 @@ fn layout_preview(profile: &LayoutProfile) -> Div {
                                     .border_1()
                                     .border_color(ui::accent().opacity(0.45)),
                             )
-                            .child(div().w(rems(20. / 16.)).h(rems(12. / 16.)).rounded_sm().bg(ui::raised()))
+                            .child(
+                                div()
+                                    .w(rems(20. / 16.))
+                                    .h(rems(12. / 16.))
+                                    .rounded_sm()
+                                    .bg(ui::raised()),
+                            )
                             .child(preview_icon(IconName::Plus))
                         })
                         .when(!horizontal && !navigation, |d| {
-                            d.child(div().text_size(rems(9. / 16.)).text_color(ui::muted()).child("Gentle Shell"))
+                            d.child(
+                                div()
+                                    .text_size(rems(9. / 16.))
+                                    .text_color(ui::muted())
+                                    .child("Gentle Shell"),
+                            )
                         }),
                 )
                 .child(
@@ -224,9 +239,13 @@ fn layout_preview(profile: &LayoutProfile) -> Div {
                         .min_w_0()
                         .gap_0p5()
                         .overflow_hidden()
-                        .when(profile.title_utilities, |d| d.child(preview_icon(IconName::Layers)))
+                        .when(profile.title_utilities, |d| {
+                            d.child(preview_icon(IconName::Layers))
+                        })
                         .children(preview_shortcuts(profile, ToolPlacement::Title, 4))
-                        .when(profile.original_controls, |d| d.child(preview_icon(IconName::PanelLeft)))
+                        .when(profile.original_controls, |d| {
+                            d.child(preview_icon(IconName::PanelLeft))
+                        })
                         .child(preview_icon(IconName::Command))
                         .when(profile.original_controls, |d| {
                             d.child(preview_icon(IconName::Settings))
@@ -241,7 +260,9 @@ fn layout_preview(profile: &LayoutProfile) -> Div {
                 .items_stretch()
                 .gap_1()
                 .p_1()
-                .when(has_left, |d| d.child(preview_rail(profile, ToolPlacement::Left)))
+                .when(has_left, |d| {
+                    d.child(preview_rail(profile, ToolPlacement::Left))
+                })
                 .when(navigation, |d| {
                     d.child(
                         v_flex()
@@ -257,7 +278,13 @@ fn layout_preview(profile: &LayoutProfile) -> Div {
                             .rounded_md()
                             .bg(ui::surface())
                             .when(profile.workspace_visible, |d| {
-                                d.child(div().text_size(rems(8. / 16.)).text_color(ui::faint()).truncate().child("Workspaces"))
+                                d.child(
+                                    div()
+                                        .text_size(rems(8. / 16.))
+                                        .text_color(ui::faint())
+                                        .truncate()
+                                        .child("Workspaces"),
+                                )
                             })
                             .children((0..4).map(|index| {
                                 h_flex()
@@ -266,7 +293,9 @@ fn layout_preview(profile: &LayoutProfile) -> Div {
                                     .rounded_sm()
                                     .when(index == 0, |d| d.bg(ui::accent().opacity(0.16)))
                                     .child(preview_icon(IconName::Bot))
-                                    .when(profile.workspace_visible, |d| d.child(preview_line(0.50)))
+                                    .when(profile.workspace_visible, |d| {
+                                        d.child(preview_line(0.50))
+                                    })
                             })),
                     )
                 })
@@ -278,7 +307,12 @@ fn layout_preview(profile: &LayoutProfile) -> Div {
                         .p_1()
                         .rounded_md()
                         .bg(ui::panel())
-                        .child(h_flex().gap_1().child(preview_icon(IconName::Bot)).child(preview_line(0.40)))
+                        .child(
+                            h_flex()
+                                .gap_1()
+                                .child(preview_icon(IconName::Bot))
+                                .child(preview_line(0.40)),
+                        )
                         .child(
                             v_flex()
                                 .gap_1()
@@ -318,20 +352,43 @@ fn layout_preview(profile: &LayoutProfile) -> Div {
                                 h_flex()
                                     .gap_0p5()
                                     .child(preview_icon(profile.dock.icon()))
-                                    .child(div().min_w_0().truncate().text_size(rems(8. / 16.)).text_color(ui::muted()).child(profile.dock.label())),
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .truncate()
+                                            .text_size(rems(8. / 16.))
+                                            .text_color(ui::muted())
+                                            .child(profile.dock.label()),
+                                    ),
                             )
-                            .when(profile.original_controls && matches!(profile.dock, LayoutTool::Files | LayoutTool::Git), |d| {
-                                d.child(h_flex().gap_0p5().child(preview_icon(IconName::Files)).child(preview_icon(IconName::Diff)).child(preview_icon(IconName::GitBranch)))
-                            })
+                            .when(
+                                profile.original_controls
+                                    && matches!(profile.dock, LayoutTool::Files | LayoutTool::Git),
+                                |d| {
+                                    d.child(
+                                        h_flex()
+                                            .gap_0p5()
+                                            .child(preview_icon(IconName::Files))
+                                            .child(preview_icon(IconName::Diff))
+                                            .child(preview_icon(IconName::GitBranch)),
+                                    )
+                                },
+                            )
                             .children((0..4).map(|index| {
                                 h_flex()
                                     .gap_0p5()
-                                    .child(preview_icon(if index == 0 { IconName::Folder } else { IconName::Files }))
+                                    .child(preview_icon(if index == 0 {
+                                        IconName::Folder
+                                    } else {
+                                        IconName::Files
+                                    }))
                                     .child(preview_line(0.45))
                             })),
                     )
                 })
-                .when(has_right, |d| d.child(preview_rail(profile, ToolPlacement::Right))),
+                .when(has_right, |d| {
+                    d.child(preview_rail(profile, ToolPlacement::Right))
+                }),
         )
 }
 
@@ -383,7 +440,13 @@ fn preset_card(
                     d.child(Icon::new(IconName::Check).xsmall().text_color(ui::accent()))
                 }),
         )
-        .child(div().px_1().text_xs().text_color(ui::muted()).child(description))
+        .child(
+            div()
+                .px_1()
+                .text_xs()
+                .text_color(ui::muted())
+                .child(description),
+        )
 }
 
 fn visibility_row(
@@ -429,7 +492,9 @@ impl SettingsView {
         cx: &mut Context<Self>,
     ) {
         edit(&mut self.layout_profiles);
-        cx.emit(SettingsEvent::PresentationChanged(self.layout_profiles.clone()));
+        cx.emit(SettingsEvent::PresentationChanged(
+            self.layout_profiles.clone(),
+        ));
         cx.notify();
     }
 
@@ -547,30 +612,48 @@ impl SettingsView {
 
         // The four destinations are also drop targets. This makes it possible
         // to move a tool into an entirely empty rail without leaving settings.
-        settings = settings.child(
-            div().grid().grid_cols(4).gap_1().children(
-                ToolPlacement::ALL.into_iter().map(|placement| {
-                    let count = profile.shortcuts.iter().filter(|s| s.placement == placement).count();
-                    v_flex()
-                        .id(("layout-destination", placement as usize))
-                        .min_w_0()
-                        .items_center()
-                        .gap_1()
-                        .p_2()
-                        .rounded_lg()
-                        .border_1()
-                        .border_color(ui::border())
-                        .bg(ui::well())
-                        .drag_over::<LayoutDrag>(|style, _, _, _| style.bg(ui::accent().opacity(0.16)))
-                        .on_drop(cx.listener(move |this, drag: &LayoutDrag, _, cx| {
-                            this.edit_presentation(|p| p.current_mut().place(drag.0, placement), cx);
-                        }))
-                        .child(Icon::new(placement_icon(placement)).small().text_color(ui::accent()))
-                        .child(div().w_full().truncate().text_center().text_xs().child(placement.label()))
-                        .child(div().text_xs().text_color(ui::muted()).child(format!("{count}")))
-                }),
-            ),
-        );
+        settings = settings.child(div().grid().grid_cols(4).gap_1().children(
+            ToolPlacement::ALL.into_iter().map(|placement| {
+                let count = profile
+                    .shortcuts
+                    .iter()
+                    .filter(|s| s.placement == placement)
+                    .count();
+                v_flex()
+                    .id(("layout-destination", placement as usize))
+                    .min_w_0()
+                    .items_center()
+                    .gap_1()
+                    .p_2()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(ui::border())
+                    .bg(ui::well())
+                    .drag_over::<LayoutDrag>(|style, _, _, _| style.bg(ui::accent().opacity(0.16)))
+                    .on_drop(cx.listener(move |this, drag: &LayoutDrag, _, cx| {
+                        this.edit_presentation(|p| p.current_mut().place(drag.0, placement), cx);
+                    }))
+                    .child(
+                        Icon::new(placement_icon(placement))
+                            .small()
+                            .text_color(ui::accent()),
+                    )
+                    .child(
+                        div()
+                            .w_full()
+                            .truncate()
+                            .text_center()
+                            .text_xs()
+                            .child(placement.label()),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(ui::muted())
+                            .child(format!("{count}")),
+                    )
+            }),
+        ));
 
         let mut rows = v_flex().gap_0p5();
         for shortcut in &profile.shortcuts {
@@ -593,7 +676,11 @@ impl SettingsView {
                     .on_drop(cx.listener(move |this, drag: &LayoutDrag, _, cx| {
                         this.edit_presentation(|p| p.current_mut().move_before(drag.0, tool), cx);
                     }))
-                    .child(Icon::new(IconName::GripHorizontal).xsmall().text_color(ui::faint()))
+                    .child(
+                        Icon::new(IconName::GripHorizontal)
+                            .xsmall()
+                            .text_color(ui::faint()),
+                    )
                     .child(Icon::new(tool.icon()).small().text_color(ui::muted()))
                     .child(
                         v_flex()
@@ -601,7 +688,13 @@ impl SettingsView {
                             .min_w_0()
                             .gap_0p5()
                             .child(div().text_sm().truncate().child(tool.label()))
-                            .child(div().text_xs().text_color(ui::muted()).truncate().child(selected.label())),
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(ui::muted())
+                                    .truncate()
+                                    .child(selected.label()),
+                            ),
                     )
                     .child(
                         h_flex()
@@ -611,15 +704,23 @@ impl SettingsView {
                             .rounded_lg()
                             .bg(ui::well())
                             .children(ToolPlacement::ALL.into_iter().map(|placement| {
-                                Button::new(("layout-placement", (tool as usize) * 4 + placement as usize))
-                                    .ghost()
-                                    .xsmall()
-                                    .selected(selected == placement)
-                                    .icon(Icon::new(placement_icon(placement)))
-                                    .tooltip(placement.label())
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.edit_presentation(|p| p.current_mut().place(tool, placement), cx);
-                                    }))
+                                Button::new((
+                                    "layout-placement",
+                                    (tool as usize) * 4 + placement as usize,
+                                ))
+                                .ghost()
+                                .xsmall()
+                                .selected(selected == placement)
+                                .icon(Icon::new(placement_icon(placement)))
+                                .tooltip(placement.label())
+                                .on_click(cx.listener(
+                                    move |this, _, _, cx| {
+                                        this.edit_presentation(
+                                            |p| p.current_mut().place(tool, placement),
+                                            cx,
+                                        );
+                                    },
+                                ))
                             })),
                     ),
             );

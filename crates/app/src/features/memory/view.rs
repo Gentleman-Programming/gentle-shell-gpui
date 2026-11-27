@@ -136,9 +136,7 @@ impl Render for MemoryView {
                 .child(
                     div()
                         .id("memory-list")
-                        .when(self.docked, |d| {
-                            d.w_full().h(relative(0.4)).min_h_0()
-                        })
+                        .when(self.docked, |d| d.w_full().h(relative(0.4)).min_h_0())
                         .when(!self.docked, |d| {
                             d.w(relative(0.4))
                                 .min_w(rems(220. / 16.))

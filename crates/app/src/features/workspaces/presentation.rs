@@ -8,35 +8,68 @@ use super::{SavedState, TabLayout};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LayoutTool {
-    Files, Git, History, Engram, Agents, Docs, Devices, Usage, Tower,
-    Profiles, Sessions, Providers, Configuration,
+    Files,
+    Git,
+    History,
+    Engram,
+    Agents,
+    Docs,
+    Devices,
+    Usage,
+    Tower,
+    Profiles,
+    Sessions,
+    Providers,
+    Configuration,
 }
 
 impl LayoutTool {
     pub const ALL: [Self; 13] = [
-        Self::Files, Self::Git, Self::History, Self::Engram, Self::Agents,
-        Self::Docs, Self::Devices, Self::Usage, Self::Tower, Self::Profiles,
-        Self::Sessions, Self::Providers, Self::Configuration,
+        Self::Files,
+        Self::Git,
+        Self::History,
+        Self::Engram,
+        Self::Agents,
+        Self::Docs,
+        Self::Devices,
+        Self::Usage,
+        Self::Tower,
+        Self::Profiles,
+        Self::Sessions,
+        Self::Providers,
+        Self::Configuration,
     ];
     pub fn label(self) -> &'static str {
         match self {
-            Self::Files => "Files", Self::Git => "Git",
-            Self::History => "Git History", Self::Engram => "Engram",
-            Self::Agents => "Agents", Self::Docs => "Architecture Docs",
-            Self::Devices => "Devices", Self::Usage => "Usage & Stats",
-            Self::Tower => "Gentle Tower", Self::Profiles => "Profiles",
-            Self::Sessions => "Sessions", Self::Providers => "Providers",
+            Self::Files => "Files",
+            Self::Git => "Git",
+            Self::History => "Git History",
+            Self::Engram => "Engram",
+            Self::Agents => "Agents",
+            Self::Docs => "Architecture Docs",
+            Self::Devices => "Devices",
+            Self::Usage => "Usage & Stats",
+            Self::Tower => "Gentle Tower",
+            Self::Profiles => "Profiles",
+            Self::Sessions => "Sessions",
+            Self::Providers => "Providers",
             Self::Configuration => "Configuration",
         }
     }
     pub fn icon(self) -> IconName {
         match self {
-            Self::Files => IconName::Files, Self::Git => IconName::GitBranch,
-            Self::History => IconName::GitGraph, Self::Engram => IconName::Brain,
-            Self::Agents => IconName::Users, Self::Docs => IconName::BookOpen,
-            Self::Devices => IconName::Smartphone, Self::Usage => IconName::Gauge,
-            Self::Tower => IconName::Building2, Self::Profiles => IconName::Route,
-            Self::Sessions => IconName::RotateCcwClock, Self::Providers => IconName::KeyRound,
+            Self::Files => IconName::Files,
+            Self::Git => IconName::GitBranch,
+            Self::History => IconName::GitGraph,
+            Self::Engram => IconName::Brain,
+            Self::Agents => IconName::Users,
+            Self::Docs => IconName::BookOpen,
+            Self::Devices => IconName::Smartphone,
+            Self::Usage => IconName::Gauge,
+            Self::Tower => IconName::Building2,
+            Self::Profiles => IconName::Route,
+            Self::Sessions => IconName::RotateCcwClock,
+            Self::Providers => IconName::KeyRound,
             Self::Configuration => IconName::Settings,
         }
     }
@@ -47,26 +80,39 @@ impl LayoutTool {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ToolPlacement { Title, Left, Right, Hidden }
+pub enum ToolPlacement {
+    Title,
+    Left,
+    Right,
+    Hidden,
+}
 
 impl ToolPlacement {
     pub const ALL: [Self; 4] = [Self::Title, Self::Left, Self::Right, Self::Hidden];
     pub fn label(self) -> &'static str {
         match self {
-            Self::Title => "Title bar", Self::Left => "Left rail",
-            Self::Right => "Right rail", Self::Hidden => "Commands only",
+            Self::Title => "Title bar",
+            Self::Left => "Left rail",
+            Self::Right => "Right rail",
+            Self::Hidden => "Commands only",
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum LayoutPreset { Minimal, Expanded }
+pub enum LayoutPreset {
+    Minimal,
+    Expanded,
+}
 
 impl LayoutPreset {
     pub const ALL: [Self; 2] = [Self::Minimal, Self::Expanded];
     pub fn label(self) -> &'static str {
-        match self { Self::Minimal => "Minimal", Self::Expanded => "Expanded" }
+        match self {
+            Self::Minimal => "Minimal",
+            Self::Expanded => "Expanded",
+        }
     }
 }
 
@@ -99,14 +145,25 @@ impl LayoutProfile {
         let expanded = preset == LayoutPreset::Expanded;
         let width = gentle_core::workspaces::SIDEBAR_DEFAULT_WIDTH;
         Self {
-            shortcuts: LayoutTool::ALL.into_iter().map(|tool| ToolShortcut {
-                tool,
-                placement: if expanded { ToolPlacement::Right } else { ToolPlacement::Hidden },
-            }).collect(),
+            shortcuts: LayoutTool::ALL
+                .into_iter()
+                .map(|tool| ToolShortcut {
+                    tool,
+                    placement: if expanded {
+                        ToolPlacement::Right
+                    } else {
+                        ToolPlacement::Hidden
+                    },
+                })
+                .collect(),
             tabs_visible: true,
             title_utilities: true,
             original_controls: !expanded,
-            tab_layout: if expanded { TabLayout::Vertical } else { TabLayout::Horizontal },
+            tab_layout: if expanded {
+                TabLayout::Vertical
+            } else {
+                TabLayout::Horizontal
+            },
             workspace_visible: expanded,
             tabs_sidebar_hidden: false,
             sidebar_visible: true,
@@ -125,9 +182,15 @@ impl LayoutProfile {
     }
     /// Reorder without introducing duplicate shortcuts.
     pub fn move_before(&mut self, tool: LayoutTool, target: LayoutTool) {
-        if tool == target { return; }
-        let Some(from) = self.shortcuts.iter().position(|s| s.tool == tool) else { return; };
-        if !self.shortcuts.iter().any(|s| s.tool == target) { return; }
+        if tool == target {
+            return;
+        }
+        let Some(from) = self.shortcuts.iter().position(|s| s.tool == tool) else {
+            return;
+        };
+        if !self.shortcuts.iter().any(|s| s.tool == target) {
+            return;
+        }
         let item = self.shortcuts.remove(from);
         if let Some(to) = self.shortcuts.iter().position(|s| s.tool == target) {
             self.shortcuts.insert(to, item);
@@ -136,12 +199,21 @@ impl LayoutProfile {
     pub fn normalize(&mut self, preset: LayoutPreset) {
         let mut seen = Vec::new();
         self.shortcuts.retain(|s| {
-            if seen.contains(&s.tool) { false } else { seen.push(s.tool); true }
+            if seen.contains(&s.tool) {
+                false
+            } else {
+                seen.push(s.tool);
+                true
+            }
         });
         for s in Self::preset(preset).shortcuts {
-            if !seen.contains(&s.tool) { self.shortcuts.push(s); }
+            if !seen.contains(&s.tool) {
+                self.shortcuts.push(s);
+            }
         }
-        if !self.dock.docked() { self.dock = LayoutTool::Files; }
+        if !self.dock.docked() {
+            self.dock = LayoutTool::Files;
+        }
         self.tabs_width = gentle_core::workspaces::saved_sidebar_width(self.tabs_width);
         self.files_width = gentle_core::workspaces::saved_sidebar_width(self.files_width);
     }
@@ -176,7 +248,10 @@ impl LayoutProfiles {
         self.profile(self.active)
     }
     pub fn current_mut(&mut self) -> &mut LayoutProfile {
-        match self.active { LayoutPreset::Minimal => &mut self.minimal, LayoutPreset::Expanded => &mut self.expanded }
+        match self.active {
+            LayoutPreset::Minimal => &mut self.minimal,
+            LayoutPreset::Expanded => &mut self.expanded,
+        }
     }
     pub fn reset(&mut self) {
         let preset = self.active;
@@ -222,7 +297,12 @@ mod tests {
         assert_eq!(current.tab_layout, TabLayout::Horizontal);
         assert!(!current.workspace_visible);
         assert_eq!(current.sidebar_visible, SavedState::default().sidebar);
-        assert!(current.shortcuts.iter().all(|s| s.placement == ToolPlacement::Hidden));
+        assert!(
+            current
+                .shortcuts
+                .iter()
+                .all(|s| s.placement == ToolPlacement::Hidden)
+        );
         assert!(!p.expanded.original_controls);
     }
 
@@ -232,7 +312,9 @@ mod tests {
             active: LayoutPreset::Expanded,
             ..LayoutProfiles::default()
         };
-        profiles.expanded.place(LayoutTool::Git, ToolPlacement::Title);
+        profiles
+            .expanded
+            .place(LayoutTool::Git, ToolPlacement::Title);
         let saved = SavedState {
             presentation: Some(profiles.clone()),
             ..SavedState::default()
@@ -243,14 +325,19 @@ mod tests {
     #[test]
     fn presets_keep_independent_changes_and_round_trip() {
         let mut p = LayoutProfiles::default();
-        p.current_mut().place(LayoutTool::Engram, ToolPlacement::Left);
-        p.current_mut().move_before(LayoutTool::Engram, LayoutTool::Files);
+        p.current_mut()
+            .place(LayoutTool::Engram, ToolPlacement::Left);
+        p.current_mut()
+            .move_before(LayoutTool::Engram, LayoutTool::Files);
         p.active = LayoutPreset::Expanded;
         assert_eq!(p.current().shortcuts[0].tool, LayoutTool::Files);
         p.current_mut().sidebar_visible = false;
         p.active = LayoutPreset::Minimal;
         assert_eq!(p.current().shortcuts[0].tool, LayoutTool::Engram);
-        assert_eq!(serde_json::from_str::<LayoutProfiles>(&serde_json::to_string(&p).unwrap()).unwrap(), p);
+        assert_eq!(
+            serde_json::from_str::<LayoutProfiles>(&serde_json::to_string(&p).unwrap()).unwrap(),
+            p
+        );
         p.reset();
         assert_eq!(p.current().shortcuts[0].tool, LayoutTool::Files);
         assert!(!p.expanded.sidebar_visible);
@@ -270,8 +357,12 @@ mod tests {
     #[test]
     fn legacy_layout_preserves_visibility_and_width() {
         let saved = SavedState {
-            version: 1, tab_layout: TabLayout::Vertical, sidebar_compact: true,
-            sidebar: false, files_sidebar_width: 420., ..SavedState::default()
+            version: 1,
+            tab_layout: TabLayout::Vertical,
+            sidebar_compact: true,
+            sidebar: false,
+            files_sidebar_width: 420.,
+            ..SavedState::default()
         };
         let p = LayoutProfiles::from_saved(&saved);
         assert_eq!(p.active, LayoutPreset::Minimal);

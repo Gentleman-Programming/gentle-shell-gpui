@@ -38,8 +38,8 @@ use crate::features::tower::TowerView;
 use crate::features::usage::{UsageEvent, UsageView};
 use crate::features::welcome::{WelcomeEvent, WelcomeView};
 use crate::features::workspaces::{
-    self, Badge, LayoutProfiles, LayoutTool, ToolPlacement, SavedPane, SavedState, SavedTab,
-    SavedWorkspace, TabLayout,
+    self, Badge, LayoutProfiles, LayoutTool, SavedPane, SavedState, SavedTab, SavedWorkspace,
+    TabLayout, ToolPlacement,
 };
 use crate::shared::pane::{
     AskAgent, CloseViewer, OpenCommitDiff, OpenTerminalAt, PaneFactories, PaneId, PaneItem,
@@ -598,7 +598,8 @@ impl Workspace {
             tabs_sidebar_motion: Default::default(),
             files_sidebar_motion: Default::default(),
             tab_layout: presentation.tab_layout,
-            sidebar_compact: presentation.tab_layout == TabLayout::Vertical && !presentation.workspace_visible,
+            sidebar_compact: presentation.tab_layout == TabLayout::Vertical
+                && !presentation.workspace_visible,
             tabs_sidebar_hidden: presentation.tabs_sidebar_hidden,
             tabs_sidebar_width: gentle_core::workspaces::saved_sidebar_width(
                 presentation.tabs_width,
@@ -752,10 +753,10 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let git = self
-            .sidebar
-            .as_ref()
-            .map_or(self.layout_profiles.current().dock == LayoutTool::Git, |tree| tree.read(cx).is_git_tab());
+        let git = self.sidebar.as_ref().map_or(
+            self.layout_profiles.current().dock == LayoutTool::Git,
+            |tree| tree.read(cx).is_git_tab(),
+        );
         let visible = self.files_sidebar_visible();
         let original_tabs = self.layout_profiles.current().original_controls;
         view.update(cx, |tree, cx| {

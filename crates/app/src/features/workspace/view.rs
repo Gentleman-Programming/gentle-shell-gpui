@@ -1011,6 +1011,16 @@ mod tests {
                         overlay: None,
                         web_shown: Default::default(),
                         sidebar: None,
+                        sidebar_memory_active: false,
+                        sidebar_memory: None,
+                        sidebar_history_active: false,
+                        sidebar_history: None,
+                        layout_profiles: {
+                            let mut profiles =
+                                crate::features::workspaces::LayoutProfiles::default();
+                            profiles.current_mut().sidebar_visible = false;
+                            profiles
+                        },
                         sidebar_visible: false,
                         tab_layout: TabLayout::Horizontal,
                         tabs_sidebar_motion: Default::default(),

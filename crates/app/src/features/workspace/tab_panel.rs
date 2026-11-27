@@ -107,7 +107,8 @@ impl Workspace {
         profile.workspace_visible = layout == TabLayout::Vertical && !self.sidebar_compact;
         self.tab_layout = layout;
         if was_open != self.navigation_visible() {
-            self.tabs_sidebar_motion.retarget(was_open, cx.reduce_motion());
+            self.tabs_sidebar_motion
+                .retarget(was_open, cx.reduce_motion());
         }
         // File browsing is a separate right sidebar; switching tab placement
         // must neither open nor hide that independent panel.
@@ -1054,7 +1055,12 @@ mod tests {
                         sidebar_history_active: false,
                         sidebar_history: None,
                         sidebar_visible: false,
-                        layout_profiles: crate::features::workspaces::LayoutProfiles::from_saved(&crate::features::workspaces::SavedState { version: 1, ..Default::default() }),
+                        layout_profiles: crate::features::workspaces::LayoutProfiles::from_saved(
+                            &crate::features::workspaces::SavedState {
+                                version: 1,
+                                ..Default::default()
+                            },
+                        ),
                         tab_layout: TabLayout::Horizontal,
                         tabs_sidebar_motion: Default::default(),
                         files_sidebar_motion: Default::default(),

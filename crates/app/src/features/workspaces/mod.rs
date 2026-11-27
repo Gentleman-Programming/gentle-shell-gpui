@@ -298,7 +298,11 @@ pub struct SavedState {
     #[serde(default)]
     pub tabs_sidebar_hidden: bool,
     /// Optional for compatibility with older workspace snapshots.
-    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "known_or_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "known_or_none"
+    )]
     pub presentation: Option<LayoutProfiles>,
 }
 
