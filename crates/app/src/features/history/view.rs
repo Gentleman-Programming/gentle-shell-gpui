@@ -23,7 +23,7 @@ use gpui_kit::*;
 
 use super::graph::{self, RowGraph};
 use super::ops::Ask;
-use super::{HistoryView, Line, Outcome};
+use super::{GraphMode, HistoryView, Line, OpenFullHistory, Outcome};
 use crate::features::git::{Scope, ops::Lfs};
 use crate::platform::ides;
 use crate::shared::ui;
@@ -218,6 +218,43 @@ impl HistoryView {
                     .tooltip("Refresh")
                     .on_click(cx.listener(|this, _, _, cx| this.reload(cx))),
             )
+    }
+
+    fn render_graph_modes(&self, cx: &mut Context<Self>) -> Div {
+        let mode = self.mode;
+        let weak = cx.entity().downgrade();
+        h_flex()
+            .flex_none()
+            .px_3()
+            .pb_1()
+            .gap_1()
+            .child(
+                Button::new("git-graph-mode")
+                    .ghost()
+                    .xsmall()
+                    .label(mode.label())
+                    .dropdown_caret(true)
+                    .dropdown_menu(move |menu, _, _| {
+                        GraphMode::ALL.into_iter().fold(menu, |menu, target| {
+                            let weak = weak.clone();
+                            menu.item(PopupMenuItem::new(target.label()).checked(mode == target)
+                                .on_click(move |_, _, cx| {
+                                    let _ = weak.update(cx, |this, cx| this.set_mode(target, cx));
+                                }))
+                        })
+                    }),
+            )
+            .child(div().flex_1())
+            .when(self.docked, |d| d.child(
+                Button::new("git-open-full")
+                    .ghost()
+                    .xsmall()
+                    .icon(Icon::new(IconName::Maximize2))
+                    .tooltip("Open full Git history in a tab")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        cx.emit(OpenFullHistory(this.toplevel.clone()));
+                    })),
+            ))
     }
 
     /// The scope picker, the filter and the actions. Only in a repository.
@@ -636,7 +673,8 @@ impl HistoryView {
     }
 
     fn graph_cell(&self, graph: RowGraph) -> Div {
-        let layout = graph::LaneLayout::new(self.graph.width.max(1), self.width.get());
+        let lanes = if self.filtering() { 1 } else { self.graph.width.max(1) };
+        let layout = graph::LaneLayout::new(lanes, self.width.get());
         div()
             .relative()
             .flex_none()
@@ -670,7 +708,7 @@ impl HistoryView {
         let row = h_flex()
             .id(("history-row", ix))
             .w_full()
-            .h(rems(ROW_HEIGHT / 16.))
+            .h(rems(if self.fit(window) == Fit::Wide { ROW_HEIGHT / 16. } else { 42. / 16. }))
             .pr_2()
             .gap_1()
             .rounded_lg();
@@ -746,7 +784,7 @@ impl HistoryView {
                     d.child(Spinner::new().xsmall().color(ui::muted()))
                 })
                 .into_any_element(),
-            Line::Commit(i) => self.render_commit(row, i, window, cx),
+            Line::Commit(i, graph_index) => self.render_commit(row, i, graph_index, window, cx),
         }
     }
 
@@ -824,11 +862,12 @@ impl HistoryView {
         &self,
         row: Stateful<Div>,
         i: usize,
+        graph_index: usize,
         window: &Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let commit = &self.commits[i];
-        let Some(graph_row) = self.graph.rows.get(i) else {
+        let Some(graph_row) = self.graph.rows.get(graph_index) else {
             return row.into_any_element();
         };
         let filtering = self.filtering();
@@ -838,22 +877,14 @@ impl HistoryView {
         let lane_color = graph::lane_color(graph_row.color);
         let fit = self.fit(window);
 
-        // Ref chips need room beside the subject: a narrow pane drops them
-        // (the hover card still names the branch), others cut long names.
-        let chips = if fit > Fit::Narrow {
-            let lane = graph_row
-                .lane_tip
-                .then_some(graph_row.branch.as_deref())
-                .flatten();
-            self.ref_chips(
-                commit,
-                lane,
-                lane_color,
-                if fit == Fit::Wide { 28 } else { 18 },
-            )
-        } else {
-            Vec::new()
-        };
+        let lane = graph_row
+            .lane_tip
+            .then_some(graph_row.branch.as_deref())
+            .flatten();
+        let chips = self.ref_chips(commit, lane, lane_color, usize::MAX);
+        let folded_count = self.folded_counts.get(&commit.hash).copied();
+        let expanded = self.expanded_merges.contains(&commit.hash);
+        let merge_hash = commit.hash.clone();
         // Filtered rows aren't neighbors in the graph: only their node.
         let graph = if filtering {
             RowGraph::node_only(graph_row, commit.head)
@@ -872,6 +903,24 @@ impl HistoryView {
         };
         let hash = commit.hash.clone();
         let menu = self.commit_menu(i, cx);
+        let subject = div()
+            .flex_1()
+            .min_w_0()
+            .truncate()
+            .text_sm()
+            .text_color(if graph_row.mainline || filtering { ui::fg() } else { ui::muted() })
+            .child(commit.subject.clone());
+        let refs = h_flex()
+            .min_w_0()
+            .overflow_x_scroll()
+            .id(("history-refs", i))
+            .gap_1()
+            .children(chips);
+        let content = if fit == Fit::Wide {
+            h_flex().flex_1().min_w_0().gap_1().child(subject).child(refs.max_w(relative(0.40))).into_any_element()
+        } else {
+            v_flex().flex_1().min_w_0().gap_0p5().child(subject).child(refs).into_any_element()
+        };
         row.cursor_pointer()
             .when(selected, |d| d.bg(ui::raised()))
             .when(!selected, |d| d.hover(|s| s.bg(ui::surface_hover())))
@@ -879,38 +928,20 @@ impl HistoryView {
             .tooltip(move |_, cx| cx.new(|_| card.clone()).into())
             .context_menu(menu)
             .child(self.graph_cell(graph))
-            .child(
-                h_flex()
-                    .flex_1()
-                    .min_w_0()
-                    .gap_1()
-                    // Keep ref labels from consuming the entire subject column
-                    // in a narrow dock. The hover card still exposes the refs.
-                    .when(!chips.is_empty(), |d| {
-                        d.child(
-                            h_flex()
-                                .flex_shrink(1.)
-                                .min_w_0()
-                                .when(fit != Fit::Wide, |d| d.max_w(relative(0.40)))
-                                .overflow_hidden()
-                                .gap_1()
-                                .children(chips.into_iter().map(|c| div().flex_none().child(c))),
-                        )
-                    })
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_sm()
-                            .text_color(if graph_row.mainline || filtering {
-                                ui::fg()
-                            } else {
-                                ui::muted()
-                            })
-                            .child(commit.subject.clone()),
-                    ),
-            )
+            .when_some(folded_count, |d, count| {
+                d.child(
+                    Button::new(("git-fold-merge", i))
+                        .ghost()
+                        .xsmall()
+                        .icon(Icon::new(if expanded { IconName::ChevronDown } else { IconName::ChevronRight }))
+                        .tooltip(format!("{} {count} loaded merged commits", if expanded { "Hide" } else { "Show" }))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.toggle_merge(merge_hash.clone(), cx);
+                        })),
+                )
+            })
+            .child(content)
             .child(
                 h_flex()
                     .flex_none()
@@ -938,7 +969,7 @@ impl HistoryView {
                     .flex_none()
                     .w(rems(TIME_WIDTH / 16.))
                     .whitespace_nowrap()
-                    .text_right()
+                    .text_left()
                     .font_family(ui::mono())
                     .text_size(ui::code_rems(12.))
                     .text_color(ui::faint())
@@ -1704,6 +1735,7 @@ impl Render for HistoryView {
             )
             .child(self.render_header(window, cx))
             .children(self.render_toolbar(window, cx))
+            .child(self.render_graph_modes(cx))
             .children(self.render_prompt(cx))
             .children(self.render_banner(cx))
             .child(self.render_body(window, cx))

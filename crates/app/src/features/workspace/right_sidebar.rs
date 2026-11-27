@@ -67,7 +67,14 @@ impl Workspace {
         {
             return;
         }
-        let view = cx.new(|cx| crate::features::history::HistoryView::new(cwd.clone(), window, cx));
+        let view = cx.new(|cx| crate::features::history::HistoryView::new_docked(cwd.clone(), window, cx));
+        cx.subscribe_in(
+            &view,
+            window,
+            |this, _, event: &crate::features::history::OpenFullHistory, window, cx| {
+                this.open_tab(PaneKind::History, event.0.clone(), None, None, window, cx);
+            },
+        ).detach();
         self.sidebar_history = Some((cwd, view));
     }
 

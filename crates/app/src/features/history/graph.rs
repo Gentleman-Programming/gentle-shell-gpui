@@ -30,12 +30,14 @@ impl LaneLayout {
         let preferred = if pane_width < 640. { 9. } else { 14. };
         let intervals = lanes.saturating_sub(1) as f32;
         let budget = (pane_width * 0.30).max(PAD * 2.);
-        let width = (PAD * 2. + preferred * intervals).min(budget);
+        // Maintain usable spacing. Extremely dense graphs are clipped in
+        // the sidebar rather than reducing nodes to invisible pixels.
         let step = if intervals > 0. {
-            (width - PAD * 2.) / intervals
+            ((budget - PAD * 2.) / intervals).clamp(8., preferred)
         } else {
             preferred
         };
+        let width = (PAD * 2. + step * intervals).min(budget);
         Self { width, step }
     }
 
@@ -44,7 +46,7 @@ impl LaneLayout {
     }
 
     fn node_scale(self) -> f32 {
-        (self.step / 14.).clamp(0.28, 1.)
+        0.85
     }
 }
 
@@ -105,6 +107,7 @@ impl RowGraph {
         Self {
             top: Vec::new(),
             bottom: Vec::new(),
+            lane: 0,
             ..Self::commit(row, head, false)
         }
     }
@@ -257,8 +260,8 @@ mod tests {
         for width in [200., 320., 480., 800.] {
             let layout = LaneLayout::new(24, width);
             assert!(layout.width <= width * 0.30);
-            assert!(layout.x(23) <= layout.width);
-            assert!(layout.x(1) > layout.x(0));
+            assert!(layout.x(1) - layout.x(0) >= 8.);
+            assert!(layout.node_scale() >= 0.8);
         }
     }
 
@@ -266,7 +269,7 @@ mod tests {
     fn graph_keeps_its_lanes_aligned_and_grows_with_the_pane() {
         let narrow = LaneLayout::new(20, 320.);
         let wide = LaneLayout::new(20, 1000.);
-        assert!(narrow.step < wide.step);
+        assert!(narrow.step <= wide.step);
         assert!(narrow.width < wide.width);
         assert_eq!(LaneLayout::new(1, 320.).width, PAD * 2.);
     }
