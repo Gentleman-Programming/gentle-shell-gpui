@@ -140,7 +140,10 @@ fn preview_shortcuts(
     let icons: Vec<_> = profile
         .shortcuts
         .iter()
-        .filter(|shortcut| shortcut.placement == placement)
+        .filter(|shortcut| {
+            shortcut.placement == placement
+                && (placement == ToolPlacement::Title || !shortcut.tool.rail_footer())
+        })
         .map(|shortcut| shortcut.tool.icon())
         .collect();
     let mut result: Vec<_> = icons
@@ -170,7 +173,13 @@ fn preview_rail(profile: &LayoutProfile, placement: ToolPlacement) -> Div {
         .py_1()
         .rounded_md()
         .bg(ui::raised())
-        .children(preview_shortcuts(profile, placement, 5))
+        .children(preview_shortcuts(profile, placement, 4))
+        .child(div().flex_1().min_h_0())
+        .children(
+            profile
+                .rail_tools(placement, true)
+                .map(|tool| preview_icon(tool.icon())),
+        )
 }
 
 /// An intentionally schematic miniature of the workspace. It follows the
@@ -607,7 +616,7 @@ impl SettingsView {
             ))
             .child(div().pt_2().child(ui::section_label("Tool placement")))
             .child(div().text_xs().text_color(ui::muted()).child(
-                "Choose a location for each shortcut or drag it onto a location below. Drag rows to reorder. Hidden tools remain available in Commands.",
+                "Choose a location for each shortcut or drag it onto a location below. Drag rows to reorder. Profiles, Providers and Configuration stay at the bottom of vertical rails. Hidden tools remain available in Commands.",
             ));
 
         // The four destinations are also drop targets. This makes it possible

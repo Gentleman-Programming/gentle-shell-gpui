@@ -76,6 +76,12 @@ impl LayoutTool {
     pub fn docked(self) -> bool {
         matches!(self, Self::Files | Self::Git | Self::History | Self::Engram)
     }
+
+    /// Configuration tools stay at the bottom of vertical activity rails,
+    /// independently of the saved order of the working tools.
+    pub fn rail_footer(self) -> bool {
+        matches!(self, Self::Profiles | Self::Providers | Self::Configuration)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -175,6 +181,18 @@ impl LayoutProfile {
     pub fn has(&self, placement: ToolPlacement) -> bool {
         self.shortcuts.iter().any(|s| s.placement == placement)
     }
+    /// Partition a vertical rail without changing stored order or placement.
+    pub fn rail_tools(
+        &self,
+        placement: ToolPlacement,
+        footer: bool,
+    ) -> impl Iterator<Item = LayoutTool> + '_ {
+        self.shortcuts
+            .iter()
+            .filter(move |s| s.placement == placement && s.tool.rail_footer() == footer)
+            .map(|s| s.tool)
+    }
+
     pub fn place(&mut self, tool: LayoutTool, placement: ToolPlacement) {
         if let Some(s) = self.shortcuts.iter_mut().find(|s| s.tool == tool) {
             s.placement = placement;
@@ -341,6 +359,27 @@ mod tests {
         p.reset();
         assert_eq!(p.current().shortcuts[0].tool, LayoutTool::Files);
         assert!(!p.expanded.sidebar_visible);
+    }
+
+    #[test]
+    fn configuration_tools_stay_in_the_footer_of_their_assigned_rail() {
+        let mut p = LayoutProfile::preset(LayoutPreset::Expanded);
+        p.move_before(LayoutTool::Configuration, LayoutTool::Files);
+        p.place(LayoutTool::Providers, ToolPlacement::Left);
+        p.place(LayoutTool::Profiles, ToolPlacement::Hidden);
+
+        let top = p.rail_tools(ToolPlacement::Right, false).collect::<Vec<_>>();
+        assert_eq!(top.first(), Some(&LayoutTool::Files));
+        assert!(top.iter().all(|tool| !tool.rail_footer()));
+        assert_eq!(
+            p.rail_tools(ToolPlacement::Right, true).collect::<Vec<_>>(),
+            vec![LayoutTool::Configuration]
+        );
+        assert_eq!(
+            p.rail_tools(ToolPlacement::Left, true).collect::<Vec<_>>(),
+            vec![LayoutTool::Providers]
+        );
+        assert!(!p.rail_tools(ToolPlacement::Right, true).any(|tool| tool == LayoutTool::Profiles));
     }
 
     #[test]

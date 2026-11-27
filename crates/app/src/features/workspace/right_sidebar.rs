@@ -546,6 +546,11 @@ impl Workspace {
         } else {
             "layout-right-scroll"
         };
+        let profile = self.layout_profiles.current();
+        let footer = profile
+            .rail_tools(placement, true)
+            .map(|tool| self.shortcut_button(tool, placement, cx))
+            .collect::<Vec<_>>();
         rail.child(
             v_flex()
                 .id(scroll_id)
@@ -556,13 +561,23 @@ impl Workspace {
                 .gap_1()
                 .overflow_y_scroll()
                 .children(
-                    self.layout_profiles
-                        .current()
-                        .shortcuts
-                        .iter()
-                        .filter(|s| s.placement == placement)
-                        .map(|s| self.shortcut_button(s.tool, placement, cx)),
+                    profile
+                        .rail_tools(placement, false)
+                        .map(|tool| self.shortcut_button(tool, placement, cx)),
                 ),
         )
+        .when(!footer.is_empty(), |rail| {
+            rail.child(
+                v_flex()
+                    .flex_none()
+                    .w_full()
+                    .items_center()
+                    .gap_1()
+                    .pt_1()
+                    .border_t_1()
+                    .border_color(ui::border())
+                    .children(footer),
+            )
+        })
     }
 }
