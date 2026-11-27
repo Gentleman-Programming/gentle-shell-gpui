@@ -4340,6 +4340,32 @@ fn opening_a_saved_session_loads_its_conversation(cx: &mut TestAppContext) {
     backend.stop(&view, cx);
 }
 
+/// The window's startup checks wait for a tab's backend to settle: not
+/// while it is only spawned, but once it answers; one that exited or failed
+/// to start counts too.
+#[cfg(unix)]
+#[gpui::test]
+fn a_backend_settles_once_it_answers_or_ends(cx: &mut TestAppContext) {
+    let (view, cx) = tab(cx);
+    let settled = |cx: &mut VisualTestContext| view.read_with(cx, |view, _| view.backend_settled());
+    assert!(!settled(cx), "not started");
+    let backend = Backend::start(&view, cx);
+    assert!(!settled(cx), "spawned, not answered");
+    view.update(cx, |view, cx| view.refresh_state(cx));
+    backend.settle(&view, cx, |read| {
+        read.iter().any(|command| command == "get_available_models")
+    });
+    assert!(settled(cx));
+    backend.stop(&view, cx);
+    assert!(settled(cx), "exited");
+
+    view.update(cx, |view, _| {
+        view.models.loaded = false;
+        view.backend.status = super::state::BackendStatus::Failed("not found".into());
+    });
+    assert!(settled(cx), "failed to start");
+}
+
 /// The conversation a notice is tied to: ⌘N and opening another session
 /// replace it as soon as they are asked (the new session's startup notices
 /// arrive before the answer); resuming the one shown (a restart) keeps it.
