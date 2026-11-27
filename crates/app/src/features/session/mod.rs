@@ -477,6 +477,17 @@ impl SessionView {
         self.transcript.running
     }
 
+    /// The backend answered (its model list came back), or it isn't coming
+    /// up: it failed to start or exited. The window holds its startup checks
+    /// until one tab's is, so they don't compete with that boot.
+    pub fn backend_settled(&self) -> bool {
+        match self.backend.status {
+            state::BackendStatus::Starting => false,
+            state::BackendStatus::Ready(_) => self.models.loaded,
+            state::BackendStatus::Failed(_) | state::BackendStatus::Exited(_) => true,
+        }
+    }
+
     /// Something was said here, a turn is running or a saved conversation
     /// is about to be resumed: moving this agent to another folder loses it.
     pub fn has_conversation(&self) -> bool {

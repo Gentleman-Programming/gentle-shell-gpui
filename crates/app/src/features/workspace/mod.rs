@@ -669,6 +669,26 @@ impl Workspace {
             this.open_welcome(None, window, cx);
         } else {
             cx.spawn_in(window, async move |this, cx| {
+                // Not while the first agent's backend boots: on a cold disk the
+                // checks (`gentle-shell --version` is another Node start) slow
+                // it down. They run once a tab's backend answers or fails, or
+                // after `WAIT`. Configuration and onboarding opened earlier
+                // look at the machine themselves.
+                const WAIT: Duration = Duration::from_secs(10);
+                const POLL: Duration = Duration::from_millis(250);
+                for _ in 0..WAIT.as_millis() / POLL.as_millis() {
+                    let Ok(settled) = this.update(cx, |this, cx| {
+                        this.sessions()
+                            .iter()
+                            .any(|session| session.read(cx).backend_settled())
+                    }) else {
+                        return;
+                    };
+                    if settled {
+                        break;
+                    }
+                    cx.background_executor().timer(POLL).await;
+                }
                 let probe = cx.background_executor().spawn(async { Probe::run() }).await;
                 if !probe.needs_onboarding() {
                     return;

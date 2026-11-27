@@ -121,6 +121,8 @@ An app launched from Finder or a `.desktop` file inherits a minimal PATH, withou
 
 It is cached until `pi_rpc::forget_cached()`. Every child process that needs the user's tools must use `pi_rpc::child_path()` and be created with `pi_rpc::command` (on Windows it adds `CREATE_NO_WINDOW`).
 
+The startup health check (`setup::run_checks` via `onboarding::Probe::run`, which opens onboarding when something required is missing) waits until an agent tab's backend has answered or failed to start (`SessionView::backend_settled`), at most 10 s, so its `gentle-shell --version`, `node --version` and friends don't compete with the first restored tab's boot on a cold disk. Configuration and the onboarding screen opened before then run their own checks.
+
 ## Isolated testing
 
 Rule: **never** test against the real app or data. Do not send keystrokes or clicks to an app the user has open, and do not edit their `workspaces.json`/`settings.json`.
