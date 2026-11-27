@@ -104,7 +104,7 @@ impl Workspace {
                 &self.files_sidebar_motion,
             ),
         };
-        let fraction = if matches!(side, Side::Files) && self.sidebar.is_none() {
+        let fraction = if matches!(side, Side::Files) && self.right_sidebar_view().is_none() {
             0.
         } else {
             motion.fraction(open, now)

@@ -54,7 +54,11 @@ impl Workspace {
         .top_0()
         .bottom_0()
         .when(matches!(side, Side::Tabs), |d| d.right(rems(-6. / 16.)))
-        .when(matches!(side, Side::Files), |d| d.left(rems(-6. / 16.)))
+        // Keep the right handle inside its panel's bounds. Cached dock
+        // views and adjacent panes must not mask an out-of-bounds hit area.
+        .when(matches!(side, Side::Files), |d| {
+            d.left_0().w(rems(10. / 16.)).occlude()
+        })
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
         .on_drag(
             SidebarDrag::new(side, cx.entity_id(), revision),
@@ -106,7 +110,7 @@ impl Workspace {
                 self.navigation_visible(),
                 self.tabs_sidebar_motion.revision,
             ),
-            Side::Files if self.sidebar.is_some() => (
+            Side::Files if self.right_sidebar_view().is_some() => (
                 event.bounds.right() - x,
                 self.sidebar_visible,
                 self.files_sidebar_motion.revision,
@@ -176,6 +180,7 @@ impl Render for Workspace {
             tab.state.set_focused(inside);
         }
         let has_files_sidebar = self.sidebar.is_some();
+        let has_right_panel = self.right_sidebar_view().is_some();
         let profile = self.layout_profiles.current();
         let tabs_visible = profile.tabs_visible;
         let vertical_tabs = self.tab_layout == TabLayout::Vertical;
@@ -201,7 +206,7 @@ impl Render for Workspace {
         let now = std::time::Instant::now();
         let tabs_moving = self.tabs_sidebar_motion.advance(now, cx.reduce_motion());
         let files_moving = self.files_sidebar_motion.advance(now, cx.reduce_motion());
-        if tabs_moving || (files_moving && has_files_sidebar) {
+        if tabs_moving || (files_moving && has_right_panel) {
             ui::request_animation_frame(window);
         }
         let (tabs_width, tabs_gap) =
@@ -565,6 +570,7 @@ impl Render for Workspace {
                         row.child(
                             div()
                                 .id("files-sidebar-panel")
+                                .debug_selector(|| "files-sidebar-panel".into())
                                 .w(rems(files_width / 16.))
                                 .ml(rems((files_gap - 6.) / 16.))
                                 .flex_none()

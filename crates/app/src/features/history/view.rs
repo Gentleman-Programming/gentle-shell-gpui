@@ -36,9 +36,10 @@ const SHA_WIDTH: f32 = 60.;
 /// its body scrolls past that.
 const DETAIL_SHARE: f32 = 0.45;
 /// Below these pane widths the row drops the author's name and the SHA,
-/// then the author and the ref chips; the toolbar drops its labels.
+/// then the ref chips; the avatar stays visible. The toolbar drops its labels.
+/// Medium must fit inside the resizable sidebar (maximum 480 at 100%).
 const WIDE: f32 = 640.;
-const MEDIUM: f32 = 460.;
+const MEDIUM: f32 = 360.;
 
 /// The activity strip's day cells (px): the gap between them, their size
 /// range (they grow with the pane up to the max, and a narrower pane shows
@@ -896,7 +897,7 @@ impl HistoryView {
                     .child(
                         div()
                             .flex_1()
-                            .min_w(rems(96. / 16.))
+                            .min_w_0()
                             .truncate()
                             .text_sm()
                             .text_color(if graph_row.mainline || filtering {
@@ -907,30 +908,28 @@ impl HistoryView {
                             .child(commit.subject.clone()),
                     ),
             )
-            .when(fit > Fit::Narrow, |d| {
-                d.child(
-                    h_flex()
-                        .flex_none()
-                        .when(fit == Fit::Wide, |d| d.w(rems(AUTHOR_WIDTH / 16.)))
-                        .gap_2()
-                        .child(avatar(
-                            &commit.author,
-                            super::avatars::picture(&commit.email, cx),
-                            !commit.coauthors.is_empty(),
-                            18.,
-                        ))
-                        .when(fit == Fit::Wide, |d| {
-                            d.child(
-                                div()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_xs()
-                                    .text_color(ui::muted())
-                                    .child(commit.author.clone()),
-                            )
-                        }),
-                )
-            })
+            .child(
+                h_flex()
+                    .flex_none()
+                    .when(fit == Fit::Wide, |d| d.w(rems(AUTHOR_WIDTH / 16.)))
+                    .gap_1()
+                    .child(avatar(
+                        &commit.author,
+                        super::avatars::picture(&commit.email, cx),
+                        !commit.coauthors.is_empty(),
+                        18.,
+                    ))
+                    .when(fit == Fit::Wide, |d| {
+                        d.child(
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .text_xs()
+                                .text_color(ui::muted())
+                                .child(commit.author.clone()),
+                        )
+                    }),
+            )
             .child(
                 div()
                     .flex_none()
