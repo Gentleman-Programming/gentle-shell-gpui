@@ -54,6 +54,11 @@ use transcript_list::{GroupRow, HeaderKey, Prepared, Row, Tail};
 /// How long a finished answer's petal line takes to draw back and fade.
 const ANSWER_FADE: Duration = Duration::from_millis(500);
 
+#[cfg(test)]
+thread_local! {
+    pub(super) static SEGMENT_PLANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 // Keys into `SessionView::expanded`: one per foldable region.
 const OUTPUT: usize = 0;
 const INPUT: usize = 1;
@@ -211,7 +216,9 @@ impl SessionView {
         let dirty = self.transcript.take_dirty();
         if let Some(dirty) = dirty {
             if dirty.reset {
+                self.segment_plans.get_mut().clear();
                 self.markdown.clear();
+                self.expanded_code.clear();
                 self.list.forget_items();
                 // Keyed by item index: they would time or fade other items.
                 self.live.tools.clear();
@@ -223,6 +230,7 @@ impl SessionView {
                 self.live.skills.clear();
             }
             let from = dirty.from.min(self.transcript.items.len());
+            self.segment_plans.get_mut().retain(|&(ix, _), _| ix < from);
             self.sync_markdown(from, cx);
             self.track_live(from);
             self.list.prepare(&self.transcript.items, from);
@@ -387,6 +395,7 @@ impl SessionView {
         state: &Entity<TextViewState>,
         text: &str,
         id: impl Into<ElementId>,
+        segment_key: (usize, usize),
         cx: &Context<Self>,
     ) -> Div {
         let diagrams = self.diagrams.clone();
@@ -395,23 +404,229 @@ impl SessionView {
         } else {
             0
         };
-        v_flex()
-            .gap_2()
-            .child(
-                TextView::new(state)
+        // Mermaid's displayed text can differ from its source. Keep the whole
+        // native view in that case rather than applying source offsets to it.
+        let plan = if has_mermaid(text) {
+            gentle_core::markdown::MarkdownPlan::Native
+        } else {
+            let mut plans = self.segment_plans.borrow_mut();
+            let entry = plans.entry(segment_key).or_insert_with(|| {
+                #[cfg(test)]
+                SEGMENT_PLANS.with(|count| count.set(count.get() + 1));
+                (text.to_owned(), gentle_core::markdown::segment_source(text))
+            });
+            if entry.0 != text {
+                #[cfg(test)]
+                SEGMENT_PLANS.with(|count| count.set(count.get() + 1));
+                *entry = (text.to_owned(), gentle_core::markdown::segment_source(text));
+            }
+            entry.1.clone()
+        };
+        let mut column = v_flex().gap_2();
+        match plan {
+            gentle_core::markdown::MarkdownPlan::Segmented(segments)
+                if segments
+                    .iter()
+                    .any(|s| s.kind == gentle_core::markdown::SegmentKind::Code) =>
+            {
+                for segment in segments {
+                    let code = segment.kind == gentle_core::markdown::SegmentKind::Code;
+                    let key = (segment_key.0, segment_key.1, segment.range.start);
+                    let block = if code {
+                        use gpui_kit::base::text::editor_host::{BlockNode, parse_markdown};
+                        parse_markdown(&text[segment.range.clone()], Arc::default())
+                            .ok()
+                            .and_then(|nodes| {
+                                nodes.into_iter().find_map(|node| match node {
+                                    BlockNode::CodeBlock(block) => Some(block),
+                                    _ => None,
+                                })
+                            })
+                    } else {
+                        None
+                    };
+                    let open = self.expanded_code.contains(&key);
+                    let preview = block
+                        .as_ref()
+                        .and_then(|block| code_preview(&block.code(), block.lang().as_deref()));
+                    let source = if !open {
+                        preview.as_ref().map(|(source, _)| source.clone())
+                    } else {
+                        None
+                    }
+                    .unwrap_or_else(|| text[segment.range.clone()].to_string());
+                    let diagrams = diagrams.clone();
+                    let view = TextView::markdown(
+                        SharedString::from(format!(
+                            "answer-segment-{}-{}-{}-{}",
+                            segment_key.0, segment_key.1, segment.range.start, open
+                        )),
+                        source,
+                    )
                     .selectable(true)
                     .style(ui::prose_style())
                     .list_style(ui::prose_list_style())
-                    .code_block_actions(|block, _, cx| code_block_header(block, cx))
                     .image_source(move |uri| {
                         diagrams.image(uri).unwrap_or_else(|| uri.clone().into())
                     })
                     .plugin(paths::AnswerPaths {
                         lookup: self.paths.clone(),
                         view: cx.entity().downgrade(),
-                    }),
-            )
-            .children(crate::features::files::mermaid_banner(blocks, id, cx))
+                    });
+                    column = if code {
+                        if let Some(block) = block {
+                            column.child(
+                                div()
+                                    .id(SharedString::from(format!(
+                                        "answer-code-card-{}-{}-{}",
+                                        segment_key.0, segment_key.1, segment.range.start
+                                    )))
+                                    .w_full()
+                                    .min_w_0()
+                                    .rounded_lg()
+                                    .border_1()
+                                    .border_color(ui::border())
+                                    .p(rems(10. / 16.))
+                                    .bg(ui::surface())
+                                    .child(code_block_header(&block, cx))
+                                    .child(
+                                        div()
+                                            .debug_selector(move || {
+                                                format!(
+                                                    "answer-code-body-{}-{}-{}",
+                                                    key.0, key.1, key.2
+                                                )
+                                            })
+                                            .child(
+                                                view.style(
+                                                    ui::prose_style().code_block(
+                                                        StyleRefinement::default()
+                                                            .rounded_md()
+                                                            .bg(ui::well())
+                                                            .border_1()
+                                                            .border_color(ui::border())
+                                                            .pt(rems(14. / 16.))
+                                                            .line_height(relative(1.7)),
+                                                    ),
+                                                )
+                                                .code_block_actions(|_, _, _| div()),
+                                            ),
+                                    )
+                                    .when_some(preview, |card, (_, count)| {
+                                        let count_label = if open {
+                                            format!("{count} lines")
+                                        } else {
+                                            format!("12 of {count} lines")
+                                        };
+                                        let count_selector = format!(
+                                            "answer-code-count-{}-{}-{}-{}",
+                                            key.0,
+                                            key.1,
+                                            key.2,
+                                            count_label.replace(' ', "-")
+                                        );
+                                        let selector = format!(
+                                            "answer-code-{}-{}-{}-{}",
+                                            if open { "collapse" } else { "expand" },
+                                            key.0,
+                                            key.1,
+                                            key.2
+                                        );
+                                        let label = if open { "Show less" } else { "Show more" };
+                                        let tip = if open {
+                                            "Click to collapse"
+                                        } else {
+                                            "Click to expand"
+                                        };
+                                        card.child(
+                                            h_flex()
+                                                .w_full()
+                                                .justify_between()
+                                                .pt_2()
+                                                .text_size(rems(12. / 16.))
+                                                .text_color(ui::muted())
+                                                .child(
+                                                    h_flex()
+                                                        .id(SharedString::from(selector.clone()))
+                                                        .debug_selector(move || selector.clone())
+                                                        .cursor_pointer()
+                                                        .gap_1()
+                                                        .hover(|s| s.text_color(ui::fg()))
+                                                        .tooltip(move |window, cx| {
+                                                            ui::tooltip(tip).build(window, cx)
+                                                        })
+                                                        .child(
+                                                            Icon::new(if open {
+                                                                IconName::ChevronUp
+                                                            } else {
+                                                                IconName::ChevronDown
+                                                            })
+                                                            .xsmall(),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .debug_selector(move || {
+                                                                    format!(
+                                                                        "answer-code-label-{label}"
+                                                                    )
+                                                                })
+                                                                .child(label),
+                                                        )
+                                                        .on_click(cx.listener(
+                                                            move |this, _, _, cx| {
+                                                                if !this.expanded_code.remove(&key)
+                                                                {
+                                                                    this.expanded_code.insert(key);
+                                                                }
+                                                                this.list.remeasure_items(
+                                                                    key.0..key.0 + 1,
+                                                                );
+                                                                cx.notify();
+                                                            },
+                                                        )),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .debug_selector(move || {
+                                                            count_selector.clone()
+                                                        })
+                                                        .child(count_label),
+                                                ),
+                                        )
+                                    }),
+                            )
+                        } else {
+                            column.child(
+                                view.code_block_actions(|block, _, cx| {
+                                    native_code_header(block, cx)
+                                }),
+                            )
+                        }
+                    } else {
+                        column.child(
+                            view.code_block_actions(|block, _, cx| native_code_header(block, cx)),
+                        )
+                    };
+                }
+            }
+            _ => {
+                column = column.child(
+                    TextView::new(state)
+                        .selectable(true)
+                        .style(ui::prose_style())
+                        .list_style(ui::prose_list_style())
+                        .code_block_actions(|block, _, cx| native_code_header(block, cx))
+                        .image_source(move |uri| {
+                            diagrams.image(uri).unwrap_or_else(|| uri.clone().into())
+                        })
+                        .plugin(paths::AnswerPaths {
+                            lookup: self.paths.clone(),
+                            view: cx.entity().downgrade(),
+                        }),
+                );
+            }
+        }
+        column.children(crate::features::files::mermaid_banner(blocks, id, cx))
     }
 
     /// Record start/end instants of live items `from..`.
@@ -923,6 +1138,7 @@ impl SessionView {
                                             state,
                                             text,
                                             ("mermaid-install", ix * 64 + block_ix),
+                                            (ix, block_ix),
                                             cx,
                                         )),
                                 );
@@ -3196,10 +3412,8 @@ fn notice_card(level: NoticeLevel, text: &str) -> Div {
         )
 }
 
-/// Along the top of a fenced block in an answer, after Tern's: its
-/// language, then Copy, which puts the code on the clipboard and says so.
-/// In the interface's font, not the code's.
-fn code_block_header(block: &gpui_kit::base::text::CodeBlock, cx: &App) -> Div {
+/// The original native header remains in nested blocks and fallback views.
+fn native_code_header(block: &gpui_kit::base::text::CodeBlock, cx: &App) -> Div {
     use gpui_kit::component::WindowExt as _;
     let code = block.code();
     h_flex()
@@ -3224,6 +3438,94 @@ fn code_block_header(block: &gpui_kit::base::text::CodeBlock, cx: &App) -> Div {
                         cx,
                     );
                 }),
+        )
+}
+
+/// A display-only Markdown block with the first twelve logical code lines and
+/// the total line count. The original parsed block remains the copy source.
+fn code_preview(code: &str, language: Option<&str>) -> Option<(String, usize)> {
+    const LIMIT: usize = 12;
+    // The Markdown parser removes the separator before the closing fence,
+    // so a remaining final newline represents a real trailing blank line.
+    let lines: Vec<_> = code
+        .split('\n')
+        .map(|line| line.strip_suffix('\r').unwrap_or(line))
+        .collect();
+    if lines.len() <= LIMIT {
+        return None;
+    }
+    // A tilde fence permits backticks in the language info. Choose one
+    // longer than any run in the content so it cannot close early.
+    let fence_len = code
+        .split(|c| c != '~')
+        .map(str::len)
+        .max()
+        .unwrap_or(0)
+        .max(2)
+        + 1;
+    let fence = "~".repeat(fence_len);
+    Some((
+        format!(
+            "{fence} {}\n{}\n{fence}",
+            language.unwrap_or(""),
+            lines[..LIMIT].join("\n")
+        ),
+        lines.len(),
+    ))
+}
+
+/// Along the top of a fenced block in an answer, after Tern's: its
+/// language, then Copy, which puts the code on the clipboard and says so.
+/// In the interface's font, not the code's.
+fn code_block_header(block: &gpui_kit::base::text::CodeBlock, cx: &App) -> Div {
+    use gpui_kit::component::WindowExt as _;
+    let code = block.code();
+    let language = block.lang().filter(|lang| !lang.is_empty()).map(|lang| {
+        let mut chars = lang.chars();
+        chars.next().unwrap().to_uppercase().collect::<String>() + chars.as_str()
+    });
+    h_flex()
+        .w_full()
+        .justify_between()
+        .items_center()
+        .gap_3()
+        .pl(rems(6. / 16.))
+        .pr(rems(4. / 16.))
+        .pb(rems(8. / 16.))
+        .font_family(cx.theme().font_family.clone())
+        .text_size(rems(12. / 16.))
+        .text_color(ui::muted())
+        .child(
+            div()
+                .id("code-language")
+                .debug_selector(|| "code-language".into())
+                .rounded_full()
+                .border_1()
+                .border_color(ui::border())
+                .px(rems(11. / 16.))
+                .py(rems(3. / 16.))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(ui::fg())
+                .bg(ui::surface_hover())
+                .children(language),
+        )
+        .child(
+            div().debug_selector(|| "copy-code".into()).child(
+                Button::new("copy-code")
+                    .ghost()
+                    .xsmall()
+                    .icon(Icon::new(IconName::Copy))
+                    .tooltip("Copy")
+                    .on_click(move |_, window, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(code.to_string()));
+                        window.push_notification(
+                            gpui_kit::component::notification::Notification::success(
+                                "Copied to the clipboard.",
+                            ),
+                            cx,
+                        );
+                    }),
+            ),
         )
 }
 

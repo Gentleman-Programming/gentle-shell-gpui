@@ -6,8 +6,10 @@
 use std::ops::Range;
 
 pub mod paths;
+mod segmentation;
 mod sent;
 
+pub use segmentation::{MarkdownPlan, MarkdownSegment, SegmentKind, segment_source};
 pub use sent::{sent_message, trim_folded};
 
 /// A fenced ` ```mermaid ` block.
