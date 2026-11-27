@@ -37,6 +37,23 @@ pub(super) struct Backend {
     pub(super) pending_session: Option<PathBuf>,
     /// A new Gentle Shell was installed mid-turn: restart on it once idle.
     pub(super) restart_pending: bool,
+    /// The resumed conversation, read from its session file while the
+    /// backend starts.
+    pub(super) preload: Preload,
+}
+
+/// Where the conversation a starting tab resumes stands, read from its
+/// session file ([`super::SessionView::preload_session`]) so it shows
+/// before the backend answers `get_messages`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Preload {
+    /// Nothing to read, or the backend's own answer came.
+    Off,
+    /// The file is being read; it shows when read unless `get_messages`
+    /// answered first.
+    Reading,
+    /// The transcript holds the file's conversation, not the backend's yet.
+    Shown,
 }
 
 impl Backend {
@@ -49,6 +66,7 @@ impl Backend {
             pending_prompt: prompt,
             pending_session: None,
             restart_pending: false,
+            preload: Preload::Off,
         }
     }
 

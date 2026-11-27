@@ -13,8 +13,8 @@ use pi_rpc::PiProcess;
 use pi_rpc::desktop_rpc::DesktopMethod;
 
 use super::SessionView;
-use super::state::BackendStatus;
 use super::state::desktop::permission::Report;
+use super::state::{BackendStatus, Preload};
 use super::view;
 use super::{ReadFailure, ReadOutcome, ReadRequest, ReadSupport};
 use gentle_core::transcript::{NoticeLevel, Transcript};
@@ -139,7 +139,9 @@ impl SessionView {
     pub fn retry_start(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let never_ran = match &self.backend.status {
             BackendStatus::Failed(_) => true,
-            BackendStatus::Exited(_) => self.transcript.items.is_empty(),
+            BackendStatus::Exited(_) => {
+                self.transcript.items.is_empty() || self.backend.preload == Preload::Shown
+            }
             BackendStatus::Starting | BackendStatus::Ready(_) => false,
         };
         if self.backend.started && never_ran {
@@ -355,6 +357,13 @@ impl SessionView {
         // one starts in Normal.
         let resume = self.backend.pending_session.take();
         let launched = resume.clone();
+        match &resume {
+            Some(path) => self.preload_session(path.clone(), cx),
+            None => {
+                self.backend.preload = Preload::Off;
+                self._preload = Task::ready(());
+            }
+        }
         // Agent UI: the extension loads in the app's mode (a change made
         // while it starts is sent once it is ready).
         let genui_mode = crate::features::genui::mode::mode(cx);
@@ -470,6 +479,43 @@ impl SessionView {
         cx.notify();
     }
 
+    /// Show the conversation `path` resumes to while the backend starts:
+    /// the session file is read off the UI thread and goes through the same
+    /// `load_messages` as the backend's `get_messages` answer, which then
+    /// replaces it. A start begun meanwhile drops the read (the task goes);
+    /// a missing, unreadable or oversized file leaves the tab as it was.
+    pub(super) fn preload_session(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.backend.preload = Preload::Reading;
+        self._preload = cx.spawn(async move |this, cx| {
+            let read = cx
+                .background_executor()
+                .spawn(async move { crate::features::sessions::resumed_messages(&path) });
+            let Some(messages) = read.await else {
+                return;
+            };
+            let _ = this.update(cx, |this, cx| this.show_preloaded(&messages, cx));
+        });
+    }
+
+    /// The file's conversation, read: shown unless the backend answered
+    /// `get_messages` first, or the tab already shows something (a notice)
+    /// that loading it would wipe.
+    pub(super) fn show_preloaded(
+        &mut self,
+        messages: &[serde_json::Value],
+        cx: &mut Context<Self>,
+    ) {
+        if self.backend.preload != Preload::Reading
+            || !self.transcript.items.is_empty()
+            || messages.is_empty()
+        {
+            return;
+        }
+        self.apply_messages(messages);
+        self.backend.preload = Preload::Shown;
+        cx.notify();
+    }
+
     /// Switch to `path` as soon as the backend is ready.
     pub fn resume_when_ready(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         if self.process().is_some() {
@@ -482,6 +528,7 @@ impl SessionView {
     /// Forget the conversation shown, for another one on the same backend.
     pub(super) fn reset_conversation(&mut self) {
         self.transcript = Transcript::default();
+        self.backend.preload = Preload::Off;
         self.markdown.clear();
         self.expanded.clear();
         self.todo.apply(Vec::new());

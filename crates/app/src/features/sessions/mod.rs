@@ -18,9 +18,10 @@
 //! folder; Gentle Shell's listing names projects, not folders, so that one
 //! file is found by its id.
 
-use std::path::PathBuf;
+use std::io::Read as _;
+use std::path::{Path, PathBuf};
 
-use gentle_core::sessions::SessionSummary;
+use gentle_core::sessions::{MAX_SCAN_BYTES, SessionSummary};
 use gpui_kit::component::input::InputState;
 use gpui_kit::*;
 use pi_rpc::desktop_rpc::{SessionEntry, SessionsScope};
@@ -33,6 +34,25 @@ mod summary;
 #[cfg(test)]
 mod tests;
 mod view;
+
+/// The conversation the session file at `path` resumes to, read from the
+/// file alone ([`gentle_core::sessions::branch`]), for a restored tab to
+/// show while its backend starts. `None` for a missing or unreadable file,
+/// one that isn't a current session, and one past [`MAX_SCAN_BYTES`] (the
+/// backend's own answer shows that one).
+pub fn resumed_messages(path: &Path) -> Option<Vec<serde_json::Value>> {
+    let file = std::fs::File::open(path).ok()?;
+    if file.metadata().ok()?.len() > MAX_SCAN_BYTES {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    // Still bounded if the file grows while it is read.
+    file.take(MAX_SCAN_BYTES + 1).read_to_end(&mut bytes).ok()?;
+    if bytes.len() as u64 > MAX_SCAN_BYTES {
+        return None;
+    }
+    gentle_core::sessions::branch::messages(&String::from_utf8_lossy(&bytes))
+}
 
 pub enum SessionsEvent {
     /// Resume `path`. When `cwd` is the tab's cwd send RPC

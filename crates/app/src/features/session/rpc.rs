@@ -20,7 +20,7 @@ use super::state::desktop::review::Applied as ReviewApplied;
 use super::state::desktop::subscription::Applied as SubscriptionApplied;
 use super::state::desktop::supervision::Applied as SupervisionApplied;
 use super::state::desktop::{self, Applied as DesktopApplied, Send as DesktopSend};
-use super::state::{BackendStatus, ModelInfo};
+use super::state::{BackendStatus, ModelInfo, Preload};
 use super::{SessionEvent, SessionView, attachments, builtins};
 use crate::features::profiles::{
     ConfigChange, ConfigFailure, ConfigOutcome, ConfigSupport, ConfigTicket, ProfileApply,
@@ -822,9 +822,16 @@ impl SessionView {
         self.refresh_thinking_levels(cx);
         self.refresh_commands(cx);
         self.request(json!({"type": "get_messages"}), cx, |this, result, _| {
+            // The backend's answer is the conversation: a read of the session
+            // file still on its way stays out, and one shown is replaced.
+            let shown = std::mem::replace(&mut this.backend.preload, Preload::Off);
             if let Some(data) = this.report(result)
                 && let Some(messages) = data["messages"].as_array()
             {
+                if messages.is_empty() && shown == Preload::Shown {
+                    // Not the file's conversation after all.
+                    this.transcript.load_messages(&[]);
+                }
                 this.apply_messages(messages);
             }
         });

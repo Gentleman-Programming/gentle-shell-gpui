@@ -204,6 +204,7 @@ When stdout closes, pending requests are flushed (their callers get the error "g
 ### Tab lifecycle (`features/session/lifecycle.rs`)
 
 - `start` clears the tab state, resolves the `LaunchSpec` on the background executor, appends `--session <path>` if there is a conversation to resume (`backend.pending_session`), queries the version and calls `PiProcess::spawn`. Then `refresh_state`, the pending prompt (`-p`), and a loop that batches queued `Incoming` items (`drain_queued`) and applies them with `handle_batch` in a single update.
+- A conversation to resume shows before the backend is up: `start` calls `preload_session`, which reads the session file off the UI thread (`sessions::resumed_messages`, see Session files) and loads it with the same `apply_messages` → `Transcript::load_messages` as the backend's answer (`backend.preload`: `Reading`, then `Shown`). The welcome banner gives way to it and the "Starting gentle-shell…" line stays above it; the composer keeps what is typed and its send stays disabled until the backend is ready. The `get_messages` answer replaces it (an empty answer clears it) and turns the preload `Off`, so a read landing after that answer, after a switch or new session (`reset_conversation`) or after another start (the task is dropped) shows nothing. A missing, unreadable, older-format or oversized file leaves the banner until the answer, as before.
 - Resuming happens at startup (`--session`), not with `switch_session` afterwards: Gentle Shell treats the startup session as new and starts it in the saved permission mode; a switched session starts in Normal.
 - `restart_when_idle` / `backend.restart_pending`: restarts in the middle of a turn (or with a dialog open) wait for it to finish. Used by `reload` (`/reload`), `reload_models` (packages, the Claude bridge's plan, and a sign-in on a Shell without `reload_credentials`), `restart_for_update` (after `gentle-shell upgrade`) and `choose_mode` (permission change).
 - `reload_credentials` (after a sign-in saved in the Providers screen): when the tab advertises `reload_credentials`, the tab sends it (a screen read, `state::desktop::reads`) instead of restarting: Gentle Shell refreshes its model registry offline, mid-turn too, and the tab re-reads `get_available_models`. An answer other than `reloaded: true, aborted: false` (a refusal, `reload_failed`, `auth_unavailable`, a timeout) falls back to `reload_models`; a backend replaced meanwhile read the credentials when it started.
@@ -411,11 +412,12 @@ Custom message cards (`gentle-agents.result`, `gentle-agents.message`, `gentle-j
 
 ### Session files
 
-Gentle Shell writes them. The app only reads them, and only where the active agent tab's Shell does not answer instead (Screen reads):
+Gentle Shell writes them. The app only reads them: where the active agent tab's Shell does not answer instead (Screen reads), and the one file a starting tab resumes:
 
 - `features/sessions/discovery.rs`: `settings.json` `sessionDir` (with `~` expanded) or `<agent>/sessions/<session_dir_name(cwd)>/*.jsonl`; `summary.rs` does a light cached scan. `find_session` finds one file by session id, so a session Gentle Shell listed for another project opens in a new tab rooted at its folder.
 - `features/usage/stats.rs`: local token and cost stats.
 - The active session path comes from `get_state.sessionFile` (re-read after either kind of switch); the window stores it in `workspaces.json` to resume with `--session`.
+- `features/sessions/mod.rs` (`resumed_messages`): while a tab's backend starts with `--session <file>`, the app reads that file (up to `MAX_SCAN_BYTES`, 16 MB) and rebuilds what `get_messages` will answer with `gentle_core::sessions::branch`, the way Pi's `SessionManager` does: the active branch runs from the file's last entry up its `parentId`s, the newest `compaction` stands for what it summarized (from `firstKeptEntryId`), each `context_edit` replaces or removes its target, and `message`, `custom_message`, `branch_summary` and `compaction` entries become messages; every other entry type and every malformed line is skipped. Files older than session version 3 are left to Pi, which migrates them.
 
 ## Devices: Android emulators and iOS simulators
 
