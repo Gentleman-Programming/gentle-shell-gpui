@@ -373,16 +373,23 @@ impl Workspace {
             )
     }
 
-    /// One title-bar button for the focused pane's layout: tile and split
-    /// (the menu takes arrow keys too). Closing lives on each pane.
+    /// One title-bar button for the focused pane's layout: tile, split and
+    /// close, each named with its shortcut (the menu takes arrow keys too).
     pub(super) fn render_layout_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let weak = cx.entity().downgrade();
+        let dismiss = weak.clone();
+        let target_id = self.focused_pane();
+        let target = target_id
+            .map(|id| self.pane_title(id))
+            .unwrap_or_default()
+            .trim_end_matches(" •")
+            .to_string();
         div()
             // Clicks here are not title-bar drags.
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .child(
                 title_button("title-layout", IconName::LayoutDashboard)
-                    .tooltip("Panes: tile or split the focused one")
+                    .tooltip("Panes: tile, split or close the focused one")
                     .dropdown_menu(move |menu, window, _| {
                         type Act = fn(&mut Workspace, &mut Window, &mut Context<Workspace>);
                         let entry = |icon: IconName,
@@ -395,6 +402,50 @@ impl Workspace {
                                 .on_click(move |_, window, cx| {
                                     let _ = weak.update(cx, |this, cx| act(this, window, cx));
                                 })
+                        };
+                        let close = {
+                            let weak = weak.clone();
+                            let target = target.clone();
+                            let hover = weak.clone();
+                            PopupMenuItem::element(move |_, _| {
+                                let hover = hover.clone();
+                                h_flex()
+                                    .id("layout-close-target")
+                                    .on_hover(move |hovered, _, cx| {
+                                        let _ = hover.update(cx, |this, cx| {
+                                            let next = if *hovered { target_id } else { None };
+                                            if this.close_hint != next {
+                                                this.close_hint = next;
+                                                cx.notify();
+                                            }
+                                        });
+                                    })
+                                    .gap_2p5()
+                                    .py_0p5()
+                                    .w_full()
+                                    .child(Icon::new(IconName::X).small().text_color(ui::danger()))
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .truncate()
+                                            .text_sm()
+                                            .child(format!("Close \u{201c}{target}\u{201d}")),
+                                    )
+                                    .child(ui::kbd(ui::platform_shortcut("⌘W", "Ctrl+W")))
+                            })
+                            .disabled(target_id.is_none())
+                            .on_click(move |_, window, cx| {
+                                let _ = weak.update(cx, |this, cx| {
+                                    this.close_hint = None;
+                                    cx.notify();
+                                    if let Some(id) = target_id
+                                        && this.tab().is_some_and(|tab| tab.state.contains(&id))
+                                    {
+                                        this.close_pane(id, window, cx);
+                                    }
+                                });
+                            })
                         };
                         menu.min_w(rems(280. / 16.).to_pixels(window.rem_size()))
                             .item(entry(
@@ -420,9 +471,18 @@ impl Workspace {
                                 ui::platform_shortcut("⌘⇧D", "Ctrl+Shift+E"),
                                 |this, window, cx| this.on_split_down(&SplitDown, window, cx),
                             ))
+                            .separator()
+                            .item(close)
                     })
-                    .on_open_change(|open, window, cx| {
-                        crate::features::browser::popover_open("title-layout", *open, window, cx)
+                    .on_open_change(move |open, window, cx| {
+                        crate::features::browser::popover_open("title-layout", *open, window, cx);
+                        if !*open {
+                            let _ = dismiss.update(cx, |this, cx| {
+                                if this.close_hint.take().is_some() {
+                                    cx.notify();
+                                }
+                            });
+                        }
                     }),
             )
     }
@@ -640,9 +700,8 @@ impl Workspace {
         let title = pane.title.clone();
         // The file viewer already has a close button in its own toolbar.
         let has_close_button = pane.item.kind != PaneKind::File;
-        // Agents have clear space in this corner. Other views may have text
-        // or controls there, so reserve a small strip rather than cover them.
-        let reserve_close_space = has_close_button && pane.item.kind != PaneKind::Agent;
+        // Keep the centered close control clear of the pane's content.
+        let reserve_close_space = has_close_button;
         let body = div()
             .id(("pane", id))
             .relative()
@@ -656,7 +715,9 @@ impl Workspace {
             // Panes read as glass on their own; only a split's focused pane gets
             // an edge. The width stays so focus changes don't shift content.
             .border_1()
-            .border_color(if focused {
+            .border_color(if self.close_hint == Some(id) {
+                ui::danger()
+            } else if focused {
                 ui::petal().opacity(0.45)
             } else {
                 gpui_kit::transparent_black()
@@ -728,13 +789,61 @@ impl Workspace {
                     .as_ref()
                     .map(|session| session.read(cx).live_layer()),
             )
+            .children(
+                self.drop_hint
+                    .filter(|(pane, _)| *pane == id && cx.has_active_drag())
+                    .map(|(_, zone)| drop_overlay(zone)),
+            );
+        // Keep the grip and close action together at the top edge, but
+        // give them separate hit targets so clicking X never starts a drag.
+        let controls = h_flex()
+            .absolute()
+            .top(rems(if tiled { -4. / 16. } else { 4. / 16. }))
+            .left_0()
+            .right_0()
+            .justify_center()
+            .items_center()
+            .gap_1()
+            .when(tiled, |d| {
+                d.child(
+                    div()
+                        .id(("pane-grip", id))
+                        .w(rems(34. / 16.))
+                        .h(rems(14. / 16.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_full()
+                        .bg(ui::surface())
+                        .border_1()
+                        .border_color(if focused {
+                            ui::petal().opacity(0.45)
+                        } else {
+                            ui::border()
+                        })
+                        .text_color(ui::faint())
+                        .cursor_grab()
+                        .when(!has_close_button && !focused, |d| {
+                            d.invisible().group_hover(
+                                SharedString::from(format!("pane-wrap-{id}")),
+                                |s| s.visible(),
+                            )
+                        })
+                        .hover(|s| s.text_color(ui::fg()).border_color(ui::border_strong()))
+                        .on_drag(
+                            PaneDrag {
+                                pane: id,
+                                title: title.clone(),
+                            },
+                            |drag, _, _, cx| cx.new(|_| DragChip(drag.title.clone())),
+                        )
+                        .child(Icon::new(IconName::GripHorizontal).xsmall()),
+                )
+            })
             .when(has_close_button, |d| {
                 d.child(
                     div()
                         .id(("close-pane", id))
-                        .absolute()
-                        .top(rems(4. / 16.))
-                        .right(rems(6. / 16.))
                         .size(rems(24. / 16.))
                         .flex()
                         .items_center()
@@ -753,55 +862,7 @@ impl Workspace {
                         }))
                         .child(Icon::new(IconName::X).small()),
                 )
-            })
-            .children(
-                self.drop_hint
-                    .filter(|(pane, _)| *pane == id && cx.has_active_drag())
-                    .map(|(_, zone)| drop_overlay(zone)),
-            );
-        // The grip: a pill straddling the pane's top edge (outside the
-        // clipped body); drag it onto another pane's edge to move the pane
-        // there, or onto its middle to swap the two.
-        let grip = h_flex()
-            .absolute()
-            // Inside the ~4 px gap under the title bar, not over the tabs.
-            .top(rems(-4. / 16.))
-            .left_0()
-            .right_0()
-            .justify_center()
-            .child(
-                div()
-                    .id(("pane-grip", id))
-                    .w(rems(34. / 16.))
-                    .h(rems(14. / 16.))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded_full()
-                    .bg(ui::surface())
-                    .border_1()
-                    .border_color(if focused {
-                        ui::petal().opacity(0.45)
-                    } else {
-                        ui::border()
-                    })
-                    .text_color(ui::faint())
-                    .cursor_grab()
-                    .invisible()
-                    .when(focused, |d| d.visible())
-                    .group_hover(SharedString::from(format!("pane-wrap-{id}")), |s| {
-                        s.visible()
-                    })
-                    .hover(|s| s.text_color(ui::fg()).border_color(ui::border_strong()))
-                    .on_drag(
-                        PaneDrag {
-                            pane: id,
-                            title: title.clone(),
-                        },
-                        |drag, _, _, cx| cx.new(|_| DragChip(drag.title.clone())),
-                    )
-                    .child(Icon::new(IconName::GripHorizontal).xsmall()),
-            );
+            });
         ui::appear(
             ("pane-in", id),
             div()
@@ -810,7 +871,7 @@ impl Workspace {
                 .flex()
                 .size_full()
                 .child(body)
-                .when(tiled, |d| d.child(grip)),
+                .when(tiled || has_close_button, |d| d.child(controls)),
         )
         .into_any_element()
     }

@@ -473,6 +473,8 @@ pub struct Workspace {
     /// While a pane is dragged: the pane under the pointer and where it would
     /// land there.
     drop_hint: Option<(PaneId, DropZone)>,
+    /// The pane targeted by the hovered Close entry in the layout menu.
+    close_hint: Option<PaneId>,
     /// Panes and tabs closed, most recent last, to reopen.
     closed: Vec<closed::Closed>,
     /// gentle-stream, behind the title bar's ♪ button.
@@ -600,6 +602,7 @@ impl Workspace {
             browser_dock_room: Default::default(),
             resume_welcome: None,
             drop_hint: None,
+            close_hint: None,
             closed: Vec::new(),
             music,
             devices,
