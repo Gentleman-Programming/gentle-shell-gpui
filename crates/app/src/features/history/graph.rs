@@ -2,7 +2,10 @@
 //! joins as curves, and the node. Paint-only, no input.
 
 use gentle_core::git::log::{Edge, GraphRow};
-use gpui_kit::*;
+use gpui_kit::{
+    BorderStyle, Bounds, Hsla, IntoElement, PathBuilder, Pixels, Point, Styled as _, Window,
+    canvas, point, px, quad, size, transparent_black,
+};
 
 use crate::shared::ui;
 
@@ -247,7 +250,6 @@ fn circle(
 
 #[cfg(test)]
 mod tests {
-    // Do not import GPUI's `test` attribute into these pure geometry tests.
     use super::{LaneLayout, PAD};
 
     #[test]
