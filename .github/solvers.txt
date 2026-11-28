@@ -1,0 +1,7 @@
+# Who can merge a pull request with `/solve` (CONTRIBUTING.md): one GitHub login
+# per line. Don't edit this file by hand or in a pull request: a PR that changes
+# it is closed. The owners of `/.github/` in CODEOWNERS change it with
+# Actions → Solvers → Run workflow.
+javijec
+josuerodcat90
+Mayloparra24
