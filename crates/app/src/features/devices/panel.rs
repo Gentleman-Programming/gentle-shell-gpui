@@ -124,6 +124,10 @@ impl DevicePanel {
         self.requested_at
     }
 
+    pub(crate) fn responsive_floating(&self) -> bool {
+        self.responsive_floating
+    }
+
     pub(crate) fn responsive_suspended(&self) -> bool {
         self.responsive_suspended
     }
@@ -133,9 +137,14 @@ impl DevicePanel {
         &mut self,
         floating: bool,
         suspended: bool,
+        area: (f32, f32, f32),
         cx: &mut Context<Self>,
     ) {
-        if self.responsive_floating != floating || self.responsive_suspended != suspended {
+        let area_changed = floating && self.card.set_area(area);
+        if area_changed
+            || self.responsive_floating != floating
+            || self.responsive_suspended != suspended
+        {
             self.responsive_floating = floating;
             self.responsive_suspended = suspended;
             cx.notify();
@@ -145,6 +154,10 @@ impl DevicePanel {
     pub fn show(&mut self, cx: &mut Context<Self>) {
         self.requested_at = Instant::now();
         if self.visible {
+            if self.slide.is_some_and(|(_, opening)| !opening) {
+                self.slide = None;
+                self.apply_cover(cx);
+            }
             cx.emit(DevicePanelEvent::Layout);
             cx.notify();
             return;

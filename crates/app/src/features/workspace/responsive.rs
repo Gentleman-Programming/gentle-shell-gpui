@@ -93,6 +93,7 @@ pub(super) struct DockRequest {
 #[derive(Clone, Copy, Debug, Default)]
 pub(super) struct DockRequests {
     pub(super) right_at: Option<Instant>,
+    pub(super) manual_float_at: Option<Instant>,
     pub(super) browser: DockRequest,
     pub(super) devices: DockRequest,
 }
@@ -145,7 +146,7 @@ pub(super) fn coexist(
     let mut browser_docked = false;
     let mut devices_docked = false;
     let mut overlay = None;
-    for (kind, minimum, _) in order {
+    for (kind, minimum, requested_at) in order {
         let requested = match kind {
             Auxiliary::Right => files.0 > 0.,
             Auxiliary::Browser => requests.browser.width > 0.,
@@ -161,8 +162,12 @@ pub(super) fn coexist(
                 Auxiliary::Browser => browser_docked = true,
                 Auxiliary::Devices => devices_docked = true,
             }
-        } else if first {
+        } else if first && requests.manual_float_at <= requested_at {
+            // Do not paint another auxiliary behind an overlay whose native
+            // view could otherwise obscure it. A later explicit floating
+            // request takes precedence over the automatic fallback.
             overlay = Some(kind);
+            break;
         }
         first = false;
     }
@@ -292,6 +297,7 @@ mod tests {
         let later = now + std::time::Duration::from_secs(1);
         DockRequests {
             right_at: Some(if newest == Auxiliary::Right { later } else { now }),
+            manual_float_at: None,
             browser: DockRequest {
                 width: 420.,
                 minimum: 320.,
@@ -338,6 +344,34 @@ mod tests {
             assert_eq!(a.browser_width, 0.);
             assert!(!a.devices_docked);
         }
+    }
+
+    #[test]
+    fn newest_overlay_does_not_leave_an_older_dock_underneath() {
+        let a = coexist(
+            950.,
+            1,
+            (48., ROW_GAP),
+            (260., ROW_GAP),
+            true,
+            competing_requests(Auxiliary::Devices),
+        );
+        assert_eq!(a.overlay, Some(Auxiliary::Devices));
+        assert_eq!(a.layout.files.0, 0.);
+        assert_eq!(a.browser_width, 0.);
+    }
+
+    #[test]
+    fn explicit_floating_request_takes_precedence_over_automatic_overlay() {
+        let mut requests = competing_requests(Auxiliary::Devices);
+        requests.manual_float_at = requests
+            .devices
+            .requested_at
+            .map(|at| at + std::time::Duration::from_secs(1));
+        let a = coexist(700., 1, (48., ROW_GAP), (260., ROW_GAP), true, requests);
+        assert_eq!(a.overlay, None);
+        assert_eq!(a.layout.files.0, 0.);
+        assert!(!a.devices_docked);
     }
 
     #[test]

@@ -87,6 +87,7 @@ impl Workspace {
             self.sidebar_compact,
             responsive::DockRequests {
                 right_at: self.files_sidebar_motion.requested_at,
+                manual_float_at: self.latest_manual_float(cx),
                 browser: self.browser_dock_request(window * scale, scale, cx),
                 devices: device_request,
             },

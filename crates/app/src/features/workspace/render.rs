@@ -238,21 +238,28 @@ impl Render for Workspace {
             };
         self.files_sidebar_motion.suspended =
             self.sidebar_visible && files_width == 0. && !right_overlay;
-        self.apply_responsive_docks(plan, cx);
+        let rail_width = responsive::ROW_GAP + right_sidebar::ACTIVITY_BAR_WIDTH;
+        let floating_left = responsive::ROW_GAP
+            + if left_rail { rail_width } else { 0. }
+            + tabs_width
+            + tabs_gap;
+        let floating_right = responsive::ROW_GAP + if right_rail { rail_width } else { 0. };
+        let floating_width = (window_px_at_100 - floating_left - floating_right).max(0.);
+        self.apply_responsive_docks(
+            plan,
+            (
+                floating_width * scale,
+                f32::from(window.viewport_size().height),
+                TITLE_BAR_HEIGHT * scale,
+            ),
+            cx,
+        );
         let automatic_compact = geometry.compact && !self.sidebar_compact;
         let tabs_resizing = self.sidebar_drag_active(Side::Tabs, cx);
         let files_resizing = self.sidebar_drag_active(Side::Files, cx);
         let files_sidebar = self.right_sidebar_view().filter(|_| files_width > 0.);
         let floating_sidebar = self.right_sidebar_view().filter(|_| right_overlay);
-        let rail_width = responsive::ROW_GAP + right_sidebar::ACTIVITY_BAR_WIDTH;
-        let overlay_width = self.files_sidebar_width.min(
-            (window_px_at_100
-                - responsive::ROW_PADDING
-                - rail_width * (usize::from(left_rail) + usize::from(right_rail)) as f32
-                - tabs_width
-                - tabs_gap)
-                .max(0.),
-        );
+        let overlay_width = self.files_sidebar_width.min(floating_width);
         // Native web views would cover a screen or a dialog opened over
         // them, and swallow the pointer while a pane is dragged over them;
         // device cards stop capturing while covered.
@@ -264,11 +271,15 @@ impl Render for Workspace {
             || crate::features::browser::popovers_open(cx);
         self.set_stages_covered(covered, active_overlay, cx);
         self.sync_web_views(covered || active_overlay.is_some(), cx);
-        let (devices_docked, devices_floating) = {
+        let (devices_docked, devices_floating, devices_overlay) = {
             let panel = self.devices.read(cx);
             let docked = panel.mode() == crate::shared::floating::Mode::Docked;
             let visible = panel.visible() && !panel.responsive_suspended();
-            (visible && docked, visible && !docked)
+            (
+                visible && docked,
+                visible && !docked && !panel.responsive_floating(),
+                visible && panel.responsive_floating(),
+            )
         };
         // Browser cards: floating over the window, or docked in a column at
         // its right, whose divider may be being dragged.
@@ -277,6 +288,10 @@ impl Render for Workspace {
             .iter()
             .filter_map(|stage| stage.element(cx))
             .collect();
+        let browser_overlay = self
+            .stages
+            .iter()
+            .find_map(|stage| stage.responsive_element(cx));
         let browser_dock = self.render_browser_dock(plan.browser_width * scale, cx);
         let browser_dock_drag = if plan.browser_width > 0. {
             self.browser_dock_drag_layer(cx)
@@ -641,6 +656,28 @@ impl Render for Workspace {
             )
             .children(floating_stages)
             .when(devices_floating, |root| root.child(self.devices.clone()))
+            .when_some(browser_overlay, |root, view| {
+                root.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .bottom_0()
+                        .left(rems(floating_left / 16.))
+                        .right(rems(floating_right / 16.))
+                        .child(view),
+                )
+            })
+            .when(devices_overlay, |root| {
+                root.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .bottom_0()
+                        .left(rems(floating_left / 16.))
+                        .right(rems(floating_right / 16.))
+                        .child(self.devices.clone()),
+                )
+            })
             .when_some(floating_sidebar, |root, view| {
                 root.child(
                     div()

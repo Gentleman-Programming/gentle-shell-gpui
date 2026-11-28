@@ -37,7 +37,15 @@ impl Stage {
 
     /// The floating card, while shown.
     pub(super) fn element(&self, cx: &App) -> Option<AnyElement> {
-        (self.shown && !self.panel.read(cx).responsive_suspended() && !self.docked(cx))
+        let panel = self.panel.read(cx);
+        (self.shown && !panel.responsive_suspended() && !panel.responsive_floating()
+            && panel.mode() == floating::Mode::Floating)
+            .then(|| self.panel.clone().into_any_element())
+    }
+
+    /// The temporarily floating browser card, constrained by the workspace.
+    pub(super) fn responsive_element(&self, cx: &App) -> Option<AnyElement> {
+        (self.shown && self.panel.read(cx).responsive_floating())
             .then(|| self.panel.clone().into_any_element())
     }
 
@@ -303,7 +311,11 @@ impl Workspace {
         let stage = self
             .stages
             .iter()
-            .find(|stage| stage.shown && stage.panel.read(cx).has_keyboard(window, cx))?;
+            .find(|stage| {
+                stage.shown
+                    && !stage.panel.read(cx).responsive_suspended()
+                    && stage.panel.read(cx).has_keyboard(window, cx)
+            })?;
         let panel = stage.panel.read(cx);
         Some(BrowserCard {
             stage: stage.id,
@@ -643,6 +655,23 @@ impl Workspace {
 
     // ── The docked column ───────────────────────────────────────────────────
 
+    /// Manual floating cards retain their ordinary behavior, including when
+    /// the user explicitly brings one forward over an automatic overlay.
+    pub(super) fn latest_manual_float(&self, cx: &App) -> Option<std::time::Instant> {
+        let browser = self
+            .stages
+            .iter()
+            .filter(|stage| {
+                stage.shown && stage.panel.read(cx).preferred_mode() == floating::Mode::Floating
+            })
+            .map(|stage| stage.panel.read(cx).requested_at())
+            .max();
+        let devices = self.devices.read(cx);
+        let device = (devices.visible() && devices.preferred_mode() == floating::Mode::Floating)
+            .then(|| devices.requested_at());
+        browser.max(device)
+    }
+
     /// Requested docked browser column, regardless of temporary placement.
     pub(super) fn browser_dock_request(
         &self,
@@ -674,6 +703,7 @@ impl Workspace {
     pub(super) fn apply_responsive_docks(
         &self,
         plan: responsive::Coexistence,
+        floating_area: (f32, f32, f32),
         cx: &mut Context<Self>,
     ) {
         let latest_browser = self
@@ -690,17 +720,27 @@ impl Workspace {
             let floating = preferred_dock
                 && plan.overlay == Some(responsive::Auxiliary::Browser)
                 && Some(stage.id) == latest_browser;
-            let suspended = preferred_dock && plan.browser_width == 0. && !floating;
+            let suspended = stage.shown
+                && if preferred_dock {
+                    plan.browser_width == 0. && !floating
+                } else {
+                    plan.overlay.is_some()
+                };
             stage.panel.update(cx, |panel, cx| {
-                panel.set_responsive_placement(floating, suspended, cx);
+                panel.set_responsive_placement(floating, suspended, floating_area, cx);
             });
         }
         let devices = self.devices.read(cx);
         let preferred_dock = devices.visible() && devices.preferred_mode() == floating::Mode::Docked;
         let floating = preferred_dock && plan.overlay == Some(responsive::Auxiliary::Devices);
-        let suspended = preferred_dock && !plan.devices_docked && !floating;
+        let suspended = devices.visible()
+            && if preferred_dock {
+                !plan.devices_docked && !floating
+            } else {
+                plan.overlay.is_some()
+            };
         self.devices.update(cx, |panel, cx| {
-            panel.set_responsive_placement(floating, suspended, cx);
+            panel.set_responsive_placement(floating, suspended, floating_area, cx);
         });
     }
 
@@ -810,13 +850,17 @@ impl Workspace {
             .stages
             .iter()
             .map(|stage| {
-                let (title, status) = stage.summary.clone();
+                let (title, mut status) = stage.summary.clone();
+                let suspended = stage.panel.read(cx).responsive_suspended();
+                if suspended {
+                    status.push_str(" · Suspended by layout");
+                }
                 TrayRow {
                     id: stage.id,
                     design: stage.panel.read(cx).is_design(),
                     title,
                     status,
-                    color: if stage.shown {
+                    color: if stage.shown && !suspended {
                         ui::accent()
                     } else {
                         ui::faint()
