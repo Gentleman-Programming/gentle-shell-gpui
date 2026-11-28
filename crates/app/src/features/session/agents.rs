@@ -696,6 +696,7 @@ impl SessionView {
             }
         });
         self.sync_subagent_thread(cx);
+        cx.emit(super::SessionEvent::AgentsPanelChanged);
         cx.notify();
     }
 
@@ -704,6 +705,7 @@ impl SessionView {
         self._agents_ticker = Task::ready(());
         self.sync_subagent_thread(cx);
         self.stop_job_output(cx);
+        cx.emit(super::SessionEvent::AgentsPanelChanged);
         cx.notify();
     }
 
@@ -796,7 +798,16 @@ impl SessionView {
         self.send_prompt(text, cx);
     }
 
-    pub(super) fn render_agents_panel(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    /// Render the session-owned panel at the host's modal layer. Reading the
+    /// owner here also makes its notifications invalidate the host render.
+    pub(crate) fn agents_overlay(session: &Entity<Self>, cx: &mut App) -> Option<AnyElement> {
+        if !session.read(cx).agents_panel_open() {
+            return None;
+        }
+        session.update(cx, |session, cx| session.render_agents_panel(cx))
+    }
+
+    fn render_agents_panel(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         if !self.agents_panel.open {
             return None;
         }
@@ -1113,10 +1124,11 @@ impl SessionView {
                 )
             });
 
-        let (backdrop, panel) = ui::screen(None);
+        let (backdrop, panel) = ui::workspace_screen(None);
         Some(
             backdrop
                 .id("agents-overlay")
+                .debug_selector(|| "agents-overlay".into())
                 .occlude()
                 .child(ui::pop_in(
                     "agents-screen",
@@ -1208,36 +1220,41 @@ impl SessionView {
                         }),
                 )
                 .child(
-                    h_flex()
+                    v_flex()
                         .flex_1()
                         .min_w_0()
-                        .gap_2()
+                        .overflow_hidden()
+                        .gap_0p5()
                         .child(
                             div()
-                                .min_w(rems(48. / 16.))
-                                .max_w(rems(200. / 16.))
+                                .min_w_0()
                                 .truncate()
                                 .text_size(ui::code_rems(14.))
                                 .font_family(ui::mono())
                                 .text_color(ui::fg())
                                 .child(name),
                         )
-                        .when_some(kind, |d, kind| d.child(kind_chip(kind)))
-                        .when_some(helper.model().map(str::to_string), |d, model| {
-                            d.child(
-                                div()
-                                    .flex_shrink_0()
-                                    .max_w(rems(220. / 16.))
-                                    .truncate()
-                                    .text_size(ui::code_rems(12.))
-                                    .font_family(ui::mono())
-                                    .text_color(ui::info())
-                                    .child(model),
-                            )
-                        })
+                        .child(
+                            h_flex()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .gap_1()
+                                .when_some(kind, |d, kind| d.child(kind_chip(kind)))
+                                .when_some(helper.model().map(str::to_string), |d, model| {
+                                    d.child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .truncate()
+                                            .text_size(ui::code_rems(12.))
+                                            .font_family(ui::mono())
+                                            .text_color(ui::info())
+                                            .child(model),
+                                    )
+                                }),
+                        )
                         .child(
                             div()
-                                .flex_1()
                                 .min_w_0()
                                 .truncate()
                                 .text_xs()

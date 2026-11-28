@@ -4,15 +4,46 @@
 use super::super::menu::WorkspaceMenuSource;
 use super::*;
 
+// The right rail defines the width. The left surface has a 1 px border
+// on each side, so reserve those as well as the inner padding and indent.
+const RAIL_INSET: f32 = 2.;
+const SESSION_INDENT: f32 = 6.;
+const TILE_WIDTH: f32 = COMPACT_SIDEBAR_WIDTH - 2. - 2. * RAIL_INSET - SESSION_INDENT;
+const GROUP_GAP: f32 = 6.;
+
+/// Compact tiles use the perimeter for both working and attention states.
+/// Attention takes priority: a steady warning outline, without a dot.
+fn compact_agent_status(running: bool, needs_you: bool, reduce_motion: bool) -> Option<Div> {
+    if needs_you {
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .rounded(rems(6. / 16.))
+                .border_1()
+                .border_color(ui::warning()),
+        )
+    } else if running {
+        Some(ui::tab_work_orbit(rems(6. / 16.), reduce_motion))
+    } else {
+        None
+    }
+}
+
 impl Workspace {
-    pub(super) fn render_compact_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_compact_sidebar(
+        &self,
+        can_expand: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let mut list = v_flex()
             .id("compact-workspaces")
             .flex_1()
             .min_h_0()
             .overflow_y_scroll()
             .w_full()
-            .items_center()
+            .items_start()
+            .px(rems(RAIL_INSET / 16.))
             .gap_1();
 
         for space in self.sidebar_spaces() {
@@ -22,7 +53,9 @@ impl Workspace {
             let row = h_flex()
                 .id(("compact-workspace", index))
                 .relative()
-                .size(rems(34. / 16.))
+                .when(index != 0, |d| d.mt(rems(GROUP_GAP / 16.)))
+                .w(rems(TILE_WIDTH / 16.))
+                .h(rems(34. / 16.))
                 .flex_none()
                 .justify_center()
                 .rounded_md()
@@ -118,7 +151,9 @@ impl Workspace {
                             h_flex()
                                 .id(SharedString::from(format!("compact-pane-{tab_id}-{leaf}")))
                                 .relative()
-                                .size(rems(34. / 16.))
+                                .ml(rems(SESSION_INDENT / 16.))
+                                .w(rems(TILE_WIDTH / 16.))
+                                .h(rems(34. / 16.))
                                 .flex_none()
                                 .gap_px()
                                 .justify_center()
@@ -139,17 +174,11 @@ impl Workspace {
                                         .text_color(color)
                                         .child(number.to_string()),
                                 )
-                                .when(running || needs_you, |d| {
-                                    d.child(
-                                        div()
-                                            .absolute()
-                                            .top(px(2.))
-                                            .right(px(2.))
-                                            .size(px(5.))
-                                            .rounded_full()
-                                            .bg(color),
-                                    )
-                                })
+                                .children(compact_agent_status(
+                                    running,
+                                    needs_you,
+                                    cx.reduce_motion(),
+                                ))
                                 .on_click(cx.listener(move |this, _, window, cx| {
                                     if let Some(pane) = pane {
                                         this.reveal_pane(pane, window, cx);
@@ -178,7 +207,9 @@ impl Workspace {
                 let row = h_flex()
                     .id(("compact-tab", tab.id))
                     .relative()
-                    .size(rems(34. / 16.))
+                    .ml(rems(SESSION_INDENT / 16.))
+                    .w(rems(TILE_WIDTH / 16.))
+                    .h(rems(34. / 16.))
                     .flex_none()
                     .gap_px()
                     .justify_center()
@@ -196,16 +227,19 @@ impl Workspace {
                             .text_color(tab.tone())
                             .child(number.to_string()),
                     )
-                    .children(
-                        tab.status_dot()
-                            .map(|dot| div().absolute().top(px(2.)).right(px(2.)).child(dot)),
-                    );
+                    .children(compact_agent_status(
+                        tab.running,
+                        tab.needs_you,
+                        cx.reduce_motion(),
+                    ));
                 list = list.child(self.tab_row_behavior(row, &tab, cx));
             }
             list = list.child(
                 h_flex()
                     .id(("compact-add-session", index))
-                    .size(rems(30. / 16.))
+                    .ml(rems(SESSION_INDENT / 16.))
+                    .w(rems(TILE_WIDTH / 16.))
+                    .h(rems(30. / 16.))
                     .flex_none()
                     .justify_center()
                     .rounded_md()
@@ -225,13 +259,6 @@ impl Workspace {
                     )
                     .child(Icon::new(IconName::Plus).small().text_color(ui::muted())),
             );
-            list = list.child(
-                div()
-                    .flex_none()
-                    .w(rems(24. / 16.))
-                    .h(px(1.))
-                    .bg(ui::border()),
-            );
         }
 
         v_flex()
@@ -239,14 +266,9 @@ impl Workspace {
             .items_center()
             .gap_1()
             .py_2()
-            .child(
-                Button::new("compact-expand")
-                    .ghost()
-                    .xsmall()
-                    .icon(Icon::new(IconName::PanelLeftOpen))
-                    .tooltip("Expand workspace sidebar")
-                    .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar_compact(cx))),
-            )
+            .when(can_expand, |d| {
+                d.child(self.sidebar_compact_button(true, cx))
+            })
             .child(list)
             .child(
                 Button::new("compact-new-workspace")

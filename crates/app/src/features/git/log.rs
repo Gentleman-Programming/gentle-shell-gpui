@@ -64,6 +64,15 @@ impl History {
 /// The newest `limit` commits `scope` reaches. `None` outside a repository;
 /// a repository without commits reads as an empty history.
 pub fn history(toplevel: &Path, scope: &Scope, limit: usize) -> Option<History> {
+    history_mode(toplevel, scope, limit, false)
+}
+
+pub fn history_mode(
+    toplevel: &Path,
+    scope: &Scope,
+    limit: usize,
+    first_parent: bool,
+) -> Option<History> {
     let current = git(toplevel, &["symbolic-ref", "--short", "-q", "HEAD"])
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
@@ -93,6 +102,9 @@ pub fn history(toplevel: &Path, scope: &Scope, limit: usize) -> Option<History> 
     };
     let limit = format!("-n{limit}");
     let mut args: Vec<&str> = LOG_ARGS.to_vec();
+    if first_parent {
+        args.push("--first-parent");
+    }
     args.push(limit.as_str());
     args.extend(&revs);
     args.push("--");
@@ -100,6 +112,9 @@ pub fn history(toplevel: &Path, scope: &Scope, limit: usize) -> Option<History> 
         .map(|raw| parse_log(&raw))
         .unwrap_or_default();
     let mut count = vec!["rev-list", "--count"];
+    if first_parent {
+        count.push("--first-parent");
+    }
     count.extend(&revs);
     count.push("--");
     let total = git(toplevel, &count)
@@ -170,6 +185,7 @@ pub fn earlier(
     tip: &str,
     skip: usize,
     n: usize,
+    first_parent: bool,
 ) -> Option<Vec<Commit>> {
     let rev = match scope {
         Scope::Head => "HEAD",
@@ -186,6 +202,9 @@ pub fn earlier(
     let skip = format!("--skip={skip}");
     let limit = format!("-n{n}");
     let mut args: Vec<&str> = LOG_ARGS.to_vec();
+    if first_parent {
+        args.push("--first-parent");
+    }
     args.extend([skip.as_str(), limit.as_str(), tip, "--"]);
     git(toplevel, &args).map(|raw| parse_log(&raw))
 }
@@ -292,7 +311,7 @@ mod tests {
             assert!(all.iter().any(Commit::is_merge), "{scope:?}");
             for loaded in 1..all.len() {
                 let read = history(dir, &scope, loaded).unwrap().commits;
-                let page = earlier(dir, &scope, &read[0].hash, loaded, 3).unwrap();
+                let page = earlier(dir, &scope, &read[0].hash, loaded, 3, false).unwrap();
                 let shown = append_page(&read, loaded, page).unwrap();
 
                 let full = history(dir, &scope, loaded + 3).unwrap().commits;
@@ -315,16 +334,16 @@ mod tests {
         let sh = |args: &[&str]| super::super::run(dir, args).unwrap();
         let read = history(dir, &Scope::Head, 4).unwrap();
         let tip = read.commits[0].hash.clone();
-        assert!(earlier(dir, &Scope::Head, &tip, 4, 3).is_some());
-        assert_eq!(earlier(dir, &Scope::All, &tip, 4, 3), None);
+        assert!(earlier(dir, &Scope::Head, &tip, 4, 3, false).is_some());
+        assert_eq!(earlier(dir, &Scope::All, &tip, 4, 3, false), None);
 
         let wip = Scope::Branch("wip".into());
         let wip_tip = history(dir, &wip, 4).unwrap().commits[0].hash.clone();
         sh(&["branch", "-q", "-D", "wip"]);
-        assert_eq!(earlier(dir, &wip, &wip_tip, 4, 3), None);
+        assert_eq!(earlier(dir, &wip, &wip_tip, 4, 3, false), None);
 
         sh(&["commit", "-q", "--amend", "-m", "m6 amended"]);
-        assert_eq!(earlier(dir, &Scope::Head, &tip, 4, 3), None);
+        assert_eq!(earlier(dir, &Scope::Head, &tip, 4, 3, false), None);
         let reread = history(dir, &Scope::Head, 7).unwrap();
         assert_eq!(reread.commits[0].subject, "m6 amended");
         assert_eq!(reread.total, read.total);
@@ -332,7 +351,7 @@ mod tests {
         let amended = reread.commits[0].hash.clone();
         std::fs::write(dir.join("a.txt"), "m7\n").unwrap();
         sh(&["commit", "-q", "-am", "m7"]);
-        assert_eq!(earlier(dir, &Scope::Head, &amended, 4, 3), None);
+        assert_eq!(earlier(dir, &Scope::Head, &amended, 4, 3, false), None);
         let reread = history(dir, &Scope::Head, 7).unwrap();
         assert_eq!(reread.commits[0].subject, "m7");
         assert_eq!(reread.total, read.total + 1);
@@ -340,6 +359,22 @@ mod tests {
 
     /// Reloading the Git pane reads whether HEAD is dirty: that read must
     /// not rewrite `.git/index` (and take `index.lock`) under the user's git.
+    #[test]
+    fn first_parent_history_counts_and_pages_the_same_walk() {
+        let Some(repo) = branched_repo("first-parent") else {
+            return;
+        };
+        let full = history(&repo.0, &Scope::Head, 100).unwrap();
+        let main = history_mode(&repo.0, &Scope::Head, 100, true).unwrap();
+        assert!(main.total < full.total);
+        assert_eq!(main.total, main.commits.len());
+        assert!(main.commits.iter().any(Commit::is_merge));
+        assert!(!main.commits.iter().any(|c| c.subject == "f1"));
+        let first = history_mode(&repo.0, &Scope::Head, 2, true).unwrap();
+        let page = earlier(&repo.0, &Scope::Head, &first.commits[0].hash, 2, 3, true).unwrap();
+        assert_eq!(append_page(&first.commits, 2, page).unwrap(), main.commits[..5]);
+    }
+
     #[test]
     fn history_leaves_a_stat_dirty_index_unwritten() {
         let Some(dir) = super::super::tests::stat_dirty_repo("history") else {

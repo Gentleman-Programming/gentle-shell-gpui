@@ -387,6 +387,77 @@ pub fn layout(commits: &[Commit]) -> Graph {
     Graph { rows, width }
 }
 
+/// The visible part of a single-tip history, with secondary ancestry grouped
+/// under its first encountered mainline merge. Never mutate the source commits.
+pub struct FoldedHistory {
+    pub indices: Vec<usize>,
+    pub graph: Graph,
+    pub counts: std::collections::HashMap<String, usize>,
+}
+
+pub fn folded_history(
+    commits: &[Commit],
+    expanded: &std::collections::HashSet<String>,
+) -> FoldedHistory {
+    use std::collections::{HashMap, HashSet};
+
+    let by_hash: HashMap<_, _> = commits.iter().map(|c| (c.hash.as_str(), c)).collect();
+    let mut mainline = HashSet::new();
+    let mut next = commits.first();
+    while let Some(commit) = next {
+        if !mainline.insert(commit.hash.as_str()) {
+            break;
+        }
+        next = commit
+            .parents
+            .first()
+            .and_then(|hash| by_hash.get(hash.as_str()).copied());
+    }
+    // Topological order puts children before parents. Propagating ownership
+    // along secondary ancestry is linear in the loaded graph.
+    let mut owner: HashMap<&str, &str> = HashMap::new();
+    let mut counts = HashMap::new();
+    let mut indices = Vec::new();
+    for (index, commit) in commits.iter().enumerate() {
+        if mainline.contains(commit.hash.as_str()) {
+            indices.push(index);
+            for parent in commit.parents.iter().skip(1) {
+                if !mainline.contains(parent.as_str()) {
+                    owner.entry(parent).or_insert(commit.hash.as_str());
+                }
+            }
+        } else if let Some(merge) = owner.get(commit.hash.as_str()).copied() {
+            *counts.entry(merge.to_string()).or_insert(0) += 1;
+            if expanded.contains(merge) {
+                indices.push(index);
+            }
+            for parent in &commit.parents {
+                if !mainline.contains(parent.as_str()) {
+                    owner.entry(parent).or_insert(merge);
+                }
+            }
+        } else {
+            // Do not hide unrelated commits if the input contains more tips.
+            indices.push(index);
+        }
+    }
+    let visible: HashSet<_> = indices.iter().map(|&i| commits[i].hash.as_str()).collect();
+    let projected: Vec<_> = indices
+        .iter()
+        .map(|&i| {
+            let mut commit = commits[i].clone();
+            // Hidden or not-yet-loaded parents do not consume phantom lanes.
+            commit.parents.retain(|parent| visible.contains(parent.as_str()));
+            commit
+        })
+        .collect();
+    FoldedHistory {
+        indices,
+        graph: layout(&projected),
+        counts,
+    }
+}
+
 /// The leftmost free lane, appending one if all are taken.
 fn free_lane(lanes: &mut Vec<Option<Slot>>) -> usize {
     match lanes.iter().position(Option::is_none) {
@@ -529,6 +600,26 @@ mod tests {
         );
         assert_eq!(merged_branch("Fix the merge of two lists"), None);
         assert_eq!(merged_branch("Merge branch ''"), None);
+    }
+
+    #[test]
+    fn smart_history_folds_and_restores_secondary_commits() {
+        let commits = [
+            commit("m", &["p", "x"], "Merge branch 'feature'"),
+            commit("x", &["b"], "feature"),
+            commit("p", &["b"], "main"),
+            commit("b", &[], "base"),
+        ];
+        let mut expanded = std::collections::HashSet::new();
+        let folded = folded_history(&commits, &expanded);
+        assert_eq!(folded.indices, vec![0, 2, 3]);
+        assert_eq!(folded.graph.width, 1);
+        assert_eq!(folded.counts.get("m"), Some(&1));
+        expanded.insert("m".to_string());
+        let open = folded_history(&commits, &expanded);
+        assert_eq!(open.indices, vec![0, 1, 2, 3]);
+        assert_eq!(open.graph, layout(&commits));
+        assert_eq!(commits[0].parents.len(), 2);
     }
 
     #[test]

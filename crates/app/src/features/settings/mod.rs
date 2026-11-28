@@ -7,7 +7,10 @@ use std::path::PathBuf;
 use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::*;
 
-use crate::{features::app_update, features::workspaces::TabLayout};
+use crate::{
+    features::app_update,
+    features::workspaces::{LayoutProfiles, TabLayout},
+};
 
 mod agent_ui;
 mod app;
@@ -63,6 +66,8 @@ pub struct SettingsView {
     /// controls never show a stale copy (the observer itself holds no strong
     /// reference back to the workspace).
     _workspace_sub: Subscription,
+    /// The two independently editable presentation presets.
+    layout_profiles: LayoutProfiles,
     page: SettingsPage,
     body_scroll: ScrollHandle,
     settings_search: Entity<InputState>,
@@ -138,6 +143,7 @@ impl SettingsView {
             initial.tabs_sidebar_hidden(),
             initial.files_sidebar_visible(),
         );
+        let layout_profiles = initial.presentation_snapshot(cx);
         let package = packages::PackageUiState::new(window, cx);
         let settings_search =
             cx.new(|cx| InputState::new(window, cx).placeholder("Find a setting…"));
@@ -168,6 +174,7 @@ impl SettingsView {
             sidebar_compact,
             tabs_sidebar_hidden,
             files_sidebar,
+            layout_profiles,
             page: SettingsPage::default(),
             body_scroll: ScrollHandle::new(),
             settings_search,
@@ -232,10 +239,13 @@ impl SettingsView {
                     this.files_sidebar_visible(),
                 )
             });
-        let changed = tab_layout != self.tab_layout
+        let layout_profiles = workspace.read(cx).presentation_snapshot(cx);
+        let changed = layout_profiles != self.layout_profiles
+            || tab_layout != self.tab_layout
             || sidebar_compact != self.sidebar_compact
             || tabs_sidebar_hidden != self.tabs_sidebar_hidden
             || files_sidebar != self.files_sidebar;
+        self.layout_profiles = layout_profiles;
         self.tab_layout = tab_layout;
         self.sidebar_compact = sidebar_compact;
         self.tabs_sidebar_hidden = tabs_sidebar_hidden;

@@ -72,6 +72,7 @@ fn sample() -> SavedState {
         ],
         sidebar: false,
         tab_layout: TabLayout::Vertical,
+        presentation: None,
         tabs_sidebar_width: 300.,
         files_sidebar_width: 350.,
         sidebar_compact: true,

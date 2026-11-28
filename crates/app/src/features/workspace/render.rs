@@ -9,6 +9,7 @@ pub(super) const TITLE_BAR_HEIGHT: f32 = 36.;
 fn sidebar_surface(side: Side, content: impl IntoElement) -> Div {
     div()
         .size_full()
+        .min_w_0()
         .debug_selector(|| match side {
             Side::Tabs => "tabs-slide-surface".into(),
             Side::Files => "files-slide-surface".into(),
@@ -54,7 +55,11 @@ impl Workspace {
         .top_0()
         .bottom_0()
         .when(matches!(side, Side::Tabs), |d| d.right(rems(-6. / 16.)))
-        .when(matches!(side, Side::Files), |d| d.left(rems(-6. / 16.)))
+        // Keep the right handle inside its panel's bounds. Cached dock
+        // views and adjacent panes must not mask an out-of-bounds hit area.
+        .when(matches!(side, Side::Files), |d| {
+            d.left_0().w(rems(10. / 16.)).occlude()
+        })
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
         .on_drag(
             SidebarDrag::new(side, cx.entity_id(), revision),
@@ -97,13 +102,16 @@ impl Workspace {
         }
         let scale = f32::from(window.rem_size()) / 16.;
         let x = event.event.position.x;
+        let left_rail = self.layout_profiles.current().has(ToolPlacement::Left);
+        let right_rail = self.layout_profiles.current().has(ToolPlacement::Right);
         let (distance, open, revision) = match drag.side {
+            Side::Tabs if self.sidebar_compact => return,
             Side::Tabs => (
                 x - event.bounds.left(),
-                self.tabs_sidebar_visible(),
+                self.navigation_visible(),
                 self.tabs_sidebar_motion.revision,
             ),
-            Side::Files if self.sidebar.is_some() => (
+            Side::Files if self.right_sidebar_view().is_some() => (
                 event.bounds.right() - x,
                 self.sidebar_visible,
                 self.files_sidebar_motion.revision,
@@ -115,9 +123,27 @@ impl Workspace {
             return;
         }
         // The row's horizontal padding is 6 px at 100% interface scale.
-        let pointer = f32::from(distance) / scale - 6.;
+        let rail = if (matches!(drag.side, Side::Files) && right_rail)
+            || (matches!(drag.side, Side::Tabs) && left_rail)
+        {
+            right_sidebar::ACTIVITY_BAR_WIDTH + 6.
+        } else {
+            0.
+        };
+        let pointer = f32::from(distance) / scale - 6. - rail;
         let window_width = f32::from(window.viewport_size().width) / scale;
+        let effective = self.responsive_geometry(
+            window_width,
+            scale,
+            std::time::Instant::now(),
+            cx,
+        );
         let side = drag.side;
+        let rendered_width = match side {
+            Side::Tabs if effective.compact => return,
+            Side::Tabs => effective.tabs.0,
+            Side::Files => effective.files.0,
+        };
         let held = event.event.pressed_button == Some(MouseButton::Left);
         let action = drag
             .gesture
@@ -128,7 +154,10 @@ impl Workspace {
             Side::Tabs => self.tabs_sidebar_width,
             Side::Files => self.files_sidebar_width,
         };
-        if let Some(w) = drag_saved_width(action, pointer, window_width, saved) {
+        if rendered_width > 0.
+            && !(saved > rendered_width && pointer >= rendered_width)
+            && let Some(w) = drag_saved_width(action, pointer, window_width, saved)
+        {
             match side {
                 Side::Tabs => self.resize_tab_sidebar(w, cx),
                 Side::Files if saved != w => {
@@ -166,36 +195,91 @@ impl Render for Workspace {
             tab.state.set_focused(inside);
         }
         let has_files_sidebar = self.sidebar.is_some();
-        let vertical_tabs = self.tab_layout == TabLayout::Vertical;
-        let window_px_at_100 =
-            f32::from(window.viewport_size().width) / (f32::from(window.rem_size()) / 16.);
+        let has_right_panel = self.right_sidebar_view().is_some();
+        let profile = self.layout_profiles.current();
+        let vertical_tabs = profile.vertical_tabs();
+        let horizontal_tabs = profile.horizontal_tabs();
+        let left_rail = profile.has(ToolPlacement::Left);
+        let right_rail = profile.has(ToolPlacement::Right);
+        let title_utilities = profile.title_utilities;
+        let original_controls = profile.original_controls;
+        let profile_has_title = profile.has(ToolPlacement::Title);
+        let navigation_visible = self.tabs_sidebar_visible();
+        // Agents is owned by a session but uses the same workspace modal layer.
+        let agents_session = if self.overlay.is_none() {
+            self.agents_overlay_session(cx)
+        } else {
+            None
+        };
+        // First-run screens keep their original full-window presentation.
+        let workspace_modal = agents_session.is_some()
+            || self.overlay.as_ref().is_some_and(|(overlay, _)| {
+                !matches!(overlay, Overlay::Onboarding(_) | Overlay::Welcome(_))
+            });
+        let scale = f32::from(window.rem_size()) / 16.;
+        let window_px_at_100 = f32::from(window.viewport_size().width) / scale;
         let now = std::time::Instant::now();
         let tabs_moving = self.tabs_sidebar_motion.advance(now, cx.reduce_motion());
         let files_moving = self.files_sidebar_motion.advance(now, cx.reduce_motion());
-        if tabs_moving || (files_moving && has_files_sidebar) {
+        if tabs_moving || (files_moving && has_right_panel) {
             ui::request_animation_frame(window);
         }
-        let (tabs_width, tabs_gap) =
-            self.visible_sidebar_geometry(Side::Tabs, window_px_at_100, now);
-        let (files_width, files_gap) =
-            self.visible_sidebar_geometry(Side::Files, window_px_at_100, now);
+        let plan = self.responsive_plan(window_px_at_100, scale, now, cx);
+        let geometry = plan.layout;
+        let (tabs_width, tabs_gap) = geometry.tabs;
+        let (files_width, files_gap) = geometry.files;
+        let right_overlay =
+            self.sidebar_visible && plan.overlay == Some(responsive::Auxiliary::Right);
+        let active_overlay =
+            if self.sidebar_visible || plan.overlay != Some(responsive::Auxiliary::Right) {
+                plan.overlay
+            } else {
+                None
+            };
+        self.files_sidebar_motion.suspended =
+            self.sidebar_visible && files_width == 0. && !right_overlay;
+        let rail_width = responsive::ROW_GAP + right_sidebar::ACTIVITY_BAR_WIDTH;
+        let floating_left = responsive::ROW_GAP
+            + if left_rail { rail_width } else { 0. }
+            + tabs_width
+            + tabs_gap;
+        let floating_right = responsive::ROW_GAP + if right_rail { rail_width } else { 0. };
+        let floating_width = (window_px_at_100 - floating_left - floating_right).max(0.);
+        self.apply_responsive_docks(
+            plan,
+            (
+                floating_width * scale,
+                f32::from(window.viewport_size().height),
+                TITLE_BAR_HEIGHT * scale,
+            ),
+            cx,
+        );
+        let automatic_compact = geometry.compact && !self.sidebar_compact;
         let tabs_resizing = self.sidebar_drag_active(Side::Tabs, cx);
         let files_resizing = self.sidebar_drag_active(Side::Files, cx);
-        let files_sidebar = self.sidebar.clone().filter(|_| files_width > 0.);
+        let files_sidebar = self.right_sidebar_view().filter(|_| files_width > 0.);
+        let floating_sidebar = self.right_sidebar_view().filter(|_| right_overlay);
+        let overlay_width = self.files_sidebar_width.min(floating_width);
         // Native web views would cover a screen or a dialog opened over
         // them, and swallow the pointer while a pane is dragged over them;
         // device cards stop capturing while covered.
         let covered = self.overlay.is_some()
+            || agents_session.is_some()
             || window.has_active_dialog(cx)
             || window.has_active_sheet(cx)
             || cx.has_active_drag()
             || crate::features::browser::popovers_open(cx);
-        self.set_stages_covered(covered, cx);
-        self.sync_web_views(covered, cx);
-        let (devices_docked, devices_floating) = {
+        self.set_stages_covered(covered, active_overlay, cx);
+        self.sync_web_views(covered || active_overlay.is_some(), cx);
+        let (devices_docked, devices_floating, devices_overlay) = {
             let panel = self.devices.read(cx);
             let docked = panel.mode() == crate::shared::floating::Mode::Docked;
-            (panel.visible() && docked, panel.visible() && !docked)
+            let visible = panel.visible() && !panel.responsive_suspended();
+            (
+                visible && docked,
+                visible && !docked && !panel.responsive_floating(),
+                visible && panel.responsive_floating(),
+            )
         };
         // Browser cards: floating over the window, or docked in a column at
         // its right, whose divider may be being dragged.
@@ -204,8 +288,16 @@ impl Render for Workspace {
             .iter()
             .filter_map(|stage| stage.element(cx))
             .collect();
-        let browser_dock = self.render_browser_dock(cx);
-        let browser_dock_drag = self.browser_dock_drag_layer(cx);
+        let browser_overlay = self
+            .stages
+            .iter()
+            .find_map(|stage| stage.responsive_element(cx));
+        let browser_dock = self.render_browser_dock(plan.browser_width * scale, cx);
+        let browser_dock_drag = if plan.browser_width > 0. {
+            self.browser_dock_drag_layer(cx)
+        } else {
+            None
+        };
         // While the surge plays, the window shakes before the rose hatches:
         // the root moves in place and asks for the next frame, so the element
         // tree (and every element's state) stays the same.
@@ -298,7 +390,7 @@ impl Render for Workspace {
                                     .when(vertical_tabs, |row| {
                                         row.child(self.new_tab_button("title-new-tab", None, cx))
                                     })
-                                    .when(!vertical_tabs, |row| {
+                                    .when(horizontal_tabs, |row| {
                                         row.child(
                                             div()
                                                 .flex_none()
@@ -322,7 +414,7 @@ impl Render for Workspace {
                                     // Tern keeps pane layout in the title bar, so
                                     // panes carry no header: one menu acts on the
                                     // focused pane, each entry with its shortcut.
-                                    .when(self.tab().is_some(), |d| {
+                                    .when(title_utilities && self.tab().is_some(), |d| {
                                         d.child(self.render_layout_menu(cx)).child(
                                             div()
                                                 .w(px(1.))
@@ -352,53 +444,67 @@ impl Render for Workspace {
                                             )
                                         },
                                     )
-                                    .children(crate::features::music::title_button(&self.music, cx))
-                                    .children(self.render_devices_button(cx))
-                                    .children(self.render_tray(cx))
-                                    .child({
-                                        let weak = cx.entity().downgrade();
-                                        div()
-                                            .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                                                cx.stop_propagation()
-                                            })
-                                            .child(notices::bell(
-                                                &self.notices,
-                                                Rc::new({
-                                                    let weak = weak.clone();
-                                                    move |pane, window, cx| {
-                                                        let _ = weak.update(cx, |this, cx| {
-                                                            this.reveal_pane(pane, window, cx)
-                                                        });
-                                                    }
-                                                }),
-                                                Rc::new(move |origin, cx| {
-                                                    weak.upgrade()
-                                                        .map_or(notices::Reach::Open, |this| {
-                                                            this.read(cx).notice_reach(origin)
-                                                        })
-                                                }),
-                                                cx,
-                                            ))
+                                    .when(title_utilities, |d| {
+                                        d.children(crate::features::music::title_button(
+                                            &self.music,
+                                            cx,
+                                        ))
+                                        .when(original_controls, |d| {
+                                            d.children(self.render_devices_button(cx))
+                                        })
+                                        .children(self.render_tray(cx))
                                     })
-                                    .when(vertical_tabs, |row| {
-                                        row.child(
+                                    .when(title_utilities, |d| {
+                                        d.child({
+                                            let weak = cx.entity().downgrade();
+                                            div()
+                                                .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                                    cx.stop_propagation()
+                                                })
+                                                .child(notices::bell(
+                                                    &self.notices,
+                                                    Rc::new({
+                                                        let weak = weak.clone();
+                                                        move |pane, window, cx| {
+                                                            let _ = weak.update(cx, |this, cx| {
+                                                                this.reveal_pane(pane, window, cx)
+                                                            });
+                                                        }
+                                                    }),
+                                                    Rc::new(move |origin, cx| {
+                                                        weak.upgrade().map_or(
+                                                            notices::Reach::Open,
+                                                            |this| {
+                                                                this.read(cx).notice_reach(origin)
+                                                            },
+                                                        )
+                                                    }),
+                                                    cx,
+                                                ))
+                                        })
+                                    })
+                                    .when(vertical_tabs && !automatic_compact, |d| {
+                                        d.child(
                                             Button::new("toggle-tab-sidebar")
                                                 .ghost()
                                                 .xsmall()
-                                                .icon(Icon::new(if !self.tabs_sidebar_hidden {
-                                                    IconName::PanelLeftClose
-                                                } else {
+                                                .icon(Icon::new(if self.sidebar_compact {
                                                     IconName::PanelLeftOpen
-                                                }))
-                                                .tooltip(if !self.tabs_sidebar_hidden {
-                                                    "Hide workspace sidebar"
                                                 } else {
-                                                    "Show workspace sidebar"
+                                                    IconName::PanelLeftClose
+                                                }))
+                                                .tooltip(if self.sidebar_compact {
+                                                    "Expand workspace sidebar"
+                                                } else {
+                                                    "Compact workspace sidebar"
                                                 })
                                                 .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.toggle_tabs_sidebar(cx)
+                                                    this.toggle_sidebar_compact(cx)
                                                 })),
                                         )
+                                    })
+                                    .when(profile_has_title, |d| {
+                                        d.child(self.render_title_shortcuts(cx))
                                     })
                                     .child(
                                         Button::new("open-palette")
@@ -412,20 +518,26 @@ impl Render for Workspace {
                                     )
                                     // The screens behind one menu; it's lit while
                                     // one of them is open.
-                                    .child(self.render_screens_menu(cx))
-                                    .when(has_files_sidebar, |d| {
+                                    .when(original_controls, |d| {
+                                        d.child(self.render_screens_menu(cx))
+                                    })
+                                    .when(original_controls && has_files_sidebar, |d| {
                                         d.child(
                                             Button::new("toggle-sidebar")
                                                 .ghost()
                                                 .xsmall()
-                                                .icon(Icon::new(if self.sidebar_visible {
+                                                .icon(Icon::new(if self.sidebar_visible
+                                                    && !self.files_sidebar_motion.suspended
+                                                {
                                                     IconName::PanelRightClose
                                                 } else {
                                                     IconName::PanelRightOpen
                                                 }))
                                                 .tooltip(format!(
                                                     "{} Files sidebar ({})",
-                                                    if self.sidebar_visible {
+                                                    if self.sidebar_visible
+                                                        && !self.files_sidebar_motion.suspended
+                                                    {
                                                         "Hide"
                                                     } else {
                                                         "Show"
@@ -433,7 +545,7 @@ impl Render for Workspace {
                                                     ui::shortcut("B")
                                                 ))
                                                 .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.toggle_sidebar(cx)
+                                                    this.request_sidebar(cx)
                                                 })),
                                         )
                                     }),
@@ -452,13 +564,26 @@ impl Render for Workspace {
                             this.resize_sidebar(event, window, cx);
                         },
                     ))
+                    .when(left_rail, |row| {
+                        if workspace_modal {
+                            row.child(
+                                div()
+                                    .w(rems(right_sidebar::ACTIVITY_BAR_WIDTH / 16.))
+                                    .flex_none(),
+                            )
+                        } else {
+                            row.child(self.render_activity_bar(ToolPlacement::Left, cx))
+                        }
+                    })
                     // The vertical tab navigator remains independent of the Files panel.
-                    .when(tabs_width > 0., |row| {
+                    .when(vertical_tabs && tabs_width > 0., |row| {
                         row.child(
                             div()
                                 .id("vertical-tab-panel")
                                 .debug_selector(|| "tabs-slide-row".into())
                                 .w(rems(tabs_width / 16.))
+                                .max_w(rems(tabs_width / 16.))
+                                .min_w_0()
                                 .mr(rems((tabs_gap - 6.) / 16.))
                                 .flex_none()
                                 .h_full()
@@ -470,10 +595,13 @@ impl Render for Workspace {
                                         this.open_empty_area_menu(event.position, window, cx);
                                     }),
                                 )
-                                .child(sidebar_surface(Side::Tabs, self.render_tab_sidebar(cx)))
+                                .child(sidebar_surface(
+                                    Side::Tabs,
+                                    self.render_tab_sidebar(geometry.compact, cx),
+                                ))
                                 .when(
-                                    tabs_resizing
-                                        || (vertical_tabs && !self.sidebar_compact && !tabs_moving),
+                                    !geometry.compact
+                                        && (tabs_resizing || (navigation_visible && !tabs_moving)),
                                     |column| column.child(self.sidebar_handle(Side::Tabs, cx)),
                                 ),
                         )
@@ -491,12 +619,15 @@ impl Render for Workspace {
                     )
                     .children(browser_dock)
                     .when(devices_docked, |row| row.child(self.devices.clone()))
-                    // Ctrl/Cmd+B toggles only the right Files/Changes/Branches sidebar.
+                    // Ctrl/Cmd+B toggles the tool content; the rail stays visible.
                     .when_some(files_sidebar, |row, view| {
                         row.child(
                             div()
                                 .id("files-sidebar-panel")
+                                .debug_selector(|| "files-sidebar-panel".into())
                                 .w(rems(files_width / 16.))
+                                .max_w(rems(files_width / 16.))
+                                .min_w_0()
                                 .ml(rems((files_gap - 6.) / 16.))
                                 .flex_none()
                                 .h_full()
@@ -510,13 +641,103 @@ impl Render for Workspace {
                                     |column| column.child(self.sidebar_handle(Side::Files, cx)),
                                 ),
                         )
+                    })
+                    .when(right_rail, |row| {
+                        if workspace_modal {
+                            row.child(
+                                div()
+                                    .w(rems(right_sidebar::ACTIVITY_BAR_WIDTH / 16.))
+                                    .flex_none(),
+                            )
+                        } else {
+                            row.child(self.render_activity_bar(ToolPlacement::Right, cx))
+                        }
                     }),
             )
             .children(floating_stages)
+            .when(devices_floating, |root| root.child(self.devices.clone()))
+            .when_some(browser_overlay, |root, view| {
+                root.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .bottom_0()
+                        .left(rems(floating_left / 16.))
+                        .right(rems(floating_right / 16.))
+                        .child(view),
+                )
+            })
+            .when(devices_overlay, |root| {
+                root.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .bottom_0()
+                        .left(rems(floating_left / 16.))
+                        .right(rems(floating_right / 16.))
+                        .child(self.devices.clone()),
+                )
+            })
+            .when_some(floating_sidebar, |root, view| {
+                root.child(
+                    div()
+                        .id("responsive-tool-overlay")
+                        .absolute()
+                        .top(rems((TITLE_BAR_HEIGHT + responsive::ROW_GAP) / 16.))
+                        .bottom(rems(responsive::ROW_GAP / 16.))
+                        .right(rems((responsive::ROW_GAP
+                            + if right_rail { rail_width } else { 0. }) / 16.))
+                        .w(rems(overlay_width / 16.))
+                        .min_w_0()
+                        .occlude()
+                        .shadow(crate::shared::floating::shadow(false))
+                        .child(sidebar_surface(
+                            Side::Files,
+                            v_flex()
+                                .size_full()
+                                .child(
+                                    h_flex()
+                                        .flex_none()
+                                        .justify_end()
+                                        .px_1()
+                                        .child(
+                                            Button::new("close-responsive-tool")
+                                                .ghost()
+                                                .xsmall()
+                                                .icon(Icon::new(IconName::X))
+                                                .tooltip("Hide tool")
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.toggle_sidebar(cx);
+                                                })),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_h_0()
+                                        .min_w_0()
+                                        .child(view.cached(StyleRefinement::default().size_full())),
+                                ),
+                        )),
+                )
+            })
             .children(self.render_badge_picker(window, cx))
             .children(self.render_context_menu(cx))
-            .when(devices_floating, |root| root.child(self.devices.clone()))
             .children(browser_dock_drag)
+            // Dim the entire workspace body once. Insetting the scrim along
+            // with the modal creates a visible rectangular edge in the gaps
+            // beside rounded panels. The rails are painted above this layer.
+            .when(workspace_modal, |root| {
+                root.child(
+                    div()
+                        .absolute()
+                        .top(rems(TITLE_BAR_HEIGHT / 16.))
+                        .left_0()
+                        .right_0()
+                        .bottom_0()
+                        .child(ui::scrim("workspace-modal-scrim")),
+                )
+            })
             .children(self.overlay.as_ref().map(|(overlay, _)| {
                 let (view, full_window) = match overlay {
                     Overlay::Providers(view) => (view.clone().into_any_element(), false),
@@ -536,16 +757,69 @@ impl Render for Workspace {
                 if full_window {
                     return view;
                 }
-                // Below the title bar, so its buttons can switch screens.
+                // Only modal content and its hit-testing area are inset.
+                // The full-width scrim is painted separately above the body.
                 div()
                     .absolute()
                     .top(rems(TITLE_BAR_HEIGHT / 16.))
-                    .left_0()
-                    .right_0()
+                    .left(rems(if left_rail {
+                        (right_sidebar::ACTIVITY_BAR_WIDTH + 6.) / 16.
+                    } else {
+                        0.
+                    }))
+                    .right(rems(if right_rail {
+                        (right_sidebar::ACTIVITY_BAR_WIDTH + 6.) / 16.
+                    } else {
+                        0.
+                    }))
                     .bottom_0()
                     .child(view)
                     .into_any_element()
             }))
+            .children(agents_session.and_then(|session| {
+                let view = SessionView::agents_overlay(&session, cx)?;
+                Some(
+                    div()
+                        .absolute()
+                        .top(rems(TITLE_BAR_HEIGHT / 16.))
+                        .left(rems(if left_rail {
+                            (right_sidebar::ACTIVITY_BAR_WIDTH + 6.) / 16.
+                        } else {
+                            0.
+                        }))
+                        .right(rems(if right_rail {
+                            (right_sidebar::ACTIVITY_BAR_WIDTH + 6.) / 16.
+                        } else {
+                            0.
+                        }))
+                        .bottom_0()
+                        .child(view),
+                )
+            }))
+            // Keep the same rail bounds as the row, above the continuous
+            // scrim. No duplicated rail is mounted in the row in this state.
+            .when(workspace_modal && left_rail, |root| {
+                root.child(
+                    div()
+                        .absolute()
+                        .top(rems(TITLE_BAR_HEIGHT / 16.))
+                        .bottom(rems(6. / 16.))
+                        .left(rems(6. / 16.))
+                        .w(rems(right_sidebar::ACTIVITY_BAR_WIDTH / 16.))
+                        .child(self.render_activity_bar(ToolPlacement::Left, cx)),
+                )
+            })
+            .when(workspace_modal && right_rail, |root| {
+                root.child(
+                    div()
+                        .absolute()
+                        .top(rems(TITLE_BAR_HEIGHT / 16.))
+                        .bottom(rems(6. / 16.))
+                        .right(rems(6. / 16.))
+                        .w(rems(right_sidebar::ACTIVITY_BAR_WIDTH / 16.))
+                        .child(self.render_activity_bar(ToolPlacement::Right, cx)),
+                )
+            })
             .when_some(self.surge, |root, (run, _, level)| {
                 root.child(crate::shared::surge::overlay(run, level))
             })
@@ -561,7 +835,8 @@ impl Workspace {
         if !crate::features::devices::hub(cx).read(cx).prefs().enabled {
             return None;
         }
-        let open = self.devices.read(cx).visible();
+        let panel = self.devices.read(cx);
+        let open = panel.visible() && !panel.responsive_suspended();
         Some(
             div()
                 // Clicks here are not title-bar drags.

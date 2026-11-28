@@ -21,7 +21,7 @@ use std::rc::Rc;
 
 use gentle_core::browser::{CardLayout, LAYOUT_KEY, Profile};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -494,6 +494,9 @@ pub struct BrowserPanel {
     screen_covered: bool,
     /// Docked in the window's right column, or floating over the window.
     mode: Mode,
+    responsive_floating: bool,
+    responsive_suspended: bool,
+    requested_at: Instant,
     card: CardState,
     /// The page itself.
     surface: Entity<WebSurface>,
@@ -535,6 +538,9 @@ impl BrowserPanel {
             } else {
                 Mode::Floating
             },
+            responsive_floating: false,
+            responsive_suspended: false,
+            requested_at: Instant::now(),
             card: CardState::new(opening_frame(cx)),
             surface,
             focus: cx.focus_handle(),
@@ -547,12 +553,58 @@ impl BrowserPanel {
     }
 
     pub fn mode(&self) -> Mode {
+        if self.responsive_floating {
+            Mode::Floating
+        } else {
+            self.mode
+        }
+    }
+
+    pub(crate) fn preferred_mode(&self) -> Mode {
         self.mode
+    }
+
+    pub(crate) fn requested_at(&self) -> Instant {
+        self.requested_at
+    }
+
+    pub(crate) fn request_attention(&mut self) {
+        self.requested_at = Instant::now();
+    }
+
+    pub(crate) fn responsive_floating(&self) -> bool {
+        self.responsive_floating
+    }
+
+    pub(crate) fn responsive_suspended(&self) -> bool {
+        self.responsive_suspended
+    }
+
+    /// Change only the effective placement; keep the requested mode intact.
+    pub(crate) fn set_responsive_placement(
+        &mut self,
+        floating: bool,
+        suspended: bool,
+        area: (f32, f32, f32),
+        cx: &mut Context<Self>,
+    ) {
+        let area_changed = floating && self.card.set_area(area);
+        if area_changed
+            || self.responsive_floating != floating
+            || self.responsive_suspended != suspended
+        {
+            self.responsive_floating = floating;
+            self.responsive_suspended = suspended;
+            cx.notify();
+        }
     }
 
     /// Dock the card or float it; later cards open the same way.
     fn set_mode(&mut self, mode: Mode, cx: &mut Context<Self>) {
         self.mode = mode;
+        self.responsive_floating = false;
+        self.responsive_suspended = false;
+        self.requested_at = Instant::now();
         if self.card.maximized() {
             self.card.toggle_maximized();
         }
@@ -712,6 +764,7 @@ impl BrowserPanel {
     }
 
     pub fn show(&mut self, cx: &mut Context<Self>) {
+        self.request_attention();
         self.surface.update(cx, |surface, cx| surface.show(cx));
     }
 
@@ -740,7 +793,7 @@ impl BrowserPanel {
     /// Fill the window (a floating card; a docked one stays in its column).
     /// The card takes the keyboard, so Esc restores it.
     pub fn maximize(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.mode == Mode::Floating && !self.card.maximized() {
+        if self.mode() == Mode::Floating && !self.card.maximized() {
             self.card.toggle_maximized();
             window.focus(&self.focus, cx);
             cx.notify();
@@ -813,7 +866,8 @@ impl BrowserPanel {
             .to_string();
         let url = self.url.clone();
         let maximized = self.card.maximized();
-        let docked = self.mode == Mode::Docked;
+        let docked = self.mode() == Mode::Docked;
+        let preferred_docked = self.mode == Mode::Docked;
         let profile_label = self.profile(cx).label();
         h_flex()
             .id("browser-header")
@@ -909,15 +963,23 @@ impl BrowserPanel {
                         Button::new("browser-dock")
                             .ghost()
                             .xsmall()
-                            .icon(Icon::new(if docked {
+                            .icon(Icon::new(if preferred_docked {
                                 IconName::PictureInPicture2
                             } else {
                                 IconName::PanelRight
                             }))
-                            .tooltip(if docked { "Float" } else { "Dock to the right" })
+                            .tooltip(if preferred_docked {
+                                if docked { "Float" } else { "Keep floating" }
+                            } else {
+                                "Dock to the right"
+                            })
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.set_mode(
-                                    if docked { Mode::Floating } else { Mode::Docked },
+                                    if preferred_docked {
+                                        Mode::Floating
+                                    } else {
+                                        Mode::Docked
+                                    },
                                     cx,
                                 )
                             })),
@@ -1104,7 +1166,7 @@ impl BrowserPanel {
 
 impl Render for BrowserPanel {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if self.mode == Mode::Docked {
+        if self.mode() == Mode::Docked {
             // The window puts it in its right column and sizes it; the
             // column's divider changes the width.
             return v_flex()

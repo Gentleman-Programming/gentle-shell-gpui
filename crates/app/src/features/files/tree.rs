@@ -187,6 +187,9 @@ pub struct FileTreeView {
     root: PathBuf,
     name: SharedString,
     tab: Tab,
+    last_git_tab: Tab,
+    original_tabs: bool,
+    integrated_history: bool,
     /// Loaded listings by folder; folders load when first expanded.
     children: HashMap<PathBuf, Vec<Entry>>,
     expanded: HashSet<PathBuf>,
@@ -263,6 +266,9 @@ impl FileTreeView {
             root,
             name,
             tab: Tab::Files,
+            last_git_tab: Tab::Changes,
+            original_tabs: true,
+            integrated_history: false,
             children: HashMap::new(),
             expanded: HashSet::new(),
             selected: None,
@@ -343,12 +349,52 @@ impl FileTreeView {
         self.refs.update(cx, |view, cx| view.set_visible(refs, cx));
     }
 
+    /// The workspace activity rail selects the existing Files or Git view.
+    pub fn set_original_tabs(&mut self, original: bool, cx: &mut Context<Self>) {
+        if self.original_tabs != original {
+            self.original_tabs = original;
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn set_integrated_history(&mut self, integrated: bool, cx: &mut Context<Self>) {
+        if self.integrated_history != integrated {
+            self.integrated_history = integrated;
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn show_git_section(
+        &mut self,
+        section: crate::features::history::GitSection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let tab = match section {
+            crate::features::history::GitSection::Changes => Tab::Changes,
+            crate::features::history::GitSection::Branches => Tab::Branches,
+        };
+        self.set_tab(tab, window, cx);
+    }
+
+    pub fn is_git_tab(&self) -> bool {
+        self.tab != Tab::Files
+    }
+
+    pub fn select_sidebar_tool(&mut self, git: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let tab = if git { self.last_git_tab } else { Tab::Files };
+        self.set_tab(tab, window, cx);
+    }
+
     fn set_tab(&mut self, tab: Tab, window: &mut Window, cx: &mut Context<Self>) {
         if self.tab == tab {
             return;
         }
         self.finish_edit(false, window, cx);
         self.tab = tab;
+        if tab != Tab::Files {
+            self.last_git_tab = tab;
+        }
         if tab == Tab::Files {
             self.refresh(cx);
         }
@@ -1459,44 +1505,7 @@ impl FileTreeView {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let active = self.tab == tab;
-        h_flex()
-            .id(label)
-            .h(rems(26. / 16.))
-            .min_w(rems(32. / 16.))
-            .px_2()
-            .gap_1()
-            .justify_center()
-            .rounded_md()
-            .cursor_pointer()
-            .when(active, |d| d.bg(ui::surface_hover()))
-            .when(!active, |d| {
-                d.hover(|s| s.bg(ui::surface_hover().opacity(0.6)))
-            })
-            .child(
-                Icon::new(icon)
-                    .small()
-                    .text_color(if active { ui::fg() } else { ui::faint() }),
-            )
-            // The open tab says what it is; the others keep to their icons.
-            .when(active, |d| {
-                d.child(
-                    div()
-                        .text_size(rems(12.5 / 16.))
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(ui::fg())
-                        .child(label),
-                )
-            })
-            .when(count > 0, |d| {
-                d.child(
-                    div()
-                        .font_family(ui::mono())
-                        .text_size(ui::code_rems(10.5))
-                        .text_color(ui::warning())
-                        .child(count.to_string()),
-                )
-            })
-            .tooltip(move |window, cx| Tooltip::new(label).build(window, cx))
+        ui::sidebar_section_tab(icon, label, count, active)
             .on_click(cx.listener(move |this, _, window, cx| this.set_tab(tab, window, cx)))
     }
 }
@@ -1571,9 +1580,24 @@ impl Render for FileTreeView {
             .px_2()
             .pb_1p5()
             .gap_1()
-            .child(self.tab_button(Tab::Files, IconName::Files, "Files", 0, cx))
+            .when(self.original_tabs, |d| {
+                d.child(self.tab_button(Tab::Files, IconName::Files, "Files", 0, cx))
+            })
             .child(self.tab_button(Tab::Changes, IconName::Diff, "Changes", change_count, cx))
-            .child(self.tab_button(Tab::Branches, IconName::GitBranch, "Branches", 0, cx));
+            .child(self.tab_button(Tab::Branches, IconName::GitBranch, "Branches", 0, cx))
+            .when(self.integrated_history || !self.original_tabs, |d| {
+                d.child(
+                    ui::sidebar_section_tab(IconName::GitGraph, "History", 0, false)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        let repo = this
+                            .git
+                            .as_ref()
+                            .and_then(|git| git.as_ref())
+                            .map_or_else(|| this.root.clone(), |state| state.toplevel.clone());
+                        cx.emit(FileTreeEvent::OpenHistory(repo));
+                    })),
+                )
+            });
         // Finding a file, under the tabs while the tree shows.
         let search = (self.tab == Tab::Files).then(|| {
             h_flex().flex_none().px_2().pb_1p5().child(
@@ -1672,7 +1696,7 @@ impl Render for FileTreeView {
             .size_full()
             .min_h_0()
             .child(header)
-            .child(tabs)
+            .when(self.original_tabs || !files, |d| d.child(tabs))
             .children(search)
             .child(match self.tab {
                 Tab::Files => self.render_files(cx),

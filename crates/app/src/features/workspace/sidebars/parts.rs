@@ -13,18 +13,56 @@ pub(super) const ROW: f32 = 26.;
 pub(super) const INDENT: f32 = 22.;
 
 impl Workspace {
+    /// The navigator's own compact/expand control, mirroring the right rail.
+    pub(super) fn sidebar_compact_button(
+        &self,
+        compact: bool,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        h_flex()
+            .id("workspace-sidebar-compact-toggle")
+            .size(rems(34. / 16.))
+            .flex_none()
+            .items_center()
+            .justify_center()
+            .rounded_md()
+            .cursor_pointer()
+            .text_color(ui::muted())
+            .hover(|d| d.bg(ui::surface_hover()))
+            .tooltip(move |window, cx| {
+                Tooltip::new(if compact {
+                    "Expand workspace sidebar"
+                } else {
+                    "Compact workspace sidebar"
+                })
+                .build(window, cx)
+            })
+            .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar_compact(cx)))
+            .child(Icon::new(if compact {
+                IconName::PanelLeftOpen
+            } else {
+                IconName::PanelLeftClose
+            }))
+    }
+
     /// The search field; it filters the tabs of every workspace.
-    pub(super) fn sidebar_search(&self) -> Div {
-        h_flex().flex_none().px_2().pb_1p5().child(
-            ui::field()
-                .flex_1()
-                .min_w_0()
-                .h(rems(30. / 16.))
-                // The field's own Cut/Copy/Paste menu is the only one.
-                .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
-                .child(Icon::new(IconName::Search).small().text_color(ui::faint()))
-                .child(Input::new(&self.tab_search).appearance(false).small()),
-        )
+    pub(super) fn sidebar_search(&self, cx: &mut Context<Self>) -> Div {
+        h_flex()
+            .flex_none()
+            .px_2()
+            .pb_1p5()
+            .gap_1()
+            .child(self.sidebar_compact_button(false, cx))
+            .child(
+                ui::field()
+                    .flex_1()
+                    .min_w_0()
+                    .h(rems(30. / 16.))
+                    // The field's own Cut/Copy/Paste menu is the only one.
+                    .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
+                    .child(Icon::new(IconName::Search).small().text_color(ui::faint()))
+                    .child(Input::new(&self.tab_search).appearance(false).small()),
+            )
     }
 
     /// Workspace `index`'s tabs that match the search.
@@ -128,11 +166,14 @@ impl Workspace {
     ) -> AnyElement {
         let tip = tab.tooltip();
         let selected = self.is_tab_selected(tab.space, tab.id);
+        let id = tab.id;
+        let close_tip: SharedString = format!("Close tab \"{}\"", tab.title).into();
         let row = h_flex()
             .id(SharedString::from(format!(
                 "sidebar-tab-{}-{}",
                 tab.space, tab.index
             )))
+            .group("sidebar-tab")
             .relative()
             .flex_none()
             .w_full()
@@ -167,24 +208,48 @@ impl Workspace {
             .child(Self::tab_icon(tab))
             .child(self.tab_title(
                 tab,
-                12.5,
+                ui::SIDEBAR_TEXT_SIZE,
                 if tab.shown { ui::fg() } else { ui::muted() },
                 cx,
             ))
             .when(tab.pinned, |d| {
                 d.child(Icon::new(IconName::Pin).xsmall().text_color(ui::faint()))
             })
-            .children(tab.status_dot())
+            .children(tab.status_dot(cx.reduce_motion()))
             .when(tab.panes > 1, |d| {
                 d.child(
                     div()
                         .flex_none()
                         .font_family(ui::mono())
-                        .text_size(ui::code_rems(10.5))
+                        .text_size(ui::code_rems(ui::SIDEBAR_METADATA_SIZE))
                         .text_color(ui::faint())
                         .child(tab.panes.to_string()),
                 )
-            });
+            })
+            .child(
+                div()
+                    .id(("sidebar-close-tab", id))
+                    .flex_none()
+                    .size(rems(18. / 16.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_md()
+                    .text_color(ui::faint())
+                    // Reserve the same space in every row, even before hover.
+                    .when(!tab.shown, |d| {
+                        d.invisible().group_hover("sidebar-tab", |s| s.visible())
+                    })
+                    .hover(|s| s.bg(ui::surface_hover()).text_color(ui::fg()))
+                    .occlude()
+                    .tooltip(move |window, cx| Tooltip::new(close_tip.clone()).build(window, cx))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.close_tab_by_id(id, window, cx);
+                    }))
+                    .child(Icon::new(IconName::X).xsmall()),
+            );
         self.tab_row_behavior(row, tab, cx)
     }
 
@@ -235,6 +300,7 @@ impl Workspace {
                     .id(SharedString::from(format!(
                         "sidebar-split-{tab_id}-{index}"
                     )))
+                    .relative()
                     .h(rems(ROW / 16.))
                     .pl(rems(30. / 16.))
                     .pr_2()
@@ -253,9 +319,11 @@ impl Workspace {
                             .text_color(ui::fg())
                             .child(title),
                     )
-                    .when(running || needs_you, |d| {
-                        d.child(div().size(px(6.)).rounded_full().bg(color))
-                    })
+                    .children(expanded_agent_status(
+                        running,
+                        needs_you,
+                        cx.reduce_motion(),
+                    ))
                     .on_click(cx.listener(move |this, _, window, cx| {
                         if let Some(pane) = pane {
                             this.reveal_pane(pane, window, cx);
@@ -371,7 +439,7 @@ impl Workspace {
                                     .flex_1()
                                     .min_w_0()
                                     .truncate()
-                                    .text_size(rems(12.5 / 16.))
+                                    .text_size(rems(ui::SIDEBAR_TEXT_SIZE / 16.))
                                     .font_weight(FontWeight::MEDIUM)
                                     .text_color(if space.current { ui::fg() } else { ui::muted() })
                                     .child(space.name.clone()),
@@ -391,7 +459,7 @@ impl Workspace {
                         div()
                             .flex_none()
                             .font_family(ui::mono())
-                            .text_size(ui::code_rems(10.5))
+                            .text_size(ui::code_rems(ui::SIDEBAR_METADATA_SIZE))
                             .text_color(ui::faint())
                             .child(space.tabs.to_string()),
                     ),

@@ -106,6 +106,48 @@ fn press_enter(view: &Entity<SessionView>, cx: &mut VisualTestContext) {
     view.update_in(cx, |view, window, cx| view.submit(window, cx));
 }
 
+/// A narrow chat and a separate, full-width modal layer, as in the workspace.
+struct AgentsHost {
+    session: Entity<SessionView>,
+}
+
+impl Render for AgentsHost {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let overlay = SessionView::agents_overlay(&self.session, cx);
+        div()
+            .relative()
+            .size_full()
+            .child(
+                div()
+                    .debug_selector(|| "agents-test-chat".into())
+                    .w(px(320.))
+                    .h_full()
+                    .child(self.session.clone()),
+            )
+            .children(overlay)
+    }
+}
+
+fn agents_host(cx: &mut TestAppContext) -> (Entity<SessionView>, &mut VisualTestContext) {
+    cx.update(|cx| {
+        gpui_kit::init(cx);
+        cx.set_reduce_motion(true);
+    });
+    let cwd = std::env::temp_dir();
+    let (host, cx) = cx.add_window_view(|window, cx| {
+        let session = cx.new(|cx| {
+            let mut view = SessionView::new(cwd, None, window, cx, false);
+            view.backend.started = true;
+            view.usage.context_test_ready = true;
+            view.usage.context_stats_received = true;
+            view
+        });
+        AgentsHost { session }
+    });
+    let session = host.read_with(cx, |host, _| host.session.clone());
+    (session, cx)
+}
+
 /// A tab whose channel is probed with `methods`, and whose job and helper
 /// lists hold one running job (`job-1`) and one helper (`agent-1`) the
 /// `gentle-agents` widget has no thread for.
@@ -113,7 +155,7 @@ fn open<'a>(
     methods: &[&str],
     cx: &'a mut TestAppContext,
 ) -> (Entity<SessionView>, &'a mut VisualTestContext) {
-    let (view, cx) = tab(cx);
+    let (view, cx) = agents_host(cx);
     let mut all = vec![
         "capabilities",
         "get_snapshot",
@@ -180,6 +222,22 @@ fn answer(view: &Entity<SessionView>, cx: &mut VisualTestContext, data: Value) {
         cx.notify();
     });
     cx.run_until_parked();
+}
+
+#[gpui::test]
+fn agents_overlay_is_wider_than_its_owning_chat(cx: &mut TestAppContext) {
+    let (view, cx) = open(&[], cx);
+    assert!(!drawn(cx, "agents-overlay"));
+
+    view.update(cx, |view, cx| view.open_agents_panel(AgentsTab::Jobs, cx));
+    assert!(drawn(cx, "job-row-job-1"));
+    let chat = cx.debug_bounds("agents-test-chat").expect("chat drawn");
+    let overlay = cx.debug_bounds("agents-overlay").expect("overlay drawn");
+    assert!(overlay.size.width > chat.size.width);
+
+    view.update(cx, |view, cx| view.close_agents_panel(cx));
+    assert!(!drawn(cx, "agents-overlay"));
+    assert!(!drawn(cx, "job-row-job-1"));
 }
 
 #[gpui::test]
@@ -268,6 +326,7 @@ fn without_get_subagent_thread_the_activity_tab_keeps_its_empty_state(cx: &mut T
     view.read_with(cx, |view, _| {
         assert!(view.desktop.output().thread().is_none())
     });
+    assert!(drawn(cx, "agents-overlay"));
     assert!(!drawn(cx, "agent-thread"));
 }
 

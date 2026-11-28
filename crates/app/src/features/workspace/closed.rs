@@ -20,7 +20,7 @@ pub(super) struct Closed {
     /// The workspace it happened in, by index.
     pub(super) space: usize,
     /// The tab, by id, and where it sat among the tabs.
-    tab: usize,
+    pub(super) tab: usize,
     pub(super) index: usize,
     /// Pin state to restore when an entire tab is reopened.
     pinned: bool,
@@ -334,7 +334,17 @@ mod tests {
                     overlay: None,
                     web_shown: Default::default(),
                     sidebar: None,
+                    sidebar_memory_active: false,
+                    sidebar_memory: None,
+                    sidebar_history_active: false,
+                    sidebar_history: None,
                     sidebar_visible: false,
+                    layout_profiles: crate::features::workspaces::LayoutProfiles::from_saved(
+                        &crate::features::workspaces::SavedState {
+                            version: 1,
+                            ..Default::default()
+                        },
+                    ),
                     tab_layout: TabLayout::Horizontal,
                     tabs_sidebar_motion: Default::default(),
                     files_sidebar_motion: Default::default(),

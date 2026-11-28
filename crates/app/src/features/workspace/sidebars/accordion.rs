@@ -56,7 +56,7 @@ impl Workspace {
         v_flex()
             .size_full()
             .pt_2()
-            .child(self.sidebar_search())
+            .child(self.sidebar_search(cx))
             .child(list)
             .child(self.global_activity_row())
             .child(self.new_tab_tiles(("sidebar-add-agent", "sidebar-add-terminal"), cx))

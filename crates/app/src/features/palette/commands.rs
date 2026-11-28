@@ -214,6 +214,30 @@ pub(super) fn screen_rows(tab_layout: TabLayout) -> Vec<Row> {
         },
         row(
             IconName::PanelRight,
+            "View: Minimal layout",
+            "Switch to the saved Minimal preset",
+            PaletteAction::SetLayoutPreset(crate::features::workspaces::LayoutPreset::Minimal),
+        ),
+        row(
+            IconName::LayoutDashboard,
+            "View: Expanded layout",
+            "Switch to the saved Expanded preset",
+            PaletteAction::SetLayoutPreset(crate::features::workspaces::LayoutPreset::Expanded),
+        ),
+        row(
+            IconName::Files,
+            "Files",
+            "Show or hide the Files panel",
+            PaletteAction::OpenFiles,
+        ),
+        row(
+            IconName::GitBranch,
+            "Git changes",
+            "Show or hide Changes and Branches",
+            PaletteAction::OpenGit,
+        ),
+        row(
+            IconName::PanelRight,
             "Toggle Files sidebar",
             &format!(
                 "Show or hide Files / Changes / Branches on the right ({})",

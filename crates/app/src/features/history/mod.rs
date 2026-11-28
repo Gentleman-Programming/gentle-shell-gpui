@@ -14,6 +14,7 @@ mod ops;
 mod view;
 
 use std::cell::Cell;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
 
@@ -34,7 +35,7 @@ enum Line {
     /// The work tree has changes on top of HEAD.
     Uncommitted,
     /// A commit by its index in the loaded history.
-    Commit(usize),
+    Commit(usize, usize),
     /// Older commits not loaded yet, by count.
     Earlier(usize),
 }
@@ -62,9 +63,42 @@ enum Source {
     GitHub,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GraphMode {
+    Smart,
+    FirstParent,
+    Full,
+}
+
+impl GraphMode {
+    const ALL: [Self; 3] = [Self::Smart, Self::FirstParent, Self::Full];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Smart => "Smart",
+            Self::FirstParent => "First Parent",
+            Self::Full => "Full Graph",
+        }
+    }
+}
+
+pub struct OpenFullHistory(pub PathBuf, pub Scope);
+
+/// Return from the integrated history to a section of the same Git dock.
+#[derive(Clone, Copy)]
+pub(crate) enum GitSection {
+    Changes,
+    Branches,
+}
+
 pub struct HistoryView {
     toplevel: PathBuf,
     scope: Scope,
+    mode: GraphMode,
+    docked: bool,
+    integrated_git: bool,
+    expanded_merges: HashSet<String>,
+    folded_counts: HashMap<String, usize>,
     limit: usize,
     /// `None` until the first read, `Some(None)` outside a repository.
     history: Option<Option<History>>,
@@ -81,6 +115,11 @@ pub struct HistoryView {
     scroll: UniformListScrollHandle,
     /// The pane's width in the last frame: narrow panes drop columns.
     width: Rc<Cell<f32>>,
+    /// Lane count measured from the last painted viewport, not the full log.
+    visible_lanes: Rc<Cell<usize>>,
+    /// Stable lane columns and a shared horizontal position for the sidebar.
+    dock_lanes: Vec<usize>,
+    graph_pan: f32,
     focus: FocusHandle,
     /// Narrows the loaded commits by subject, author, hash or ref.
     filter: Entity<InputState>,
@@ -113,6 +152,9 @@ pub struct HistoryView {
     _subscriptions: Vec<Subscription>,
 }
 
+impl EventEmitter<OpenFullHistory> for HistoryView {}
+impl EventEmitter<GitSection> for HistoryView {}
+
 impl Focusable for HistoryView {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus.clone()
@@ -122,6 +164,21 @@ impl Focusable for HistoryView {
 impl HistoryView {
     /// `cwd` is any folder inside the repository.
     pub fn new(cwd: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        Self::with_mode(cwd, false, window, cx)
+    }
+
+    pub fn new_docked(cwd: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        Self::with_mode(cwd, true, window, cx)
+    }
+
+    pub(crate) fn set_integrated_git(&mut self, integrated: bool, cx: &mut Context<Self>) {
+        if self.integrated_git != integrated {
+            self.integrated_git = integrated;
+            cx.notify();
+        }
+    }
+
+    fn with_mode(cwd: PathBuf, docked: bool, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let filter = cx.new(|cx| InputState::new(window, cx).placeholder("Filter commits"));
         let subscriptions = vec![
             cx.subscribe(&filter, |this, input, event, cx| {
@@ -137,6 +194,11 @@ impl HistoryView {
         let mut this = Self {
             toplevel: cwd.clone(),
             scope: Scope::Head,
+            mode: GraphMode::Full,
+            docked,
+            integrated_git: false,
+            expanded_merges: HashSet::new(),
+            folded_counts: HashMap::new(),
             limit: PAGE,
             history: None,
             commits: Rc::new(Vec::new()),
@@ -149,6 +211,9 @@ impl HistoryView {
             now_ms: 0,
             scroll: UniformListScrollHandle::new(),
             width: Rc::default(),
+            visible_lanes: Rc::new(Cell::new(1)),
+            dock_lanes: vec![0],
+            graph_pan: 0.,
             focus: cx.focus_handle(),
             filter,
             query: String::new(),
@@ -205,6 +270,7 @@ impl HistoryView {
         let cwd = self.toplevel.clone();
         let scope = self.scope.clone();
         let limit = self.limit;
+        let first_parent = self.mode == GraphMode::FirstParent;
         self.loading = true;
         self.read_activity(cx);
         self._load = cx.spawn(async move |this, cx| {
@@ -212,7 +278,7 @@ impl HistoryView {
                 .background_executor()
                 .spawn(async move {
                     let toplevel = git::toplevel(&cwd)?;
-                    git::history(&toplevel, &scope, limit).map(|h| (toplevel, h))
+                    git::history_mode(&toplevel, &scope, limit, first_parent).map(|h| (toplevel, h))
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
@@ -332,7 +398,6 @@ impl HistoryView {
 
     /// List `commits` with their graph, and look up their authors' pictures.
     fn show_commits(&mut self, commits: Vec<Commit>, cx: &mut Context<Self>) {
-        self.graph = Rc::new(gentle_core::git::log::layout(&commits));
         self.commits = Rc::new(commits);
         self.relayout();
         let github = self.read().and_then(|h| h.github.clone());
@@ -346,27 +411,53 @@ impl HistoryView {
     fn relayout(&mut self) {
         let Some(history) = self.read() else {
             self.lines = Rc::new(Vec::new());
+            self.dock_lanes = vec![0];
+            self.graph_pan = 0.;
             return;
         };
         let filtering = !self.query.is_empty();
-        let mut lines = Vec::with_capacity(self.commits.len() + 2);
-        if history.dirty && !self.commits.is_empty() && !filtering {
+        let dirty = history.dirty;
+        let total = history.total;
+        let (indices, graph, counts) = if self.mode == GraphMode::Smart && !filtering {
+            let folded = gentle_core::git::log::folded_history(&self.commits, &self.expanded_merges);
+            (folded.indices, folded.graph, folded.counts)
+        } else {
+            let graph = if self.mode == GraphMode::FirstParent {
+                let mut projected = self.commits.as_ref().clone();
+                for commit in &mut projected {
+                    commit.parents.truncate(1);
+                }
+                gentle_core::git::log::layout(&projected)
+            } else {
+                gentle_core::git::log::layout(&self.commits)
+            };
+            ((0..self.commits.len()).collect(), graph, HashMap::new())
+        };
+        self.dock_lanes = if self.docked && !filtering {
+            graph::all_lanes(&graph.rows)
+        } else {
+            vec![0]
+        };
+        self.graph = Rc::new(graph);
+        self.folded_counts = counts;
+        let mut lines = Vec::with_capacity(indices.len() + 2);
+        if dirty && !self.commits.is_empty() && !filtering {
             lines.push(Line::Uncommitted);
         }
         lines.extend(
-            self.commits
-                .iter()
+            indices
+                .into_iter()
                 .enumerate()
-                .filter(|(_, c)| !filtering || c.matches(&self.query))
-                .map(|(i, _)| Line::Commit(i)),
+                .filter(|(_, i)| !filtering || self.commits[*i].matches(&self.query))
+                .map(|(graph_index, i)| Line::Commit(i, graph_index)),
         );
-        let earlier = history.total.saturating_sub(self.commits.len());
+        let earlier = total.saturating_sub(self.commits.len());
         if earlier > 0 && !filtering {
             lines.push(Line::Earlier(earlier));
         }
         self.matched = lines
             .iter()
-            .filter(|l| matches!(l, Line::Commit(_)))
+            .filter(|l| matches!(l, Line::Commit(..)))
             .count();
         self.lines = Rc::new(lines);
     }
@@ -375,8 +466,34 @@ impl HistoryView {
         !self.query.is_empty()
     }
 
-    fn show(&mut self, scope: Scope, cx: &mut Context<Self>) {
+    fn set_mode(&mut self, mode: GraphMode, cx: &mut Context<Self>) {
+        if self.mode == mode {
+            return;
+        }
+        self.mode = mode;
+        let scope = if mode != GraphMode::Full && self.scope == Scope::All {
+            Scope::Head
+        } else {
+            self.scope.clone()
+        };
+        self.show(scope, cx);
+    }
+
+    fn toggle_merge(&mut self, hash: String, cx: &mut Context<Self>) {
+        if !self.expanded_merges.remove(&hash) {
+            self.expanded_merges.insert(hash);
+        }
+        self.relayout();
+        cx.notify();
+    }
+
+    pub(crate) fn show(&mut self, scope: Scope, cx: &mut Context<Self>) {
+        if scope == Scope::All {
+            self.mode = GraphMode::Full;
+        }
+        self.expanded_merges.clear();
         self.scope = scope;
+        self.graph_pan = 0.;
         self.limit = PAGE;
         self.selected = None;
         self.detail = None;
@@ -399,13 +516,14 @@ impl HistoryView {
         };
         let top = self.toplevel.clone();
         let scope = self.scope.clone();
+        let first_parent = self.mode == GraphMode::FirstParent;
         let skip = self.commits.len();
         let n = self.limit.saturating_sub(skip);
         self.loading = true;
         self._load = cx.spawn(async move |this, cx| {
             let page = cx
                 .background_executor()
-                .spawn(async move { git::earlier(&top, &scope, &tip, skip, n) })
+                .spawn(async move { git::earlier(&top, &scope, &tip, skip, n, first_parent) })
                 .await;
             let _ = this.update(cx, |this, cx| {
                 this.loading = false;
@@ -483,7 +601,7 @@ impl HistoryView {
         if let Some(row) = self
             .lines
             .iter()
-            .position(|l| matches!(l, Line::Commit(i) if *i == index))
+            .position(|l| matches!(l, Line::Commit(i, _) if *i == index))
         {
             self.scroll.scroll_to_item(row, ScrollStrategy::Center);
         }

@@ -108,6 +108,15 @@ impl CardState {
         self.drag.is_some()
     }
 
+    /// Set a known viewport before painting a responsive card. The canvas
+    /// will confirm these bounds during layout.
+    pub fn set_area(&self, (width, height, title): (f32, f32, f32)) -> bool {
+        let changed = self.area.get() != (width, height) || self.title_bar.get() != title;
+        self.area.set((width, height));
+        self.title_bar.set(title);
+        changed
+    }
+
     /// Keep the card inside the window area measured by [`area_canvas`].
     pub fn fit(&mut self) {
         let (aw, ah) = self.area.get();

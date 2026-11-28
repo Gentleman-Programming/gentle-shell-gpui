@@ -193,13 +193,26 @@ impl Workspace {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.toggle_sidebar(cx);
+        self.request_sidebar(cx);
+    }
+
+    pub(super) fn request_sidebar(&mut self, cx: &mut Context<Self>) {
+        if self.sidebar_visible && self.files_sidebar_motion.suspended {
+            self.files_sidebar_motion.requested_at = Some(std::time::Instant::now());
+            cx.notify();
+        } else {
+            self.toggle_sidebar(cx);
+        }
     }
 
     pub fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
         self.files_sidebar_motion
             .retarget(self.sidebar_visible, cx.reduce_motion());
         self.sidebar_visible = !self.sidebar_visible;
+        if self.sidebar_visible {
+            self.files_sidebar_motion.requested_at = Some(std::time::Instant::now());
+        }
+        self.files_sidebar_motion.suspended = false;
         cx.emit(WorkspaceEvent::FilesVisibilityChanged(
             self.files_sidebar_visible(),
         ));
@@ -207,10 +220,9 @@ impl Workspace {
         cx.notify();
     }
 
-    /// The right Files sidebar polls only while it is visible, regardless
-    /// of whether tabs are arranged horizontally or vertically.
+    /// Files and Git only poll while their shared view is visible.
     pub fn files_sidebar_visible(&self) -> bool {
-        self.sidebar_visible
+        self.sidebar_visible && !self.sidebar_memory_active && !self.sidebar_history_active
     }
 
     pub(super) fn on_open_providers(
@@ -295,7 +307,15 @@ impl Workspace {
             Some((Overlay::Onboarding(view), _)) if view.read(cx).busy() => {}
             Some((Overlay::Welcome(view), _)) if view.read(cx).busy(cx) => {}
             Some(_) => self.close_overlay(window, cx),
-            None => cx.propagate(),
+            None => {
+                if let Some(session) = self.agents_overlay_session(cx) {
+                    session.update(cx, |session, cx| session.close_agents_panel(cx));
+                    self.focus_active(window, cx);
+                    cx.notify();
+                } else {
+                    cx.propagate();
+                }
+            }
         }
     }
 

@@ -121,11 +121,38 @@ impl Workspace {
             PaletteAction::NewTerminalPane => self.split_with_kind(PaneKind::Terminal, window, cx),
             PaletteAction::ClosePane => self.on_close_pane(&ClosePane, window, cx),
             PaletteAction::ReopenClosed => self.reopen_closed(window, cx),
-            PaletteAction::ToggleSidebar => self.toggle_sidebar(cx),
+            PaletteAction::ToggleSidebar => self.request_sidebar(cx),
+            PaletteAction::OpenFiles => self.select_right_tool(LayoutTool::Files, window, cx),
+            PaletteAction::OpenGit => self.select_right_tool(LayoutTool::Git, window, cx),
+            PaletteAction::SetLayoutPreset(preset) => {
+                let mut profiles = self.presentation_snapshot(cx);
+                profiles.active = preset;
+                self.apply_presentation(profiles, window, cx);
+            }
             PaletteAction::SetTabLayout(layout) => self.set_tab_layout(layout, cx),
             PaletteAction::Agents => {
-                if let Some(tab) = tab {
-                    tab.update(cx, |s, cx| s.open_agents_panel(AgentsTab::Agents, cx));
+                if let Some(session) = tab {
+                    // Agents is presented by the workspace for its owning
+                    // session. Reveal that pane first: active_session can
+                    // fall back to an agent in another tab.
+                    let pane = self
+                        .panes
+                        .iter()
+                        .find(|(_, pane)| pane.session.as_ref() == Some(&session))
+                        .map(|(id, _)| *id);
+                    if let Some(pane) = pane {
+                        self.reveal_pane(pane, window, cx);
+                    }
+                    session.update(cx, |s, cx| {
+                        s.ensure_started(window, cx);
+                        s.open_agents_panel(AgentsTab::Agents, cx);
+                    });
+                    cx.notify();
+                } else {
+                    window.push_notification(
+                        Notification::info("Open an agent tab first to view its agents and jobs."),
+                        cx,
+                    );
                 }
             }
             PaletteAction::NewSession => {
@@ -467,17 +494,8 @@ impl Workspace {
             window,
             |this, view, event: &SettingsEvent, window, cx| match event {
                 SettingsEvent::Close => this.close_overlay(window, cx),
-                SettingsEvent::TabLayoutChanged(layout) => this.set_tab_layout(*layout, cx),
-                SettingsEvent::SidebarCompactChanged(compact) => {
-                    this.set_sidebar_compact(*compact, cx);
-                }
-                SettingsEvent::TabsSidebarHidden(hidden) => {
-                    this.set_tabs_sidebar_hidden(*hidden, cx);
-                }
-                SettingsEvent::FilesSidebarShown(shown) => {
-                    if this.sidebar_visible != *shown {
-                        this.toggle_sidebar(cx);
-                    }
+                SettingsEvent::PresentationChanged(profiles) => {
+                    this.apply_presentation(profiles.clone(), window, cx)
                 }
                 SettingsEvent::OpenProfiles => this.open_profiles(window, cx),
                 SettingsEvent::Changed => {

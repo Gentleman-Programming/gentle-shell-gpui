@@ -8,6 +8,8 @@ use std::time::Instant;
 pub(super) struct SidebarMotion {
     slide: Option<(Instant, SidebarSlide)>,
     pub(super) revision: u64,
+    pub(super) requested_at: Option<Instant>,
+    pub(super) suspended: bool,
     pub(super) active_drag: std::rc::Weak<std::cell::Cell<u64>>,
 }
 
@@ -43,6 +45,55 @@ impl SidebarMotion {
 }
 
 impl Workspace {
+    /// The effective row geometry is computed once from all dock reservations.
+    pub(super) fn responsive_geometry(
+        &self,
+        window: f32,
+        scale: f32,
+        now: Instant,
+        cx: &App,
+    ) -> responsive::Allocation {
+        self.responsive_plan(window, scale, now, cx).layout
+    }
+
+    pub(super) fn responsive_plan(
+        &self,
+        window: f32,
+        scale: f32,
+        now: Instant,
+        cx: &App,
+    ) -> responsive::Coexistence {
+        let profile = self.layout_profiles.current();
+        let rails = usize::from(profile.has(ToolPlacement::Left))
+            + usize::from(profile.has(ToolPlacement::Right));
+        let devices = self.devices.read(cx);
+        let device_request = if devices.visible()
+            && devices.preferred_mode() == crate::shared::floating::Mode::Docked
+        {
+            let width = crate::features::devices::DOCK_WIDTH / scale;
+            responsive::DockRequest {
+                width,
+                minimum: width,
+                requested_at: Some(devices.requested_at()),
+            }
+        } else {
+            responsive::DockRequest::default()
+        };
+        responsive::coexist(
+            window,
+            rails,
+            self.visible_sidebar_geometry(Side::Tabs, window, now),
+            self.visible_sidebar_geometry(Side::Files, window, now),
+            self.sidebar_compact,
+            responsive::DockRequests {
+                right_at: self.files_sidebar_motion.requested_at,
+                manual_float_at: self.latest_manual_float(cx),
+                browser: self.browser_dock_request(window * scale, scale, cx),
+                devices: device_request,
+            },
+        )
+    }
+
     /// The visible panel and inner gap, shared by layout and painting.
     pub(super) fn visible_sidebar_geometry(
         &self,
@@ -95,7 +146,7 @@ impl Workspace {
         let (saved, open, motion) = match side {
             Side::Tabs => (
                 self.tabs_sidebar_width,
-                self.tabs_sidebar_visible(),
+                self.navigation_visible(),
                 &self.tabs_sidebar_motion,
             ),
             Side::Files => (
@@ -104,7 +155,7 @@ impl Workspace {
                 &self.files_sidebar_motion,
             ),
         };
-        let fraction = if matches!(side, Side::Files) && self.sidebar.is_none() {
+        let fraction = if matches!(side, Side::Files) && self.right_sidebar_view().is_none() {
             0.
         } else {
             motion.fraction(open, now)

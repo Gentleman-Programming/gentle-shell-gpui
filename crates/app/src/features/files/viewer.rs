@@ -16,6 +16,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use gentle_core::header_layout::{HeaderBudget, needs_action_row};
 use gentle_core::preview::{self, Fit, Limits};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -940,25 +941,15 @@ impl FileView {
         }
         let facts = facts.join(" · ");
 
-        // Facts join the header by priority (language, change, size) while
-        // they fit beside the path, measured from the last frame's width;
-        // the path prefix keeps a little room before it truncates. Costs are
-        // px at 100 %, so the width is counted in those too.
+        // Work in logical units at 100% interface size. The fixed actions
+        // get their own budget before the mode selector and metadata.
         let chars = |s: &str| s.chars().count() as f32;
         let unit = f32::from(rems(1. / 16.).to_pixels(window.rem_size()));
+        let available = self.header_width.get() / unit;
         let edit = self.edit.as_ref();
         let dirty = edit.is_some_and(|e| e.dirty);
         let saving = edit.is_some_and(|e| e.saving);
         let just_saved = edit.is_some_and(|e| e.just_saved) && !dirty;
-        // The save button, and the hint or "Saved" beside it.
-        let save_width = match edit {
-            None => 0.,
-            Some(_) if just_saved => 28. + 58.,
-            Some(_) if dirty => 28. + chars(SAVE_HINT) * 7. + 8.,
-            Some(_) => 28.,
-        };
-        // A Markdown pane's Edit · Split · Preview toggle, or a diff's
-        // Split · Unified one.
         let mode = self.markdown.as_ref().map(|m| m.mode);
         let diff_mode = matches!(self.body, Body::Diff(_)).then_some(self.diff_mode);
         let toggle_labels: &[&str] = match (mode, diff_mode) {
@@ -966,90 +957,74 @@ impl FileView {
             (None, Some(_)) => &DIFF_LABELS,
             (None, None) => &[],
         };
-        let toggle_width = if toggle_labels.is_empty() {
-            0.
-        } else {
-            toggle_labels
-                .iter()
-                .map(|l| chars(l) * 6.5 + 22.)
-                .sum::<f32>()
-                + 14.
-        };
-        let path_width = chars(&self.crumbs.1) * 7.6
-            + (chars(&self.crumbs.0) * 6.8).min(90.)
-            + if dirty { 13. } else { 0. };
-        let mut budget = self.header_width.get() / unit
-            - 32.
-            - 24.
-            // Two trailing xsmall icon buttons (reveal and close): 20 px + 8 px gap each.
-            - 32.
-            - 28.
-            - save_width
-            - toggle_width
-            - path_width;
-        let mut fits = |cost: f32| {
-            let fit = cost + 8. <= budget;
-            if fit {
-                budget -= cost + 8.;
-            }
-            fit
-        };
-        // Content too large for syntax colors says so in place of its language.
+        let has_mode = !toggle_labels.is_empty();
+        // Include conservative room for xsmall buttons and their gaps.
+        // The compact mode menu and diff wrapping control remain usable.
+        let action_count = 2 + usize::from(edit.is_some())
+            + usize::from(has_mode) + usize::from(diff_mode.is_some());
+        let reserved = 32. + 8. + action_count as f32 * 32.;
+        let stacked = needs_action_row(available, reserved, 56.);
+        let name_width = (chars(&self.crumbs.1) * 7.6).max(56.)
+            + 22. + if dirty { 13. } else { 0. };
+        let mut budget = HeaderBudget::new(available, reserved + name_width);
+        let full_mode_width = toggle_labels
+            .iter()
+            .map(|label| chars(label) * 7.5 + 24.)
+            .sum::<f32>() + 14.;
+        let full_mode = has_mode && !stacked && budget.take((full_mode_width - 28.).max(0.));
         let chip_label = if self.meta.plain {
             PLAIN_NOTE
         } else {
             self.meta.language
         };
-        let show_language = fits(chars(chip_label) * 6. + 16.);
-        let show_change = self.meta.change.is_some_and(|(status, added, removed)| {
+        let show_saved = !stacked && just_saved && budget.take(66.);
+        let show_change = !stacked && self.meta.change.is_some_and(|(status, added, removed)| {
             let counts = format!("+{added} −{removed}");
-            fits(chars(&counts) * 7. + chars(status) * 6. + 24.)
+            budget.take(chars(&counts) * 7. + chars(status) * 6. + 42.)
         });
-        let show_facts = !facts.is_empty() && fits(chars(&facts) * 6.6);
+        let show_language = !stacked && budget.take(chars(chip_label) * 6. + 24.);
+        let show_facts = !stacked && !facts.is_empty() && budget.take(chars(&facts) * 6.6 + 8.);
+        let show_prefix = !stacked && budget.take((chars(&self.crumbs.0) * 6.8).min(90.) + 8.);
+        let show_hint = !stacked && dirty && budget.take(chars(SAVE_HINT) * 7. + 8.);
 
         let path = self.path.clone();
         let width = self.header_width.clone();
         let view = cx.entity_id();
-        h_flex()
-            .relative()
-            .flex_none()
-            .h(rems(38. / 16.))
-            .px_4()
+        let title = h_flex()
+            .flex_1()
+            .min_w_0()
             .gap_2()
-            .child(
-                canvas(
-                    move |bounds, _, cx| {
-                        let w = f32::from(bounds.size.width);
-                        if (w - width.get()).abs() > 1. {
-                            width.set(w);
-                            cx.notify(view);
-                        }
-                    },
-                    |_, _, _, _| {},
-                )
-                .absolute()
-                .size_full(),
-            )
+            .overflow_hidden()
             .child(Icon::new(icon).small().text_color(tint))
             .child(
                 h_flex()
                     .flex_1()
                     .min_w_0()
                     .overflow_hidden()
+                    .when(show_prefix, |d| {
+                        d.child(
+                            div()
+                                .min_w_0()
+                                .max_w(rems(90. / 16.))
+                                .truncate()
+                                .text_size(rems(12.5 / 16.))
+                                .text_color(ui::faint())
+                                .child(self.crumbs.0.clone()),
+                        )
+                    })
                     .child(
                         div()
+                            .id("file-view-name")
+                            .flex_1()
                             .min_w_0()
                             .truncate()
-                            .text_size(rems(12.5 / 16.))
-                            .text_color(ui::faint())
-                            .child(self.crumbs.0.clone()),
-                    )
-                    .child(
-                        div()
-                            .flex_none()
                             .text_size(rems(13. / 16.))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(ui::fg())
+                            .tooltip({
+                                let full_path = self.path.display().to_string();
+                                move |window, cx| ui::tooltip(full_path.clone()).build(window, cx)
+                            })
                             .child(self.crumbs.1.clone()),
                     )
                     .when(dirty, |d| {
@@ -1108,12 +1083,37 @@ impl FileView {
                         }),
                 )
             })
+            .when(show_saved, |d| {
+                d.child(ui::appear(
+                    "file-view-saved",
+                    h_flex()
+                        .flex_none()
+                        .gap_1()
+                        .text_size(rems(12. / 16.))
+                        .text_color(ui::success())
+                        .child(Icon::new(IconName::Check).xsmall())
+                        .child("Saved"),
+                ))
+            })
+            .when(show_hint, |d| {
+                d.child(
+                    div()
+                        .flex_none()
+                        .font_family(ui::mono())
+                        .text_size(ui::code_rems(11.5))
+                        .text_color(ui::faint())
+                        .child(SAVE_HINT),
+                )
+            });
+
+        let actions = ui::header_actions()
             .when_some(mode, |d, mode| {
                 let view = cx.entity().downgrade();
-                d.child(ui::segmented(
+                d.child(ui::adaptive_segmented(
                     "file-view-mode",
                     &MdMode::LABELS,
                     Some(mode.index()),
+                    !full_mode,
                     move |ix, window, cx| {
                         if let Some(&mode) = MdMode::ALL.get(*ix) {
                             let _ = view.update(cx, |this, cx| this.set_mode(mode, window, cx));
@@ -1123,10 +1123,11 @@ impl FileView {
             })
             .when_some(diff_mode, |d, current| {
                 let view = cx.entity().downgrade();
-                d.child(ui::segmented(
+                d.child(ui::adaptive_segmented(
                     "file-view-diff-mode",
                     &DIFF_LABELS,
                     DIFF_MODES.iter().position(|m| *m == current),
+                    !full_mode,
                     move |ix, _, cx| {
                         if let Some(&mode) = DIFF_MODES.get(*ix) {
                             let _ = view.update(cx, |this, cx| this.set_diff_mode(mode, cx));
@@ -1151,28 +1152,6 @@ impl FileView {
                             this.diff_wrap = Some(!wraps);
                             cx.notify();
                         })),
-                )
-            })
-            .when(just_saved, |d| {
-                d.child(ui::appear(
-                    "file-view-saved",
-                    h_flex()
-                        .flex_none()
-                        .gap_1()
-                        .text_size(rems(12. / 16.))
-                        .text_color(ui::success())
-                        .child(Icon::new(IconName::Check).xsmall())
-                        .child("Saved"),
-                ))
-            })
-            .when(dirty, |d| {
-                d.child(
-                    div()
-                        .flex_none()
-                        .font_family(ui::mono())
-                        .text_size(ui::code_rems(11.5))
-                        .text_color(ui::faint())
-                        .child(SAVE_HINT),
                 )
             })
             .when(edit.is_some(), |d| {
@@ -1205,6 +1184,44 @@ impl FileView {
                     .on_click(move |_, window, cx| {
                         window.dispatch_action(Box::new(CloseViewer { pane: view }), cx)
                     })
+            });
+
+        // Measure the entire header, not a child whose width changes as
+        // controls are compacted. The action group is never inside a clip.
+        v_flex()
+            .relative()
+            .flex_none()
+            .w_full()
+            .min_w_0()
+            .px_4()
+            .child(
+                canvas(
+                    move |bounds, _, cx| {
+                        let w = f32::from(bounds.size.width);
+                        if (w - width.get()).abs() > 1. {
+                            width.set(w);
+                            cx.notify(view);
+                        }
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full(),
+            )
+            .child(if stacked {
+                v_flex()
+                    .gap_1()
+                    .py_1()
+                    .child(title.flex_none().w_full())
+                    .child(actions.w_full().flex_wrap().justify_end())
+                    .into_any_element()
+            } else {
+                h_flex()
+                    .h(rems(38. / 16.))
+                    .gap_2()
+                    .child(title)
+                    .child(actions)
+                    .into_any_element()
             })
     }
 

@@ -21,6 +21,7 @@ use gpui_kit::*;
 use crate::features::canvas::{CanvasEvent, CanvasView};
 use crate::features::docs::{DocsEvent, DocsView};
 use crate::features::explorer::{ExplorerEvent, ExplorerView};
+use crate::features::files::FileTreeView;
 use crate::features::memory::{MemoryEvent, MemoryView};
 use crate::features::notices::{self, Notices};
 use crate::features::onboarding::{OnboardingEvent, OnboardingView, Probe};
@@ -37,7 +38,8 @@ use crate::features::tower::TowerView;
 use crate::features::usage::{UsageEvent, UsageView};
 use crate::features::welcome::{WelcomeEvent, WelcomeView};
 use crate::features::workspaces::{
-    self, Badge, SavedPane, SavedState, SavedTab, SavedWorkspace, TabLayout,
+    self, Badge, LayoutPreset, LayoutProfiles, LayoutTool, SavedPane, SavedState, SavedTab, SavedWorkspace,
+    TabLayout, ToolPlacement,
 };
 use crate::shared::pane::{
     AskAgent, CloseViewer, OpenCommitDiff, OpenTerminalAt, PaneFactories, PaneId, PaneItem,
@@ -56,6 +58,8 @@ mod overlays;
 mod panes;
 mod persistence;
 mod render;
+mod responsive;
+mod right_sidebar;
 mod sidebar_motion;
 mod sidebars;
 mod spaces;
@@ -101,7 +105,8 @@ actions!(
     ]
 );
 
-const COMPACT_SIDEBAR_WIDTH: f32 = 48.;
+// Both compact rails follow the right activity bar's width.
+const COMPACT_SIDEBAR_WIDTH: f32 = right_sidebar::ACTIVITY_BAR_WIDTH;
 
 /// What the window tells whoever embeds things in it (the sidebar's owner).
 pub enum WorkspaceEvent {
@@ -417,8 +422,13 @@ pub struct Workspace {
     /// Agent panes last told their web views may show (see
     /// `sync_web_views`).
     web_shown: std::collections::HashSet<PaneId>,
-    sidebar: Option<AnyView>,
+    sidebar: Option<Entity<FileTreeView>>,
+    sidebar_memory_active: bool,
+    sidebar_memory: Option<(Entity<MemoryView>, Subscription)>,
+    sidebar_history_active: bool,
+    sidebar_history: Option<(PathBuf, Entity<crate::features::history::HistoryView>)>,
     sidebar_visible: bool,
+    layout_profiles: LayoutProfiles,
     tabs_sidebar_motion: sidebar_motion::SidebarMotion,
     files_sidebar_motion: sidebar_motion::SidebarMotion,
     tab_layout: TabLayout,
@@ -503,6 +513,8 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> Self {
         let saved = workspaces::load();
+        let layout_profiles = LayoutProfiles::from_saved(&saved);
+        let presentation = layout_profiles.current().clone();
         let mut restored = Vec::new();
         let spaces: Vec<Space> = saved
             .workspaces
@@ -553,6 +565,9 @@ impl Workspace {
                 if this.floating_stages(cx) >= 2 {
                     this.tile_stages(window, cx);
                 }
+                // Responsive sidebar widths depend on the viewport, even
+                // when no floating stages are present.
+                cx.notify();
             }),
             // The ♪ button's look follows the player; the player's own panel
             // redraws itself (its spectrum) without redrawing the window.
@@ -579,17 +594,22 @@ impl Workspace {
             overlay: None,
             web_shown: Default::default(),
             sidebar: None,
-            sidebar_visible: saved.sidebar,
+            sidebar_memory_active: presentation.dock == LayoutTool::Engram,
+            sidebar_memory: None,
+            sidebar_history_active: presentation.dock == LayoutTool::History,
+            sidebar_history: None,
+            sidebar_visible: presentation.sidebar_visible,
+            layout_profiles,
             tabs_sidebar_motion: Default::default(),
             files_sidebar_motion: Default::default(),
-            tab_layout: saved.tab_layout,
-            sidebar_compact: saved.sidebar_compact,
-            tabs_sidebar_hidden: saved.tabs_sidebar_hidden,
+            tab_layout: presentation.tab_layout,
+            sidebar_compact: presentation.navigation_compact(),
+            tabs_sidebar_hidden: presentation.tabs_sidebar_hidden,
             tabs_sidebar_width: gentle_core::workspaces::saved_sidebar_width(
-                saved.tabs_sidebar_width,
+                presentation.tabs_width,
             ),
             files_sidebar_width: gentle_core::workspaces::saved_sidebar_width(
-                saved.files_sidebar_width,
+                presentation.files_width,
             ),
             badge_picker: None,
             open_menu: None,
@@ -730,9 +750,34 @@ impl Workspace {
         });
     }
 
-    /// Put `view` in the right Files sidebar (Cmd/Ctrl+B toggles it).
-    pub fn set_sidebar(&mut self, view: AnyView, cx: &mut Context<Self>) {
+    /// Mount the existing file/Git view for the active workspace.
+    pub fn set_sidebar(
+        &mut self,
+        view: Entity<FileTreeView>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let git = self.sidebar.as_ref().map_or(
+            self.layout_profiles.current().dock == LayoutTool::Git,
+            |tree| tree.read(cx).is_git_tab(),
+        );
+        let visible = self.files_sidebar_visible();
+        let original_tabs = self.layout_profiles.current().original_controls;
+        let integrated_history = self.layout_profiles.active == LayoutPreset::Expanded;
+        view.update(cx, |tree, cx| {
+            tree.set_original_tabs(original_tabs, cx);
+            tree.set_integrated_history(integrated_history, cx);
+            tree.select_sidebar_tool(git, window, cx);
+            tree.set_visible(visible, cx);
+        });
         self.sidebar = Some(view);
+        self.sidebar_memory = None;
+        self.sidebar_history = None;
+        if self.sidebar_memory_active {
+            self.ensure_sidebar_memory(window, cx);
+        } else if self.sidebar_history_active {
+            self.ensure_sidebar_history(self.root().to_path_buf(), window, cx);
+        }
         cx.notify();
     }
 
@@ -790,11 +835,14 @@ impl Workspace {
         self.place_preview(id, window, cx);
     }
 
-    /// The Git pane of the repository `cwd` is in, placed like a preview: it
-    /// takes the place of the tab's preview pane, if any.
+    /// Expanded keeps Git history inside Git; Minimal opens the original preview.
     pub fn open_history(&mut self, cwd: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(id) = self.new_factory_pane(PaneKind::History, cwd, window, cx) {
-            self.place_preview(id, window, cx);
+        if self.layout_profiles.active == LayoutPreset::Minimal {
+            if let Some(id) = self.new_factory_pane(PaneKind::History, cwd, window, cx) {
+                self.place_preview(id, window, cx);
+            }
+        } else {
+            self.show_sidebar_history(cwd, window, cx);
         }
     }
 

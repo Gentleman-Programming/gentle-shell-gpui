@@ -17,7 +17,8 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     Animation, AnimationElement, AnimationExt as _, App, BoxShadow, Div, ElementId, EntityId,
     FontWeight, Hsla, InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Rems,
-    SharedString, Stateful, Styled, Window, canvas, div, ease_out_quint, point, px, rems, rgb,
+    SharedString, Stateful, StatefulInteractiveElement as _, Styled, Window, canvas, div,
+    ease_out_quint, point, px, rems, rgb,
 };
 
 use crate::shared::themes::{self, Glass, Theme, mix};
@@ -402,6 +403,11 @@ static CODE_SIZE: AtomicU32 = AtomicU32::new(gentle_core::fonts::DEFAULT_CODE_SI
 static TERMINAL_SIZE: AtomicU32 =
     AtomicU32::new(gentle_core::fonts::DEFAULT_TERMINAL_SIZE.to_bits());
 
+/// Primary and secondary text sizes shared by the workspace's side panels,
+/// at the default interface and code font sizes.
+pub const SIDEBAR_TEXT_SIZE: f32 = 12.5;
+pub const SIDEBAR_METADATA_SIZE: f32 = 10.5;
+
 /// Code text of `px_at_100` px (at the default code size and 100 % zoom) as
 /// rems: it follows the chosen code size and the zoom (the rem), and at the
 /// default code size it is exactly `rems(px_at_100 / 16.)`. Every
@@ -761,14 +767,21 @@ pub fn section_label(text: impl Into<SharedString>) -> Div {
 /// centered glass panel with a header (icon, title, subtitle, trailing).
 /// `width` is in px at 100 % and grows with the interface size.
 pub fn screen(width: Option<f32>) -> (Div, Div) {
+    let (backdrop, panel) = workspace_screen(width);
+    (backdrop.child(scrim("screen-scrim")), panel)
+}
+
+/// Workspace modals share one full-width scrim painted by the workspace.
+/// Their content is inset independently to keep the activity rails usable.
+/// Standalone and first-run screens use `screen` instead.
+pub fn workspace_screen(width: Option<f32>) -> (Div, Div) {
     let backdrop = div()
         .absolute()
         .inset_0()
         .flex()
         .items_center()
         .justify_center()
-        .p(rems(32. / 16.))
-        .child(scrim("screen-scrim"));
+        .p(rems(32. / 16.));
     let panel = div()
         .flex()
         .flex_col()
@@ -938,6 +951,50 @@ pub fn segmented(
                 .on_click(move |_, window, cx| on_select(&i, window, cx))
                 .child(*label)
         }))
+}
+
+/// A fixed group of header actions. Flexible text and optional metadata
+/// belong outside this group, so they cannot clip its buttons.
+pub fn header_actions() -> Div {
+    h_flex().flex_none().gap_1()
+}
+
+/// A full segmented selector when space permits, otherwise an icon-only
+/// menu with the same options and current selection.
+pub fn adaptive_segmented(
+    id: &'static str,
+    labels: &'static [&'static str],
+    selected: Option<usize>,
+    compact: bool,
+    on_select: impl Fn(&usize, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    use gpui_kit::component::button::{Button, ButtonVariants as _};
+    use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
+
+    if compact {
+        let on_select = std::rc::Rc::new(on_select);
+        let tooltip = selected
+            .and_then(|index| labels.get(index))
+            .map_or_else(|| "View mode".to_string(), |label| format!("View mode: {label}"));
+        Button::new(id)
+            .ghost()
+            .xsmall()
+            .icon(Icon::new(IconName::Ellipsis))
+            .tooltip(tooltip)
+            .dropdown_menu(move |menu, _, _| {
+                labels.iter().enumerate().fold(menu, |menu, (index, label)| {
+                    let on_select = on_select.clone();
+                    menu.item(
+                        PopupMenuItem::new(*label)
+                            .checked(selected == Some(index))
+                            .on_click(move |_, window, cx| on_select(&index, window, cx)),
+                    )
+                })
+            })
+            .into_any_element()
+    } else {
+        segmented(id, labels, selected, on_select).into_any_element()
+    }
 }
 
 // ── Motion ─────────────────────────────────────────────────────────────────
@@ -1309,6 +1366,66 @@ pub fn orbit(color: Hsla, radius: Rems) -> Div {
             .size_full(),
         )
         .child(frames_every(SLOW_FRAME))
+}
+
+/// A sidebar section tab: inactive sections are icons, the active one has a label.
+pub(crate) fn sidebar_section_tab(
+    icon: IconName,
+    label: &'static str,
+    count: usize,
+    active: bool,
+) -> Stateful<Div> {
+    h_flex()
+        .id(label)
+        .h(rems(26. / 16.))
+        .min_w(rems(32. / 16.))
+        .px_2()
+        .gap_1()
+        .justify_center()
+        .rounded_md()
+        .cursor_pointer()
+        .when(active, |d| d.bg(surface_hover()))
+        .when(!active, |d| {
+            d.hover(|s| s.bg(surface_hover().opacity(0.6)))
+        })
+        .child(
+            Icon::new(icon)
+                .small()
+                .text_color(if active { fg() } else { faint() }),
+        )
+        // The open tab says what it is; the others keep to their icons.
+        .when(active, |d| {
+            d.child(
+                div()
+                    .text_size(rems(12.5 / 16.))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(fg())
+                    .child(label),
+            )
+        })
+        .when(count > 0, |d| {
+            d.child(
+                div()
+                    .font_family(mono())
+                    .text_size(code_rems(10.5))
+                    .text_color(warning())
+                    .child(count.to_string()),
+            )
+        })
+        .tooltip(move |window, cx| Tooltip::new(label).build(window, cx))
+}
+
+/// The running tab's loading streak. Its absolute overlay never changes row
+/// measurements or adds an interactive surface. Reduced motion uses a
+/// stationary outline rather than a moving streak.
+#[track_caller]
+pub(crate) fn tab_work_orbit(radius: Rems, reduce_motion: bool) -> Div {
+    let overlay = div().absolute().inset_0().rounded(radius);
+    if reduce_motion {
+        overlay.border_1().border_color(accent().opacity(0.65))
+    } else {
+        overlay.child(orbit(accent(), radius))
+    }
 }
 
 /// A five-second orbit with a pause on each side, for compaction in progress.
