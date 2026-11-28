@@ -779,6 +779,8 @@ A build from source never updates itself; `git pull` and run `cargo run --releas
 cargo run --release -- [FOLDER] [--prompt "first message"]
 ```
 
+`--version` (`-V`) prints the app's version and `--help` (`-h`) lists the options; both exit without opening a window. An option the app doesn't know is reported and ignored, never opened as the folder.
+
 | Variable | Effect |
 | --- | --- |
 | `GENTLE_SHELL_BIN` | Path of the launcher to use instead of `gentle-shell` on `PATH`. |

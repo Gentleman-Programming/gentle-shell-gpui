@@ -27,6 +27,25 @@ fn main() {
     // An explicit folder (or `--cwd`, which `gsd` passes) selects or creates
     // the workspace rooted there; without one the last workspace is restored.
     let cli = cli::parse_cli();
+    if cli.version || cli.help {
+        // Release builds use the Windows GUI subsystem: print to the
+        // terminal that launched the app.
+        #[cfg(windows)]
+        unsafe {
+            let _ = windows::Win32::System::Console::AttachConsole(
+                windows::Win32::System::Console::ATTACH_PARENT_PROCESS,
+            );
+        }
+        if cli.help {
+            println!("{}", cli::USAGE);
+        } else {
+            println!("gentle-shell-gpui {}", env!("CARGO_PKG_VERSION"));
+        }
+        return;
+    }
+    for option in &cli.ignored {
+        eprintln!("gentle-shell-gpui: ignoring unknown option {option}");
+    }
     let folder = cli::requested_folder(&cli);
     let prompt = cli.prompt;
     let url = cli.url;

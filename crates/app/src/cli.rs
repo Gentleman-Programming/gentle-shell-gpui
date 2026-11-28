@@ -1,7 +1,20 @@
 //! Command line: `gentle-shell-gpui [FOLDER] [--cwd] [-p|--prompt TEXT]
-//! [--open-url URL] [--diagnostics]`.
+//! [--open-url URL] [--diagnostics] [-V|--version] [-h|--help]`.
 
 use std::path::{Path, PathBuf};
+
+/// What `--help` prints.
+pub const USAGE: &str = "Usage: gentle-shell-gpui [FOLDER] [OPTIONS]
+
+  FOLDER               Open this folder as a workspace (default: the last one)
+  --cwd                Open the folder the app was launched in
+  -p, --prompt TEXT    Start a new agent tab with this first message
+  --open-url URL       Show a page in the running app's browser
+  --diagnostics        Record diagnostics from launch
+  -V, --version        Print the version and exit
+  -h, --help           Print this help and exit
+
+  workspace <command>  Manage the running app's workspaces (workspace --help)";
 
 /// `gentle-shell-gpui [FOLDER] [--cwd] [-p|--prompt TEXT]`
 pub struct Cli {
@@ -13,16 +26,30 @@ pub struct Cli {
     pub prompt: Option<String>,
     /// `--open-url URL`: show a page in the running app's browser.
     pub url: Option<String>,
+    /// `-V`/`--version`: print the version and exit.
+    pub version: bool,
+    /// `-h`/`--help`: print the usage and exit.
+    pub help: bool,
+    /// Options this version doesn't know, ignored instead of opened as the
+    /// folder.
+    pub ignored: Vec<String>,
 }
 
 pub fn parse_cli() -> Cli {
+    parse_args(std::env::args_os().skip(1))
+}
+
+fn parse_args(args: impl IntoIterator<Item = std::ffi::OsString>) -> Cli {
     let mut cli = Cli {
         folder: None,
         here: false,
         prompt: None,
         url: None,
+        version: false,
+        help: false,
+        ignored: Vec::new(),
     };
-    let mut args = std::env::args_os().skip(1);
+    let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         if arg == "-p" || arg == "--prompt" {
             cli.prompt = args.next().map(|p| p.to_string_lossy().into_owned());
@@ -36,6 +63,12 @@ pub fn parse_cli() -> Cli {
             );
         } else if arg == crate::shared::diagnostics::FLAG {
             // Read by `diagnostics::enabled`.
+        } else if arg == "-V" || arg == "--version" {
+            cli.version = true;
+        } else if arg == "-h" || arg == "--help" {
+            cli.help = true;
+        } else if arg.len() > 1 && arg.to_string_lossy().starts_with('-') {
+            cli.ignored.push(arg.to_string_lossy().into_owned());
         } else if cli.folder.is_none() {
             cli.folder = Some(PathBuf::from(arg));
         }
@@ -117,6 +150,58 @@ fn within(path: &Path, root: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn parse(args: &[&str]) -> Cli {
+        parse_args(args.iter().map(std::ffi::OsString::from))
+    }
+
+    #[test]
+    fn version_and_help_flags_are_not_taken_as_the_folder() {
+        for flag in ["--version", "-V"] {
+            let cli = parse(&[flag]);
+            assert!(cli.version, "{flag}");
+            assert!(!cli.help, "{flag}");
+            assert_eq!(cli.folder, None, "{flag}");
+        }
+        for flag in ["--help", "-h"] {
+            let cli = parse(&[flag]);
+            assert!(cli.help, "{flag}");
+            assert!(!cli.version, "{flag}");
+            assert_eq!(cli.folder, None, "{flag}");
+        }
+    }
+
+    /// An option this version doesn't know (a newer one, or one a launcher
+    /// adds) is reported and skipped; the folder after it still opens.
+    #[test]
+    fn an_unknown_option_is_ignored_not_opened_as_the_folder() {
+        let cli = parse(&["--bogus", "project"]);
+        assert_eq!(cli.ignored, ["--bogus"]);
+        assert_eq!(cli.folder, Some(PathBuf::from("project")));
+        assert!(!cli.version && !cli.help);
+    }
+
+    /// The existing options keep working, and a value that looks like an
+    /// option stays the value.
+    #[test]
+    fn existing_options_and_their_values_parse_as_before() {
+        let cli = parse(&[
+            "project",
+            "--cwd",
+            "-p",
+            "--version",
+            "--open-url",
+            "https://example.com",
+        ]);
+        assert_eq!(cli.folder, Some(PathBuf::from("project")));
+        assert!(cli.here);
+        assert_eq!(cli.prompt.as_deref(), Some("--version"));
+        assert_eq!(cli.url.as_deref(), Some("https://example.com"));
+        assert!(!cli.version && !cli.help);
+        assert!(cli.ignored.is_empty());
+        // `--diagnostics` is read elsewhere and isn't unknown here.
+        assert!(parse(&["--diagnostics"]).ignored.is_empty());
+    }
 
     #[test]
     fn here_flag_uses_the_launch_folder_only_without_a_folder() {
