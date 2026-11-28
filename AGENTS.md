@@ -37,6 +37,7 @@ Dependency rules and the anatomy of a feature: [`docs/architecture.md`](docs/arc
 - **Tests:** pure logic is tested in `gentle-core`; file effects use temporary directories. No tests that only restate the implementation.
 - **Gentle Shell configuration:** the app reads and writes files that Gentle Shell also owns. Before touching one, check who owns it in [`docs/integrations.md`](docs/integrations.md).
 - **Security:** crates only from crates.io, never `pull_request_target`, actions pinned to a commit SHA, workflows with a read-only token. A PR that touches `.github/`, `build.rs`, `Cargo.*`, `packaging/` or the updater gets a Code Owner's review. See [`docs/security.md`](docs/security.md).
+- **Solvers list:** never edit `.github/solvers.txt`, not even in a PR (it gets closed); the owner changes it with Actions → Solvers. See [`CONTRIBUTING.md`](CONTRIBUTING.md#merging-with-solve).
 - **Windows and Linux:** code under `#[cfg(windows)]` or `#[cfg(target_os = "linux")]` doesn't compile on macOS; be careful with imports and paths there, and rely on CI to check it.
 
 ## Testing without breaking anything

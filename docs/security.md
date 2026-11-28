@@ -30,7 +30,7 @@ The risk report lists sensitive files (CI, `build.rs`, `Cargo.*`, `packaging/`, 
 
 Also enforced in the workflows:
 
-- Every workflow runs with `permissions: contents: read` unless a job needs more: `release` writes, only on tags, and `issue-claims` writes issues (assignees, labels, comments) for `/take` and `/drop`, without checking out or running code.
+- Every workflow runs with `permissions: contents: read` unless a job needs more: `release` writes, only on tags; `issue-claims` writes issues (assignees, labels, comments) for `/take` and `/drop`, without checking out or running code; and `solvers` comments on and closes PRs, and merges on `/solve` and edits the solvers list with the owner's token (`SOLVE_TOKEN`), running only the default branch's `.github/scripts/solvers.py`, never a PR's code.
 - PRs use `pull_request`, never `pull_request_target`: a fork's code gets no secrets and a read-only token.
 - Actions are pinned to a commit SHA (a moved tag can't change what runs); Dependabot keeps them current ([`.github/dependabot.yml`](../.github/dependabot.yml)).
 - `actions/checkout` runs with `persist-credentials: false`, so later steps can't reuse the token.
@@ -47,6 +47,8 @@ These checks run code from the PR itself, so a PR that edits `.github/` can also
 6. **Obfuscation**: encoded strings, very long lines, code that builds code (`include_bytes!` of something new, `eval` in scripts) without a clear reason are reasons to reject.
 7. When in doubt, ask for the change to be split, or close the PR. Suspicion of malice goes to [`SECURITY.md`](../SECURITY.md), not to a public comment.
 
+**Merges by `/solve`** ([`CONTRIBUTING.md`](../CONTRIBUTING.md#merging-with-solve)): someone on [`.github/solvers.txt`](../.github/solvers.txt) approving a PR replaces a maintainer's review, and the bot merges it with the owner's token and `--admin`, exactly like the owner's Merge button, getting past the approvals `main` asks for. So the list is the control. Only the owners of `/.github/` in CODEOWNERS can change it (the Solvers workflow checks it), each change is a commit naming who asked, and a PR that touches it is closed. The bot never merges a PR touching a sensitive path from the risk report (those still need a Code Owner), merges only the commit the solver approved, and needs every check green.
+
 ## Repository settings (admins)
 
 Files can't enforce these; an admin of `Gentleman-Programming/gentle-shell-gpui` sets them once. Without them, the checks above are advice.
@@ -56,6 +58,7 @@ Files can't enforce these; an admin of `Gentleman-Programming/gentle-shell-gpui`
 - Fork pull request workflows from outside collaborators: **Require approval for all external contributors**.
 - Workflow permissions: **Read repository contents and packages permissions**; leave "Allow GitHub Actions to create and approve pull requests" off.
 - Optional: "Require actions to be pinned to a full-length commit SHA".
+- **`SOLVE_TOKEN`** (Settings → Secrets and variables → Actions → New repository secret): a personal access token of the repository owner, with an expiry date. If they're a member of the organization: fine-grained, resource owner the organization, only this repository, with **Contents: Read and write** and **Pull requests: Read and write**. An outside collaborator can't pick the organization as resource owner, so it's a classic token with only the **`public_repo`** scope (the repository is public). `/solve` merges and the Solvers workflow edits the list with it; without it the bot says it can't merge. Whoever can change `main`'s workflows can use it, the same as any secret: that's why `.github/` has Code Owners. Revoke it and the bot stops merging.
 
 **Settings → Rules → Rulesets → New branch ruleset** (target: default branch, enforcement: Active):
 

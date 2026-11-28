@@ -15,3 +15,9 @@ rules:
       # comment reaches the script only through environment variables, and
       # its token can write issues and nothing else.
       - issue-claims.yml
+      # `/solve` merges a pull request with the owner's token (`SOLVE_TOKEN`),
+      # and only `issue_comment` reaches fork PRs with secrets. Every job
+      # checks out the default branch, never the PR, runs only main's
+      # solvers.py, and the comment and inputs reach it only through
+      # environment variables. The merge is pinned to the approved commit.
+      - solvers.yml
