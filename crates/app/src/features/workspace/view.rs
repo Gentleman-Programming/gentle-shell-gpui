@@ -157,6 +157,9 @@ impl Workspace {
             .children(space.tabs.iter().enumerate().map(|(i, tab)| {
                 let active = i == space.active;
                 let running = self.tab_running(tab);
+                let needs_you = tab.leaves().iter().any(|id| {
+                    self.panes.get(id).is_some_and(|pane| pane.needs_you)
+                });
                 let focused = tab.focused();
                 let saved = tab.state.saved_focused();
                 let kind = match (&focused, &saved) {
@@ -342,7 +345,10 @@ impl Workspace {
                                 this.close_tab(i, window, cx);
                             }))
                             .child(Icon::new(IconName::X).xsmall()),
-                    );
+                    )
+                    .when(running && !needs_you, |d| {
+                        d.child(ui::tab_work_orbit(rems(8. / 16.), cx.reduce_motion()))
+                    });
                 // Tabs shrink (titles end in …) so the title bar's buttons
                 // keep their place in a narrow window.
                 ui::appear(("tab-in", tab.id), div().flex().min_w_0().child(item))

@@ -249,7 +249,10 @@ impl Workspace {
                         this.close_tab_by_id(id, window, cx);
                     }))
                     .child(Icon::new(IconName::X).xsmall()),
-            );
+            )
+            .when(tab.running && !tab.needs_you, |d| {
+                d.child(ui::tab_work_orbit(rems(6. / 16.), cx.reduce_motion()))
+            });
         self.tab_row_behavior(row, tab, cx)
     }
 
@@ -300,6 +303,7 @@ impl Workspace {
                     .id(SharedString::from(format!(
                         "sidebar-split-{tab_id}-{index}"
                     )))
+                    .relative()
                     .h(rems(ROW / 16.))
                     .pl(rems(30. / 16.))
                     .pr_2()
@@ -320,6 +324,9 @@ impl Workspace {
                     )
                     .when(running || needs_you, |d| {
                         d.child(div().size(px(6.)).rounded_full().bg(color))
+                    })
+                    .when(running && !needs_you, |d| {
+                        d.child(ui::tab_work_orbit(rems(6. / 16.), cx.reduce_motion()))
                     })
                     .on_click(cx.listener(move |this, _, window, cx| {
                         if let Some(pane) = pane {

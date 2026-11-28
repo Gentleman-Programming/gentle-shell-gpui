@@ -154,6 +154,9 @@ impl Workspace {
                                             .bg(color),
                                     )
                                 })
+                                .when(running && !needs_you, |d| {
+                                    d.child(ui::tab_work_orbit(rems(6. / 16.), cx.reduce_motion()))
+                                })
                                 .on_click(cx.listener(move |this, _, window, cx| {
                                     if let Some(pane) = pane {
                                         this.reveal_pane(pane, window, cx);
@@ -203,7 +206,10 @@ impl Workspace {
                     .children(
                         tab.status_dot()
                             .map(|dot| div().absolute().top(px(2.)).right(px(2.)).child(dot)),
-                    );
+                    )
+                    .when(tab.running && !tab.needs_you, |d| {
+                        d.child(ui::tab_work_orbit(rems(6. / 16.), cx.reduce_motion()))
+                    });
                 list = list.child(self.tab_row_behavior(row, &tab, cx));
             }
             list = list.child(

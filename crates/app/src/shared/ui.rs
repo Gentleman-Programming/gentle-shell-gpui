@@ -1367,6 +1367,19 @@ pub fn orbit(color: Hsla, radius: Rems) -> Div {
         .child(frames_every(SLOW_FRAME))
 }
 
+/// The running tab's loading streak. Its absolute overlay never changes row
+/// measurements or adds an interactive surface. Reduced motion uses a
+/// stationary outline rather than a moving streak.
+#[track_caller]
+pub(crate) fn tab_work_orbit(radius: Rems, reduce_motion: bool) -> Div {
+    let overlay = div().absolute().inset_0().rounded(radius);
+    if reduce_motion {
+        overlay.border_1().border_color(accent().opacity(0.65))
+    } else {
+        overlay.child(orbit(accent(), radius))
+    }
+}
+
 /// A five-second orbit with a pause on each side, for compaction in progress.
 #[track_caller]
 pub(crate) fn paused_orbit(color: Hsla, radius: Rems) -> Div {
