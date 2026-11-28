@@ -29,6 +29,8 @@ use crate::platform::ides;
 use crate::shared::ui;
 
 const ROW_HEIGHT: f32 = 30.;
+const SIDEBAR_ROW_HEIGHT: f32 = 28.;
+const SIDEBAR_TIME_WIDTH: f32 = 36.;
 const AUTHOR_WIDTH: f32 = 150.;
 const TIME_WIDTH: f32 = 40.;
 const SHA_WIDTH: f32 = 60.;
@@ -132,7 +134,8 @@ fn ref_chip(text: String, color: Hsla, lead: Option<IconName>, trail: Option<Ico
         .px_1p5()
         .py(px(1.))
         .rounded_md()
-        .text_size(rems(10.5 / 16.))
+        .text_size(rems(ui::SIDEBAR_METADATA_SIZE / 16.))
+        .whitespace_nowrap()
         .text_color(color)
         .bg(color.opacity(0.12))
         .border_1()
@@ -676,7 +679,89 @@ impl HistoryView {
         graph::LaneLayout::new(self.visible_lanes.get(), self.width.get())
     }
 
+    fn sidebar_graph_geometry(&self) -> (graph::LaneLayout, f32, f32) {
+        let width = self.width.get();
+        let layout = graph::LaneLayout::sidebar(self.dock_lanes.len(), width);
+        let viewport = layout.sidebar_viewport(width);
+        let pan = self.graph_pan.clamp(0., layout.max_pan(viewport));
+        (layout, viewport, pan)
+    }
+
+    fn pan_graph(&mut self, direction: f32, cx: &mut Context<Self>) {
+        let (layout, viewport, pan) = self.sidebar_graph_geometry();
+        self.graph_pan = (pan + direction * layout.pan_step(viewport))
+            .clamp(0., layout.max_pan(viewport));
+        cx.notify();
+    }
+
+    /// One horizontal navigator for the graph in every virtualized row.
+    /// The subject, refs, avatar and time never move with these controls.
+    fn render_graph_navigation(&self, cx: &mut Context<Self>) -> Option<Div> {
+        if !self.docked {
+            return None;
+        }
+        let (layout, viewport, pan) = self.sidebar_graph_geometry();
+        let max_pan = layout.max_pan(viewport);
+        if max_pan <= 0.01 {
+            return None;
+        }
+        let count = self.dock_lanes.len();
+        let (first, last) = layout.visible_range(pan, viewport, count);
+        Some(
+            h_flex()
+                .flex_none()
+                .px_3()
+                .gap_1()
+                .h(rems(24. / 16.))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(rems(ui::SIDEBAR_METADATA_SIZE / 16.))
+                        .text_color(ui::muted())
+                        .child(format!("Graph lanes {first}–{last} / {count}")),
+                )
+                .child(
+                    Button::new("history-graph-left")
+                        .ghost()
+                        .xsmall()
+                        .icon(Icon::new(IconName::ChevronLeft))
+                        .disabled(pan <= 0.01)
+                        .tooltip("Scroll all graph lanes left")
+                        .on_click(cx.listener(|this, _, _, cx| this.pan_graph(-1., cx))),
+                )
+                .child(
+                    Button::new("history-graph-right")
+                        .ghost()
+                        .xsmall()
+                        .icon(Icon::new(IconName::ChevronRight))
+                        .disabled(pan >= max_pan - 0.01)
+                        .tooltip("Scroll all graph lanes right")
+                        .on_click(cx.listener(|this, _, _, cx| this.pan_graph(1., cx))),
+                ),
+        )
+    }
+
     fn graph_cell(&self, graph: RowGraph, lanes: &[usize]) -> Div {
+        if self.docked {
+            let (layout, viewport, pan) = self.sidebar_graph_geometry();
+            return div()
+                .relative()
+                .flex_none()
+                .w(px(viewport))
+                .h_full()
+                .overflow_hidden()
+                .child(
+                    div()
+                        .absolute()
+                        .left(px(-pan))
+                        .top_0()
+                        .w(px(layout.width))
+                        .h_full()
+                        .child(graph.compact(lanes).element(layout)),
+                );
+        }
         let layout = graph::LaneLayout::new(lanes.len(), self.width.get());
         div()
             .relative()
@@ -730,7 +815,13 @@ impl HistoryView {
         let row = h_flex()
             .id(("history-row", ix))
             .w_full()
-            .h(rems(if self.fit(window) == Fit::Wide { ROW_HEIGHT / 16. } else { 42. / 16. }))
+            .h(rems(if self.docked {
+                SIDEBAR_ROW_HEIGHT / 16.
+            } else if self.fit(window) == Fit::Wide {
+                ROW_HEIGHT / 16.
+            } else {
+                42. / 16.
+            }))
             .pr_2()
             .gap_1()
             .rounded_lg();
@@ -769,7 +860,7 @@ impl HistoryView {
                 .hover(|s| s.bg(ui::surface_hover()))
                 .on_click(cx.listener(|this, _, _, cx| this.load_earlier(cx)))
                 .child(
-                    self.graph_cell(RowGraph::earlier(), lanes).child(
+                    self.graph_cell(RowGraph::earlier(), lanes).when(!self.docked, |d| d.child(
                         div()
                             .absolute()
                             .top_0()
@@ -794,7 +885,7 @@ impl HistoryView {
                                     .text_color(ui::info())
                                     .child(count.to_string()),
                             ),
-                    ),
+                    )),
                 )
                 .child(
                     div()
@@ -806,7 +897,11 @@ impl HistoryView {
                             d.text_size(rems(ui::SIDEBAR_TEXT_SIZE / 16.))
                         })
                         .text_color(ui::faint())
-                        .child("Earlier history"),
+                        .child(if self.docked {
+                            format!("Earlier history ({count})")
+                        } else {
+                            "Earlier history".to_string()
+                        }),
                 )
                 .when(self.loading, |d| {
                     d.child(Spinner::new().xsmall().color(ui::muted()))
@@ -929,6 +1024,7 @@ impl HistoryView {
                 .clone()
                 .or_else(|| self.read().and_then(|h| h.branch().map(str::to_string))),
             now_ms: self.now_ms,
+            docked: self.docked,
         };
         let hash = commit.hash.clone();
         let menu = self.commit_menu(i, cx);
@@ -948,7 +1044,18 @@ impl HistoryView {
             .overflow_x_scroll()
             .gap_1()
             .children(chips);
-        let content = if fit == Fit::Wide {
+        let content = if self.docked {
+            // Keep the subject and refs in one line. The ref strip scrolls
+            // independently, so even a long branch/tag has no ellipsis.
+            h_flex()
+                .flex_1()
+                .min_w_0()
+                .overflow_hidden()
+                .gap_1()
+                .child(subject)
+                .child(refs.max_w(relative(0.55)).flex_shrink_0())
+                .into_any_element()
+        } else if fit == Fit::Wide {
             h_flex().flex_1().min_w_0().gap_1().child(subject).child(refs.max_w(relative(0.40))).into_any_element()
         } else {
             v_flex().flex_1().min_w_0().gap_0p5().child(subject).child(refs).into_any_element()
@@ -999,7 +1106,11 @@ impl HistoryView {
             .child(
                 div()
                     .flex_none()
-                    .w(rems(TIME_WIDTH / 16.))
+                    .w(rems(if self.docked {
+                        SIDEBAR_TIME_WIDTH / 16.
+                    } else {
+                        TIME_WIDTH / 16.
+                    }))
                     .whitespace_nowrap()
                     .text_left()
                     .font_family(ui::mono())
@@ -1223,11 +1334,13 @@ impl HistoryView {
         }
         let graph_width = self.lane_layout().width;
         let viewport = self.width.get().max(200.);
-        // Preserve a useful message area plus avatar, time, and row padding.
+        // The full pane retains its horizontal list. In the sidebar, only
+        // the graph and each row's ref strip may move horizontally.
         let row_width = viewport.max(graph_width + if viewport >= 640. { 440. } else { 180. });
         let list = div()
             .relative()
-            .w(px(row_width))
+            .when(self.docked, |d| d.w_full())
+            .when(!self.docked, |d| d.w(px(row_width)))
             .h_full()
             .flex_none()
             .child(
@@ -1236,7 +1349,9 @@ impl HistoryView {
                     self.lines.len(),
                     cx.processor(|this, range: std::ops::Range<usize>, window, cx| {
                         let lines = this.lines.clone();
-                        let lanes = if this.filtering() {
+                        let lanes = if this.docked {
+                            this.dock_lanes.clone()
+                        } else if this.filtering() {
                             vec![0]
                         } else {
                             graph::visible_lanes(range.clone().filter_map(|ix| match lines[ix] {
@@ -1260,7 +1375,7 @@ impl HistoryView {
             .flex_1()
             .min_h_0()
             .w_full()
-            .overflow_x_scroll()
+            .when(!self.docked, |d| d.overflow_x_scroll())
             .child(list)
             .into_any_element()
     }
@@ -1799,6 +1914,7 @@ impl Render for HistoryView {
             .child(self.render_header(window, cx))
             .children(self.render_toolbar(window, cx))
             .child(self.render_graph_modes(cx))
+            .children(self.render_graph_navigation(cx))
             .children(self.render_prompt(cx))
             .children(self.render_banner(cx))
             .child(self.render_body(window, cx))
@@ -1814,6 +1930,7 @@ struct CommitCard {
     index: usize,
     branch: Option<String>,
     now_ms: i64,
+    docked: bool,
 }
 
 impl Render for CommitCard {
@@ -1904,6 +2021,33 @@ impl Render for CommitCard {
                         .text_color(ui::fg())
                         .child(commit.subject.clone()),
                 )
+                .when(self.docked && !commit.refs.is_empty(), |d| {
+                    d.child(
+                        v_flex()
+                            .gap_1()
+                            .child(ui::section_label("References"))
+                            .children(commit.refs.iter().map(|label| {
+                                let (name, color, icon) = match label {
+                                    RefLabel::Branch(name) => (name, ui::fg(), IconName::GitBranch),
+                                    RefLabel::Remote(name) => (name, ui::muted(), IconName::Globe),
+                                    RefLabel::Tag(name) => (name, ui::info(), IconName::Tag),
+                                };
+                                h_flex()
+                                    .items_start()
+                                    .gap_1()
+                                    .child(Icon::new(icon).xsmall().text_color(color))
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .whitespace_normal()
+                                            .text_size(rems(ui::SIDEBAR_METADATA_SIZE / 16.))
+                                            .text_color(color)
+                                            .child(name.clone()),
+                                    )
+                            })),
+                    )
+                })
                 .child(
                     v_flex()
                         .gap_1p5()

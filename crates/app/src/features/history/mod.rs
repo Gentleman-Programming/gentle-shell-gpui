@@ -109,6 +109,9 @@ pub struct HistoryView {
     width: Rc<Cell<f32>>,
     /// Lane count measured from the last painted viewport, not the full log.
     visible_lanes: Rc<Cell<usize>>,
+    /// Stable lane columns and a shared horizontal position for the sidebar.
+    dock_lanes: Vec<usize>,
+    graph_pan: f32,
     focus: FocusHandle,
     /// Narrows the loaded commits by subject, author, hash or ref.
     filter: Entity<InputState>,
@@ -192,6 +195,8 @@ impl HistoryView {
             scroll: UniformListScrollHandle::new(),
             width: Rc::default(),
             visible_lanes: Rc::new(Cell::new(1)),
+            dock_lanes: vec![0],
+            graph_pan: 0.,
             focus: cx.focus_handle(),
             filter,
             query: String::new(),
@@ -389,6 +394,8 @@ impl HistoryView {
     fn relayout(&mut self) {
         let Some(history) = self.read() else {
             self.lines = Rc::new(Vec::new());
+            self.dock_lanes = vec![0];
+            self.graph_pan = 0.;
             return;
         };
         let filtering = !self.query.is_empty();
@@ -408,6 +415,11 @@ impl HistoryView {
                 gentle_core::git::log::layout(&self.commits)
             };
             ((0..self.commits.len()).collect(), graph, HashMap::new())
+        };
+        self.dock_lanes = if self.docked && !filtering {
+            graph::all_lanes(&graph.rows)
+        } else {
+            vec![0]
         };
         self.graph = Rc::new(graph);
         self.folded_counts = counts;
@@ -464,6 +476,7 @@ impl HistoryView {
         }
         self.expanded_merges.clear();
         self.scope = scope;
+        self.graph_pan = 0.;
         self.limit = PAGE;
         self.selected = None;
         self.detail = None;

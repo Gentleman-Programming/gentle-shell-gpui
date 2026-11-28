@@ -41,6 +41,42 @@ impl LaneLayout {
         Self { width, step }
     }
 
+    /// The sidebar reserves at most a quarter of its width for the graph.
+    /// Never squeeze lanes below 8 px: overflowing lanes remain accessible
+    /// through the single shared horizontal pan position.
+    pub fn sidebar(lanes: usize, pane_width: f32) -> Self {
+        let intervals = lanes.saturating_sub(1) as f32;
+        let budget = sidebar_budget(pane_width);
+        let step = if intervals > 0. {
+            ((budget - PAD * 2.) / intervals).clamp(8., 9.)
+        } else {
+            9.
+        };
+        Self {
+            width: PAD * 2. + step * intervals,
+            step,
+        }
+    }
+
+    pub fn sidebar_viewport(self, pane_width: f32) -> f32 {
+        self.width.min(sidebar_budget(pane_width))
+    }
+
+    pub fn max_pan(self, viewport: f32) -> f32 {
+        (self.width - viewport).max(0.)
+    }
+
+    /// Scroll by a whole group of lanes, retaining one lane for context.
+    pub fn pan_step(self, viewport: f32) -> f32 {
+        ((viewport / self.step).floor() - 1.).max(1.) * self.step
+    }
+
+    pub fn visible_range(self, pan: f32, viewport: f32, lanes: usize) -> (usize, usize) {
+        let first = ((pan - PAD) / self.step).ceil().max(0.) as usize;
+        let last = ((pan + viewport - PAD) / self.step).floor().max(0.) as usize;
+        (first.min(lanes.saturating_sub(1)) + 1, last.min(lanes.saturating_sub(1)) + 1)
+    }
+
     fn x(self, lane: usize) -> f32 {
         PAD + self.step * lane as f32
     }
@@ -48,6 +84,26 @@ impl LaneLayout {
     fn node_scale(self) -> f32 {
         0.85
     }
+}
+
+fn sidebar_budget(pane_width: f32) -> f32 {
+    let width = if pane_width > 0. { pane_width } else { 480. };
+    width * 0.25
+}
+
+/// Keep every original lane with an edge or node, even straight-through
+/// branches. Compute once per graph, not once per visible scroll batch.
+pub(super) fn all_lanes(rows: &[GraphRow]) -> Vec<usize> {
+    let mut lanes = vec![0];
+    for row in rows {
+        lanes.push(row.lane);
+        for edge in row.top.iter().chain(&row.bottom) {
+            lanes.extend([edge.from, edge.to]);
+        }
+    }
+    lanes.sort_unstable();
+    lanes.dedup();
+    lanes
 }
 
 /// Keep the main line, visible commit lanes and the endpoints of visible
@@ -289,7 +345,7 @@ fn circle(
 
 #[cfg(test)]
 mod tests {
-    use super::{LaneLayout, PAD, RowGraph, visible_lanes};
+    use super::{LaneLayout, PAD, RowGraph, all_lanes, visible_lanes};
     use gentle_core::git::log::{Edge, GraphRow};
 
     #[test]
@@ -311,6 +367,41 @@ mod tests {
         assert_eq!(compact.top.len(), 1);
         assert_eq!((compact.bottom[0].from, compact.bottom[0].to), (1, 2));
         assert_eq!(visible_lanes(std::iter::empty()), vec![0]);
+    }
+
+    #[test]
+    fn sidebar_keeps_passing_lanes_and_junction_endpoints() {
+        let row = GraphRow {
+            lane: 8,
+            color: 1,
+            top: vec![Edge { from: 3, to: 3, color: 1 }],
+            bottom: vec![Edge { from: 8, to: 12, color: 1 }],
+            mainline: false,
+            branch: None,
+            lane_tip: false,
+        };
+        let lanes = all_lanes(std::slice::from_ref(&row));
+        assert_eq!(lanes, vec![0, 3, 8, 12]);
+        let compact = RowGraph::commit(&row, false, false).compact(&lanes);
+        assert_eq!(compact.top.len(), 1);
+        assert_eq!((compact.bottom[0].from, compact.bottom[0].to), (2, 3));
+    }
+
+    #[test]
+    fn sidebar_caps_graph_width_and_can_reach_every_lane() {
+        for width in [200., 320., 480., 800.] {
+            for lanes in [1, 4, 12, 24, 100] {
+                let layout = LaneLayout::sidebar(lanes, width);
+                let viewport = layout.sidebar_viewport(width);
+                let max_pan = layout.max_pan(viewport);
+                assert!(viewport <= width * 0.25 + 0.01);
+                assert!(layout.step >= 8.);
+                assert_eq!(layout.visible_range(0., viewport, lanes).0, 1);
+                assert_eq!(layout.visible_range(max_pan, viewport, lanes).1, lanes);
+                assert!(layout.x(lanes - 1) <= max_pan + viewport);
+                assert!(layout.pan_step(viewport) > 0.);
+            }
+        }
     }
 
     #[test]
