@@ -105,7 +105,8 @@ actions!(
     ]
 );
 
-const COMPACT_SIDEBAR_WIDTH: f32 = 48.;
+// Both compact rails follow the right activity bar's width.
+const COMPACT_SIDEBAR_WIDTH: f32 = right_sidebar::ACTIVITY_BAR_WIDTH;
 
 /// What the window tells whoever embeds things in it (the sidebar's owner).
 pub enum WorkspaceEvent {

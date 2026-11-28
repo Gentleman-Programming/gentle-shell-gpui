@@ -232,7 +232,7 @@ mod tests {
         assert_eq!(a.files.0, SIDEBAR_MIN_WIDTH);
         assert!(a.tabs.0 >= SIDEBAR_MIN_WIDTH && a.tabs.0 < 480.);
         assert!(!a.compact);
-        assert!(occupied(a) <= 1100. - ROW_PADDING - 96. - WORK_AREA_MIN_WIDTH + 0.01);
+        assert!(occupied(a) <= 1100. - ROW_PADDING - 2. * (ACTIVITY_BAR_WIDTH + ROW_GAP) - WORK_AREA_MIN_WIDTH + 0.01);
     }
 
     #[test]
@@ -313,7 +313,7 @@ mod tests {
 
     #[test]
     fn newest_dock_replaces_an_older_one_when_space_is_limited() {
-        let tabs = (48., ROW_GAP);
+        let tabs = (COMPACT_SIDEBAR_WIDTH, ROW_GAP);
         let files = (260., ROW_GAP);
         let a = coexist(1000., 1, tabs, files, true, competing_requests(Auxiliary::Browser));
         assert!(a.browser_width >= 320.);
@@ -333,7 +333,7 @@ mod tests {
             let a = coexist(
                 700.,
                 1,
-                (48., ROW_GAP),
+                (COMPACT_SIDEBAR_WIDTH, ROW_GAP),
                 (260., ROW_GAP),
                 true,
                 competing_requests(newest),
@@ -351,7 +351,7 @@ mod tests {
         let a = coexist(
             950.,
             1,
-            (48., ROW_GAP),
+            (COMPACT_SIDEBAR_WIDTH, ROW_GAP),
             (260., ROW_GAP),
             true,
             competing_requests(Auxiliary::Devices),
@@ -368,7 +368,7 @@ mod tests {
             .devices
             .requested_at
             .map(|at| at + std::time::Duration::from_secs(1));
-        let a = coexist(700., 1, (48., ROW_GAP), (260., ROW_GAP), true, requests);
+        let a = coexist(700., 1, (COMPACT_SIDEBAR_WIDTH, ROW_GAP), (260., ROW_GAP), true, requests);
         assert_eq!(a.overlay, None);
         assert_eq!(a.layout.files.0, 0.);
         assert!(!a.devices_docked);
@@ -400,7 +400,7 @@ mod tests {
                 let used = occupied(a.layout)
                     + if a.browser_width > 0. { a.browser_width + ROW_GAP } else { 0. }
                     + if a.devices_docked { 400. + ROW_GAP } else { 0. };
-                assert!(width as f32 - ROW_PADDING - 96. - used >= WORK_AREA_MIN_WIDTH - 0.01);
+                assert!(width as f32 - ROW_PADDING - 2. * (ACTIVITY_BAR_WIDTH + ROW_GAP) - used >= WORK_AREA_MIN_WIDTH - 0.01);
                 assert!(a.layout.tabs.0 >= COMPACT_SIDEBAR_WIDTH);
             }
         }
@@ -419,7 +419,7 @@ mod tests {
                     0.,
                 );
                 assert!(a.tabs.0 >= 0. && a.files.0 >= 0.);
-                assert!(occupied(a) <= (width - ROW_PADDING - 96.).max(0.) + 0.01);
+                assert!(occupied(a) <= (width - ROW_PADDING - 2. * (ACTIVITY_BAR_WIDTH + ROW_GAP)).max(0.) + 0.01);
             }
         }
     }

@@ -4,9 +4,11 @@
 use super::super::menu::WorkspaceMenuSource;
 use super::*;
 
-// Keep both 34 px tiles inside the existing 48 px rail: 3 + 8 + 34 = 45.
-const RAIL_INSET: f32 = 3.;
-const SESSION_INDENT: f32 = 8.;
+// The right rail defines the width. The left surface has a 1 px border
+// on each side, so reserve those as well as the inner padding and indent.
+const RAIL_INSET: f32 = 2.;
+const SESSION_INDENT: f32 = 6.;
+const TILE_WIDTH: f32 = COMPACT_SIDEBAR_WIDTH - 2. - 2. * RAIL_INSET - SESSION_INDENT;
 const GROUP_GAP: f32 = 6.;
 
 /// Compact tiles use the perimeter for both working and attention states.
@@ -52,7 +54,8 @@ impl Workspace {
                 .id(("compact-workspace", index))
                 .relative()
                 .when(index != 0, |d| d.mt(rems(GROUP_GAP / 16.)))
-                .size(rems(34. / 16.))
+                .w(rems(TILE_WIDTH / 16.))
+                .h(rems(34. / 16.))
                 .flex_none()
                 .justify_center()
                 .rounded_md()
@@ -149,7 +152,8 @@ impl Workspace {
                                 .id(SharedString::from(format!("compact-pane-{tab_id}-{leaf}")))
                                 .relative()
                                 .ml(rems(SESSION_INDENT / 16.))
-                                .size(rems(34. / 16.))
+                                .w(rems(TILE_WIDTH / 16.))
+                                .h(rems(34. / 16.))
                                 .flex_none()
                                 .gap_px()
                                 .justify_center()
@@ -204,7 +208,8 @@ impl Workspace {
                     .id(("compact-tab", tab.id))
                     .relative()
                     .ml(rems(SESSION_INDENT / 16.))
-                    .size(rems(34. / 16.))
+                    .w(rems(TILE_WIDTH / 16.))
+                    .h(rems(34. / 16.))
                     .flex_none()
                     .gap_px()
                     .justify_center()
@@ -232,9 +237,9 @@ impl Workspace {
             list = list.child(
                 h_flex()
                     .id(("compact-add-session", index))
-                    // Center the smaller add button under the session tiles.
-                    .ml(rems((SESSION_INDENT + 2.) / 16.))
-                    .size(rems(30. / 16.))
+                    .ml(rems(SESSION_INDENT / 16.))
+                    .w(rems(TILE_WIDTH / 16.))
+                    .h(rems(30. / 16.))
                     .flex_none()
                     .justify_center()
                     .rounded_md()
