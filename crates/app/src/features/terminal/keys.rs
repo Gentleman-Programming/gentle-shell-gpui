@@ -76,6 +76,21 @@ fn alt_composes(ks: &Keystroke) -> bool {
     }
 }
 
+/// On Windows AltGr arrives as Ctrl+Alt: AltGr+2 types `@` on Spanish and
+/// German layouts. The platform flags keys whose modifiers change the
+/// character (`prefer_character_input`); those are text, not Ctrl chords.
+pub(crate) fn altgr_composes(ks: &Keystroke, prefer_character_input: bool) -> bool {
+    let m = &ks.modifiers;
+    prefer_character_input
+        && m.control
+        && m.alt
+        && !m.platform
+        && ks
+            .key_char
+            .as_deref()
+            .is_some_and(|text| !text.is_empty() && !text.chars().any(char::is_control))
+}
+
 /// xterm modifier parameter: 1 + shift + 2·alt + 4·ctrl.
 fn modifier_param(ks: &Keystroke) -> u8 {
     let m = &ks.modifiers;
@@ -227,7 +242,7 @@ pub(crate) fn is_interrupt(ks: &Keystroke) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_interrupt, is_text_input, key_to_bytes};
+    use super::{altgr_composes, is_interrupt, is_text_input, key_to_bytes};
     use gpui_kit::{KeyContext, Keystroke, Modifiers, TestAppContext};
 
     /// The action the app's key map routes `key` to while `contexts` (the
@@ -286,6 +301,26 @@ mod tests {
             routed_action(cx, "shift-tab", &["Root", "Session"]),
             "root::TabPrev"
         );
+    }
+
+    /// AltGr+2 (`@`) and AltGr+E (`€`) are text when the platform flags
+    /// them; a Ctrl+Alt chord it does not flag, or Ctrl+W, stays a chord.
+    #[test]
+    fn altgr_characters_are_text() {
+        let ctrl_alt = Modifiers {
+            control: true,
+            alt: true,
+            ..Default::default()
+        };
+        assert!(altgr_composes(&ks("2", Some("@"), ctrl_alt), true));
+        assert!(altgr_composes(&ks("e", Some("€"), ctrl_alt), true));
+        assert!(!altgr_composes(&ks("2", Some("@"), ctrl_alt), false));
+        let ctrl = Modifiers {
+            control: true,
+            ..Default::default()
+        };
+        assert!(!altgr_composes(&ks("w", None, ctrl), false));
+        assert!(!altgr_composes(&ks("w", None, ctrl), true));
     }
 
     fn ks(key: &str, key_char: Option<&str>, mods: Modifiers) -> Keystroke {

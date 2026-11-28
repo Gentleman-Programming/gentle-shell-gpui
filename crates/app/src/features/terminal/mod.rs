@@ -544,7 +544,10 @@ impl TerminalView {
             return;
         }
         // Composition in progress or plain text: the input handler delivers it.
-        if self.marked.is_some() || keys::is_text_input(ks) {
+        if self.marked.is_some()
+            || keys::is_text_input(ks)
+            || (cfg!(windows) && keys::altgr_composes(ks, event.prefer_character_input))
+        {
             return;
         }
         let app_cursor = self.term.lock().mode().contains(TermMode::APP_CURSOR);

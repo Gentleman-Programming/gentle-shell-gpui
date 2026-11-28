@@ -197,6 +197,13 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new(split_down, SplitDown, None),
         KeyBinding::new(key!("]"), FocusNextPane, None),
         KeyBinding::new(key!("["), FocusPrevPane, None),
+        // Off macOS also F6, the Windows convention for the next pane: on
+        // layouts such as Spanish, [ and ] need AltGr. Terminals don't keep
+        // it, so it is also the keyboard's way out of a terminal pane.
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("f6", FocusNextPane, None),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("shift-f6", FocusPrevPane, None),
         KeyBinding::new(key!("b"), ToggleSidebar, None),
         KeyBinding::new(key!("q"), Quit, None),
         KeyBinding::new("escape", workspace::CloseOverlay, Some("GentleWorkspace")),
@@ -227,9 +234,24 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new(key!("-"), ZoomOut, None),
         KeyBinding::new(key!("0"), ActualSize, None),
     ]);
+    // Off macOS these global chords are control keys a shell or vim needs
+    // (Ctrl+W deletes a word, Ctrl+[ is Escape): a focused terminal gets
+    // them, every other view keeps the command.
+    #[cfg(not(target_os = "macos"))]
+    cx.bind_keys(
+        TERMINAL_KEEPS
+            .iter()
+            .map(|keys| KeyBinding::new(keys, NoAction, Some("Terminal"))),
+    );
     files::FileView::bind_keys(cx);
     crate::features::canvas::bind_keys(cx);
 }
+
+/// Global chords off macOS that a focused terminal receives instead.
+#[cfg(not(target_os = "macos"))]
+const TERMINAL_KEEPS: [&str; 8] = [
+    "ctrl-t", "ctrl-w", "ctrl-b", "ctrl-k", "ctrl-o", "ctrl-q", "ctrl-[", "ctrl-]",
+];
 
 fn set_menus(cx: &mut App) {
     cx.set_menus(vec![Menu {
@@ -256,4 +278,74 @@ fn set_menus(cx: &mut App) {
         ],
         disabled: false,
     }]);
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(not(target_os = "macos"))]
+    use gpui_kit::TestAppContext;
+
+    /// Off macOS a focused terminal receives the shell/vim control keys;
+    /// elsewhere the same chords keep their command.
+    #[cfg(not(target_os = "macos"))]
+    #[gpui::test]
+    fn terminals_keep_their_control_keys_off_macos(cx: &mut TestAppContext) {
+        use gpui::{KeyContext, Keystroke};
+        use gpui_kit::Action as _;
+
+        use crate::features::workspace::{
+            ClosePane, FocusNextPane, FocusPrevPane, NewTab, NewTerminalTab, OpenExplorer,
+            OpenPalette, Quit, ToggleSidebar,
+        };
+
+        cx.update(gpui_kit::init);
+        cx.update(super::bind_keys);
+        let workspace = KeyContext::parse("GentleWorkspace").unwrap();
+        let terminal = KeyContext::parse("Terminal").unwrap();
+        let resolve = |cx: &mut TestAppContext, keys: &'static str, stack: &[KeyContext]| {
+            let input = [Keystroke::parse(keys).unwrap()];
+            cx.update(|cx| {
+                cx.key_bindings()
+                    .borrow()
+                    .bindings_for_input(&input, stack)
+                    .0
+                    .iter()
+                    .map(|b| b.action().name().to_string())
+                    .collect::<Vec<_>>()
+            })
+        };
+        let in_terminal = [workspace.clone(), terminal];
+        let elsewhere = [workspace];
+        for (keys, action) in [
+            ("ctrl-t", NewTab.name()),
+            ("ctrl-w", ClosePane.name()),
+            ("ctrl-b", ToggleSidebar.name()),
+            ("ctrl-k", OpenPalette.name()),
+            ("ctrl-o", OpenExplorer.name()),
+            ("ctrl-q", Quit.name()),
+            ("ctrl-[", FocusPrevPane.name()),
+            ("ctrl-]", FocusNextPane.name()),
+        ] {
+            assert_eq!(
+                resolve(cx, keys, &in_terminal),
+                Vec::<String>::new(),
+                "{keys}"
+            );
+            assert_eq!(resolve(cx, keys, &elsewhere), [action], "{keys}");
+        }
+        // F6 / Shift+F6 stay the app's everywhere: the way out of a terminal
+        // pane from the keyboard.
+        for (keys, action) in [
+            ("f6", FocusNextPane.name()),
+            ("shift-f6", FocusPrevPane.name()),
+        ] {
+            assert_eq!(resolve(cx, keys, &in_terminal), [action], "{keys}");
+            assert_eq!(resolve(cx, keys, &elsewhere), [action], "{keys}");
+        }
+        // Chords with shift stay app commands inside a terminal.
+        assert_eq!(
+            resolve(cx, "ctrl-shift-t", &in_terminal),
+            [NewTerminalTab.name()]
+        );
+    }
 }
