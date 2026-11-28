@@ -8,7 +8,7 @@ use gentle_core::workspaces::SIDEBAR_MIN_WIDTH;
 pub(super) const ROW_GAP: f32 = 6.;
 pub(super) const ROW_PADDING: f32 = 2. * ROW_GAP;
 /// A useful conversation/editor width, where the window can provide it.
-pub(super) const WORK_AREA_MIN_WIDTH: f32 = 400.;
+pub(super) const WORK_AREA_MIN_WIDTH: f32 = 500.;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) struct Allocation {
@@ -38,30 +38,28 @@ pub(super) fn allocate(
     let budget = room - center;
     let mut tabs_total = tabs.0 + tabs.1;
     let mut files_total = files.0 + files.1;
-    let mut tabs_min = if compact {
+    let tabs_min = if compact {
         tabs_total
     } else {
         tabs.0.min(SIDEBAR_MIN_WIDTH * tabs.1 / ROW_GAP) + tabs.1
     };
-    let mut files_min = files.0.min(SIDEBAR_MIN_WIDTH * files.1 / ROW_GAP) + files.1;
+    let files_min = files.0.min(SIDEBAR_MIN_WIDTH * files.1 / ROW_GAP) + files.1;
     let mut effective_compact = compact;
-    if tabs_min + files_min > budget && tabs_total > 0. {
+
+    // The auxiliary dock yields first. When both panels reach their minimum,
+    // compact the navigation without giving the freed width back to the dock.
+    let excess = (tabs_total + files_total - budget).max(0.);
+    let files_shrink = excess.min((files_total - files_min).max(0.));
+    files_total -= files_shrink;
+    let tabs_shrink = (excess - files_shrink).min((tabs_total - tabs_min).max(0.));
+    tabs_total -= tabs_shrink;
+
+    if tabs_total + files_total > budget + 0.001 && tabs_total > 0. && !compact {
         tabs_total = compact_tabs;
-        tabs_min = compact_tabs;
         effective_compact = true;
     }
-    if tabs_min + files_min > budget {
+    if tabs_total + files_total > budget + 0.001 {
         files_total = 0.;
-        files_min = 0.;
-    }
-    let excess = (tabs_total + files_total - budget).max(0.);
-    let tabs_slack = (tabs_total - tabs_min).max(0.);
-    let files_slack = (files_total - files_min).max(0.);
-    let slack = tabs_slack + files_slack;
-    if excess > 0. && slack > 0. {
-        let shrink = (excess / slack).min(1.);
-        tabs_total -= tabs_slack * shrink;
-        files_total -= files_slack * shrink;
     }
     // Only a window smaller than the compact navigation itself reaches this.
     tabs_total = tabs_total.min(budget);
@@ -95,21 +93,42 @@ mod tests {
     }
 
     #[test]
-    fn both_sidebars_share_one_budget() {
+    fn the_right_sidebar_shrinks_first_to_preserve_the_chat() {
+        let a = layout(1450., 2);
+        assert_eq!(a.tabs.0, 480.);
+        assert!(a.files.0 < 480. && a.files.0 > SIDEBAR_MIN_WIDTH);
         let a = layout(1100., 2);
-        assert_eq!(a.tabs.0, a.files.0);
+        assert_eq!(a.files.0, SIDEBAR_MIN_WIDTH);
         assert!(a.tabs.0 >= SIDEBAR_MIN_WIDTH && a.tabs.0 < 480.);
         assert!(!a.compact);
         assert!(occupied(a) <= 1100. - ROW_PADDING - 96. - WORK_AREA_MIN_WIDTH + 0.01);
     }
 
     #[test]
+    fn right_sidebar_alone_yields_before_the_chat() {
+        let a = allocate(900., 0, (0., 0.), (480., ROW_GAP), false, 0.);
+        assert_eq!(a.files, (382., ROW_GAP));
+        let narrow = allocate(700., 0, (0., 0.), (480., ROW_GAP), false, 0.);
+        assert_eq!(narrow.files, (0., 0.));
+    }
+
+    #[test]
+    fn narrowing_the_window_never_expands_the_right_sidebar() {
+        let mut previous = f32::INFINITY;
+        for width in (600..=1600).rev() {
+            let a = layout(width as f32, 2);
+            assert!(a.files.0 <= previous + 0.01);
+            previous = a.files.0;
+        }
+    }
+
+    #[test]
     fn navigation_compacts_before_the_tool_dock_is_suppressed() {
-        let a = layout(800., 2);
+        let a = layout(900., 2);
         assert!(a.compact);
         assert_eq!(a.tabs.0, COMPACT_SIDEBAR_WIDTH);
         assert!(a.files.0 >= SIDEBAR_MIN_WIDTH);
-        let narrow = layout(650., 2);
+        let narrow = layout(800., 2);
         assert_eq!(narrow.tabs.0, COMPACT_SIDEBAR_WIDTH);
         assert_eq!(narrow.files, (0., 0.));
         let restored = layout(1600., 2);

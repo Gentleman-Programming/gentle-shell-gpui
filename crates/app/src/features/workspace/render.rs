@@ -9,6 +9,7 @@ pub(super) const TITLE_BAR_HEIGHT: f32 = 36.;
 fn sidebar_surface(side: Side, content: impl IntoElement) -> Div {
     div()
         .size_full()
+        .min_w_0()
         .debug_selector(|| match side {
             Side::Tabs => "tabs-slide-surface".into(),
             Side::Files => "files-slide-surface".into(),
@@ -535,6 +536,8 @@ impl Render for Workspace {
                                 .id("vertical-tab-panel")
                                 .debug_selector(|| "tabs-slide-row".into())
                                 .w(rems(tabs_width / 16.))
+                                .max_w(rems(tabs_width / 16.))
+                                .min_w_0()
                                 .mr(rems((tabs_gap - 6.) / 16.))
                                 .flex_none()
                                 .h_full()
@@ -577,6 +580,8 @@ impl Render for Workspace {
                                 .id("files-sidebar-panel")
                                 .debug_selector(|| "files-sidebar-panel".into())
                                 .w(rems(files_width / 16.))
+                                .max_w(rems(files_width / 16.))
+                                .min_w_0()
                                 .ml(rems((files_gap - 6.) / 16.))
                                 .flex_none()
                                 .h_full()

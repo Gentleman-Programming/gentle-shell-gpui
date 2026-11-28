@@ -564,6 +564,9 @@ impl Workspace {
                 if this.floating_stages(cx) >= 2 {
                     this.tile_stages(window, cx);
                 }
+                // Responsive sidebar widths depend on the viewport, even
+                // when no floating stages are present.
+                cx.notify();
             }),
             // The ♪ button's look follows the player; the player's own panel
             // redraws itself (its spectrum) without redrawing the window.
