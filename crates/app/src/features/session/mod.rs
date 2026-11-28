@@ -492,6 +492,12 @@ impl SessionView {
         }
     }
 
+    /// Its backend was started and hasn't settled yet
+    /// ([`Self::backend_settled`]): the window's startup checks wait on it.
+    pub fn backend_booting(&self) -> bool {
+        self.backend.started && !self.backend_settled()
+    }
+
     /// Something was said here, a turn is running or a saved conversation
     /// is about to be resumed: moving this agent to another folder loses it.
     pub fn has_conversation(&self) -> bool {

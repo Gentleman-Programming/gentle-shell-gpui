@@ -140,7 +140,8 @@ impl SessionView {
         let never_ran = match &self.backend.status {
             BackendStatus::Failed(_) => true,
             BackendStatus::Exited(_) => {
-                self.transcript.items.is_empty() || self.backend.preload == Preload::Shown
+                self.transcript.items.is_empty()
+                    || matches!(self.backend.preload, Preload::Shown(_))
             }
             BackendStatus::Starting | BackendStatus::Ready(_) => false,
         };
@@ -487,17 +488,26 @@ impl SessionView {
     /// the session file is read off the UI thread and goes through the same
     /// `load_messages` as the backend's `get_messages` answer, which then
     /// replaces it. A start begun meanwhile drops the read (the task goes);
-    /// a missing, unreadable or oversized file leaves the tab as it was.
+    /// a missing, unreadable or oversized file leaves the tab as it was. A
+    /// backend reached through a command reads its session files on its
+    /// side (`backend::read` goes through `cat` there), so its tabs wait
+    /// for it as before rather than read a path this computer may not hold.
     pub(super) fn preload_session(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         self.backend.preload = Preload::Reading;
+        let runs_on = self.runs_on.clone();
+        let cwd = self.cwd.clone();
         self._preload = cx.spawn(async move |this, cx| {
-            let read = cx
-                .background_executor()
-                .spawn(async move { crate::features::sessions::resumed_messages(&path) });
+            let read = cx.background_executor().spawn(async move {
+                let runs_on = runs_on.unwrap_or_else(|| crate::features::backend::for_tab(&cwd));
+                if matches!(runs_on, gentle_core::backend::Backend::Command { .. }) {
+                    return None;
+                }
+                crate::features::sessions::resumed_messages(&path)
+            });
             let Some(messages) = read.await else {
                 return;
             };
-            let _ = this.update(cx, |this, cx| this.show_preloaded(&messages, cx));
+            let _ = this.update(cx, |this, cx| this.show_preloaded(messages, cx));
         });
     }
 
@@ -506,7 +516,7 @@ impl SessionView {
     /// that loading it would wipe.
     pub(super) fn show_preloaded(
         &mut self,
-        messages: &[serde_json::Value],
+        messages: Vec<serde_json::Value>,
         cx: &mut Context<Self>,
     ) {
         if self.backend.preload != Preload::Reading
@@ -515,8 +525,9 @@ impl SessionView {
         {
             return;
         }
-        self.apply_messages(messages);
-        self.backend.preload = Preload::Shown;
+        self.apply_messages(&messages);
+        self.backend.preload = Preload::Shown(messages);
+        self.backend.startup.file_shown();
         cx.notify();
     }
 

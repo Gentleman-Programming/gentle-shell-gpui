@@ -194,16 +194,17 @@ fn protected_launcher(launcher: &Path, candidates: &[PathBuf]) -> bool {
 /// the child gets the same PATH so the launcher's `#!/usr/bin/env node`
 /// resolves. gentle-ai's managed install starts its own Node instead.
 pub fn resolve_backend(cwd: &Path) -> Result<LaunchSpec> {
-    let path = search_path();
     let launcher = match chosen_launcher() {
         Some(launcher) => launcher,
-        None => which::which_in("gentle-shell", Some(&path), cwd).map_err(|_| {
-            anyhow!(
-                "gentle-shell was not found on your PATH.\n\
-                 Install it with `npm i -g gentle-pi`, or set GENTLE_SHELL_BIN to the launcher."
-            )
-        })?,
+        None => find_on_path(|path| which::which_in("gentle-shell", Some(path), cwd).ok())
+            .ok_or_else(|| {
+                anyhow!(
+                    "gentle-shell was not found on your PATH.\n\
+                     Install it with `npm i -g gentle-pi`, or set GENTLE_SHELL_BIN to the launcher."
+                )
+            })?,
     };
+    let path = search_path();
     let prompt = SYSTEM_PROMPT
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -741,14 +742,14 @@ pub fn split_args(text: &str) -> Vec<String> {
 
 /// `node` on the merged search PATH (Gentle Shell requires it).
 pub fn resolve_node(cwd: &Path) -> Result<PathBuf> {
-    which::which_in("node", Some(search_path()), cwd)
-        .map_err(|_| anyhow::anyhow!("node was not found on your PATH"))
+    find_on_path(|path| which::which_in("node", Some(path), cwd).ok())
+        .ok_or_else(|| anyhow::anyhow!("node was not found on your PATH"))
 }
 
 /// `name` on the merged search PATH (with the app's extra dirs first).
 pub fn find_program(name: &str) -> Option<PathBuf> {
     let cwd = std::env::temp_dir();
-    which::which_in(name, Some(search_path()), cwd).ok()
+    find_on_path(|path| which::which_in(name, Some(path), &cwd).ok())
 }
 
 /// The merged search PATH handed to every child.
@@ -994,6 +995,9 @@ struct BasePath {
     /// The saved login PATH was offered already: only a run's first use
     /// takes it, and none after `forget_cached`, which wants a fresh read.
     offered: bool,
+    /// `value` is still the saved login PATH: the background read hasn't
+    /// answered yet, so a program missing from it may be in the fresh one.
+    provisional: bool,
 }
 
 impl BasePath {
@@ -1002,6 +1006,7 @@ impl BasePath {
             value: None,
             generation: 0,
             offered: false,
+            provisional: false,
         }
     }
 
@@ -1009,6 +1014,7 @@ impl BasePath {
         self.value = None;
         self.generation += 1;
         self.offered = true;
+        self.provisional = false;
     }
 }
 
@@ -1046,6 +1052,7 @@ fn resolve_base(
     {
         let value = merge_login(Some(saved.clone()));
         base.value = Some(value.clone());
+        base.provisional = true;
         let generation = base.generation;
         std::thread::spawn(move || {
             let Some(fresh) = login(&source) else {
@@ -1059,6 +1066,7 @@ fn resolve_base(
                 save_login_path(&file, &source, &fresh);
             }
             base.value = Some(merge_login(Some(fresh)));
+            base.provisional = false;
         });
         return value;
     }
@@ -1069,6 +1077,47 @@ fn resolve_base(
     let value = merge_login(fresh);
     base.value = Some(value.clone());
     value
+}
+
+/// The run started on the saved login PATH and the fresh read hasn't
+/// answered: read the login shell now (a program wasn't found, and an
+/// install since the last launch may have added its folder) and keep what it
+/// found. Whether the PATH may have changed; `false` once it is a fresh read.
+fn confirm_base(
+    state: &'static Mutex<BasePath>,
+    file: Option<PathBuf>,
+    source: String,
+    login: fn(&str) -> Option<OsString>,
+) -> bool {
+    let mut base = state.lock().unwrap_or_else(|e| e.into_inner());
+    if !base.provisional {
+        return false;
+    }
+    base.provisional = false;
+    // The background read, still running, is dropped: this one answers.
+    base.generation += 1;
+    let Some(fresh) = login(&source) else {
+        return false;
+    };
+    if let Some(file) = &file {
+        save_login_path(file, &source, &fresh);
+    }
+    base.value = Some(merge_login(Some(fresh)));
+    true
+}
+
+/// `find` on the search PATH; when it finds nothing on a saved login PATH
+/// not yet confirmed, once more on a fresh read of it.
+fn find_on_path<T>(find: impl Fn(&OsString) -> Option<T>) -> Option<T> {
+    find(&search_path()).or_else(|| {
+        let file = LOGIN_PATH_FILE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        confirm_base(&BASE_PATH, file, login_source(), login_path)
+            .then(|| find(&search_path()))
+            .flatten()
+    })
 }
 
 /// The login PATH kept in `file`, when it was read from `source`.
@@ -1520,6 +1569,34 @@ mod tests {
             saved_login_path(&file, &shell),
             Some(OsString::from("/fresh/bin"))
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A program missing from the saved login PATH (installed since the last
+    /// launch, into a folder only the fresh PATH has) is looked for again on
+    /// a fresh read right away, not after the background one; once the PATH
+    /// is a fresh read, a miss is just a miss.
+    #[test]
+    fn a_miss_on_the_saved_login_path_reads_it_again_once() {
+        static STATE: Mutex<BasePath> = Mutex::new(BasePath::new());
+        let dir = login_dir("confirm");
+        let shell = fake_shell(
+            &dir,
+            "sleep 1; printf '__GENTLE_PATH_START__%s__GENTLE_PATH_END__' /fresh/bin",
+        );
+        let file = dir.join("login-path.json");
+        save_login_path(&file, &shell, OsStr::new("/saved/bin"));
+        let base = || resolve_base(&STATE, Some(file.clone()), shell.clone(), login_shell_path);
+        let confirm = || confirm_base(&STATE, Some(file.clone()), shell.clone(), login_shell_path);
+
+        assert_eq!(first_dir(&base()), Path::new("/saved/bin"));
+        assert!(confirm(), "the saved PATH was read again");
+        assert_eq!(first_dir(&base()), Path::new("/fresh/bin"));
+        assert_eq!(
+            saved_login_path(&file, &shell),
+            Some(OsString::from("/fresh/bin"))
+        );
+        assert!(!confirm(), "a fresh PATH isn't read again");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

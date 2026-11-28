@@ -825,15 +825,20 @@ impl SessionView {
         self.refresh_commands(cx);
         self.request(json!({"type": "get_messages"}), cx, |this, result, _| {
             // The backend's answer is the conversation: a read of the session
-            // file still on its way stays out, and one shown is replaced.
+            // file still on its way stays out, and one shown is replaced
+            // unless it already is that conversation (reloading it would
+            // clear the list and its Markdown for a frame).
             let shown = std::mem::replace(&mut this.backend.preload, Preload::Off);
             if let Some(data) = this.report(result) {
                 if let Some(messages) = data["messages"].as_array() {
-                    if messages.is_empty() && shown == Preload::Shown {
-                        // Not the file's conversation after all.
-                        this.transcript.load_messages(&[]);
+                    match shown {
+                        Preload::Shown(file) if file == *messages => {}
+                        Preload::Shown(_) if messages.is_empty() => {
+                            // Not the file's conversation after all.
+                            this.transcript.load_messages(&[]);
+                        }
+                        _ => this.apply_messages(messages),
                     }
-                    this.apply_messages(messages);
                 }
                 this.backend.startup.messages_answered();
             }

@@ -110,9 +110,13 @@ pub struct Startup {
     /// `get_state` answered.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state_ms: Option<u64>,
-    /// `get_messages` answered: the conversation shows.
+    /// `get_messages` answered: the backend's conversation shows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub messages_ms: Option<u64>,
+    /// The resumed conversation showed from its session file, before the
+    /// backend's answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_ms: Option<u64>,
 }
 
 /// One agent tab: its backend and what it runs.
@@ -539,7 +543,7 @@ fn startup_lines(
         ));
     }
     for ((at, tab), startup) in startups {
-        let steps = [
+        let mut steps: Vec<String> = [
             ("launch spec", startup.resolved_ms),
             ("spawned", startup.spawned_ms),
             ("first record", startup.first_record_ms),
@@ -549,11 +553,21 @@ fn startup_lines(
         .map(|(step, ms)| match ms {
             Some(ms) => format!("{step} {ms}"),
             None => format!("{step} pending"),
-        });
-        let shown = startup
-            .messages_ms
-            .map(|ms| format!(" (conversation at +{})", at + ms))
-            .unwrap_or_default();
+        })
+        .into();
+        if let Some(ms) = startup.file_ms {
+            steps.push(format!("session file {ms}"));
+        }
+        // Whichever showed the conversation first: its session file, or
+        // the backend's answer.
+        let shown = match (startup.file_ms, startup.messages_ms) {
+            (Some(file), Some(ms)) if ms < file => format!(" (conversation at +{})", at + ms),
+            (Some(file), _) => {
+                format!(" (conversation at +{}, from its session file)", at + file)
+            }
+            (None, Some(ms)) => format!(" (conversation at +{})", at + ms),
+            (None, None) => String::new(),
+        };
         lines.push(format!("  tab {tab} at +{at}: {}{shown}", steps.join(", ")));
     }
     lines
@@ -763,9 +777,11 @@ mod tests {
             messages_ms: Some(1410),
             ..booting
         };
+        // A restored tab: its session file showed while the backend booted.
         let second_tab = Startup {
             at_ms: 200,
             resolved_ms: Some(5),
+            file_ms: Some(40),
             ..Default::default()
         };
         // `/reload` later, after the login PATH was forgotten and read again.
@@ -795,7 +811,8 @@ mod tests {
                  \x20 login PATH at +120: 52 ms\n\
                  \x20 login PATH at +9001: 5003 ms, timed out: the inherited PATH was used\n\
                  \x20 tab 2 at +200: launch spec 5, spawned pending, first record pending, \
-                 get_state pending, get_messages pending\n\
+                 get_state pending, get_messages pending, session file 40 \
+                 (conversation at +240, from its session file)\n\
                  \x20 tab 1 at +310: launch spec 60, spawned 75, first record 1320, \
                  get_state 1400, get_messages 1410 (conversation at +1720)\n\
                  \x20 tab 1 at +9000: launch spec 5010, spawned 5030, first record pending, \

@@ -56,6 +56,8 @@ pub struct StartupClock {
     first_record: Option<Instant>,
     state: Option<Instant>,
     messages: Option<Instant>,
+    /// The resumed conversation shown from its session file.
+    file: Option<Instant>,
 }
 
 impl StartupClock {
@@ -86,6 +88,12 @@ impl StartupClock {
         self.messages.get_or_insert_with(Instant::now);
     }
 
+    /// The resumed conversation showed from its session file, before the
+    /// backend's answer.
+    pub fn file_shown(&mut self) {
+        self.file.get_or_insert_with(Instant::now);
+    }
+
     /// The steps so far, with the running backend's first record at
     /// `first_record`; `None` before the first start.
     pub fn sample(&self, first_record: Option<Instant>) -> Option<Startup> {
@@ -100,6 +108,7 @@ impl StartupClock {
             first_record_ms: ms(self.first_record.or(first_record)),
             state_ms: ms(self.state),
             messages_ms: ms(self.messages),
+            file_ms: ms(self.file),
         })
     }
 }
