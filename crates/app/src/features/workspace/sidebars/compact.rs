@@ -4,6 +4,36 @@
 use super::super::menu::WorkspaceMenuSource;
 use super::*;
 
+/// In the compact navigator the corner indicator, not the whole tile,
+/// animates. A request for attention always takes priority over working.
+fn compact_agent_status(running: bool, needs_you: bool, reduce_motion: bool) -> Option<Div> {
+    if needs_you {
+        Some(
+            div()
+                .absolute()
+                .top(px(2.))
+                .right(px(2.))
+                .size(px(6.))
+                .rounded_full()
+                .bg(ui::warning()),
+        )
+    } else if running {
+        Some(
+            div()
+                .absolute()
+                .top(px(1.))
+                .right(px(1.))
+                .child(if reduce_motion {
+                    div().child(Icon::new(IconName::Loader).xsmall().text_color(ui::accent()))
+                } else {
+                    ui::spinner(gpui_kit::component::Size::XSmall, ui::accent())
+                }),
+        )
+    } else {
+        None
+    }
+}
+
 impl Workspace {
     pub(super) fn render_compact_sidebar(
         &self,
@@ -143,20 +173,11 @@ impl Workspace {
                                         .text_color(color)
                                         .child(number.to_string()),
                                 )
-                                .when(running || needs_you, |d| {
-                                    d.child(
-                                        div()
-                                            .absolute()
-                                            .top(px(2.))
-                                            .right(px(2.))
-                                            .size(px(5.))
-                                            .rounded_full()
-                                            .bg(color),
-                                    )
-                                })
-                                .when(running && !needs_you, |d| {
-                                    d.child(ui::tab_work_orbit(rems(6. / 16.), cx.reduce_motion()))
-                                })
+                                .children(compact_agent_status(
+                                    running,
+                                    needs_you,
+                                    cx.reduce_motion(),
+                                ))
                                 .on_click(cx.listener(move |this, _, window, cx| {
                                     if let Some(pane) = pane {
                                         this.reveal_pane(pane, window, cx);
@@ -203,13 +224,11 @@ impl Workspace {
                             .text_color(tab.tone())
                             .child(number.to_string()),
                     )
-                    .children(
-                        tab.status_dot()
-                            .map(|dot| div().absolute().top(px(2.)).right(px(2.)).child(dot)),
-                    )
-                    .when(tab.running && !tab.needs_you, |d| {
-                        d.child(ui::tab_work_orbit(rems(6. / 16.), cx.reduce_motion()))
-                    });
+                    .children(compact_agent_status(
+                        tab.running,
+                        tab.needs_you,
+                        cx.reduce_motion(),
+                    ));
                 list = list.child(self.tab_row_behavior(row, &tab, cx));
             }
             list = list.child(
