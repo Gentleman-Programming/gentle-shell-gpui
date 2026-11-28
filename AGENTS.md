@@ -32,7 +32,6 @@ Dependency rules and the anatomy of a feature: [`docs/architecture.md`](docs/arc
 ## Rules
 
 - **Design:** use the tokens and components in `crates/app/src/shared/ui.rs`; don't invent one-off colors, borders or animations. The window chrome has no lines: separate with space and surface changes. Inside an overlay screen, the only lines are the thin ones from `ui::screen_header` and the footers. See [`docs/design-system.md`](docs/design-system.md).
-- **Responsive layout:** before adding or changing any screen, pane, header, toolbar, dock or tab presentation, read [`docs/design-system.md#responsive-layout`](docs/design-system.md#responsive-layout). Measure the actual available bounds, reserve essential actions, let secondary content yield, and share the workspace space budget. Automatic compaction must preserve user preferences and live views; horizontal and vertical tabs must never be duplicated. Test narrow/wide layouts, split panes and 80/100/150% interface size.
 - **Behavior-preserving refactors** ([ADR 0003](docs/adr/0003-behavior-preserving-refactors.md)): moving code doesn't change what it does; a fix found along the way goes in its own commit.
 - **No single-implementation abstractions:** don't create traits, adapters or new crates without a real second need.
 - **Tests:** pure logic is tested in `gentle-core`; file effects use temporary directories. No tests that only restate the implementation.
