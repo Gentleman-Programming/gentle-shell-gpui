@@ -26,6 +26,7 @@ use gpui_kit::*;
 use crate::features::setup::devices as setup;
 pub use instructions::agent_instructions;
 pub use panel::{DevicePanel, DevicePanelEvent};
+pub(crate) use panel::DOCK_WIDTH;
 pub(crate) use sdk::{android_sdk, android_tool_dirs, simctl_path, xcode_developer_dir};
 
 /// The longest quitting waits on devices: the app's quit handlers block.

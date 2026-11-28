@@ -5,7 +5,11 @@ use super::super::menu::WorkspaceMenuSource;
 use super::*;
 
 impl Workspace {
-    pub(super) fn render_compact_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_compact_sidebar(
+        &self,
+        can_expand: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let mut list = v_flex()
             .id("compact-workspaces")
             .flex_1()
@@ -239,14 +243,16 @@ impl Workspace {
             .items_center()
             .gap_1()
             .py_2()
-            .child(
-                Button::new("compact-expand")
-                    .ghost()
-                    .xsmall()
-                    .icon(Icon::new(IconName::PanelLeftOpen))
-                    .tooltip("Expand workspace sidebar")
-                    .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar_compact(cx))),
-            )
+            .when(can_expand, |d| {
+                d.child(
+                    Button::new("compact-expand")
+                        .ghost()
+                        .xsmall()
+                        .icon(Icon::new(IconName::PanelLeftOpen))
+                        .tooltip("Expand workspace sidebar")
+                        .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar_compact(cx))),
+                )
+            })
             .child(list)
             .child(
                 Button::new("compact-new-workspace")

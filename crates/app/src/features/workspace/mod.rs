@@ -58,6 +58,7 @@ mod overlays;
 mod panes;
 mod persistence;
 mod render;
+mod responsive;
 mod right_sidebar;
 mod sidebar_motion;
 mod sidebars;

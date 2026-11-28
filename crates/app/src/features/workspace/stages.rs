@@ -621,6 +621,21 @@ impl Workspace {
 
     // ── The docked column ───────────────────────────────────────────────────
 
+    /// Reserve the browser's requested column width before allocating sidebars.
+    /// Use the current viewport rather than the previous frame's measured body
+    /// so resizing cannot feed back into the sidebar breakpoints.
+    pub(super) fn browser_dock_reservation(&self, window: f32, cx: &App) -> f32 {
+        if self
+            .stages
+            .iter()
+            .any(|stage| stage.shown && stage.docked(cx))
+        {
+            floating::dock_width(card_layout(cx).dock_width, window)
+        } else {
+            0.
+        }
+    }
+
     /// The docked cards, stacked in a column at the window's right (left of
     /// the device panel's), with the divider that changes its width. `None`
     /// while no shown card is docked. Its width leaves the conversation room

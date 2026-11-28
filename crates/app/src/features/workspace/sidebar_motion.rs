@@ -43,6 +43,41 @@ impl SidebarMotion {
 }
 
 impl Workspace {
+    /// The effective row geometry is computed once from all dock reservations.
+    pub(super) fn responsive_geometry(
+        &self,
+        window: f32,
+        scale: f32,
+        now: Instant,
+        cx: &App,
+    ) -> responsive::Allocation {
+        let profile = self.layout_profiles.current();
+        let rails = usize::from(profile.has(ToolPlacement::Left))
+            + usize::from(profile.has(ToolPlacement::Right));
+        let devices = self.devices.read(cx);
+        let device_width = if devices.visible()
+            && devices.mode() == crate::shared::floating::Mode::Docked
+        {
+            crate::features::devices::DOCK_WIDTH / scale + responsive::ROW_GAP
+        } else {
+            0.
+        };
+        let browser_width = self.browser_dock_reservation(window * scale, cx) / scale;
+        let browser_gap = if browser_width > 0. {
+            responsive::ROW_GAP
+        } else {
+            0.
+        };
+        responsive::allocate(
+            window,
+            rails,
+            self.visible_sidebar_geometry(Side::Tabs, window, now),
+            self.visible_sidebar_geometry(Side::Files, window, now),
+            self.sidebar_compact,
+            device_width + browser_width + browser_gap,
+        )
+    }
+
     /// The visible panel and inner gap, shared by layout and painting.
     pub(super) fn visible_sidebar_geometry(
         &self,

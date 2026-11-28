@@ -131,7 +131,18 @@ impl Workspace {
         };
         let pointer = f32::from(distance) / scale - 6. - rail;
         let window_width = f32::from(window.viewport_size().width) / scale;
+        let effective = self.responsive_geometry(
+            window_width,
+            scale,
+            std::time::Instant::now(),
+            cx,
+        );
         let side = drag.side;
+        let rendered_width = match side {
+            Side::Tabs if effective.compact => return,
+            Side::Tabs => effective.tabs.0,
+            Side::Files => effective.files.0,
+        };
         let held = event.event.pressed_button == Some(MouseButton::Left);
         let action = drag
             .gesture
@@ -142,7 +153,10 @@ impl Workspace {
             Side::Tabs => self.tabs_sidebar_width,
             Side::Files => self.files_sidebar_width,
         };
-        if let Some(w) = drag_saved_width(action, pointer, window_width, saved) {
+        if rendered_width > 0.
+            && !(saved > rendered_width && pointer >= rendered_width)
+            && let Some(w) = drag_saved_width(action, pointer, window_width, saved)
+        {
             match side {
                 Side::Tabs => self.resize_tab_sidebar(w, cx),
                 Side::Files if saved != w => {
@@ -201,18 +215,18 @@ impl Render for Workspace {
             || self.overlay.as_ref().is_some_and(|(overlay, _)| {
                 !matches!(overlay, Overlay::Onboarding(_) | Overlay::Welcome(_))
             });
-        let window_px_at_100 =
-            f32::from(window.viewport_size().width) / (f32::from(window.rem_size()) / 16.);
+        let scale = f32::from(window.rem_size()) / 16.;
+        let window_px_at_100 = f32::from(window.viewport_size().width) / scale;
         let now = std::time::Instant::now();
         let tabs_moving = self.tabs_sidebar_motion.advance(now, cx.reduce_motion());
         let files_moving = self.files_sidebar_motion.advance(now, cx.reduce_motion());
         if tabs_moving || (files_moving && has_right_panel) {
             ui::request_animation_frame(window);
         }
-        let (tabs_width, tabs_gap) =
-            self.visible_sidebar_geometry(Side::Tabs, window_px_at_100, now);
-        let (files_width, files_gap) =
-            self.visible_sidebar_geometry(Side::Files, window_px_at_100, now);
+        let geometry = self.responsive_geometry(window_px_at_100, scale, now, cx);
+        let (tabs_width, tabs_gap) = geometry.tabs;
+        let (files_width, files_gap) = geometry.files;
+        let automatic_compact = geometry.compact && !self.sidebar_compact;
         let tabs_resizing = self.sidebar_drag_active(Side::Tabs, cx);
         let files_resizing = self.sidebar_drag_active(Side::Files, cx);
         let files_sidebar = self.right_sidebar_view().filter(|_| files_width > 0.);
@@ -426,7 +440,7 @@ impl Render for Workspace {
                                                 ))
                                         })
                                     })
-                                    .when(vertical_tabs, |d| {
+                                    .when(vertical_tabs && !automatic_compact, |d| {
                                         d.child(
                                             Button::new("toggle-tab-sidebar")
                                                 .ghost()
@@ -532,12 +546,13 @@ impl Render for Workspace {
                                         this.open_empty_area_menu(event.position, window, cx);
                                     }),
                                 )
-                                .child(sidebar_surface(Side::Tabs, self.render_tab_sidebar(cx)))
+                                .child(sidebar_surface(
+                                    Side::Tabs,
+                                    self.render_tab_sidebar(geometry.compact, cx),
+                                ))
                                 .when(
-                                    tabs_resizing
-                                        || (navigation_visible
-                                            && !self.sidebar_compact
-                                            && !tabs_moving),
+                                    !geometry.compact
+                                        && (tabs_resizing || (navigation_visible && !tabs_moving)),
                                     |column| column.child(self.sidebar_handle(Side::Tabs, cx)),
                                 ),
                         )
