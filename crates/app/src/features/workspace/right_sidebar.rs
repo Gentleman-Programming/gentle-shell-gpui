@@ -96,6 +96,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.ensure_sidebar_history(cwd, window, cx);
+        self.files_sidebar_motion.requested_at = Some(std::time::Instant::now());
         self.sidebar_history_active = true;
         self.sidebar_memory_active = false;
         self.layout_profiles.current_mut().dock = LayoutTool::History;
@@ -115,9 +116,10 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         if self.sidebar_visible && self.active_right_tool(cx) == tool {
-            self.toggle_sidebar(cx);
+            self.request_sidebar(cx);
             return;
         }
+        self.files_sidebar_motion.requested_at = Some(std::time::Instant::now());
         if tool == LayoutTool::History {
             let cwd = self.root().to_path_buf();
             self.show_sidebar_history(cwd, window, cx);
@@ -308,11 +310,16 @@ impl Workspace {
 
     fn shortcut_selected(&self, tool: LayoutTool, cx: &App) -> bool {
         if tool.docked() {
-            return self.sidebar_visible && self.active_right_tool(cx) == tool;
+            return self.sidebar_visible
+                && !self.files_sidebar_motion.suspended
+                && self.active_right_tool(cx) == tool;
         }
         match tool {
             LayoutTool::Agents => self.agents_window_open(cx),
-            LayoutTool::Devices => self.devices.read(cx).visible(),
+            LayoutTool::Devices => {
+                let devices = self.devices.read(cx);
+                devices.visible() && !devices.responsive_suspended()
+            }
             LayoutTool::Tower => self.shown_tower().is_some(),
             LayoutTool::Docs => matches!(self.overlay, Some((Overlay::Docs(_), _))),
             LayoutTool::Usage => matches!(self.overlay, Some((Overlay::Usage(_), _))),

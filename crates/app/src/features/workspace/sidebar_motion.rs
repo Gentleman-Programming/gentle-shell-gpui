@@ -8,6 +8,8 @@ use std::time::Instant;
 pub(super) struct SidebarMotion {
     slide: Option<(Instant, SidebarSlide)>,
     pub(super) revision: u64,
+    pub(super) requested_at: Option<Instant>,
+    pub(super) suspended: bool,
     pub(super) active_drag: std::rc::Weak<std::cell::Cell<u64>>,
 }
 
@@ -51,30 +53,43 @@ impl Workspace {
         now: Instant,
         cx: &App,
     ) -> responsive::Allocation {
+        self.responsive_plan(window, scale, now, cx).layout
+    }
+
+    pub(super) fn responsive_plan(
+        &self,
+        window: f32,
+        scale: f32,
+        now: Instant,
+        cx: &App,
+    ) -> responsive::Coexistence {
         let profile = self.layout_profiles.current();
         let rails = usize::from(profile.has(ToolPlacement::Left))
             + usize::from(profile.has(ToolPlacement::Right));
         let devices = self.devices.read(cx);
-        let device_width = if devices.visible()
-            && devices.mode() == crate::shared::floating::Mode::Docked
+        let device_request = if devices.visible()
+            && devices.preferred_mode() == crate::shared::floating::Mode::Docked
         {
-            crate::features::devices::DOCK_WIDTH / scale + responsive::ROW_GAP
+            let width = crate::features::devices::DOCK_WIDTH / scale;
+            responsive::DockRequest {
+                width,
+                minimum: width,
+                requested_at: Some(devices.requested_at()),
+            }
         } else {
-            0.
+            responsive::DockRequest::default()
         };
-        let browser_width = self.browser_dock_reservation(window * scale, cx) / scale;
-        let browser_gap = if browser_width > 0. {
-            responsive::ROW_GAP
-        } else {
-            0.
-        };
-        responsive::allocate(
+        responsive::coexist(
             window,
             rails,
             self.visible_sidebar_geometry(Side::Tabs, window, now),
             self.visible_sidebar_geometry(Side::Files, window, now),
             self.sidebar_compact,
-            device_width + browser_width + browser_gap,
+            responsive::DockRequests {
+                right_at: self.files_sidebar_motion.requested_at,
+                browser: self.browser_dock_request(window * scale, scale, cx),
+                devices: device_request,
+            },
         )
     }
 

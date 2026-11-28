@@ -121,7 +121,7 @@ impl Workspace {
             PaletteAction::NewTerminalPane => self.split_with_kind(PaneKind::Terminal, window, cx),
             PaletteAction::ClosePane => self.on_close_pane(&ClosePane, window, cx),
             PaletteAction::ReopenClosed => self.reopen_closed(window, cx),
-            PaletteAction::ToggleSidebar => self.toggle_sidebar(cx),
+            PaletteAction::ToggleSidebar => self.request_sidebar(cx),
             PaletteAction::OpenFiles => self.select_right_tool(LayoutTool::Files, window, cx),
             PaletteAction::OpenGit => self.select_right_tool(LayoutTool::Git, window, cx),
             PaletteAction::SetLayoutPreset(preset) => {

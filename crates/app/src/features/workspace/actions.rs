@@ -193,13 +193,26 @@ impl Workspace {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.toggle_sidebar(cx);
+        self.request_sidebar(cx);
+    }
+
+    pub(super) fn request_sidebar(&mut self, cx: &mut Context<Self>) {
+        if self.sidebar_visible && self.files_sidebar_motion.suspended {
+            self.files_sidebar_motion.requested_at = Some(std::time::Instant::now());
+            cx.notify();
+        } else {
+            self.toggle_sidebar(cx);
+        }
     }
 
     pub fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
         self.files_sidebar_motion
             .retarget(self.sidebar_visible, cx.reduce_motion());
         self.sidebar_visible = !self.sidebar_visible;
+        if self.sidebar_visible {
+            self.files_sidebar_motion.requested_at = Some(std::time::Instant::now());
+        }
+        self.files_sidebar_motion.suspended = false;
         cx.emit(WorkspaceEvent::FilesVisibilityChanged(
             self.files_sidebar_visible(),
         ));

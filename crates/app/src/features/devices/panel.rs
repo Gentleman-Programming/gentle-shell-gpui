@@ -59,6 +59,9 @@ pub struct DevicePanel {
     active: usize,
     visible: bool,
     mode: Mode,
+    responsive_floating: bool,
+    responsive_suspended: bool,
+    requested_at: Instant,
     card: CardState,
     covered: bool,
     /// The docked column sliding in (`true`) or out, since when. The web
@@ -87,6 +90,9 @@ impl DevicePanel {
             active: 0,
             visible: false,
             mode: Mode::Docked,
+            responsive_floating: false,
+            responsive_suspended: false,
+            requested_at: Instant::now(),
             card: CardState::new(FLOAT_FRAME),
             covered: false,
             slide: None,
@@ -103,11 +109,44 @@ impl DevicePanel {
     }
 
     pub fn mode(&self) -> Mode {
+        if self.responsive_floating {
+            Mode::Floating
+        } else {
+            self.mode
+        }
+    }
+
+    pub(crate) fn preferred_mode(&self) -> Mode {
         self.mode
     }
 
+    pub(crate) fn requested_at(&self) -> Instant {
+        self.requested_at
+    }
+
+    pub(crate) fn responsive_suspended(&self) -> bool {
+        self.responsive_suspended
+    }
+
+    /// Change only the effective placement; keep the requested mode intact.
+    pub(crate) fn set_responsive_placement(
+        &mut self,
+        floating: bool,
+        suspended: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if self.responsive_floating != floating || self.responsive_suspended != suspended {
+            self.responsive_floating = floating;
+            self.responsive_suspended = suspended;
+            cx.notify();
+        }
+    }
+
     pub fn show(&mut self, cx: &mut Context<Self>) {
+        self.requested_at = Instant::now();
         if self.visible {
+            cx.emit(DevicePanelEvent::Layout);
+            cx.notify();
             return;
         }
         self.visible = true;
@@ -124,7 +163,7 @@ impl DevicePanel {
         if !self.visible || self.slide.is_some_and(|(_, opening)| !opening) {
             return;
         }
-        if self.mode == Mode::Docked {
+        if self.mode() == Mode::Docked && !self.responsive_suspended {
             self.start_slide(false, cx);
         } else {
             self.finish_hide(cx);
@@ -135,7 +174,7 @@ impl DevicePanel {
     /// redrawing every frame until it lands; then the web view shows again,
     /// or the panel finishes hiding.
     fn start_slide(&mut self, opening: bool, cx: &mut Context<Self>) {
-        if self.mode != Mode::Docked {
+        if self.mode() != Mode::Docked {
             return;
         }
         self.slide = Some((Instant::now(), opening));
@@ -193,6 +232,9 @@ impl DevicePanel {
 
     fn finish_hide(&mut self, cx: &mut Context<Self>) {
         self.visible = false;
+        self.slide = None;
+        self.responsive_floating = false;
+        self.responsive_suspended = false;
         // The web views (and their streams) go; the tabs stay.
         for tab in &mut self.tabs {
             tab.surface = None;
@@ -203,7 +245,7 @@ impl DevicePanel {
     }
 
     pub fn toggle(&mut self, cx: &mut Context<Self>) {
-        if self.visible {
+        if self.visible && !self.responsive_suspended {
             self.hide(cx)
         } else {
             self.show(cx)
@@ -212,6 +254,9 @@ impl DevicePanel {
 
     fn set_mode(&mut self, mode: Mode, cx: &mut Context<Self>) {
         self.mode = mode;
+        self.responsive_floating = false;
+        self.responsive_suspended = false;
+        self.requested_at = Instant::now();
         cx.emit(DevicePanelEvent::Layout);
         cx.notify();
     }
@@ -487,7 +532,8 @@ impl DevicePanel {
     }
 
     fn render_header(&self, cx: &mut Context<Self>) -> Stateful<Div> {
-        let docked = self.mode == Mode::Docked;
+        let docked = self.mode() == Mode::Docked;
+        let preferred_docked = self.mode == Mode::Docked;
         h_flex()
             .id("device-header")
             .h(rems(floating::HEADER / 16.))
@@ -524,15 +570,23 @@ impl DevicePanel {
                         Button::new("device-mode")
                             .ghost()
                             .xsmall()
-                            .icon(Icon::new(if docked {
+                            .icon(Icon::new(if preferred_docked {
                                 IconName::PictureInPicture2
                             } else {
                                 IconName::PanelRight
                             }))
-                            .tooltip(if docked { "Float" } else { "Dock to the right" })
+                            .tooltip(if preferred_docked {
+                                if docked { "Float" } else { "Keep floating" }
+                            } else {
+                                "Dock to the right"
+                            })
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.set_mode(
-                                    if docked { Mode::Floating } else { Mode::Docked },
+                                    if preferred_docked {
+                                        Mode::Floating
+                                    } else {
+                                        Mode::Docked
+                                    },
                                     cx,
                                 )
                             })),
@@ -723,7 +777,7 @@ impl Render for DevicePanel {
         if !self.visible {
             return div().into_any_element();
         }
-        match self.mode {
+        match self.mode() {
             // The column's width slides; its content keeps the full width
             // inside, clipped, so nothing reflows while it moves.
             Mode::Docked => div()

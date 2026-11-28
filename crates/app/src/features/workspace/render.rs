@@ -224,13 +224,35 @@ impl Render for Workspace {
         if tabs_moving || (files_moving && has_right_panel) {
             ui::request_animation_frame(window);
         }
-        let geometry = self.responsive_geometry(window_px_at_100, scale, now, cx);
+        let plan = self.responsive_plan(window_px_at_100, scale, now, cx);
+        let geometry = plan.layout;
         let (tabs_width, tabs_gap) = geometry.tabs;
         let (files_width, files_gap) = geometry.files;
+        let right_overlay =
+            self.sidebar_visible && plan.overlay == Some(responsive::Auxiliary::Right);
+        let active_overlay =
+            if self.sidebar_visible || plan.overlay != Some(responsive::Auxiliary::Right) {
+                plan.overlay
+            } else {
+                None
+            };
+        self.files_sidebar_motion.suspended =
+            self.sidebar_visible && files_width == 0. && !right_overlay;
+        self.apply_responsive_docks(plan, cx);
         let automatic_compact = geometry.compact && !self.sidebar_compact;
         let tabs_resizing = self.sidebar_drag_active(Side::Tabs, cx);
         let files_resizing = self.sidebar_drag_active(Side::Files, cx);
         let files_sidebar = self.right_sidebar_view().filter(|_| files_width > 0.);
+        let floating_sidebar = self.right_sidebar_view().filter(|_| right_overlay);
+        let rail_width = responsive::ROW_GAP + right_sidebar::ACTIVITY_BAR_WIDTH;
+        let overlay_width = self.files_sidebar_width.min(
+            (window_px_at_100
+                - responsive::ROW_PADDING
+                - rail_width * (usize::from(left_rail) + usize::from(right_rail)) as f32
+                - tabs_width
+                - tabs_gap)
+                .max(0.),
+        );
         // Native web views would cover a screen or a dialog opened over
         // them, and swallow the pointer while a pane is dragged over them;
         // device cards stop capturing while covered.
@@ -240,12 +262,13 @@ impl Render for Workspace {
             || window.has_active_sheet(cx)
             || cx.has_active_drag()
             || crate::features::browser::popovers_open(cx);
-        self.set_stages_covered(covered, cx);
-        self.sync_web_views(covered, cx);
+        self.set_stages_covered(covered, active_overlay, cx);
+        self.sync_web_views(covered || active_overlay.is_some(), cx);
         let (devices_docked, devices_floating) = {
             let panel = self.devices.read(cx);
             let docked = panel.mode() == crate::shared::floating::Mode::Docked;
-            (panel.visible() && docked, panel.visible() && !docked)
+            let visible = panel.visible() && !panel.responsive_suspended();
+            (visible && docked, visible && !docked)
         };
         // Browser cards: floating over the window, or docked in a column at
         // its right, whose divider may be being dragged.
@@ -254,8 +277,12 @@ impl Render for Workspace {
             .iter()
             .filter_map(|stage| stage.element(cx))
             .collect();
-        let browser_dock = self.render_browser_dock(cx);
-        let browser_dock_drag = self.browser_dock_drag_layer(cx);
+        let browser_dock = self.render_browser_dock(plan.browser_width * scale, cx);
+        let browser_dock_drag = if plan.browser_width > 0. {
+            self.browser_dock_drag_layer(cx)
+        } else {
+            None
+        };
         // While the surge plays, the window shakes before the rose hatches:
         // the root moves in place and asks for the next frame, so the element
         // tree (and every element's state) stays the same.
@@ -484,14 +511,18 @@ impl Render for Workspace {
                                             Button::new("toggle-sidebar")
                                                 .ghost()
                                                 .xsmall()
-                                                .icon(Icon::new(if self.sidebar_visible {
+                                                .icon(Icon::new(if self.sidebar_visible
+                                                    && !self.files_sidebar_motion.suspended
+                                                {
                                                     IconName::PanelRightClose
                                                 } else {
                                                     IconName::PanelRightOpen
                                                 }))
                                                 .tooltip(format!(
                                                     "{} Files sidebar ({})",
-                                                    if self.sidebar_visible {
+                                                    if self.sidebar_visible
+                                                        && !self.files_sidebar_motion.suspended
+                                                    {
                                                         "Hide"
                                                     } else {
                                                         "Show"
@@ -499,7 +530,7 @@ impl Render for Workspace {
                                                     ui::shortcut("B")
                                                 ))
                                                 .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.toggle_sidebar(cx)
+                                                    this.request_sidebar(cx)
                                                 })),
                                         )
                                     }),
@@ -609,9 +640,52 @@ impl Render for Workspace {
                     }),
             )
             .children(floating_stages)
+            .when(devices_floating, |root| root.child(self.devices.clone()))
+            .when_some(floating_sidebar, |root, view| {
+                root.child(
+                    div()
+                        .id("responsive-tool-overlay")
+                        .absolute()
+                        .top(rems((TITLE_BAR_HEIGHT + responsive::ROW_GAP) / 16.))
+                        .bottom(rems(responsive::ROW_GAP / 16.))
+                        .right(rems((responsive::ROW_GAP
+                            + if right_rail { rail_width } else { 0. }) / 16.))
+                        .w(rems(overlay_width / 16.))
+                        .min_w_0()
+                        .occlude()
+                        .shadow(crate::shared::floating::shadow(false))
+                        .child(sidebar_surface(
+                            Side::Files,
+                            v_flex()
+                                .size_full()
+                                .child(
+                                    h_flex()
+                                        .flex_none()
+                                        .justify_end()
+                                        .px_1()
+                                        .child(
+                                            Button::new("close-responsive-tool")
+                                                .ghost()
+                                                .xsmall()
+                                                .icon(Icon::new(IconName::X))
+                                                .tooltip("Hide tool")
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.toggle_sidebar(cx);
+                                                })),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_h_0()
+                                        .min_w_0()
+                                        .child(view.cached(StyleRefinement::default().size_full())),
+                                ),
+                        )),
+                )
+            })
             .children(self.render_badge_picker(window, cx))
             .children(self.render_context_menu(cx))
-            .when(devices_floating, |root| root.child(self.devices.clone()))
             .children(browser_dock_drag)
             // Dim the entire workspace body once. Insetting the scrim along
             // with the modal creates a visible rectangular edge in the gaps
@@ -724,7 +798,8 @@ impl Workspace {
         if !crate::features::devices::hub(cx).read(cx).prefs().enabled {
             return None;
         }
-        let open = self.devices.read(cx).visible();
+        let panel = self.devices.read(cx);
+        let open = panel.visible() && !panel.responsive_suspended();
         Some(
             div()
                 // Clicks here are not title-bar drags.

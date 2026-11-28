@@ -1,6 +1,9 @@
 //! Effective workspace widths at 100% interface scale.
 //! This policy never changes the persisted widths or visibility preferences.
 
+use std::cmp::Reverse;
+use std::time::Instant;
+
 use super::COMPACT_SIDEBAR_WIDTH;
 use super::right_sidebar::ACTIVITY_BAR_WIDTH;
 use gentle_core::workspaces::SIDEBAR_MIN_WIDTH;
@@ -69,6 +72,129 @@ pub(super) fn allocate(
         tabs: (tabs_total - tabs_gap, tabs_gap),
         files: (files_total - files_gap, files_gap),
         compact: effective_compact,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum Auxiliary {
+    Right,
+    Browser,
+    Devices,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct DockRequest {
+    /// Content width at 100% scale, without the row gap.
+    pub(super) width: f32,
+    pub(super) minimum: f32,
+    pub(super) requested_at: Option<Instant>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct DockRequests {
+    pub(super) right_at: Option<Instant>,
+    pub(super) browser: DockRequest,
+    pub(super) devices: DockRequest,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct Coexistence {
+    pub(super) layout: Allocation,
+    pub(super) browser_width: f32,
+    pub(super) devices_docked: bool,
+    /// The newest request can float if its minimum cannot fit.
+    /// Displaced older requests retain their state off screen.
+    pub(super) overlay: Option<Auxiliary>,
+}
+
+/// Give the newest request first access to a dock slot. Reserve the chat,
+/// rails and compact navigation before admitting any auxiliary columns.
+/// Neither ordering nor the resulting placements are persisted.
+pub(super) fn coexist(
+    window: f32,
+    rails: usize,
+    tabs: (f32, f32),
+    files: (f32, f32),
+    compact: bool,
+    requests: DockRequests,
+) -> Coexistence {
+    let compact_tabs = tabs.0.min(COMPACT_SIDEBAR_WIDTH * tabs.1 / ROW_GAP) + tabs.1;
+    let mut remaining = (window
+        - ROW_PADDING
+        - rails as f32 * (ACTIVITY_BAR_WIDTH + ROW_GAP)
+        - WORK_AREA_MIN_WIDTH
+        - compact_tabs)
+        .max(0.);
+    let right_min = files.0.min(SIDEBAR_MIN_WIDTH * files.1 / ROW_GAP) + files.1;
+    let mut order = [
+        (Auxiliary::Right, right_min, requests.right_at),
+        (
+            Auxiliary::Browser,
+            requests.browser.minimum + ROW_GAP,
+            requests.browser.requested_at,
+        ),
+        (
+            Auxiliary::Devices,
+            requests.devices.minimum + ROW_GAP,
+            requests.devices.requested_at,
+        ),
+    ];
+    order.sort_by_key(|&(_, _, at)| Reverse(at));
+    let mut first = true;
+    let mut right_docked = false;
+    let mut browser_docked = false;
+    let mut devices_docked = false;
+    let mut overlay = None;
+    for (kind, minimum, _) in order {
+        let requested = match kind {
+            Auxiliary::Right => files.0 > 0.,
+            Auxiliary::Browser => requests.browser.width > 0.,
+            Auxiliary::Devices => requests.devices.width > 0.,
+        };
+        if !requested {
+            continue;
+        }
+        if minimum <= remaining {
+            remaining -= minimum;
+            match kind {
+                Auxiliary::Right => right_docked = true,
+                Auxiliary::Browser => browser_docked = true,
+                Auxiliary::Devices => devices_docked = true,
+            }
+        } else if first {
+            overlay = Some(kind);
+        }
+        first = false;
+    }
+
+    let browser_width = if browser_docked {
+        requests.browser.width.min(requests.browser.minimum + remaining)
+    } else {
+        0.
+    };
+    let browser_reservation = if browser_docked {
+        browser_width + ROW_GAP
+    } else {
+        0.
+    };
+    let device_reservation = if devices_docked {
+        requests.devices.width + ROW_GAP
+    } else {
+        0.
+    };
+    let layout = allocate(
+        window,
+        rails,
+        tabs,
+        if right_docked { files } else { (0., 0.) },
+        compact,
+        browser_reservation + device_reservation,
+    );
+    Coexistence {
+        layout,
+        browser_width,
+        devices_docked,
+        overlay,
     }
 }
 
@@ -159,6 +285,91 @@ mod tests {
         let without = layout(1200., 0);
         let with = allocate(1200., 2, (480., ROW_GAP), (480., ROW_GAP), false, 326.);
         assert!(occupied(with) < occupied(without));
+    }
+
+    fn competing_requests(newest: Auxiliary) -> DockRequests {
+        let now = Instant::now();
+        let later = now + std::time::Duration::from_secs(1);
+        DockRequests {
+            right_at: Some(if newest == Auxiliary::Right { later } else { now }),
+            browser: DockRequest {
+                width: 420.,
+                minimum: 320.,
+                requested_at: Some(if newest == Auxiliary::Browser { later } else { now }),
+            },
+            devices: DockRequest {
+                width: 400.,
+                minimum: 400.,
+                requested_at: Some(if newest == Auxiliary::Devices { later } else { now }),
+            },
+        }
+    }
+
+    #[test]
+    fn newest_dock_replaces_an_older_one_when_space_is_limited() {
+        let tabs = (48., ROW_GAP);
+        let files = (260., ROW_GAP);
+        let a = coexist(1000., 1, tabs, files, true, competing_requests(Auxiliary::Browser));
+        assert!(a.browser_width >= 320.);
+        assert_eq!(a.layout.files.0, 0.);
+        assert!(!a.devices_docked);
+        let b = coexist(1000., 1, tabs, files, true, competing_requests(Auxiliary::Right));
+        assert!(b.layout.files.0 >= SIDEBAR_MIN_WIDTH);
+        assert_eq!(b.browser_width, 0.);
+        let c = coexist(1050., 1, tabs, files, true, competing_requests(Auxiliary::Devices));
+        assert!(c.devices_docked);
+        assert_eq!(c.layout.files.0, 0.);
+    }
+
+    #[test]
+    fn narrow_window_floats_only_the_latest_requested_panel() {
+        for newest in [Auxiliary::Right, Auxiliary::Browser, Auxiliary::Devices] {
+            let a = coexist(
+                700.,
+                1,
+                (48., ROW_GAP),
+                (260., ROW_GAP),
+                true,
+                competing_requests(newest),
+            );
+            assert_eq!(a.overlay, Some(newest));
+            assert_eq!(a.layout.tabs.0, COMPACT_SIDEBAR_WIDTH);
+            assert_eq!(a.layout.files.0, 0.);
+            assert_eq!(a.browser_width, 0.);
+            assert!(!a.devices_docked);
+        }
+    }
+
+    #[test]
+    fn expanding_the_window_restores_all_requested_docks() {
+        let requests = competing_requests(Auxiliary::Devices);
+        let a = coexist(2400., 2, (260., ROW_GAP), (260., ROW_GAP), false, requests);
+        assert_eq!(a.overlay, None);
+        assert_eq!(a.layout.tabs.0, 260.);
+        assert_eq!(a.layout.files.0, 260.);
+        assert_eq!(a.browser_width, 420.);
+        assert!(a.devices_docked);
+    }
+
+    #[test]
+    fn coexistence_keeps_the_chat_budget_and_navigation() {
+        for width in (700..=2400).step_by(10) {
+            for newest in [Auxiliary::Right, Auxiliary::Browser, Auxiliary::Devices] {
+                let a = coexist(
+                    width as f32,
+                    2,
+                    (260., ROW_GAP),
+                    (260., ROW_GAP),
+                    false,
+                    competing_requests(newest),
+                );
+                let used = occupied(a.layout)
+                    + if a.browser_width > 0. { a.browser_width + ROW_GAP } else { 0. }
+                    + if a.devices_docked { 400. + ROW_GAP } else { 0. };
+                assert!(width as f32 - ROW_PADDING - 96. - used >= WORK_AREA_MIN_WIDTH - 0.01);
+                assert!(a.layout.tabs.0 >= COMPACT_SIDEBAR_WIDTH);
+            }
+        }
     }
 
     #[test]

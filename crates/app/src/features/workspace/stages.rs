@@ -37,12 +37,14 @@ impl Stage {
 
     /// The floating card, while shown.
     pub(super) fn element(&self, cx: &App) -> Option<AnyElement> {
-        (self.shown && !self.docked(cx)).then(|| self.panel.clone().into_any_element())
+        (self.shown && !self.panel.read(cx).responsive_suspended() && !self.docked(cx))
+            .then(|| self.panel.clone().into_any_element())
     }
 
     /// The card in the docked column, while shown.
     pub(super) fn docked_element(&self, cx: &App) -> Option<AnyElement> {
-        (self.shown && self.docked(cx)).then(|| self.panel.clone().into_any_element())
+        (self.shown && !self.panel.read(cx).responsive_suspended() && self.docked(cx))
+            .then(|| self.panel.clone().into_any_element())
     }
 
     fn set_shown(&mut self, shown: bool, cx: &mut App) {
@@ -265,6 +267,10 @@ impl Workspace {
             return;
         };
         if stage.shown == shown {
+            if shown {
+                stage.panel.update(cx, |panel, _| panel.request_attention());
+                cx.notify();
+            }
             return;
         }
         stage.set_shown(shown, cx);
@@ -533,14 +539,26 @@ impl Workspace {
 
     /// A screen or dialog opened or closed over the window: web views hide
     /// under it.
-    pub(super) fn set_stages_covered(&self, covered: bool, cx: &mut App) {
+    pub(super) fn set_stages_covered(
+        &self,
+        covered: bool,
+        overlay: Option<responsive::Auxiliary>,
+        cx: &mut App,
+    ) {
         for stage in self.stages.iter().filter(|stage| stage.shown) {
-            stage
-                .panel
-                .update(cx, |panel, cx| panel.set_covered(covered, cx));
+            stage.panel.update(cx, |panel, cx| {
+                let concealed = covered
+                    || panel.responsive_suspended()
+                    || (overlay.is_some() && !panel.responsive_floating());
+                panel.set_covered(concealed, cx);
+            });
         }
-        self.devices
-            .update(cx, |panel, cx| panel.set_covered(covered, cx));
+        self.devices.update(cx, |panel, cx| {
+            let concealed = covered
+                || panel.responsive_suspended()
+                || overlay.is_some_and(|kind| kind != responsive::Auxiliary::Devices);
+            panel.set_covered(concealed, cx);
+        });
     }
 
     /// Tell agent panes whether their web views (an expanded HTML surface)
@@ -588,7 +606,9 @@ impl Workspace {
     pub(super) fn floating_stages(&self, cx: &App) -> usize {
         self.stages
             .iter()
-            .filter(|stage| stage.shown && !stage.docked(cx))
+            .filter(|stage| {
+                stage.shown && !stage.panel.read(cx).responsive_suspended() && !stage.docked(cx)
+            })
             .count()
     }
 
@@ -601,7 +621,9 @@ impl Workspace {
         let shown: Vec<&Stage> = self
             .stages
             .iter()
-            .filter(|stage| stage.shown && !stage.docked(cx))
+            .filter(|stage| {
+                stage.shown && !stage.panel.read(cx).responsive_suspended() && !stage.docked(cx)
+            })
             .collect();
         let frame = crate::features::browser::opening_frame(cx);
         let sizes: Vec<(f32, f32)> = shown.iter().map(|_| (frame.w, frame.h)).collect();
@@ -621,38 +643,87 @@ impl Workspace {
 
     // ── The docked column ───────────────────────────────────────────────────
 
-    /// Reserve the browser's requested column width before allocating sidebars.
-    /// Use the current viewport rather than the previous frame's measured body
-    /// so resizing cannot feed back into the sidebar breakpoints.
-    pub(super) fn browser_dock_reservation(&self, window: f32, cx: &App) -> f32 {
-        if self
+    /// Requested docked browser column, regardless of temporary placement.
+    pub(super) fn browser_dock_request(
+        &self,
+        window: f32,
+        scale: f32,
+        cx: &App,
+    ) -> responsive::DockRequest {
+        let requested_at = self
             .stages
             .iter()
-            .any(|stage| stage.shown && stage.docked(cx))
-        {
-            floating::dock_width(card_layout(cx).dock_width, window)
+            .filter(|stage| {
+                stage.shown && stage.panel.read(cx).preferred_mode() == floating::Mode::Docked
+            })
+            .map(|stage| stage.panel.read(cx).requested_at())
+            .max();
+        if requested_at.is_some() {
+            responsive::DockRequest {
+                width: floating::dock_width(card_layout(cx).dock_width, window) / scale,
+                minimum: floating::MIN_W / scale,
+                requested_at,
+            }
         } else {
-            0.
+            responsive::DockRequest::default()
         }
+    }
+
+    /// Apply ephemeral placements without hiding or closing native pages.
+    /// When the browser column floats, only its latest card takes the overlay.
+    pub(super) fn apply_responsive_docks(
+        &self,
+        plan: responsive::Coexistence,
+        cx: &mut Context<Self>,
+    ) {
+        let latest_browser = self
+            .stages
+            .iter()
+            .filter(|stage| {
+                stage.shown && stage.panel.read(cx).preferred_mode() == floating::Mode::Docked
+            })
+            .max_by_key(|stage| stage.panel.read(cx).requested_at())
+            .map(|stage| stage.id);
+        for stage in &self.stages {
+            let preferred_dock = stage.shown
+                && stage.panel.read(cx).preferred_mode() == floating::Mode::Docked;
+            let floating = preferred_dock
+                && plan.overlay == Some(responsive::Auxiliary::Browser)
+                && Some(stage.id) == latest_browser;
+            let suspended = preferred_dock && plan.browser_width == 0. && !floating;
+            stage.panel.update(cx, |panel, cx| {
+                panel.set_responsive_placement(floating, suspended, cx);
+            });
+        }
+        let devices = self.devices.read(cx);
+        let preferred_dock = devices.visible() && devices.preferred_mode() == floating::Mode::Docked;
+        let floating = preferred_dock && plan.overlay == Some(responsive::Auxiliary::Devices);
+        let suspended = preferred_dock && !plan.devices_docked && !floating;
+        self.devices.update(cx, |panel, cx| {
+            panel.set_responsive_placement(floating, suspended, cx);
+        });
     }
 
     /// The docked cards, stacked in a column at the window's right (left of
     /// the device panel's), with the divider that changes its width. `None`
     /// while no shown card is docked. Its width leaves the conversation room
     /// ([`floating::dock_width`]).
-    pub(super) fn render_browser_dock(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    pub(super) fn render_browser_dock(
+        &self,
+        width: f32,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
         let cards: Vec<AnyElement> = self
             .stages
             .iter()
             .filter_map(|stage| stage.docked_element(cx))
             .collect();
         let (conversation, column) = self.browser_dock_room.get();
-        if cards.is_empty() {
+        if cards.is_empty() || width <= 0. {
             self.browser_dock_room.set((conversation, 0.));
             return None;
         }
         let room = conversation + column;
-        let width = floating::dock_width(card_layout(cx).dock_width, room);
         self.browser_dock_room.set((conversation, width));
         Some(
             div()
@@ -706,6 +777,9 @@ impl Workspace {
             move |_, at, cx| {
                 // The column grows leftwards from the window's right edge.
                 let asked = start_width + start_x - at.x.as_f32();
+                if card_layout(cx).dock_width > start_width && asked >= start_width {
+                    return;
+                }
                 let layout = CardLayout {
                     dock_width: floating::dock_width(asked, room),
                     ..card_layout(cx)
