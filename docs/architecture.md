@@ -28,7 +28,7 @@ flowchart TD
 | Component | Responsibility |
 | --- | --- |
 | `crates/app` | Binary, composition, feature state, GPUI views, and the effects (files, processes, sound) of the logic that lives in `core`. |
-| `crates/core` (`gentle-core`) | Pure logic with no GPUI or IO: transcript and subagent activity models, tool summaries, permission mode, jobs and ODD phase, `/` command routing, `notifications.json` policy, usage and statistics models, and the profile and model routing model. |
+| `crates/core` (`gentle-core`) | Pure logic with no GPUI or IO: transcript and subagent activity models, tool summaries, permission mode, jobs and ODD phase, `/` command routing, `notifications.json` policy, usage and statistics models, the profile and model routing model, `list_nav` (keyboard selection in lists) and `vim_keys` (the opt-in vim-style navigation setting). |
 | `crates/pi-rpc` | Backend resolution and launch, JSONL transport, authentication and protocol types. |
 | `packaging` | Packaging and distribution integration per operating system. |
 

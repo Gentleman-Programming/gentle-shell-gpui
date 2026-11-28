@@ -43,6 +43,7 @@ pub fn run(
             crate::shared::kisses::init(cx);
             crate::features::genui::mode::init(cx);
             crate::features::session::input_style::init(cx);
+            crate::shared::vim_keys::init(cx);
             crate::features::backend::init(cx);
             crate::features::diagnostics::start(cx);
 
@@ -227,7 +228,7 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new(key!("-"), ZoomOut, None),
         KeyBinding::new(key!("0"), ActualSize, None),
     ]);
-    files::FileView::bind_keys(cx);
+    files::bind_keys(cx);
     crate::features::canvas::bind_keys(cx);
 }
 

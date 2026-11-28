@@ -53,6 +53,8 @@ gpui_kit::assets::icon_assets!(
         Paperclip,
         // Configuration → Water reminder.
         Droplets,
+        // Configuration → Appearance → Keyboard.
+        Keyboard,
         // Architecture docs and the diagram renderer.
         BookOpen,
         FileText,

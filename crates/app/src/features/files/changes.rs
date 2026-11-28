@@ -45,6 +45,40 @@ pub enum ChangesEvent {
     ShowStashes,
 }
 
+actions!(
+    changes,
+    [
+        SelectPrev,
+        SelectNext,
+        SelectFirst,
+        SelectLast,
+        OpenSelected,
+        ToggleSelected,
+        StageSelected,
+        UnstageSelected,
+    ]
+);
+
+/// Bindings for the changes list. Arrows, Enter and Space work always;
+/// j/k/gg/G/s/u/d are gated by the opt-in vim-keys setting.
+pub fn bind_keys(cx: &mut App) {
+    let ctx = Some("GentleChanges && !Input");
+    let vim_ctx = Some("GentleChanges && vim && !Input");
+    cx.bind_keys([
+        KeyBinding::new("up", SelectPrev, ctx),
+        KeyBinding::new("down", SelectNext, ctx),
+        KeyBinding::new("enter", OpenSelected, ctx),
+        KeyBinding::new("space", ToggleSelected, ctx),
+        KeyBinding::new("j", SelectNext, vim_ctx),
+        KeyBinding::new("k", SelectPrev, vim_ctx),
+        KeyBinding::new("g g", SelectFirst, vim_ctx),
+        KeyBinding::new("shift-g", SelectLast, vim_ctx),
+        KeyBinding::new("s", StageSelected, vim_ctx),
+        KeyBinding::new("u", UnstageSelected, vim_ctx),
+        KeyBinding::new("d", OpenSelected, vim_ctx),
+    ]);
+}
+
 #[derive(Clone, PartialEq)]
 struct Repo {
     /// Status paths are relative to this, not to the sidebar's root.
@@ -126,13 +160,21 @@ pub struct ChangesView {
     /// The clean view offers "Show stashes" (the sidebar; the review has
     /// no Branches tab to show them in).
     pub(super) offers_stashes: bool,
+    focus: FocusHandle,
     _poll: Task<()>,
     _commit: Task<()>,
     _generate: Task<()>,
     _subscriptions: Vec<Subscription>,
+    _vim_keys: Subscription,
 }
 
 impl EventEmitter<ChangesEvent> for ChangesView {}
+
+impl Focusable for ChangesView {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus.clone()
+    }
+}
 
 impl ChangesView {
     pub fn new(root: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
@@ -144,12 +186,14 @@ impl ChangesView {
         });
         let stash_message =
             cx.new(|cx| InputState::new(window, cx).placeholder("Message (optional)"));
+        let focus = cx.focus_handle();
         // The primary button reads "Generate" until a summary exists.
         let subscriptions = vec![cx.subscribe(&summary, |_, _, event: &InputEvent, cx| {
             if let InputEvent::Change = event {
                 cx.notify();
             }
         })];
+        let vim_keys = crate::shared::vim_keys::follow(cx);
         let mut this = Self {
             root,
             repo: None,
@@ -171,10 +215,12 @@ impl ChangesView {
             visible: true,
             open_pending: false,
             offers_stashes: false,
+            focus,
             _poll: Task::ready(()),
             _commit: Task::ready(()),
             _generate: Task::ready(()),
             _subscriptions: subscriptions,
+            _vim_keys: vim_keys,
         };
         this._poll = cx.spawn_in(window, async move |this, cx| {
             loop {
@@ -400,6 +446,124 @@ impl ChangesView {
         self.selected = Some((group, path.to_string()));
         cx.emit(ChangesEvent::OpenDiff(toplevel.join(path)));
         cx.notify();
+    }
+
+    /// Whether a line is selectable for keyboard navigation.
+    fn line_selectable(&self, line: &Line) -> bool {
+        matches!(line, Line::Entry { .. })
+    }
+
+    fn selectable_rows(&self) -> Vec<bool> {
+        self.lines.iter().map(|l| self.line_selectable(l)).collect()
+    }
+
+    fn selected_index(&self) -> Option<usize> {
+        let (group, path) = self.selected.as_ref()?;
+        self.lines.iter().position(|line| match line {
+            Line::Entry {
+                group: g, entry, ..
+            } => self
+                .tree()
+                .and_then(|tree| tree.entries.get(*entry))
+                .is_some_and(|e| *g == *group && e.path == *path),
+            _ => false,
+        })
+    }
+
+    fn select_index(&mut self, ix: usize, cx: &mut Context<Self>) {
+        let Some(Line::Entry { group, entry, .. }) = self.lines.get(ix) else {
+            return;
+        };
+        let Some(tree) = self.tree() else { return };
+        let Some(entry) = tree.entries.get(*entry) else {
+            return;
+        };
+        self.selected = Some((*group, entry.path.clone()));
+        self.scroll.scroll_to_item(ix, ScrollStrategy::Nearest);
+        cx.notify();
+    }
+
+    fn select_prev(&mut self, _: &SelectPrev, _: &mut Window, cx: &mut Context<Self>) {
+        let current = self.selected_index();
+        if let Some(ix) = gentle_core::list_nav::prev(current, &self.selectable_rows()) {
+            self.select_index(ix, cx);
+        }
+    }
+
+    fn select_next(&mut self, _: &SelectNext, _: &mut Window, cx: &mut Context<Self>) {
+        let current = self.selected_index();
+        if let Some(ix) = gentle_core::list_nav::next(current, &self.selectable_rows()) {
+            self.select_index(ix, cx);
+        }
+    }
+
+    fn select_first(&mut self, _: &SelectFirst, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(ix) = gentle_core::list_nav::first(&self.selectable_rows()) {
+            self.select_index(ix, cx);
+        }
+    }
+
+    fn select_last(&mut self, _: &SelectLast, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(ix) = gentle_core::list_nav::last(&self.selectable_rows()) {
+            self.select_index(ix, cx);
+        }
+    }
+
+    fn open_selected(&mut self, _: &OpenSelected, _: &mut Window, cx: &mut Context<Self>) {
+        let Some((group, path)) = self.selected.clone() else {
+            return;
+        };
+        self.click_entry(&path, group, cx);
+    }
+
+    fn toggle_selected(&mut self, _: &ToggleSelected, _: &mut Window, cx: &mut Context<Self>) {
+        let Some((group, path)) = self.selected.clone() else {
+            return;
+        };
+        let Some(entry) = self
+            .tree()
+            .and_then(|tree| tree.entries.iter().find(|e| e.path == path))
+            .cloned()
+        else {
+            return;
+        };
+        self.toggle(&entry, group, cx);
+    }
+
+    /// `s` stages the selected entry; untracked files count as unstaged.
+    fn stage_selected(&mut self, _: &StageSelected, _: &mut Window, cx: &mut Context<Self>) {
+        let Some((group, path)) = self.selected.clone() else {
+            return;
+        };
+        if group == ChangeGroup::Staged {
+            return;
+        }
+        let Some(entry) = self
+            .tree()
+            .and_then(|tree| tree.entries.iter().find(|e| e.path == path))
+            .cloned()
+        else {
+            return;
+        };
+        self.toggle(&entry, group, cx);
+    }
+
+    /// `u` unstages the selected entry; only staged entries can be unstaged.
+    fn unstage_selected(&mut self, _: &UnstageSelected, _: &mut Window, cx: &mut Context<Self>) {
+        let Some((group, path)) = self.selected.clone() else {
+            return;
+        };
+        if group != ChangeGroup::Staged {
+            return;
+        }
+        let Some(entry) = self
+            .tree()
+            .and_then(|tree| tree.entries.iter().find(|e| e.path == path))
+            .cloned()
+        else {
+            return;
+        };
+        self.toggle(&entry, group, cx);
     }
 
     fn confirm_discard(
@@ -1274,9 +1438,24 @@ impl ChangesView {
 impl Render for ChangesView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // The sidebar slot paints the glass; no fill here.
+        let ctx = if crate::shared::vim_keys::enabled(cx) {
+            "GentleChanges vim"
+        } else {
+            "GentleChanges"
+        };
         v_flex()
+            .track_focus(&self.focus)
+            .key_context(ctx)
             .size_full()
             .min_h_0()
+            .on_action(cx.listener(Self::select_prev))
+            .on_action(cx.listener(Self::select_next))
+            .on_action(cx.listener(Self::select_first))
+            .on_action(cx.listener(Self::select_last))
+            .on_action(cx.listener(Self::open_selected))
+            .on_action(cx.listener(Self::toggle_selected))
+            .on_action(cx.listener(Self::stage_selected))
+            .on_action(cx.listener(Self::unstage_selected))
             .child(self.render_header(cx))
             .when_some(self.repository_path(), |d, path| {
                 let line = format!("Repository: {path}");

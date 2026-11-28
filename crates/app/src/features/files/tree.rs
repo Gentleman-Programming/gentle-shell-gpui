@@ -27,7 +27,6 @@ use crate::features::git::GitSnapshot;
 use crate::platform::ides;
 use crate::shared::{themes, ui};
 
-const CONTEXT: &str = "FileTree";
 const ROW_HEIGHT: f32 = 26.;
 const INDENT: f32 = 14.;
 const POLL: Duration = Duration::from_secs(3);
@@ -69,17 +68,22 @@ actions!(
         MoveToTrash,
         SelectPrev,
         SelectNext,
+        SelectFirst,
+        SelectLast,
         CollapseSelected,
         ExpandSelected,
     ]
 );
 
-/// The tree's shortcuts, live while it has focus (the context menu shows them).
+/// The tree's persisted "show ignored" state.
 pub fn init(cx: &mut App) {
     let path = themes::store_path();
     let value = path.as_deref().is_some_and(read_show_ignored);
     cx.set_global(ShowIgnored { value, path });
+}
 
+/// The tree's shortcuts, live while it has focus (the context menu shows them).
+pub fn bind_keys(cx: &mut App) {
     // Cmd on macOS, Ctrl elsewhere, as main.rs binds the app shortcuts
     // (this gpui has no `secondary-` modifier: it panics at startup).
     macro_rules! key {
@@ -96,7 +100,8 @@ pub fn init(cx: &mut App) {
     } else {
         "delete"
     };
-    let ctx = Some(CONTEXT);
+    let ctx = Some("FileTree && !Input");
+    let vim_ctx = Some("FileTree && vim && !Input");
     cx.bind_keys([
         KeyBinding::new("enter", Open, ctx),
         KeyBinding::new(key!("", "enter"), OpenToSide, ctx),
@@ -114,6 +119,14 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("down", SelectNext, ctx),
         KeyBinding::new("left", CollapseSelected, ctx),
         KeyBinding::new("right", ExpandSelected, ctx),
+        // Vim-style navigation, gated by the opt-in setting.
+        KeyBinding::new("j", SelectNext, vim_ctx),
+        KeyBinding::new("k", SelectPrev, vim_ctx),
+        KeyBinding::new("h", CollapseSelected, vim_ctx),
+        KeyBinding::new("l", ExpandSelected, vim_ctx),
+        KeyBinding::new("o", Open, vim_ctx),
+        KeyBinding::new("g g", SelectFirst, vim_ctx),
+        KeyBinding::new("shift-g", SelectLast, vim_ctx),
     ]);
 }
 
@@ -239,6 +252,7 @@ impl FileTreeView {
                 let value = cx.global::<ShowIgnored>().value;
                 this.apply_show_ignored(value, cx);
             }),
+            crate::shared::vim_keys::follow(cx),
             cx.subscribe_in(
                 &changes,
                 window,
@@ -525,22 +539,37 @@ impl FileTreeView {
         }
     }
 
+    fn selectable_rows(&self) -> Vec<bool> {
+        self.rows
+            .iter()
+            .map(|r| matches!(r.item, Item::Entry(_)))
+            .collect()
+    }
+
     fn select_prev(&mut self, _: &SelectPrev, _: &mut Window, cx: &mut Context<Self>) {
         let current = self.selected.as_deref().and_then(|p| self.row_index(p));
-        let ix = match current {
-            Some(ix) => ix.saturating_sub(1),
-            None => self.rows.len().saturating_sub(1),
-        };
-        self.select_row(ix, cx);
+        if let Some(ix) = gentle_core::list_nav::prev(current, &self.selectable_rows()) {
+            self.select_row(ix, cx);
+        }
     }
 
     fn select_next(&mut self, _: &SelectNext, _: &mut Window, cx: &mut Context<Self>) {
         let current = self.selected.as_deref().and_then(|p| self.row_index(p));
-        let ix = match current {
-            Some(ix) => (ix + 1).min(self.rows.len().saturating_sub(1)),
-            None => 0,
-        };
-        self.select_row(ix, cx);
+        if let Some(ix) = gentle_core::list_nav::next(current, &self.selectable_rows()) {
+            self.select_row(ix, cx);
+        }
+    }
+
+    fn select_first(&mut self, _: &SelectFirst, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(ix) = gentle_core::list_nav::first(&self.selectable_rows()) {
+            self.select_row(ix, cx);
+        }
+    }
+
+    fn select_last(&mut self, _: &SelectLast, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(ix) = gentle_core::list_nav::last(&self.selectable_rows()) {
+            self.select_row(ix, cx);
+        }
     }
 
     /// ←: fold an open folder, else go to the parent folder.
@@ -1257,7 +1286,14 @@ impl FileTreeView {
             .id("file-tree-files")
             .track_focus(&self.focus)
             // Not while a name field is open: its keys are its own.
-            .when(self.editing.is_none(), |d| d.key_context(CONTEXT))
+            .when(self.editing.is_none(), |d| {
+                let ctx = if crate::shared::vim_keys::enabled(cx) {
+                    "FileTree vim"
+                } else {
+                    "FileTree"
+                };
+                d.key_context(ctx)
+            })
             .on_action(cx.listener(Self::open))
             .on_action(cx.listener(Self::open_to_side))
             .on_action(cx.listener(Self::open_in_new_tab))
@@ -1276,6 +1312,8 @@ impl FileTreeView {
             .on_action(cx.listener(Self::move_to_trash))
             .on_action(cx.listener(Self::select_prev))
             .on_action(cx.listener(Self::select_next))
+            .on_action(cx.listener(Self::select_first))
+            .on_action(cx.listener(Self::select_last))
             .on_action(cx.listener(Self::collapse_selected))
             .on_action(cx.listener(Self::expand_selected))
             .relative()
