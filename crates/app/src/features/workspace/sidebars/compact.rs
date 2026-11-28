@@ -4,6 +4,11 @@
 use super::super::menu::WorkspaceMenuSource;
 use super::*;
 
+// Keep both 34 px tiles inside the existing 48 px rail: 3 + 8 + 34 = 45.
+const RAIL_INSET: f32 = 3.;
+const SESSION_INDENT: f32 = 8.;
+const GROUP_GAP: f32 = 6.;
+
 /// Compact tiles use the perimeter for both working and attention states.
 /// Attention takes priority: a steady warning outline, without a dot.
 fn compact_agent_status(running: bool, needs_you: bool, reduce_motion: bool) -> Option<Div> {
@@ -35,7 +40,8 @@ impl Workspace {
             .min_h_0()
             .overflow_y_scroll()
             .w_full()
-            .items_center()
+            .items_start()
+            .px(rems(RAIL_INSET / 16.))
             .gap_1();
 
         for space in self.sidebar_spaces() {
@@ -45,6 +51,7 @@ impl Workspace {
             let row = h_flex()
                 .id(("compact-workspace", index))
                 .relative()
+                .when(index != 0, |d| d.mt(rems(GROUP_GAP / 16.)))
                 .size(rems(34. / 16.))
                 .flex_none()
                 .justify_center()
@@ -141,6 +148,7 @@ impl Workspace {
                             h_flex()
                                 .id(SharedString::from(format!("compact-pane-{tab_id}-{leaf}")))
                                 .relative()
+                                .ml(rems(SESSION_INDENT / 16.))
                                 .size(rems(34. / 16.))
                                 .flex_none()
                                 .gap_px()
@@ -195,6 +203,7 @@ impl Workspace {
                 let row = h_flex()
                     .id(("compact-tab", tab.id))
                     .relative()
+                    .ml(rems(SESSION_INDENT / 16.))
                     .size(rems(34. / 16.))
                     .flex_none()
                     .gap_px()
@@ -223,6 +232,8 @@ impl Workspace {
             list = list.child(
                 h_flex()
                     .id(("compact-add-session", index))
+                    // Center the smaller add button under the session tiles.
+                    .ml(rems((SESSION_INDENT + 2.) / 16.))
                     .size(rems(30. / 16.))
                     .flex_none()
                     .justify_center()
@@ -242,13 +253,6 @@ impl Workspace {
                         }),
                     )
                     .child(Icon::new(IconName::Plus).small().text_color(ui::muted())),
-            );
-            list = list.child(
-                div()
-                    .flex_none()
-                    .w(rems(24. / 16.))
-                    .h(px(1.))
-                    .bg(ui::border()),
             );
         }
 
