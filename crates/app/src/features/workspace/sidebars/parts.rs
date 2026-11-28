@@ -128,11 +128,14 @@ impl Workspace {
     ) -> AnyElement {
         let tip = tab.tooltip();
         let selected = self.is_tab_selected(tab.space, tab.id);
+        let id = tab.id;
+        let close_tip: SharedString = format!("Close tab \"{}\"", tab.title).into();
         let row = h_flex()
             .id(SharedString::from(format!(
                 "sidebar-tab-{}-{}",
                 tab.space, tab.index
             )))
+            .group("sidebar-tab")
             .relative()
             .flex_none()
             .w_full()
@@ -184,7 +187,31 @@ impl Workspace {
                         .text_color(ui::faint())
                         .child(tab.panes.to_string()),
                 )
-            });
+            })
+            .child(
+                div()
+                    .id(("sidebar-close-tab", id))
+                    .flex_none()
+                    .size(rems(18. / 16.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_md()
+                    .text_color(ui::faint())
+                    // Reserve the same space in every row, even before hover.
+                    .when(!tab.shown, |d| {
+                        d.invisible().group_hover("sidebar-tab", |s| s.visible())
+                    })
+                    .hover(|s| s.bg(ui::surface_hover()).text_color(ui::fg()))
+                    .occlude()
+                    .tooltip(move |window, cx| Tooltip::new(close_tip.clone()).build(window, cx))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.close_tab_by_id(id, window, cx);
+                    }))
+                    .child(Icon::new(IconName::X).xsmall()),
+            );
         self.tab_row_behavior(row, tab, cx)
     }
 

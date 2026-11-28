@@ -284,13 +284,7 @@ impl Workspace {
                 .icon(Icon::new(IconName::X))
                 .on_click(move |_, window, cx| {
                     let _ = close.update(cx, |this, cx| {
-                        let index = this
-                            .spaces
-                            .get(space)
-                            .and_then(|s| s.tabs.iter().position(|t| t.id == id));
-                        if let Some(i) = index {
-                            this.close_tab_in_space(space, i, window, cx);
-                        }
+                        this.close_tab_by_id(id, window, cx);
                     });
                 }),
         )
@@ -1095,6 +1089,27 @@ mod tests {
                 ws.close_tab_now(0, window, cx);
                 assert!(ws.space().tabs.is_empty());
                 assert!(!ws.panes.contains_key(&pane));
+            },
+        );
+    }
+
+    #[gpui::test]
+    fn close_tab_by_id_leaves_other_workspaces_and_tabs_untouched(cx: &mut TestAppContext) {
+        with_workspace(
+            cx,
+            vec![space_with("A", &[1, 2]), space_with("B", &[3, 4, 5])],
+            0,
+            |ws, window, cx| {
+                ws.close_tab_by_id(4, window, cx);
+                assert_eq!(ws.current, 0);
+                assert_eq!(ids(&ws.spaces[0].tabs), [1, 2]);
+                assert_eq!(ids(&ws.spaces[1].tabs), [3, 5]);
+                assert!(ws.spaces[1].tabs.iter().all(|tab| !tab.is_built()));
+                assert_eq!(ws.closed.last().unwrap().tab, 4);
+
+                // A stale click must not close the tab that filled its row.
+                ws.close_tab_by_id(4, window, cx);
+                assert_eq!(ids(&ws.spaces[1].tabs), [3, 5]);
             },
         );
     }

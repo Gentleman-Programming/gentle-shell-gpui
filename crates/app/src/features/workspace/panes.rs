@@ -919,6 +919,26 @@ impl Workspace {
         self.close_tab_in_space(self.current, index, window, cx);
     }
 
+    /// Close a tab from a sidebar row or menu, resolving its current index
+    /// by identity rather than by a possibly stale row position.
+    pub(super) fn close_tab_by_id(
+        &mut self,
+        id: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let target = self.spaces.iter().enumerate().find_map(|(space, entry)| {
+            entry
+                .tabs
+                .iter()
+                .position(|tab| tab.id == id)
+                .map(|index| (space, index))
+        });
+        if let Some((space, index)) = target {
+            self.close_tab_in_space(space, index, window, cx);
+        }
+    }
+
     /// Close tab `index` of workspace `space`. Unbuilt tabs close without
     /// a confirmation and can be reopened from the closed tab stack.
     pub(super) fn close_tab_in_space(
