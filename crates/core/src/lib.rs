@@ -23,6 +23,7 @@ pub mod gentle_state;
 pub mod genui;
 pub mod git;
 pub mod glass;
+pub mod header_layout;
 pub mod hydration;
 pub mod ides;
 pub mod input_style;

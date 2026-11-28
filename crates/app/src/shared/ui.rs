@@ -947,6 +947,50 @@ pub fn segmented(
         }))
 }
 
+/// A fixed group of header actions. Flexible text and optional metadata
+/// belong outside this group, so they cannot clip its buttons.
+pub fn header_actions() -> Div {
+    h_flex().flex_none().gap_1()
+}
+
+/// A full segmented selector when space permits, otherwise an icon-only
+/// menu with the same options and current selection.
+pub fn adaptive_segmented(
+    id: &'static str,
+    labels: &'static [&'static str],
+    selected: Option<usize>,
+    compact: bool,
+    on_select: impl Fn(&usize, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    use gpui_kit::component::button::{Button, ButtonVariants as _};
+    use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
+
+    if compact {
+        let on_select = std::rc::Rc::new(on_select);
+        let tooltip = selected
+            .and_then(|index| labels.get(index))
+            .map_or_else(|| "View mode".to_string(), |label| format!("View mode: {label}"));
+        Button::new(id)
+            .ghost()
+            .xsmall()
+            .icon(Icon::new(IconName::Ellipsis))
+            .tooltip(tooltip)
+            .dropdown_menu(move |menu, _, _| {
+                labels.iter().enumerate().fold(menu, |menu, (index, label)| {
+                    let on_select = on_select.clone();
+                    menu.item(
+                        PopupMenuItem::new(*label)
+                            .checked(selected == Some(index))
+                            .on_click(move |_, window, cx| on_select(&index, window, cx)),
+                    )
+                })
+            })
+            .into_any_element()
+    } else {
+        segmented(id, labels, selected, on_select).into_any_element()
+    }
+}
+
 // ── Motion ─────────────────────────────────────────────────────────────────
 
 /// A gentle spring with a ~3% overshoot, for anything that opens or unfolds.
