@@ -170,7 +170,7 @@ impl Workspace {
             .child(Self::tab_icon(tab))
             .child(self.tab_title(
                 tab,
-                12.5,
+                ui::SIDEBAR_TEXT_SIZE,
                 if tab.shown { ui::fg() } else { ui::muted() },
                 cx,
             ))
@@ -183,7 +183,7 @@ impl Workspace {
                     div()
                         .flex_none()
                         .font_family(ui::mono())
-                        .text_size(ui::code_rems(10.5))
+                        .text_size(ui::code_rems(ui::SIDEBAR_METADATA_SIZE))
                         .text_color(ui::faint())
                         .child(tab.panes.to_string()),
                 )
@@ -398,7 +398,7 @@ impl Workspace {
                                     .flex_1()
                                     .min_w_0()
                                     .truncate()
-                                    .text_size(rems(12.5 / 16.))
+                                    .text_size(rems(ui::SIDEBAR_TEXT_SIZE / 16.))
                                     .font_weight(FontWeight::MEDIUM)
                                     .text_color(if space.current { ui::fg() } else { ui::muted() })
                                     .child(space.name.clone()),
@@ -418,7 +418,7 @@ impl Workspace {
                         div()
                             .flex_none()
                             .font_family(ui::mono())
-                            .text_size(ui::code_rems(10.5))
+                            .text_size(ui::code_rems(ui::SIDEBAR_METADATA_SIZE))
                             .text_color(ui::faint())
                             .child(space.tabs.to_string()),
                     ),

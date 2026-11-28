@@ -402,6 +402,11 @@ static CODE_SIZE: AtomicU32 = AtomicU32::new(gentle_core::fonts::DEFAULT_CODE_SI
 static TERMINAL_SIZE: AtomicU32 =
     AtomicU32::new(gentle_core::fonts::DEFAULT_TERMINAL_SIZE.to_bits());
 
+/// Primary and secondary text sizes shared by the workspace's side panels,
+/// at the default interface and code font sizes.
+pub const SIDEBAR_TEXT_SIZE: f32 = 12.5;
+pub const SIDEBAR_METADATA_SIZE: f32 = 10.5;
+
 /// Code text of `px_at_100` px (at the default code size and 100 % zoom) as
 /// rems: it follows the chosen code size and the zoom (the rem), and at the
 /// default code size it is exactly `rems(px_at_100 / 16.)`. Every
