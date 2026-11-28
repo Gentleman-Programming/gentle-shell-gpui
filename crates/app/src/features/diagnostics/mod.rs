@@ -4,9 +4,10 @@
 //! one line per second to `<data dir>/diagnostics/diagnostics-<UTC>.jsonl`:
 //! the app's own CPU and memory, the counters of
 //! [`crate::shared::diagnostics`] (frames by source line, renders, poll
-//! wakeups), and every tab's backend with all the processes under it
-//! (subagents, jobs, tools). Nothing leaves the machine;
-//! `--diagnostics-report [FILE]` ranks a recording.
+//! wakeups), every tab's backend with all the processes under it
+//! (subagents, jobs, tools), and how long each tab's backend took to start
+//! (its [`StartupClock`], and the login PATH read). Nothing leaves the
+//! machine; `--diagnostics-report [FILE]` ranks a recording.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -14,7 +15,9 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use gentle_core::diagnostics::{self as model, AppSample, Header, HeaderLine, Sample, TabSample};
+use gentle_core::diagnostics::{
+    self as model, AppSample, Header, HeaderLine, LoginPath, Sample, Startup, TabSample,
+};
 use gpui_kit::{App, Global, Task, WeakEntity};
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 
@@ -38,6 +41,76 @@ pub struct TabResources {
     pub jobs: usize,
     pub jobs_running: usize,
     pub items: usize,
+    pub startup: Option<Startup>,
+}
+
+/// When a tab's backend start reached each step: a few `Instant`s set
+/// whether or not a recording runs, read only by one.
+#[derive(Clone, Copy, Default)]
+pub struct StartupClock {
+    started: Option<Instant>,
+    resolved: Option<Instant>,
+    spawned: Option<Instant>,
+    /// Kept from the backend once `get_state` answers (a record itself), so
+    /// it outlives the backend.
+    first_record: Option<Instant>,
+    state: Option<Instant>,
+    messages: Option<Instant>,
+    /// The resumed conversation shown from its session file.
+    file: Option<Instant>,
+}
+
+impl StartupClock {
+    /// A start beginning now.
+    pub fn start() -> Self {
+        Self {
+            started: Some(Instant::now()),
+            ..Self::default()
+        }
+    }
+
+    /// The launch spec resolved at `resolved` and the backend spawned at
+    /// `spawned`.
+    pub fn spawned(&mut self, resolved: Instant, spawned: Instant) {
+        self.resolved = Some(resolved);
+        self.spawned = Some(spawned);
+    }
+
+    /// `get_state` answered without an error (the first time since the
+    /// start); the backend's first record came at `first_record`.
+    pub fn state_answered(&mut self, first_record: Option<Instant>) {
+        self.state.get_or_insert_with(Instant::now);
+        self.first_record = self.first_record.or(first_record);
+    }
+
+    /// `get_messages` answered (the first time since the start).
+    pub fn messages_answered(&mut self) {
+        self.messages.get_or_insert_with(Instant::now);
+    }
+
+    /// The resumed conversation showed from its session file, before the
+    /// backend's answer.
+    pub fn file_shown(&mut self) {
+        self.file.get_or_insert_with(Instant::now);
+    }
+
+    /// The steps so far, with the running backend's first record at
+    /// `first_record`; `None` before the first start.
+    pub fn sample(&self, first_record: Option<Instant>) -> Option<Startup> {
+        let started = self.started?;
+        let ms = |at: Option<Instant>| {
+            at.map(|at| at.saturating_duration_since(started).as_millis() as u64)
+        };
+        Some(Startup {
+            at_ms: crate::shared::diagnostics::since_launch(started),
+            resolved_ms: ms(self.resolved),
+            spawned_ms: ms(self.spawned),
+            first_record_ms: ms(self.first_record.or(first_record)),
+            state_ms: ms(self.state),
+            messages_ms: ms(self.messages),
+            file_ms: ms(self.file),
+        })
+    }
 }
 
 thread_local! {
@@ -171,6 +244,12 @@ fn snapshot(seconds: f64, cx: &mut App) -> (AppSample, Vec<(u64, TabResources)>)
         frames,
         renders,
         ticks,
+        login_path: pi_rpc::path_probe().map(|probe| LoginPath {
+            at_ms: crate::shared::diagnostics::since_launch(probe.started),
+            took_ms: probe.took.as_millis() as u64,
+            found: probe.found,
+            timed_out: probe.timed_out,
+        }),
         ..Default::default()
     };
     let tabs = TABS.with_borrow_mut(|tabs| {
@@ -195,6 +274,7 @@ fn rate_tab(
         jobs: resources.jobs,
         jobs_running: resources.jobs_running,
         items: resources.items,
+        startup: resources.startup,
         ..Default::default()
     };
     let pid = resources.backend.map(|(pid, records, bytes)| {

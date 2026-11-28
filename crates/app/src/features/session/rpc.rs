@@ -20,7 +20,7 @@ use super::state::desktop::review::Applied as ReviewApplied;
 use super::state::desktop::subscription::Applied as SubscriptionApplied;
 use super::state::desktop::supervision::Applied as SupervisionApplied;
 use super::state::desktop::{self, Applied as DesktopApplied, Send as DesktopSend};
-use super::state::{BackendStatus, ModelInfo};
+use super::state::{BackendStatus, ModelInfo, Preload};
 use super::{SessionEvent, SessionView, attachments, builtins};
 use crate::features::profiles::{
     ConfigChange, ConfigFailure, ConfigOutcome, ConfigSupport, ConfigTicket, ProfileApply,
@@ -811,6 +811,8 @@ impl SessionView {
         self.set_model_default(None, cx);
         self.request(json!({"type": "get_state"}), cx, |this, result, _| {
             if let Some(state) = this.report(result) {
+                let first_record = this.process().and_then(|p| p.first_record());
+                this.backend.startup.state_answered(first_record);
                 this.models.current = ModelInfo::parse(&state["model"]);
                 this.models.thinking = state["thinkingLevel"].as_str().unwrap_or("off").to_string();
                 this.session_name = state["sessionName"].as_str().map(str::to_string);
@@ -822,10 +824,23 @@ impl SessionView {
         self.refresh_thinking_levels(cx);
         self.refresh_commands(cx);
         self.request(json!({"type": "get_messages"}), cx, |this, result, _| {
-            if let Some(data) = this.report(result)
-                && let Some(messages) = data["messages"].as_array()
-            {
-                this.apply_messages(messages);
+            // The backend's answer is the conversation: a read of the session
+            // file still on its way stays out, and one shown is replaced
+            // unless it already is that conversation (reloading it would
+            // clear the list and its Markdown for a frame).
+            let shown = std::mem::replace(&mut this.backend.preload, Preload::Off);
+            if let Some(data) = this.report(result) {
+                if let Some(messages) = data["messages"].as_array() {
+                    match shown {
+                        Preload::Shown(file) if file == *messages => {}
+                        Preload::Shown(_) if messages.is_empty() => {
+                            // Not the file's conversation after all.
+                            this.transcript.load_messages(&[]);
+                        }
+                        _ => this.apply_messages(messages),
+                    }
+                }
+                this.backend.startup.messages_answered();
             }
         });
         self.refresh_stats(cx);

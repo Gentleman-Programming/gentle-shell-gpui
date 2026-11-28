@@ -108,7 +108,7 @@ gsd workspace remove web --force
 
 `gsd workspace --help` lists the commands. Relative paths are resolved from the calling terminal. List and current read the live state when Desktop is open, otherwise the last saved state; mutations start Desktop if needed. Switching keeps other agents running. Changing a root only affects Files and future tabs; existing tabs keep their own working folders. Removing a workspace closes its tabs and stops its agents, but keeps files and conversations; `--force` explicitly confirms this. Each workspace still has one root. Use `gsd ./workspace` to open a directory literally named `workspace`.
 
-Named workspaces (each with its own folder and tabs), saved and restored; agents in other workspaces keep running while you switch. A dot on the title bar's workspace chip says an agent in another workspace is working (accent) or needs you (amber) (with vertical tabs, each project row also carries its own dot), and the switcher (⌃⌘K) shows which: "working" or "needs you" on each workspace.
+Named workspaces (each with its own folder and tabs), saved and restored; agents in other workspaces keep running while you switch. A restored agent tab shows its conversation, read from its session file, while its Gentle Shell starts; what you type waits in the composer until it's ready. A dot on the title bar's workspace chip says an agent in another workspace is working (accent) or needs you (amber) (with vertical tabs, each project row also carries its own dot), and the switcher (⌃⌘K) shows which: "working" or "needs you" on each workspace.
 
 <details>
 <summary><kbd>More</kbd> <strong>Switching, panes and tiling</strong></summary>

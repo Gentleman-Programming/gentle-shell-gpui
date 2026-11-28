@@ -4340,6 +4340,170 @@ fn opening_a_saved_session_loads_its_conversation(cx: &mut TestAppContext) {
     backend.stop(&view, cx);
 }
 
+/// The window's startup checks wait for a tab's backend to settle: not
+/// while it is only spawned, but once it answers; one that exited or failed
+/// to start counts too. Only a started, unsettled backend holds them.
+#[cfg(unix)]
+#[gpui::test]
+fn a_backend_settles_once_it_answers_or_ends(cx: &mut TestAppContext) {
+    let (view, cx) = tab(cx);
+    let settled = |cx: &mut VisualTestContext| view.read_with(cx, |view, _| view.backend_settled());
+    let booting = |cx: &mut VisualTestContext| view.read_with(cx, |view, _| view.backend_booting());
+    assert!(!settled(cx), "not started");
+    // A tab not shown yet (its backend never started) holds nothing.
+    view.update(cx, |view, _| view.backend.started = false);
+    assert!(!booting(cx), "never started");
+    view.update(cx, |view, _| view.backend.started = true);
+    assert!(booting(cx), "starting");
+    let backend = Backend::start(&view, cx);
+    assert!(!settled(cx), "spawned, not answered");
+    assert!(booting(cx), "spawned, not answered");
+    view.update(cx, |view, cx| view.refresh_state(cx));
+    backend.settle(&view, cx, |read| {
+        read.iter().any(|command| command == "get_available_models")
+    });
+    assert!(settled(cx));
+    assert!(!booting(cx));
+    backend.stop(&view, cx);
+    assert!(settled(cx), "exited");
+
+    view.update(cx, |view, _| {
+        view.models.loaded = false;
+        view.backend.status = super::state::BackendStatus::Failed("not found".into());
+    });
+    assert!(settled(cx), "failed to start");
+}
+
+/// A restored tab shows the conversation its session file holds while its
+/// backend starts, instead of the welcome banner; the backend's
+/// `get_messages` answer then replaces it, without doubling a message.
+#[cfg(unix)]
+#[gpui::test]
+fn a_restored_conversation_shows_before_the_backend_answers(cx: &mut TestAppContext) {
+    let (view, cx) = tab(cx);
+    let saved = std::env::temp_dir().join(format!(
+        "gs-restored-{}-{}.jsonl",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let lines = [
+        json!({"type": "session", "version": 3, "id": "s1", "cwd": "/w",
+               "timestamp": "2026-01-01T00:00:00.000Z"}),
+        json!({"type": "message", "id": "a", "parentId": null,
+               "message": {"role": "user", "content": "hello"}}),
+        json!({"type": "message", "id": "b", "parentId": "a",
+               "message": {"role": "assistant", "content": [{"type": "text", "text": "hi there"}]}}),
+    ];
+    let text: String = lines.iter().map(|line| format!("{line}\n")).collect();
+    std::fs::write(&saved, text).unwrap();
+
+    view.update(cx, |view, cx| view.preload_session(saved.clone(), cx));
+    assert!(drawn(cx, "user-text-0"), "the file's conversation is drawn");
+    view.read_with(cx, |view, _| {
+        assert!(!view.backend.is_ready(), "before the backend is up");
+        assert!(!view.hero_shown(), "the banner gives way to it");
+        assert_eq!(view.transcript.items.len(), 2);
+    });
+
+    let backend = Backend::start(&view, cx);
+    view.update(cx, |view, cx| view.refresh_state(cx));
+    backend.settle(&view, cx, |read| {
+        read.iter().any(|command| command == "get_messages")
+    });
+    assert_eq!(user_texts(&view, cx), ["hello"]);
+    view.read_with(cx, |view, _| {
+        assert_eq!(
+            view.transcript.items.len(),
+            1,
+            "the backend's conversation replaced the file's"
+        );
+    });
+    assert!(drawn(cx, "user-text-0"));
+    backend.stop(&view, cx);
+    let _ = std::fs::remove_file(&saved);
+}
+
+/// The backend's answer equal to what the file showed leaves the transcript
+/// as it is: reloading it would clear the list's measurements and Markdown,
+/// a visible flash of the whole conversation.
+#[cfg(unix)]
+#[gpui::test]
+fn an_answer_equal_to_the_session_file_keeps_the_conversation_shown(cx: &mut TestAppContext) {
+    let (view, cx) = tab(cx);
+    let saved = std::env::temp_dir().join(format!(
+        "gs-restored-same-{}-{}.jsonl",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    // What the fake backend's `get_messages` answers.
+    let lines = [
+        json!({"type": "session", "version": 3, "id": "s1", "cwd": "/w",
+               "timestamp": "2026-01-01T00:00:00.000Z"}),
+        json!({"type": "message", "id": "a", "parentId": null,
+               "message": {"role": "user", "content": "hello"}}),
+    ];
+    let text: String = lines.iter().map(|line| format!("{line}\n")).collect();
+    std::fs::write(&saved, text).unwrap();
+
+    view.update(cx, |view, cx| view.preload_session(saved.clone(), cx));
+    assert!(drawn(cx, "user-text-0"), "the file's conversation is drawn");
+    // A reload would clear this (it is keyed by item index).
+    view.update(cx, |view, _| {
+        view.expanded_code.insert((0, 0, 0));
+    });
+
+    let backend = Backend::start(&view, cx);
+    view.update(cx, |view, cx| view.refresh_state(cx));
+    backend.settle(&view, cx, |read| {
+        read.iter().any(|command| command == "get_messages")
+    });
+    assert_eq!(user_texts(&view, cx), ["hello"]);
+    view.read_with(cx, |view, _| {
+        assert!(
+            view.expanded_code.contains(&(0, 0, 0)),
+            "the conversation shown was reloaded"
+        );
+        assert_eq!(view.backend.preload, super::state::Preload::Off);
+    });
+    backend.stop(&view, cx);
+    let _ = std::fs::remove_file(&saved);
+}
+
+/// The backend's conversation wins: a file read that lands after its
+/// `get_messages` answer, or after the tab moved to another conversation,
+/// shows nothing.
+#[cfg(unix)]
+#[gpui::test]
+fn a_late_session_file_read_never_replaces_the_backends_conversation(cx: &mut TestAppContext) {
+    use super::state::Preload;
+    let stale = [json!({"role": "user", "content": "from the file"})];
+    let (view, cx) = tab(cx);
+    let backend = Backend::start(&view, cx);
+    view.update(cx, |view, cx| {
+        view.backend.preload = Preload::Reading;
+        view.refresh_state(cx);
+    });
+    backend.settle(&view, cx, |read| {
+        read.iter().any(|command| command == "get_messages")
+    });
+    view.update(cx, |view, cx| view.show_preloaded(stale.to_vec(), cx));
+    assert_eq!(user_texts(&view, cx), ["hello"]);
+
+    view.update(cx, |view, cx| {
+        view.backend.preload = Preload::Reading;
+        view.reset_conversation();
+        view.show_preloaded(stale.to_vec(), cx);
+    });
+    assert!(user_texts(&view, cx).is_empty(), "another conversation");
+    backend.stop(&view, cx);
+}
+
 /// The conversation a notice is tied to: ⌘N and opening another session
 /// replace it as soon as they are asked (the new session's startup notices
 /// arrive before the answer); resuming the one shown (a restart) keeps it.

@@ -1,18 +1,32 @@
 //! The counters behind the resource diagnostics
 //! ([`crate::features::diagnostics`]): frames asked for and poll wakeups by
-//! source line, renders by view. Off (the default), every hook is one
-//! relaxed load of a flag.
+//! source line, renders by view, and the launch the startup steps count
+//! from. Off (the default), every hook is one relaxed load of a flag.
 
 use std::collections::BTreeMap;
 use std::panic::Location;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{LazyLock, Mutex};
+use std::time::Instant;
 
 const ENV: &str = "GENTLE_SHELL_GPUI_DIAGNOSTICS";
 /// Records from launch, like the variable does.
 pub const FLAG: &str = "--diagnostics";
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// When the app launched: `main` reads it first.
+static LAUNCH: LazyLock<Instant> = LazyLock::new(Instant::now);
+
+/// Note the launch; called first thing in `main`.
+pub fn mark_launch() {
+    LazyLock::force(&LAUNCH);
+}
+
+/// Milliseconds from the launch to `at`.
+pub fn since_launch(at: Instant) -> u64 {
+    at.saturating_duration_since(*LAUNCH).as_millis() as u64
+}
 
 /// Whether this launch asked to record from the start (the variable or
 /// [`FLAG`]).

@@ -11,6 +11,8 @@ use features::setup;
 use platform::instance;
 
 fn main() {
+    // What the diagnostics' startup steps count from.
+    shared::diagnostics::mark_launch();
     // `gentle-device …`, `gentle-browser …` and `gentle-screen …` (the
     // agents' commands) and `--diagnostics-report` run here and exit.
     let mut args = std::env::args().skip(1);
@@ -55,6 +57,9 @@ fn main() {
         }
         instance::Role::Primary(requests) => requests,
     };
+    // The login PATH the last launch read: the first agent starts on it
+    // while the login shell runs again in the background.
+    pi_rpc::set_login_path_file(shared::data_dir::app().map(|dir| dir.join("login-path.json")));
     // Windows can't rename a folder a process works in, and a shortcut may
     // start the app in its install folder: work from a neutral folder so an
     // update can replace the install. The first tab still opens where the

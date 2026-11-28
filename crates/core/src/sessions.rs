@@ -1,8 +1,11 @@
 //! Session browser model: the summary shown for one Pi session file (title,
 //! search match, ordering), Pi's per-cwd session directory name, and the
-//! timestamp parsing/formatting the summaries use.
+//! timestamp parsing/formatting the summaries use. [`branch`] rebuilds the
+//! conversation a session file resumes to.
 
 use std::path::{Path, PathBuf};
+
+pub mod branch;
 
 /// What the browser shows for one session file.
 #[derive(Clone, Debug, PartialEq)]

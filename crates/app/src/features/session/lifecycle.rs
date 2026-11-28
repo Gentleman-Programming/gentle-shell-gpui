@@ -13,8 +13,8 @@ use pi_rpc::PiProcess;
 use pi_rpc::desktop_rpc::DesktopMethod;
 
 use super::SessionView;
-use super::state::BackendStatus;
 use super::state::desktop::permission::Report;
+use super::state::{BackendStatus, Preload};
 use super::view;
 use super::{ReadFailure, ReadOutcome, ReadRequest, ReadSupport};
 use gentle_core::transcript::{NoticeLevel, Transcript};
@@ -139,7 +139,10 @@ impl SessionView {
     pub fn retry_start(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let never_ran = match &self.backend.status {
             BackendStatus::Failed(_) => true,
-            BackendStatus::Exited(_) => self.transcript.items.is_empty(),
+            BackendStatus::Exited(_) => {
+                self.transcript.items.is_empty()
+                    || matches!(self.backend.preload, Preload::Shown(_))
+            }
             BackendStatus::Starting | BackendStatus::Ready(_) => false,
         };
         if self.backend.started && never_ran {
@@ -324,6 +327,7 @@ impl SessionView {
         self.shutdown_backend();
         self.backend.started = true;
         self.backend.status = BackendStatus::Starting;
+        self.backend.startup = crate::features::diagnostics::StartupClock::start();
         self.models.loaded = false;
         // This tab now has a backend of its own to ask: the previous one's
         // Desktop answers and event numbering are gone.
@@ -355,6 +359,13 @@ impl SessionView {
         // one starts in Normal.
         let resume = self.backend.pending_session.take();
         let launched = resume.clone();
+        match &resume {
+            Some(path) => self.preload_session(path.clone(), cx),
+            None => {
+                self.backend.preload = Preload::Off;
+                self._preload = Task::ready(());
+            }
+        }
         // Agent UI: the extension loads in the app's mode (a change made
         // while it starts is sent once it is ready).
         let genui_mode = crate::features::genui::mode::mode(cx);
@@ -386,6 +397,7 @@ impl SessionView {
                         .collect();
                     let mut spec =
                         crate::features::backend::launch_spec(&runs_on, &cwd, &env, &files)?;
+                    let resolved = std::time::Instant::now();
                     if let Some(path) = &resume {
                         // A conversation listed from this computer's view of the
                         // backend's home reads there as the backend's path.
@@ -395,11 +407,12 @@ impl SessionView {
                             .push(runs_on.path(&path).unwrap_or_else(|| path.into_owned()));
                     }
                     let (process, rx) = PiProcess::spawn(&spec)?;
-                    anyhow::Ok((process, rx, spec, runs_on))
+                    let steps = (resolved, std::time::Instant::now());
+                    anyhow::Ok((process, rx, spec, runs_on, steps))
                 })
                 .await;
             let (rx, probe) = match spawned {
-                Ok((process, rx, spec, runs_on)) => {
+                Ok((process, rx, spec, runs_on, (resolved, spawned_at))) => {
                     // The version is only shown: asked while the backend
                     // boots, not before (`--version` is a cold Node start).
                     let probe = {
@@ -410,6 +423,7 @@ impl SessionView {
                     };
                     let ok = this.update(cx, |this, cx| {
                         this.backend.status = BackendStatus::Ready(process);
+                        this.backend.startup.spawned(resolved, spawned_at);
                         this.runs_on = Some(runs_on);
                         this.genui_mode = genui_mode;
                         this.sync_genui_mode(cx);
@@ -470,6 +484,53 @@ impl SessionView {
         cx.notify();
     }
 
+    /// Show the conversation `path` resumes to while the backend starts:
+    /// the session file is read off the UI thread and goes through the same
+    /// `load_messages` as the backend's `get_messages` answer, which then
+    /// replaces it. A start begun meanwhile drops the read (the task goes);
+    /// a missing, unreadable or oversized file leaves the tab as it was. A
+    /// backend reached through a command reads its session files on its
+    /// side (`backend::read` goes through `cat` there), so its tabs wait
+    /// for it as before rather than read a path this computer may not hold.
+    pub(super) fn preload_session(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.backend.preload = Preload::Reading;
+        let runs_on = self.runs_on.clone();
+        let cwd = self.cwd.clone();
+        self._preload = cx.spawn(async move |this, cx| {
+            let read = cx.background_executor().spawn(async move {
+                let runs_on = runs_on.unwrap_or_else(|| crate::features::backend::for_tab(&cwd));
+                if matches!(runs_on, gentle_core::backend::Backend::Command { .. }) {
+                    return None;
+                }
+                crate::features::sessions::resumed_messages(&path)
+            });
+            let Some(messages) = read.await else {
+                return;
+            };
+            let _ = this.update(cx, |this, cx| this.show_preloaded(messages, cx));
+        });
+    }
+
+    /// The file's conversation, read: shown unless the backend answered
+    /// `get_messages` first, or the tab already shows something (a notice)
+    /// that loading it would wipe.
+    pub(super) fn show_preloaded(
+        &mut self,
+        messages: Vec<serde_json::Value>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.backend.preload != Preload::Reading
+            || !self.transcript.items.is_empty()
+            || messages.is_empty()
+        {
+            return;
+        }
+        self.apply_messages(&messages);
+        self.backend.preload = Preload::Shown(messages);
+        self.backend.startup.file_shown();
+        cx.notify();
+    }
+
     /// Switch to `path` as soon as the backend is ready.
     pub fn resume_when_ready(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         if self.process().is_some() {
@@ -482,6 +543,7 @@ impl SessionView {
     /// Forget the conversation shown, for another one on the same backend.
     pub(super) fn reset_conversation(&mut self) {
         self.transcript = Transcript::default();
+        self.backend.preload = Preload::Off;
         self.markdown.clear();
         self.expanded.clear();
         self.todo.apply(Vec::new());
@@ -771,6 +833,19 @@ mod tests {
         view.read_with(cx, |view, _| {
             assert!(matches!(view.backend.status, BackendStatus::Ready(_)));
             assert_eq!(view.backend.version.as_deref(), Some("9.9.9"));
+            // The diagnostics see the spawn; the fake backend never wrote
+            // or answered.
+            let startup = view.resources().startup.expect("no startup steps");
+            let (resolved, spawned) = (startup.resolved_ms.unwrap(), startup.spawned_ms.unwrap());
+            assert!(resolved <= spawned);
+            assert_eq!(
+                (
+                    startup.first_record_ms,
+                    startup.state_ms,
+                    startup.messages_ms
+                ),
+                (None, None, None)
+            );
         });
         assert_eq!(log(&dir), ["rpc", "talked", "version"]);
 

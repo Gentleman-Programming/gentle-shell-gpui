@@ -1,7 +1,8 @@
 //! Resource diagnostics: what one sample of the running app records (its
-//! own CPU and memory, the frames it asked for, its polls, and every tab's
-//! backend with the whole process tree under it), grouping a process table
-//! into those trees, and the report that ranks a recording.
+//! own CPU and memory, the frames it asked for, its polls, every tab's
+//! backend with the whole process tree under it, and how long each tab's
+//! backend took to start), grouping a process table into those trees, and
+//! the report that ranks a recording.
 //!
 //! A sample holds only numbers, source locations and executable names:
 //! never prompts, paths, arguments or project names, so a recording can be
@@ -73,6 +74,49 @@ pub struct AppSample {
     pub renders: BTreeMap<String, f64>,
     /// Poll and timer wakeups per second, by the source line of the loop.
     pub ticks: BTreeMap<String, f64>,
+    /// The last login PATH read; absent before the first (and in
+    /// recordings older than it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub login_path: Option<LoginPath>,
+}
+
+/// One read of the login PATH (the login shell; the registry on Windows),
+/// which a tab's first start waits for.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct LoginPath {
+    /// When it started, in milliseconds since the app launched.
+    pub at_ms: u64,
+    pub took_ms: u64,
+    /// It gave a PATH; otherwise the inherited one was used.
+    pub found: bool,
+    /// It ran into its time limit.
+    pub timed_out: bool,
+}
+
+/// How long a tab's backend took to start. `at_ms` counts from the app's
+/// launch; each step's end counts from `at_ms`, absent until it is reached.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct Startup {
+    pub at_ms: u64,
+    /// The launch spec resolved: the login PATH and the launcher's lookup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_ms: Option<u64>,
+    /// The backend process spawned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spawned_ms: Option<u64>,
+    /// Its first RPC record arrived.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_record_ms: Option<u64>,
+    /// `get_state` answered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_ms: Option<u64>,
+    /// `get_messages` answered: the backend's conversation shows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub messages_ms: Option<u64>,
+    /// The resumed conversation showed from its session file, before the
+    /// backend's answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_ms: Option<u64>,
 }
 
 /// One agent tab: its backend and what it runs.
@@ -91,6 +135,10 @@ pub struct TabSample {
     pub rpc_kb: f64,
     /// The backend and everything under it; `None` while it isn't running.
     pub tree: Option<Tree>,
+    /// Its backend's last start; absent before the first (and in
+    /// recordings older than it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub startup: Option<Startup>,
 }
 
 /// A process and all its descendants.
@@ -262,8 +310,9 @@ struct TabStats {
 
 /// A plain-text ranking of a recording (JSONL, one [`Sample`] per line):
 /// the app's CPU and memory, which source lines ask for frames and wake
-/// polls the most, and each tab's process tree, agents and RPC traffic.
-/// Lines that don't parse are counted and skipped.
+/// polls the most, each tab's process tree, agents and RPC traffic, and how
+/// long each tab's backend took to start. Lines that don't parse are
+/// counted and skipped.
 pub fn report(recording: &str) -> String {
     let mut samples = 0;
     let mut skipped = 0;
@@ -278,6 +327,9 @@ pub fn report(recording: &str) -> String {
     let mut others: BTreeMap<String, (Stat, Stat)> = BTreeMap::new();
     let mut themes: BTreeMap<String, Stat> = BTreeMap::new();
     let mut header = None;
+    // Keyed by start time, the latest sample of each (the most steps).
+    let mut login_paths: BTreeMap<u64, LoginPath> = BTreeMap::new();
+    let mut startups: BTreeMap<(u64, u64), Startup> = BTreeMap::new();
     for line in recording.lines().filter(|l| !l.trim().is_empty()) {
         if let Ok(line) = serde_json::from_str::<HeaderLine>(line) {
             header = Some(line.header);
@@ -297,6 +349,9 @@ pub fn report(recording: &str) -> String {
         app_cpu.add(sample.app.cpu.into());
         app_rss.add(sample.app.rss_mb);
         windows.add(sample.app.windows as f64);
+        if let Some(login) = sample.app.login_path {
+            login_paths.insert(login.at_ms, login);
+        }
         for (series, values) in [
             (&mut frames, &sample.app.frames),
             (&mut renders, &sample.app.renders),
@@ -307,6 +362,9 @@ pub fn report(recording: &str) -> String {
             }
         }
         for tab in &sample.tabs {
+            if let Some(startup) = tab.startup {
+                startups.insert((startup.at_ms, tab.tab), startup);
+            }
             let stats = tabs.entry(tab.tab).or_default();
             let tree = tab.tree.clone().unwrap_or_default();
             stats.cpu.add(tree.cpu.into());
@@ -439,6 +497,10 @@ pub fn report(recording: &str) -> String {
         }
     }
     line(String::new());
+    for text in startup_lines(&login_paths, &startups) {
+        line(text);
+    }
+    line(String::new());
     line("Other child processes".into());
     if others.is_empty() {
         line("  none".into());
@@ -454,6 +516,61 @@ pub fn report(recording: &str) -> String {
         ));
     }
     out
+}
+
+/// The report's startup section: each login PATH read and each tab start,
+/// in the order they began.
+fn startup_lines(
+    login_paths: &BTreeMap<u64, LoginPath>,
+    startups: &BTreeMap<(u64, u64), Startup>,
+) -> Vec<String> {
+    let mut lines =
+        vec!["Backend startup (ms; \"at\" counts from launch, steps from the tab's start)".into()];
+    if login_paths.is_empty() && startups.is_empty() {
+        lines.push("  not recorded".into());
+    }
+    for login in login_paths.values() {
+        let outcome = if login.timed_out {
+            ", timed out: the inherited PATH was used"
+        } else if !login.found {
+            ", no PATH read: the inherited PATH was used"
+        } else {
+            ""
+        };
+        lines.push(format!(
+            "  login PATH at +{}: {} ms{outcome}",
+            login.at_ms, login.took_ms
+        ));
+    }
+    for ((at, tab), startup) in startups {
+        let mut steps: Vec<String> = [
+            ("launch spec", startup.resolved_ms),
+            ("spawned", startup.spawned_ms),
+            ("first record", startup.first_record_ms),
+            ("get_state", startup.state_ms),
+            ("get_messages", startup.messages_ms),
+        ]
+        .map(|(step, ms)| match ms {
+            Some(ms) => format!("{step} {ms}"),
+            None => format!("{step} pending"),
+        })
+        .into();
+        if let Some(ms) = startup.file_ms {
+            steps.push(format!("session file {ms}"));
+        }
+        // Whichever showed the conversation first: its session file, or
+        // the backend's answer.
+        let shown = match (startup.file_ms, startup.messages_ms) {
+            (Some(file), Some(ms)) if ms < file => format!(" (conversation at +{})", at + ms),
+            (Some(file), _) => {
+                format!(" (conversation at +{}, from its session file)", at + file)
+            }
+            (None, Some(ms)) => format!(" (conversation at +{})", at + ms),
+            (None, None) => String::new(),
+        };
+        lines.push(format!("  tab {tab} at +{at}: {}{shown}", steps.join(", ")));
+    }
+    lines
 }
 
 #[cfg(test)]
@@ -622,5 +739,99 @@ mod tests {
         let rates = rates(&counts, 2.);
         assert_eq!(rates["a"], 15.);
         assert_eq!(rates["b"], 0.5);
+    }
+
+    #[test]
+    fn report_lists_each_backend_start_step_by_step() {
+        let sample = |t: u64, login_path: Option<LoginPath>, tabs: Vec<(u64, Startup)>| Sample {
+            t,
+            app: AppSample {
+                login_path,
+                ..Default::default()
+            },
+            tabs: tabs
+                .into_iter()
+                .map(|(tab, startup)| TabSample {
+                    tab,
+                    startup: Some(startup),
+                    ..Default::default()
+                })
+                .collect(),
+            others: Vec::new(),
+        };
+        let login = LoginPath {
+            at_ms: 120,
+            took_ms: 52,
+            found: true,
+            timed_out: false,
+        };
+        let booting = Startup {
+            at_ms: 310,
+            resolved_ms: Some(60),
+            spawned_ms: Some(75),
+            ..Default::default()
+        };
+        let shown = Startup {
+            first_record_ms: Some(1320),
+            state_ms: Some(1400),
+            messages_ms: Some(1410),
+            ..booting
+        };
+        // A restored tab: its session file showed while the backend booted.
+        let second_tab = Startup {
+            at_ms: 200,
+            resolved_ms: Some(5),
+            file_ms: Some(40),
+            ..Default::default()
+        };
+        // `/reload` later, after the login PATH was forgotten and read again.
+        let restarted = Startup {
+            at_ms: 9000,
+            resolved_ms: Some(5010),
+            spawned_ms: Some(5030),
+            ..Default::default()
+        };
+        let reread = LoginPath {
+            at_ms: 9001,
+            took_ms: 5003,
+            found: false,
+            timed_out: true,
+        };
+        let recording = [
+            sample(1_000, Some(login), vec![(1, booting), (2, second_tab)]),
+            sample(2_000, Some(login), vec![(1, shown), (2, second_tab)]),
+            sample(15_000, Some(reread), vec![(1, restarted)]),
+        ]
+        .map(|s| serde_json::to_string(&s).unwrap())
+        .join("\n");
+        let report = report(&recording);
+        assert!(
+            report.contains(
+                "\nBackend startup (ms; \"at\" counts from launch, steps from the tab's start)\n\
+                 \x20 login PATH at +120: 52 ms\n\
+                 \x20 login PATH at +9001: 5003 ms, timed out: the inherited PATH was used\n\
+                 \x20 tab 2 at +200: launch spec 5, spawned pending, first record pending, \
+                 get_state pending, get_messages pending, session file 40 \
+                 (conversation at +240, from its session file)\n\
+                 \x20 tab 1 at +310: launch spec 60, spawned 75, first record 1320, \
+                 get_state 1400, get_messages 1410 (conversation at +1720)\n\
+                 \x20 tab 1 at +9000: launch spec 5010, spawned 5030, first record pending, \
+                 get_state pending, get_messages pending\n\n"
+            ),
+            "{report}"
+        );
+    }
+
+    #[test]
+    fn a_recording_from_before_startup_steps_still_reports() {
+        let recording = r#"{"header":{"version":"0.1.27","os":"macos","arch":"aarch64","cores":10,"memory_mb":16384.0,"interval_ms":1000}}
+{"t":1000,"app":{"cpu":10.0,"rss_mb":300.0,"windows":1,"theme":"Aurora","motion":"Smooth","frames":{},"renders":{},"ticks":{}},"tabs":[{"tab":1,"agents":0,"agents_running":0,"jobs":0,"jobs_running":0,"items":4,"rpc_records":2.0,"rpc_kb":1.0,"tree":null}],"others":[]}"#;
+        let report = report(recording);
+        assert!(report.contains("\n1 samples over 0m00s\n"), "{report}");
+        assert!(report.contains("items 4 max"), "{report}");
+        assert!(
+            report.contains("\nBackend startup (ms; \"at\" counts from launch, steps from the tab's start)\n  not recorded\n"),
+            "{report}"
+        );
     }
 }

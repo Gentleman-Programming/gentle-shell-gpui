@@ -514,3 +514,37 @@ fn a_row_spelled_differently_is_still_the_current_session(cx: &mut TestAppContex
     let (view, cx) = listed_view(&current, listed, cx);
     assert_eq!(marked(&view, cx), expected);
 }
+
+/// A restored tab reads its session file's conversation before the
+/// backend is up: the active branch's messages, nothing for a file it
+/// can't use, and nothing past the size every session read stops at.
+#[test]
+fn a_resumed_session_file_reads_as_its_conversation() {
+    let tmp = TempDir::new("resume");
+    let path = write_session(
+        &tmp.0,
+        "a.jsonl",
+        &[
+            header("abc", "/w", "2024-12-03T14:00:00.000Z"),
+            user("u1", "hello", 1),
+        ],
+    );
+    let messages = super::resumed_messages(&path).expect("a session");
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0]["role"], "user");
+    assert_eq!(messages[0]["content"][0]["text"], "hello");
+
+    assert_eq!(super::resumed_messages(&tmp.0.join("gone.jsonl")), None);
+    let notes = write_session(&tmp.0, "notes.jsonl", &["just text".to_string()]);
+    assert_eq!(super::resumed_messages(&notes), None);
+
+    let huge = tmp.0.join("huge.jsonl");
+    std::fs::copy(&path, &huge).unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&huge)
+        .unwrap()
+        .set_len(gentle_core::sessions::MAX_SCAN_BYTES + 1)
+        .unwrap();
+    assert_eq!(super::resumed_messages(&huge), None);
+}

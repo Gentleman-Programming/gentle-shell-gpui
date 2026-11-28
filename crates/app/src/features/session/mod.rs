@@ -237,6 +237,9 @@ pub struct SessionView {
     drop_over: bool,
     focus_handle: FocusHandle,
     _io: Task<()>,
+    /// Reads the resumed session file while the backend starts; a restart
+    /// drops it with the read.
+    _preload: Task<()>,
     _subscriptions: Vec<Subscription>,
     /// View-only state: live timers, the prompt in flight, picker highlights.
     live: view::Live,
@@ -432,6 +435,7 @@ impl SessionView {
             chrome: None,
             focus_handle: cx.focus_handle(),
             _io: Task::ready(()),
+            _preload: Task::ready(()),
             _subscriptions: subscriptions,
             live: view::Live::default(),
             model_search,
@@ -475,6 +479,23 @@ impl SessionView {
 
     pub fn is_running(&self) -> bool {
         self.transcript.running
+    }
+
+    /// The backend answered (its model list came back), or it isn't coming
+    /// up: it failed to start or exited. The window holds its startup checks
+    /// until one tab's is, so they don't compete with that boot.
+    pub fn backend_settled(&self) -> bool {
+        match self.backend.status {
+            state::BackendStatus::Starting => false,
+            state::BackendStatus::Ready(_) => self.models.loaded,
+            state::BackendStatus::Failed(_) | state::BackendStatus::Exited(_) => true,
+        }
+    }
+
+    /// Its backend was started and hasn't settled yet
+    /// ([`Self::backend_settled`]): the window's startup checks wait on it.
+    pub fn backend_booting(&self) -> bool {
+        self.backend.started && !self.backend_settled()
     }
 
     /// Something was said here, a turn is running or a saved conversation

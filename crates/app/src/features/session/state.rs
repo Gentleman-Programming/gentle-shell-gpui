@@ -37,6 +37,26 @@ pub(super) struct Backend {
     pub(super) pending_session: Option<PathBuf>,
     /// A new Gentle Shell was installed mid-turn: restart on it once idle.
     pub(super) restart_pending: bool,
+    /// How far its last start got, for the diagnostics.
+    pub(super) startup: crate::features::diagnostics::StartupClock,
+    /// The resumed conversation, read from its session file while the
+    /// backend starts.
+    pub(super) preload: Preload,
+}
+
+/// Where the conversation a starting tab resumes stands, read from its
+/// session file ([`super::SessionView::preload_session`]) so it shows
+/// before the backend answers `get_messages`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum Preload {
+    /// Nothing to read, or the backend's own answer came.
+    Off,
+    /// The file is being read; it shows when read unless `get_messages`
+    /// answered first.
+    Reading,
+    /// The transcript holds the file's conversation (these messages), not
+    /// the backend's yet: an equal answer leaves it as it is.
+    Shown(Vec<serde_json::Value>),
 }
 
 impl Backend {
@@ -49,6 +69,8 @@ impl Backend {
             pending_prompt: prompt,
             pending_session: None,
             restart_pending: false,
+            startup: Default::default(),
+            preload: Preload::Off,
         }
     }
 
