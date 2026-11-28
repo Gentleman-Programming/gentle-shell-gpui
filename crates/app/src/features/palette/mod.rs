@@ -18,6 +18,8 @@ mod commands;
 mod keyboard;
 mod rows;
 mod sources;
+#[cfg(test)]
+mod tests;
 mod view;
 
 use commands::{card_rows, command_row, screen_rows};
@@ -147,8 +149,11 @@ pub struct WorkspaceRow {
     /// Index in the window's workspace list.
     pub index: usize,
     pub name: String,
+    pub root: PathBuf,
     pub tabs: usize,
     pub current: bool,
+    /// Persisted last-use time in Unix seconds; zero for older workspaces.
+    pub last_active: u64,
     pub activity: Activity,
 }
 

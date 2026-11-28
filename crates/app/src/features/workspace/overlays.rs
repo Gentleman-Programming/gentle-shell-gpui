@@ -67,8 +67,10 @@ impl Workspace {
             .map(|(index, space)| WorkspaceRow {
                 index,
                 name: space.name.clone(),
+                root: space.root.clone(),
                 tabs: space.tabs.len(),
                 current: index == self.current,
+                last_active: space.last_active,
                 activity: self.space_activity(space),
             })
             .collect()

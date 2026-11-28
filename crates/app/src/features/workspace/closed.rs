@@ -234,6 +234,7 @@ pub(super) const REOPEN_KEY: &str = ui::platform_shortcut("⌥⌘T", "Ctrl+Alt+S
 
 #[cfg(test)]
 mod tests {
+    use crate::features::workspaces::fresh_id;
     use std::{cell::RefCell, collections::HashMap, path::PathBuf, rc::Rc};
 
     use gpui_kit::component::input::InputState;
@@ -292,7 +293,7 @@ mod tests {
             .unwrap();
         cx.update(|cx| {
             handle.update(cx, |_, window, cx| {
-                let mut source = Space::new("Source".into(), root.join("source"));
+                let mut source = Space::new(fresh_id([]), "Source".into(), root.join("source"));
                 source.tabs.push(Tab {
                     id: 1,
                     pinned: false,
@@ -301,7 +302,7 @@ mod tests {
                         focused: 1,
                     },
                 });
-                let mut target = Space::new("Target".into(), root.clone());
+                let mut target = Space::new(fresh_id([]), "Target".into(), root.clone());
                 if !missing_file {
                     target.tabs.push(Tab {
                         id: 2,

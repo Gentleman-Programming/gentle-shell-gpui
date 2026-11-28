@@ -45,6 +45,9 @@ pub struct SavedTab {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SavedWorkspace {
+    /// Opaque identity, independent of the workspace's name and root.
+    #[serde(default, deserialize_with = "workspace_id_or_empty")]
+    pub id: String,
     pub name: String,
     pub root: PathBuf,
     #[serde(default)]
@@ -360,6 +363,39 @@ impl Default for SavedState {
             files_sidebar_width: default_sidebar_width(),
             sidebar_compact: false,
             tabs_sidebar_hidden: false,
+        }
+    }
+}
+
+/// Accept malformed identities without losing otherwise readable workspace data.
+fn workspace_id_or_empty<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    Ok(known_or_none::<D, String>(d)?.unwrap_or_default())
+}
+
+fn valid_id(id: &str) -> bool {
+    id.len() == 32
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Allocate independently of roots, names and the single-instance authentication token.
+/// RandomState supplies per-instance randomized keys; the counter also separates
+/// allocations within this process. The caller's complete reserved set prevents reuse.
+pub fn fresh_id<'a>(existing: impl IntoIterator<Item = &'a str>) -> String {
+    use std::hash::BuildHasher;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let existing: std::collections::HashSet<&str> = existing.into_iter().collect();
+    loop {
+        let mut parts = [0u64; 2];
+        for part in &mut parts {
+            *part = std::collections::hash_map::RandomState::new()
+                .hash_one(NEXT.fetch_add(1, Ordering::Relaxed));
+        }
+        let id = format!("{:016x}{:016x}", parts[0], parts[1]);
+        if !existing.contains(id.as_str()) {
+            return id;
         }
     }
 }

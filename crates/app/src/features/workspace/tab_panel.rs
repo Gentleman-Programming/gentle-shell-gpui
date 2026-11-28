@@ -802,6 +802,7 @@ pub(super) fn after_removal(space: &mut Space, index: usize) {
 
 #[cfg(test)]
 mod tests {
+    use crate::features::workspaces::fresh_id;
     use std::path::PathBuf;
 
     use super::{
@@ -855,7 +856,7 @@ mod tests {
 
     #[test]
     fn closing_above_the_active_tab_keeps_it_selected() {
-        let mut space = Space::new("w".into(), PathBuf::from("/w"));
+        let mut space = Space::new(fresh_id([]), "w".into(), PathBuf::from("/w"));
         space.tabs = vec![unbuilt(1, false), unbuilt(2, false), unbuilt(3, false)];
         space.active = 1;
         space.tabs.remove(0);
@@ -866,7 +867,7 @@ mod tests {
 
     #[test]
     fn closing_the_last_active_tab_clamps_active() {
-        let mut space = Space::new("w".into(), PathBuf::from("/w"));
+        let mut space = Space::new(fresh_id([]), "w".into(), PathBuf::from("/w"));
         space.tabs = vec![unbuilt(1, false), unbuilt(2, false)];
         space.active = 1;
         space.tabs.remove(1);
@@ -907,7 +908,7 @@ mod tests {
     /// Reordering a workspace's tabs never changes which tab is the active one.
     #[test]
     fn reordering_keeps_the_active_tab() {
-        let mut space = Space::new("w".into(), PathBuf::from("/w"));
+        let mut space = Space::new(fresh_id([]), "w".into(), PathBuf::from("/w"));
         space.tabs = vec![unbuilt(1, false), unbuilt(2, false), unbuilt(3, false)];
         space.active = 2;
         reorder_keeping_active(&mut space, |tabs| move_by(tabs, 3, -1));
@@ -941,7 +942,7 @@ mod tests {
 
     #[test]
     fn pin_tabs_through_the_reorder_path_keeps_the_shown_tab() {
-        let mut space = Space::new("w".into(), PathBuf::from("/w"));
+        let mut space = Space::new(fresh_id([]), "w".into(), PathBuf::from("/w"));
         space.tabs = vec![unbuilt(1, false), unbuilt(2, false), unbuilt(3, false)];
         space.active = 2;
         reorder_keeping_active(&mut space, |tabs| pin_tabs(tabs, &[2, 3]));
@@ -997,7 +998,7 @@ mod tests {
     use crate::features::workspace::Overlay;
 
     fn space_with(name: &str, ids: &[usize]) -> Space {
-        let mut space = Space::new(name.into(), std::env::temp_dir());
+        let mut space = Space::new(fresh_id([]), name.into(), std::env::temp_dir());
         space.tabs = ids.iter().map(|id| unbuilt(*id, false)).collect();
         space
     }

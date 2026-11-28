@@ -45,7 +45,11 @@ impl PaletteView {
             .iter()
             .filter_map(|w| Some((fuzzy_score(&self.needle.lower, &w.name)?, w)))
             .collect();
-        scored.sort_by_key(|(score, w)| (*score, w.index));
+        if query.is_empty() {
+            scored.sort_by_key(|(_, w)| (std::cmp::Reverse(w.last_active), !w.current, w.index));
+        } else {
+            scored.sort_by_key(|(score, w)| (*score, w.index));
+        }
         let mut rows: Vec<Row> = scored
             .into_iter()
             .take(if all { 6 } else { usize::MAX })

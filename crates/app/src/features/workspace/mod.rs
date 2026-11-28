@@ -277,6 +277,7 @@ impl Tab {
 
 /// One named workspace.
 struct Space {
+    id: String,
     name: String,
     root: PathBuf,
     last_active: u64,
@@ -289,8 +290,9 @@ struct Space {
 }
 
 impl Space {
-    fn new(name: String, root: PathBuf) -> Self {
+    fn new(id: String, name: String, root: PathBuf) -> Self {
         Self {
+            id,
             name,
             root,
             last_active: workspaces::now(),
@@ -510,6 +512,7 @@ impl Workspace {
             .map(|w| {
                 restored.push((w.tabs, w.active_tab));
                 Space {
+                    id: w.id,
                     name: w.name,
                     root: w.root,
                     last_active: w.last_active,

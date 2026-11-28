@@ -93,6 +93,7 @@ impl Workspace {
                     .filter_map(|tab| saved_tab(tab, |id| self.saved_pane(id, cx)))
                     .collect();
                 SavedWorkspace {
+                    id: space.id.clone(),
                     name: space.name.clone(),
                     root: space.root.clone(),
                     tabs,

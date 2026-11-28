@@ -7,6 +7,91 @@ use super::{
 };
 use crate::shared::pane::{PaneKind, PaneTree, SplitAxis};
 
+/// Exercise the store boundary without relying on identity's Rust representation.
+#[test]
+fn workspace_identity_normalizes_and_survives_save() {
+    for recovery in [false, true] {
+        let dir = std::env::temp_dir().join(format!(
+            "gentle-ws-identity-{}-{recovery}",
+            std::process::id()
+        ));
+        let path = dir.join("workspaces.json");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut input = serde_json::to_value(sample()).unwrap();
+        let template = input["workspaces"][1].clone();
+        input["workspaces"] = serde_json::json!([
+            template.clone(),
+            template.clone(),
+            template.clone(),
+            template.clone(),
+            template.clone(),
+            template.clone()
+        ]);
+        let kept = "0123456789abcdef0123456789abcdef";
+        input["workspaces"][0]["id"] = kept.into();
+        input["workspaces"][1]["id"] = kept.into();
+        input["workspaces"][2].as_object_mut().unwrap().remove("id");
+        input["workspaces"][3]["id"] = "".into();
+        input["workspaces"][4]["id"] = 42.into();
+        input["workspaces"][5]["id"] = "invalid".into();
+        // Recovery drops only the extra unknown tab; all original fields survive.
+        if recovery {
+            let mut unknown = template["tabs"][0].clone();
+            unknown["layout"] = serde_json::json!({"leaf": {"kind": "future", "cwd": "/tmp"}});
+            input["workspaces"][0]["tabs"]
+                .as_array_mut()
+                .unwrap()
+                .push(unknown);
+        }
+        let text = input.to_string();
+        std::fs::write(&path, &text).unwrap();
+        let state = load_from(&path).expect("identity repair must not reject a workspace");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            text,
+            "load never writes"
+        );
+        assert!(!path.with_extension("json.unreadable").exists());
+        let actual = serde_json::to_value(&state).unwrap();
+        let mut ids = std::collections::HashSet::new();
+        for workspace in actual["workspaces"].as_array().unwrap() {
+            let id = workspace["id"]
+                .as_str()
+                .expect("every workspace gets an ID");
+            assert_eq!(id.len(), 32);
+            assert!(
+                id.bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            );
+            assert!(ids.insert(id), "same-root workspaces need distinct IDs");
+        }
+        assert_eq!(actual["workspaces"][0]["id"], kept);
+        let mut expected = input;
+        if recovery {
+            expected["workspaces"][0]["tabs"]
+                .as_array_mut()
+                .unwrap()
+                .pop();
+        }
+        let strip_ids = |mut value: serde_json::Value| {
+            for workspace in value["workspaces"].as_array_mut().unwrap() {
+                workspace.as_object_mut().unwrap().remove("id");
+            }
+            value
+        };
+        assert_eq!(strip_ids(actual), strip_ids(expected));
+        save_to(&path, &state).unwrap();
+        assert_eq!(load_from(&path), Some(state.clone()));
+        // Rename and root changes retain identity on the existing save path.
+        let mut changed = state;
+        changed.workspaces[0].name = "renamed".into();
+        changed.workspaces[0].root = PathBuf::from("/elsewhere");
+        save_to(&path, &changed).unwrap();
+        assert_eq!(load_from(&path), Some(changed));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
 fn sample() -> SavedState {
     let agent = SavedPane {
         kind: PaneKind::Agent,
@@ -31,6 +116,7 @@ fn sample() -> SavedState {
         current: 1,
         workspaces: vec![
             SavedWorkspace {
+                id: "11111111111111111111111111111111".into(),
                 name: "Default".into(),
                 root: PathBuf::from("/tmp"),
                 tabs: vec![SavedTab {
@@ -44,6 +130,7 @@ fn sample() -> SavedState {
                 sidebar_expanded: true,
             },
             SavedWorkspace {
+                id: "22222222222222222222222222222222".into(),
                 name: "project".into(),
                 root: PathBuf::from("/tmp/project"),
                 tabs: vec![SavedTab {

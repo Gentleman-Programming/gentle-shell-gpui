@@ -14,7 +14,8 @@ impl Workspace {
     pub(super) fn push_space(&mut self, name: Option<String>, root: PathBuf) -> usize {
         let base = name.unwrap_or_else(|| ui::split_path(&root).1);
         let name = workspaces::unique_name(self.spaces.iter().map(|s| s.name.as_str()), &base);
-        self.spaces.push(Space::new(name, root));
+        let id = workspaces::fresh_id(self.spaces.iter().map(|s| s.id.as_str()));
+        self.spaces.push(Space::new(id, name, root));
         self.spaces.len() - 1
     }
 

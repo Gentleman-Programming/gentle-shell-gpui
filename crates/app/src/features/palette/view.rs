@@ -4,6 +4,7 @@ use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::Input;
 use gpui_kit::component::spinner::Spinner;
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -58,10 +59,10 @@ impl PaletteView {
             .as_ref()
             .filter(|(index, _)| Some(*index) == row.workspace)
             .map(|(_, state)| state.clone());
-        let activity = row
+        let workspace = row
             .workspace
-            .and_then(|index| self.workspaces.iter().find(|w| w.index == index))
-            .and_then(|w| activity_badge(w.activity));
+            .and_then(|index| self.workspaces.iter().find(|w| w.index == index));
+        let activity = workspace.and_then(|w| activity_badge(w.activity));
         h_flex()
             .id(("palette-row", i))
             .group("palette-row")
@@ -125,8 +126,8 @@ impl PaletteView {
                             )),
                     )
                 }
-                None => d.child(
-                    h_flex()
+                None => {
+                    let heading = h_flex()
                         .flex_1()
                         .min_w_0()
                         .gap_2()
@@ -150,19 +151,45 @@ impl PaletteView {
                                     .child(row.meta.clone()),
                             )
                         })
-                        .children(activity)
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .overflow_hidden()
-                                .text_ellipsis()
-                                .whitespace_nowrap()
-                                .text_xs()
-                                .text_color(ui::muted())
-                                .child(row.detail.clone()),
-                        ),
-                ),
+                        .children(activity);
+                    if let Some(workspace) = workspace {
+                        let path: SharedString =
+                            workspace.root.to_string_lossy().into_owned().into();
+                        d.child(
+                            v_flex().flex_1().min_w_0().child(heading).child(
+                                div()
+                                    .id(("workspace-root", workspace.index))
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .whitespace_nowrap()
+                                    .text_xs()
+                                    .text_color(ui::muted())
+                                    .tooltip({
+                                        let path = path.clone();
+                                        move |window, cx| {
+                                            Tooltip::new(path.clone()).build(window, cx)
+                                        }
+                                    })
+                                    .child(path),
+                            ),
+                        )
+                    } else {
+                        d.child(
+                            heading.child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .whitespace_nowrap()
+                                    .text_xs()
+                                    .text_color(ui::muted())
+                                    .child(row.detail.clone()),
+                            ),
+                        )
+                    }
+                }
             })
             .when_some(row.workspace, |d, index| {
                 let deletable = self.workspaces.len() > 1;

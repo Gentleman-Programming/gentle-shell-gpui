@@ -24,7 +24,7 @@ pub fn load() -> SavedState {
 pub(super) fn load_from(path: &Path) -> Option<SavedState> {
     let text = std::fs::read_to_string(path).ok()?;
     if let Ok(state) = serde_json::from_str(&text) {
-        return Some(state);
+        return Some(normalize_ids(state));
     }
     let lenient = serde_json::from_str::<Value>(&text)
         .ok()
@@ -33,7 +33,27 @@ pub(super) fn load_from(path: &Path) -> Option<SavedState> {
     if lenient.is_none() {
         let _ = std::fs::copy(path, path.with_extension("json.unreadable"));
     }
-    lenient
+    lenient.map(normalize_ids)
+}
+
+/// Reserve even later valid IDs before allocating replacements, so the first
+/// occurrence of every valid ID survives in either loading path.
+fn normalize_ids(mut state: SavedState) -> SavedState {
+    let mut reserved: std::collections::HashSet<String> = state
+        .workspaces
+        .iter()
+        .filter(|w| super::valid_id(&w.id))
+        .map(|w| w.id.clone())
+        .collect();
+    let mut seen = std::collections::HashSet::new();
+    for workspace in &mut state.workspaces {
+        if !super::valid_id(&workspace.id) || !seen.insert(workspace.id.clone()) {
+            workspace.id = super::fresh_id(reserved.iter().map(String::as_str));
+            reserved.insert(workspace.id.clone());
+            seen.insert(workspace.id.clone());
+        }
+    }
+    state
 }
 
 /// `state` without the panes that don't read as a [`SavedPane`]: a split
