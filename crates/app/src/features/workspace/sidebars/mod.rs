@@ -48,20 +48,9 @@ impl TabEntry {
         }
     }
 
-    /// A dot for a tab that works or waits on you.
-    pub fn status_dot(&self) -> Option<Div> {
-        (self.running || self.needs_you).then(|| {
-            let dot = div()
-                .size(rems(6. / 16.))
-                .flex_none()
-                .rounded_full()
-                .bg(self.tone());
-            if self.running && !self.needs_you {
-                ui::pulse(dot)
-            } else {
-                dot
-            }
-        })
+    /// The expanded navigator's inline loading or attention indicator.
+    pub fn status_dot(&self, reduce_motion: bool) -> Option<Div> {
+        expanded_agent_status(self.running, self.needs_you, reduce_motion)
     }
 
     pub fn tooltip(&self) -> SharedString {
@@ -71,6 +60,31 @@ impl TabEntry {
             self.title.clone()
         }
     }
+}
+
+/// Keep the loading indicator in the same slot as the attention dot.
+/// No perimeter animation in expanded rows.
+fn expanded_agent_status(running: bool, needs_you: bool, reduce_motion: bool) -> Option<Div> {
+    if !running && !needs_you {
+        return None;
+    }
+    let slot = h_flex()
+        .flex_none()
+        .size(rems(12. / 16.))
+        .items_center()
+        .justify_center();
+    Some(if needs_you {
+        slot.child(
+            div()
+                .size(rems(6. / 16.))
+                .rounded_full()
+                .bg(ui::warning()),
+        )
+    } else if reduce_motion {
+        slot.child(Icon::new(IconName::Loader).xsmall().text_color(ui::accent()))
+    } else {
+        slot.child(ui::spinner(gpui_kit::component::Size::XSmall, ui::accent()))
+    })
 }
 
 /// One workspace as the sidebar draws it.

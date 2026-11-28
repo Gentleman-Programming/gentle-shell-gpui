@@ -4,8 +4,7 @@
 use super::super::menu::WorkspaceMenuSource;
 use super::*;
 
-/// In the compact navigator the corner indicator, not the whole tile,
-/// animates. A request for attention always takes priority over working.
+/// A running compact tile carries the perimeter animation instead of a dot.
 fn compact_agent_status(running: bool, needs_you: bool, reduce_motion: bool) -> Option<Div> {
     if needs_you {
         Some(
@@ -18,17 +17,7 @@ fn compact_agent_status(running: bool, needs_you: bool, reduce_motion: bool) -> 
                 .bg(ui::warning()),
         )
     } else if running {
-        Some(
-            div()
-                .absolute()
-                .top(px(1.))
-                .right(px(1.))
-                .child(if reduce_motion {
-                    div().child(Icon::new(IconName::Loader).xsmall().text_color(ui::accent()))
-                } else {
-                    ui::spinner(gpui_kit::component::Size::XSmall, ui::accent())
-                }),
-        )
+        Some(ui::tab_work_orbit(rems(6. / 16.), reduce_motion))
     } else {
         None
     }
