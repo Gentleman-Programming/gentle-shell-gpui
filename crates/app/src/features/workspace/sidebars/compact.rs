@@ -4,17 +4,17 @@
 use super::super::menu::WorkspaceMenuSource;
 use super::*;
 
-/// A running compact tile carries the perimeter animation instead of a dot.
+/// Compact tiles use the perimeter for both working and attention states.
+/// Attention takes priority: a steady warning outline, without a dot.
 fn compact_agent_status(running: bool, needs_you: bool, reduce_motion: bool) -> Option<Div> {
     if needs_you {
         Some(
             div()
                 .absolute()
-                .top(px(2.))
-                .right(px(2.))
-                .size(px(6.))
-                .rounded_full()
-                .bg(ui::warning()),
+                .inset_0()
+                .rounded(rems(6. / 16.))
+                .border_1()
+                .border_color(ui::warning()),
         )
     } else if running {
         Some(ui::tab_work_orbit(rems(6. / 16.), reduce_motion))
