@@ -284,22 +284,20 @@ Panel coexistence is a workspace-level decision. A tool cannot independently tak
 | Surface | Coexistence rule |
 | --- | --- |
 | Activity rails | May coexist on either side if the remaining workspace fits; empty rails take no space. Keep access to tools through Commands when a rail is not shown. |
-| Workspace navigator | May coexist with horizontal tabs, but then shows workspaces rather than a second copy of their tab list. Compact or hide its effective presentation as needed. |
+| Workspace navigator | Owns the vertical tab presentation. May compact to a rail with usable tab entries, but must not disappear while tabs are vertical. Horizontal tabs use the title-bar workspace switcher instead. |
 | Files, Changes, Branches, Git History, Engram | The right tool dock is a shared slot; switching tools replaces the displayed view in that slot, not the underlying workspace or its sessions. |
 | Additional browser/device or other auxiliary docks | Coexist only when the total space budget permits. Define a compact or on-demand presentation rather than squeezing the primary workspace below its minimum. |
 | Overlay screens | Use the established screen/scrim pattern; fit the available bounds and keep close/back actions accessible. Do not create a second persistent dock merely to show a screen. |
 
-Tabs have exactly one effective placement. The workspace navigator's visibility is a separate choice:
+Tabs have exactly one effective placement: horizontal or vertical. Neither both nor neither is a valid state, including during layout transitions. Keep the existing title-bar workspace switcher in both orientations.
 
-| Requested tabs | Navigator | Horizontal tab strip | Vertical tab list |
+| Requested tabs | Title-bar workspace switcher | Horizontal tab strip | Vertical navigator |
 | --- | --- | --- | --- |
-| Horizontal | Off | Yes | No |
-| Horizontal | On | Yes | No (workspace navigation only) |
-| Vertical | Either | No | Yes, unless effectively hidden by compact presentation |
-| Hidden | On | No | No (workspace navigation only) |
-| Hidden | Off | No | No |
+| Horizontal | Yes | Current workspace's tabs | No |
+| Vertical (expanded) | Yes | No | Workspaces grouped with their tabs |
+| Vertical (compact) | Yes | No | Workspace groups and usable compact tab entries |
 
-Derive the title bar, navigator, settings preview and command state from the same presentation decision. A layout transition may change presentation, but must not create duplicate tabs, agents, panes or persisted state.
+There is no Hidden setting for tabs. A legacy hidden preference restores its saved orientation. Compacting vertical navigation keeps access to its tabs; switching orientations replaces one presentation atomically with the other. Derive the title bar, navigator, settings preview and command state from the same presentation decision. A layout transition must not duplicate tabs, agents, panes or persisted state, or remove both tab presentations. Automatic adaptation must respect this invariant; if space is insufficient, compact the vertical navigator or use the horizontal presentation without losing access to tabs.
 
 ### Dense lists, trees and graphs
 
