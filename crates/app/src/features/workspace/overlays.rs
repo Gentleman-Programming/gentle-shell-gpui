@@ -115,8 +115,21 @@ impl Workspace {
             PaletteAction::NewTerminalTab => self.on_new_terminal_tab(&NewTerminalTab, window, cx),
             PaletteAction::NewCanvasTab => self.on_new_canvas_tab(&NewCanvasTab, window, cx),
             PaletteAction::TilePane => self.tile(None, window, cx),
-            PaletteAction::SplitRight => self.split(SplitAxis::Horizontal, None, window, cx),
-            PaletteAction::SplitDown => self.split(SplitAxis::Vertical, None, window, cx),
+            PaletteAction::SplitRight => self.split(SplitAxis::Horizontal, None, false, window, cx),
+            PaletteAction::SplitDown => self.split(SplitAxis::Vertical, None, false, window, cx),
+            PaletteAction::SplitLeft => self.on_split_left(&SplitLeft, window, cx),
+            PaletteAction::SplitUp => self.on_split_up(&SplitUp, window, cx),
+            PaletteAction::FocusPaneLeft => self.on_focus_pane_left(&FocusPaneLeft, window, cx),
+            PaletteAction::FocusPaneRight => self.on_focus_pane_right(&FocusPaneRight, window, cx),
+            PaletteAction::FocusPaneUp => self.on_focus_pane_up(&FocusPaneUp, window, cx),
+            PaletteAction::FocusPaneDown => self.on_focus_pane_down(&FocusPaneDown, window, cx),
+            PaletteAction::ResizePaneLeft => self.on_resize_pane_left(&ResizePaneLeft, window, cx),
+            PaletteAction::ResizePaneRight => {
+                self.on_resize_pane_right(&ResizePaneRight, window, cx)
+            }
+            PaletteAction::ResizePaneUp => self.on_resize_pane_up(&ResizePaneUp, window, cx),
+            PaletteAction::ResizePaneDown => self.on_resize_pane_down(&ResizePaneDown, window, cx),
+            PaletteAction::TogglePaneMode => self.on_toggle_pane_mode(&TogglePaneMode, window, cx),
             PaletteAction::NewAgentPane => self.split_with_kind(PaneKind::Agent, window, cx),
             PaletteAction::NewTerminalPane => self.split_with_kind(PaneKind::Terminal, window, cx),
             PaletteAction::ClosePane => self.on_close_pane(&ClosePane, window, cx),

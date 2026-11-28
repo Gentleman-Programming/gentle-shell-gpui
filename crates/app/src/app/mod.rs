@@ -14,12 +14,40 @@ use crate::features::workspace::{
     NextTab, PrevTab, Quit, ReopenClosed, SplitDown, SplitRight, TilePane, ToggleSidebar,
     Workspace,
 };
+use crate::features::workspace::{
+    ExitPaneMode, FocusPaneDown, FocusPaneLeft, FocusPaneRight, FocusPaneUp, ResizePaneDown,
+    ResizePaneLeft, ResizePaneRight, ResizePaneUp,
+};
 use crate::{
     features::app_update, features::files, features::session, features::workspace,
     platform::instance, shared::assets, shared::themes,
 };
 
 actions!(gentle, [ZoomIn, ZoomOut, ActualSize]);
+
+/// Key context of the workspace while pane mode is on.
+const PANE_MODE: &str = "GentleWorkspace && pane_mode";
+
+/// Sticky pane mode bindings: active while the workspace root carries the
+/// `pane_mode` context flag.
+fn pane_mode_bindings() -> Vec<KeyBinding> {
+    let c = Some(PANE_MODE);
+    vec![
+        KeyBinding::new("h", FocusPaneLeft, c),
+        KeyBinding::new("j", FocusPaneDown, c),
+        KeyBinding::new("k", FocusPaneUp, c),
+        KeyBinding::new("l", FocusPaneRight, c),
+        KeyBinding::new("shift-h", ResizePaneLeft, c),
+        KeyBinding::new("shift-j", ResizePaneDown, c),
+        KeyBinding::new("shift-k", ResizePaneUp, c),
+        KeyBinding::new("shift-l", ResizePaneRight, c),
+        KeyBinding::new("v", SplitRight, c),
+        KeyBinding::new("s", SplitDown, c),
+        KeyBinding::new("x", ClosePane, c),
+        KeyBinding::new("escape", ExitPaneMode, c),
+        KeyBinding::new("enter", ExitPaneMode, c),
+    ]
+}
 
 /// Runs the app until its last window closes. `requests` carries later
 /// launches' folders and prompts to this window.
@@ -206,7 +234,11 @@ fn bind_keys(cx: &mut App) {
             crate::features::browser::RestoreCard,
             Some(crate::features::browser::CONTEXT),
         ),
-        KeyBinding::new("escape", session::Abort, Some(session::CONTEXT)),
+        KeyBinding::new(
+            "escape",
+            session::Abort,
+            Some("GentleSession && !pane_mode"),
+        ),
         KeyBinding::new(key!("."), session::Stop, Some(session::CONTEXT)),
         KeyBinding::new(
             key!("shift-a"),
@@ -227,6 +259,7 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new(key!("-"), ZoomOut, None),
         KeyBinding::new(key!("0"), ActualSize, None),
     ]);
+    cx.bind_keys(pane_mode_bindings());
     files::FileView::bind_keys(cx);
     crate::features::canvas::bind_keys(cx);
 }
@@ -256,4 +289,45 @@ fn set_menus(cx: &mut App) {
         ],
         disabled: false,
     }]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pane_mode_bindings;
+    use gpui_kit::OperatingSystem;
+
+    #[test]
+    fn pane_mode_bindings_map_each_key_to_its_action() {
+        let got: Vec<(String, &'static str)> = pane_mode_bindings()
+            .iter()
+            .map(|binding| {
+                let keystrokes = binding.keystrokes();
+                assert_eq!(
+                    keystrokes.len(),
+                    1,
+                    "pane-mode bindings are single keystrokes"
+                );
+                (
+                    keystrokes[0].unparse(OperatingSystem::Mac),
+                    binding.action().name(),
+                )
+            })
+            .collect();
+        let expected: Vec<(String, &str)> = vec![
+            ("h".into(), "gentle::FocusPaneLeft"),
+            ("j".into(), "gentle::FocusPaneDown"),
+            ("k".into(), "gentle::FocusPaneUp"),
+            ("l".into(), "gentle::FocusPaneRight"),
+            ("shift-h".into(), "gentle::ResizePaneLeft"),
+            ("shift-j".into(), "gentle::ResizePaneDown"),
+            ("shift-k".into(), "gentle::ResizePaneUp"),
+            ("shift-l".into(), "gentle::ResizePaneRight"),
+            ("v".into(), "gentle::SplitRight"),
+            ("s".into(), "gentle::SplitDown"),
+            ("x".into(), "gentle::ClosePane"),
+            ("escape".into(), "gentle::ExitPaneMode"),
+            ("enter".into(), "gentle::ExitPaneMode"),
+        ];
+        assert_eq!(got, expected);
+    }
 }

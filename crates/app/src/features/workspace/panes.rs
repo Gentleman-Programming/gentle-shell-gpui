@@ -81,6 +81,16 @@ impl Workspace {
 
     /// Approximate on-screen size of each pane in the current tab.
     pub(super) fn pane_sizes(&self, window: &Window) -> Vec<(PaneId, f32, f32)> {
+        let (w, h) = self.pane_area(window);
+        let mut out = Vec::new();
+        if let Some(tree) = self.tab().and_then(|t| t.built_tree()) {
+            leaf_sizes(tree, w, h, &mut out);
+        }
+        out
+    }
+
+    /// Approximate size of the area the tab's pane tree fills.
+    pub(super) fn pane_area(&self, window: &Window) -> (f32, f32) {
         let viewport = window.viewport_size();
         let rem = |n: f32| f32::from(rems(n / 16.).to_pixels(window.rem_size()));
         // Vertical tabs and Files are separate columns. Keep pane hit-testing
@@ -96,11 +106,7 @@ impl Workspace {
             (f32::from(viewport.width) - rem(12.) - occupied(Side::Tabs) - occupied(Side::Files))
                 .max(0.);
         let h = f32::from(viewport.height) - rem(super::render::TITLE_BAR_HEIGHT + 6.);
-        let mut out = Vec::new();
-        if let Some(tree) = self.tab().and_then(|t| t.built_tree()) {
-            leaf_sizes(tree, w, h, &mut out);
-        }
-        out
+        (w, h)
     }
 
     // ── Workspaces ──────────────────────────────────────────────────────────
@@ -657,11 +663,13 @@ impl Workspace {
     }
 
     /// Split the focused pane: with `what`, that kind and target; otherwise
-    /// the focused pane's kind in its folder (or on its file).
+    /// the focused pane's kind in its folder (or on its file). `before`
+    /// places the new pane before the focused one (left or above).
     pub(super) fn split(
         &mut self,
         axis: SplitAxis,
         what: Option<(PaneKind, PathBuf)>,
+        before: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -695,10 +703,57 @@ impl Workspace {
             return;
         }
         if let Some(tree) = self.tab_mut().and_then(|t| t.built_tree_mut()) {
-            tree.split(&focused, pane, axis);
+            tree.insert(&focused, pane, axis, before);
         }
         self.focus_pane(pane, window, cx);
         self.schedule_save(cx);
+    }
+
+    /// Move focus to the spatial neighbour of the focused pane.
+    pub(super) fn focus_neighbour(
+        &mut self,
+        direction: PaneDirection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(focused) = self.focused_pane() else {
+            return;
+        };
+        let Some(tree) = self.tab().and_then(|t| t.built_tree()) else {
+            return;
+        };
+        // `neighbour` wants the full size the tree fills, not the pane's.
+        let (w, h) = self.pane_area(window);
+        if let Some(next) = tree.neighbour(&focused, direction, w, h) {
+            self.focus_pane(next, window, cx);
+        }
+    }
+
+    /// Move the focused pane's nearest border in `direction` by one step
+    /// (tmux `resize-pane`), keeping both sides of the changed split at
+    /// least the pane minimum.
+    pub(super) fn resize_pane(
+        &mut self,
+        direction: PaneDirection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        const STEP: f32 = 0.05;
+        let Some(focused) = self.focused_pane() else {
+            return;
+        };
+        let (w, h) = self.pane_area(window);
+        let min_px = match direction {
+            PaneDirection::Left | PaneDirection::Right => MIN_PANE_WIDTH,
+            PaneDirection::Up | PaneDirection::Down => MIN_PANE_HEIGHT,
+        };
+        let Some(tree) = self.tab_mut().and_then(|t| t.built_tree_mut()) else {
+            return;
+        };
+        if tree.resize_toward(&focused, direction, STEP, min_px, w, h) {
+            self.schedule_save(cx);
+            cx.notify();
+        }
     }
 
     /// A new pane tiled like Hyprland's dwindle: the focused pane splits
@@ -718,7 +773,7 @@ impl Workspace {
             .and_then(|(_, w, h)| tile_axis(w, h))
             // No size yet, or no room either way: `split` opens a tab.
             .unwrap_or(SplitAxis::Horizontal);
-        self.split(axis, what, window, cx);
+        self.split(axis, what, false, window, cx);
     }
 
     pub(super) fn split_with_kind(

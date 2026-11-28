@@ -163,6 +163,12 @@ pub(super) fn screen_rows(tab_layout: TabLayout) -> Vec<Row> {
             PaletteAction::SplitRight,
         ),
         row(
+            IconName::Columns2,
+            "Split left",
+            "Same kind of pane to the left of this one",
+            PaletteAction::SplitLeft,
+        ),
+        row(
             IconName::Rows2,
             "Split down",
             &format!(
@@ -170,6 +176,66 @@ pub(super) fn screen_rows(tab_layout: TabLayout) -> Vec<Row> {
                 ui::platform_shortcut("⌘⇧D", "Ctrl+Shift+E")
             ),
             PaletteAction::SplitDown,
+        ),
+        row(
+            IconName::Rows2,
+            "Split up",
+            "Same kind of pane above this one",
+            PaletteAction::SplitUp,
+        ),
+        row(
+            IconName::ArrowLeft,
+            "Focus pane left",
+            "Move focus to the pane on the left",
+            PaletteAction::FocusPaneLeft,
+        ),
+        row(
+            IconName::ArrowRight,
+            "Focus pane right",
+            "Move focus to the pane on the right",
+            PaletteAction::FocusPaneRight,
+        ),
+        row(
+            IconName::ArrowUp,
+            "Focus pane up",
+            "Move focus to the pane above",
+            PaletteAction::FocusPaneUp,
+        ),
+        row(
+            IconName::ArrowDown,
+            "Focus pane down",
+            "Move focus to the pane below",
+            PaletteAction::FocusPaneDown,
+        ),
+        row(
+            IconName::ArrowLeftRight,
+            "Resize pane left",
+            "Move the focused pane's left edge",
+            PaletteAction::ResizePaneLeft,
+        ),
+        row(
+            IconName::ArrowLeftRight,
+            "Resize pane right",
+            "Move the focused pane's right edge",
+            PaletteAction::ResizePaneRight,
+        ),
+        row(
+            IconName::ArrowUpDown,
+            "Resize pane up",
+            "Move the focused pane's top edge",
+            PaletteAction::ResizePaneUp,
+        ),
+        row(
+            IconName::ArrowUpDown,
+            "Resize pane down",
+            "Move the focused pane's bottom edge",
+            PaletteAction::ResizePaneDown,
+        ),
+        row(
+            IconName::LayoutDashboard,
+            "Pane mode",
+            "Sticky keys: hjkl move, HJKL resize, v s split, x close, Esc exits",
+            PaletteAction::TogglePaneMode,
         ),
         row(
             IconName::Bot,

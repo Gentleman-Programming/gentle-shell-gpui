@@ -40,8 +40,8 @@ use crate::features::workspaces::{
     self, Badge, SavedPane, SavedState, SavedTab, SavedWorkspace, TabLayout,
 };
 use crate::shared::pane::{
-    AskAgent, CloseViewer, OpenCommitDiff, OpenTerminalAt, PaneFactories, PaneId, PaneItem,
-    PaneKind, PaneTree, ShowInPane, SplitAxis,
+    AskAgent, CloseViewer, OpenCommitDiff, OpenTerminalAt, PaneDirection, PaneFactories, PaneId,
+    PaneItem, PaneKind, PaneTree, ShowInPane, SplitAxis,
 };
 use crate::shared::ui;
 use gentle_core::commands::Screen;
@@ -97,7 +97,19 @@ actions!(
         OpenSettings,
         OpenExplorer,
         CloseOverlay,
-        Quit
+        Quit,
+        FocusPaneLeft,
+        FocusPaneRight,
+        FocusPaneUp,
+        FocusPaneDown,
+        ResizePaneLeft,
+        ResizePaneRight,
+        ResizePaneUp,
+        ResizePaneDown,
+        SplitLeft,
+        SplitUp,
+        TogglePaneMode,
+        ExitPaneMode
     ]
 );
 
@@ -475,6 +487,13 @@ pub struct Workspace {
     /// While a pane is dragged: the pane under the pointer and where it would
     /// land there.
     drop_hint: Option<(PaneId, DropZone)>,
+    /// Sticky pane mode: hjkl/HJKL/v/s/x act on panes and other keys are
+    /// swallowed until Esc or Enter.
+    pane_mode: bool,
+    /// Holds keyboard focus during pane mode: it has no input handler (no IME)
+    /// and no deeper key contexts, so the pane-mode keys and the swallow of
+    /// everything else apply wherever focus was before.
+    pane_mode_focus: FocusHandle,
     /// Panes and tabs closed, most recent last, to reopen.
     closed: Vec<closed::Closed>,
     /// gentle-stream, behind the title bar's ♪ button.
@@ -609,6 +628,8 @@ impl Workspace {
             browser_dock_room: Default::default(),
             resume_welcome: None,
             drop_hint: None,
+            pane_mode: false,
+            pane_mode_focus: cx.focus_handle(),
             closed: Vec::new(),
             music,
             devices,
@@ -808,6 +829,7 @@ impl Workspace {
         self.split(
             SplitAxis::Horizontal,
             Some((PaneKind::File, path)),
+            false,
             window,
             cx,
         );

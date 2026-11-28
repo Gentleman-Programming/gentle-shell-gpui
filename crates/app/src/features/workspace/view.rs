@@ -441,7 +441,7 @@ impl Workspace {
                                 "Same kind, to the right",
                                 "",
                                 |this, window, cx| {
-                                    this.split(SplitAxis::Horizontal, None, window, cx)
+                                    this.split(SplitAxis::Horizontal, None, false, window, cx)
                                 },
                             ))
                             .item(entry(
@@ -1043,6 +1043,8 @@ mod tests {
                         browser_dock_room: Default::default(),
                         resume_welcome: None,
                         drop_hint: None,
+                        pane_mode: false,
+                        pane_mode_focus: cx.focus_handle(),
                         closed: Vec::new(),
                         music: cx.new(|cx| Music::new(window, cx)),
                         devices: cx.new(DevicePanel::new),

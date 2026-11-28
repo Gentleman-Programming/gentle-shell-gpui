@@ -190,6 +190,14 @@ impl Render for Workspace {
             || window.has_active_sheet(cx)
             || cx.has_active_drag()
             || crate::features::browser::popovers_open(cx);
+        if self.pane_mode && (covered || !window.is_window_active()) {
+            self.pane_mode = false;
+            // Focus still parked on the pane-mode handle goes back to the
+            // active pane; an overlay that already took it keeps it.
+            if self.pane_mode_focus.is_focused(window) {
+                self.focus_active(window, cx);
+            }
+        }
         self.set_stages_covered(covered, cx);
         self.sync_web_views(covered, cx);
         let (devices_docked, devices_floating) = {
@@ -257,7 +265,31 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_open_workspaces))
             .on_action(cx.listener(Self::on_open_explorer))
             .on_action(cx.listener(Self::on_close_overlay))
-            .key_context("GentleWorkspace")
+            .on_action(cx.listener(Self::on_focus_pane_left))
+            .on_action(cx.listener(Self::on_focus_pane_right))
+            .on_action(cx.listener(Self::on_focus_pane_up))
+            .on_action(cx.listener(Self::on_focus_pane_down))
+            .on_action(cx.listener(Self::on_resize_pane_left))
+            .on_action(cx.listener(Self::on_resize_pane_right))
+            .on_action(cx.listener(Self::on_resize_pane_up))
+            .on_action(cx.listener(Self::on_resize_pane_down))
+            .on_action(cx.listener(Self::on_split_left))
+            .on_action(cx.listener(Self::on_split_up))
+            .on_action(cx.listener(Self::on_toggle_pane_mode))
+            .on_action(cx.listener(Self::on_exit_pane_mode))
+            .key_context(if self.pane_mode {
+                "GentleWorkspace pane_mode"
+            } else {
+                "GentleWorkspace"
+            })
+            .when(self.pane_mode, |this| {
+                this.track_focus(&self.pane_mode_focus)
+                    .capture_key_down(cx.listener(|this, _: &KeyDownEvent, _, cx| {
+                        if this.pane_mode {
+                            cx.stop_propagation();
+                        }
+                    }))
+            })
             .relative()
             .left(px(shake_x))
             .top(px(shake_y))
@@ -324,6 +356,21 @@ impl Render for Workspace {
                                     // focused pane, each entry with its shortcut.
                                     .when(self.tab().is_some(), |d| {
                                         d.child(self.render_layout_menu(cx)).child(
+                                            div()
+                                                .w(px(1.))
+                                                .h(rems(14. / 16.))
+                                                .mx_1()
+                                                .bg(ui::border()),
+                                        )
+                                    })
+                                    .when(self.pane_mode, |d| {
+                                        d.child(
+                                            h_flex()
+                                                .gap_1()
+                                                .child(ui::chip("PANE", ui::petal()))
+                                                .child(ui::kbd("esc")),
+                                        )
+                                        .child(
                                             div()
                                                 .w(px(1.))
                                                 .h(rems(14. / 16.))

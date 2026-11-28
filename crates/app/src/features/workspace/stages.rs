@@ -1072,6 +1072,8 @@ mod tests {
                     browser_dock_room: Default::default(),
                     resume_welcome: None,
                     drop_hint: None,
+                    pane_mode: false,
+                    pane_mode_focus: cx.focus_handle(),
                     closed: Vec::new(),
                     music: cx.new(|cx| Music::new(window, cx)),
                     devices: cx.new(DevicePanel::new),
