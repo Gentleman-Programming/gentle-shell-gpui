@@ -1127,7 +1127,7 @@ mod tests {
             ws.resize_tab_sidebar(345., cx);
             assert_eq!(width(ws), 345.);
             ws.set_sidebar_compact(true, cx);
-            assert_eq!(width(ws), 48.);
+            assert_eq!(width(ws), super::super::right_sidebar::ACTIVITY_BAR_WIDTH);
             // Resizing while compact leaves the saved expanded width alone.
             ws.resize_tab_sidebar(420., cx);
             assert_eq!(ws.tabs_sidebar_width, 345.);

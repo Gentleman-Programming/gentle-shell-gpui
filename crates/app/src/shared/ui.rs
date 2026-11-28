@@ -17,7 +17,8 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     Animation, AnimationElement, AnimationExt as _, App, BoxShadow, Div, ElementId, EntityId,
     FontWeight, Hsla, InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Rems,
-    SharedString, Stateful, Styled, Window, canvas, div, ease_out_quint, point, px, rems, rgb,
+    SharedString, Stateful, StatefulInteractiveElement as _, Styled, Window, canvas, div,
+    ease_out_quint, point, px, rems, rgb,
 };
 
 use crate::shared::themes::{self, Glass, Theme, mix};
