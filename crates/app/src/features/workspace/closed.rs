@@ -20,7 +20,7 @@ pub(super) struct Closed {
     /// The workspace it happened in, by index.
     pub(super) space: usize,
     /// The tab, by id, and where it sat among the tabs.
-    tab: usize,
+    pub(super) tab: usize,
     pub(super) index: usize,
     /// Pin state to restore when an entire tab is reopened.
     pinned: bool,
