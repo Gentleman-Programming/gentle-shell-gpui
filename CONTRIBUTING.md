@@ -27,10 +27,35 @@ Many people work on this repository at once. These rules keep two people from do
 |State|Meaning|
 |---|---|
 |Draft|In progress; not reviewed yet.|
-|Ready for review|Ready for a maintainer to review.|
+|Ready for review|Ready for anyone to review: a maintainer or another contributor.|
 |Changes requested|There are comments to address. Reply in the PR when they're done so we look again.|
 |Needs testing on Windows / Linux|The code is fine; someone with that system has to try it. If you have it, your help counts.|
-|Approved and CI green|It gets merged into `main`.|
+|Approved and `/solve`|Someone on the solvers list approved it and wrote `/solve`: a bot merges it into `main`.|
+
+## Reviewing a pull request
+
+Anyone can review a PR that's Ready for review, not only maintainers:
+
+1. **Try it for real:** a release build (`cargo build --release`) in an isolated copy ([`docs/development.md`](docs/development.md#isolated-testing)), never on the app you use.
+2. **Go through what the PR says it does**, and run `cargo test` on your system.
+3. **Write what you found** in the PR: the system you used (macOS, Windows, Linux), what works and what doesn't.
+4. **Decide:**
+   - Something has to change: **Files changed → Review changes → Request changes**, and say what.
+   - Small things for later: say them in your comment, and open an issue if they're worth it.
+   - It's ready: **Files changed → Review changes → Approve**.
+
+### Merging with `/solve`
+
+People on the solvers list ([`.github/solvers.txt`](.github/solvers.txt)) merge what they review, without write access to the repository: after approving, they comment `/solve` and a bot merges the PR into `main` on the owner's behalf, right away. It merges only when:
+
+- whoever writes `/solve` is on the list and isn't the PR's author;
+- their latest review approves the PR's current commit (if the author pushes again, review the new commits and approve again);
+- it isn't a Draft, every check is green and it merges cleanly;
+- it doesn't touch sensitive paths (CI, `Cargo.*`, `build.rs`, `packaging/`, the updater, `setup/`, `pi-rpc/`, scripts): those wait for a Code Owner.
+
+Otherwise the bot answers with what's missing; fix it and write `/solve` again. If you're not on the list, your review still counts: someone on it takes it from there.
+
+Only the repository owner edits the list, from **Actions → Solvers → Run workflow** (add or remove, and the login). It can't change in a pull request: a PR that touches `.github/solvers.txt` is closed automatically.
 
 ### For maintainers: where to look
 

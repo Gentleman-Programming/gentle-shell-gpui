@@ -1,0 +1,115 @@
+name: Solvers
+
+# The solvers list (.github/solvers.txt) says who can merge a pull request with
+# `/solve` (CONTRIBUTING.md). .github/scripts/solvers.py does the work:
+#
+# - `/solve` in a PR comment, from someone on the list whose latest review
+#   approves the PR's current commit, merges it once CI is green, unless it
+#   touches a sensitive path (that needs a Code Owner).
+# - Run workflow adds or removes someone; only the owners of `/.github/` in
+#   CODEOWNERS can, and it commits the change to the default branch.
+# - Every 15 minutes, open PRs that change the list are closed: it's edited
+#   only through this workflow.
+#
+# Merges and list edits use the repository owner's token (the `SOLVE_TOKEN`
+# secret), as if the owner had clicked Merge: the Actions token can't get past
+# the approvals `main` asks for. Only the step that merges or edits gets it.
+#
+# Every job checks out the default branch's scripts, never a PR's code, and the
+# comment and inputs reach them only through environment variables (no `${{ }}`
+# inside `run`).
+
+on:
+  issue_comment:
+    types: [created]
+  workflow_dispatch:
+    inputs:
+      action:
+        description: Add or remove
+        type: choice
+        options: [add, remove]
+      user:
+        description: GitHub login
+        type: string
+        required: true
+  schedule:
+    - cron: "*/15 * * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  solve:
+    if: >-
+      github.event_name == 'issue_comment' &&
+      github.event.issue.pull_request &&
+      github.event.issue.state == 'open' &&
+      github.event.comment.user.type != 'Bot' &&
+      startsWith(github.event.comment.body, '/solve')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    concurrency:
+      group: solve-${{ github.event.issue.number }}
+    permissions:
+      issues: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+          sparse-checkout: .github
+      - name: Merge if a solver approved it
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OWNER_TOKEN: ${{ secrets.SOLVE_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          PR: ${{ github.event.issue.number }}
+          SOLVER: ${{ github.event.comment.user.login }}
+          BODY: ${{ github.event.comment.body }}
+        run: python3 .github/scripts/solvers.py solve
+
+  edit:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    concurrency:
+      group: solvers-edit
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+          sparse-checkout: .github
+      - name: Add or remove a solver
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OWNER_TOKEN: ${{ secrets.SOLVE_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          ACTION: ${{ inputs.action }}
+          LOGIN: ${{ inputs.user }}
+          ACTOR: ${{ github.triggering_actor }}
+        run: python3 .github/scripts/solvers.py edit
+
+  guard:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+          sparse-checkout: .github
+      - name: Close pull requests that change the list
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: python3 .github/scripts/solvers.py guard
