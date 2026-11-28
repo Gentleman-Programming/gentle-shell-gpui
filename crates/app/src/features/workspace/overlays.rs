@@ -495,18 +495,6 @@ impl Workspace {
             window,
             |this, view, event: &SettingsEvent, window, cx| match event {
                 SettingsEvent::Close => this.close_overlay(window, cx),
-                SettingsEvent::TabLayoutChanged(layout) => this.set_tab_layout(*layout, cx),
-                SettingsEvent::SidebarCompactChanged(compact) => {
-                    this.set_sidebar_compact(*compact, cx);
-                }
-                SettingsEvent::TabsSidebarHidden(hidden) => {
-                    this.set_tabs_sidebar_hidden(*hidden, cx);
-                }
-                SettingsEvent::FilesSidebarShown(shown) => {
-                    if this.sidebar_visible != *shown {
-                        this.toggle_sidebar(cx);
-                    }
-                }
                 SettingsEvent::PresentationChanged(profiles) => {
                     this.apply_presentation(profiles.clone(), window, cx)
                 }

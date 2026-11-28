@@ -598,8 +598,7 @@ impl Workspace {
             tabs_sidebar_motion: Default::default(),
             files_sidebar_motion: Default::default(),
             tab_layout: presentation.tab_layout,
-            sidebar_compact: presentation.tab_layout == TabLayout::Vertical
-                && !presentation.workspace_visible,
+            sidebar_compact: presentation.navigation_compact(),
             tabs_sidebar_hidden: presentation.tabs_sidebar_hidden,
             tabs_sidebar_width: gentle_core::workspaces::saved_sidebar_width(
                 presentation.tabs_width,

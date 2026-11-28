@@ -57,10 +57,12 @@ impl Workspace {
             return;
         }
         self.cancel_workspace_rename_state(cx);
-        self.tabs_sidebar_motion
-            .retarget(!self.tabs_sidebar_hidden, cx.reduce_motion());
+        let was_open = self.navigation_visible();
         self.tabs_sidebar_hidden = hidden;
         self.layout_profiles.current_mut().tabs_sidebar_hidden = hidden;
+        if was_open != self.navigation_visible() {
+            self.tabs_sidebar_motion.retarget(was_open, cx.reduce_motion());
+        }
         self.schedule_save(cx);
         cx.notify();
     }
@@ -74,10 +76,7 @@ impl Workspace {
     /// Resize only the expanded navigator, keeping its width while compact
     /// or hidden.
     pub(super) fn resize_tab_sidebar(&mut self, width: f32, cx: &mut Context<Self>) {
-        if self.tab_layout != TabLayout::Vertical
-            || self.sidebar_compact
-            || self.tabs_sidebar_hidden
-            || !width.is_finite()
+        if !self.navigation_visible() || self.sidebar_compact || !width.is_finite()
         {
             return;
         }
@@ -105,6 +104,7 @@ impl Workspace {
         profile.tabs_visible = true;
         profile.tab_layout = layout;
         profile.workspace_visible = layout == TabLayout::Vertical && !self.sidebar_compact;
+        self.sidebar_compact = profile.navigation_compact();
         self.tab_layout = layout;
         if was_open != self.navigation_visible() {
             self.tabs_sidebar_motion
@@ -1134,7 +1134,7 @@ mod tests {
             };
             // Compact is an explicit state change: it never moves the tabs
             // between the strip and the sidebar.
-            ws.tab_layout = TabLayout::Vertical;
+            ws.set_tab_layout(TabLayout::Vertical, cx);
             ws.resize_tab_sidebar(345., cx);
             assert_eq!(width(ws), 345.);
             ws.set_sidebar_compact(true, cx);
@@ -1154,7 +1154,7 @@ mod tests {
     #[gpui::test]
     fn dragging_below_the_minimum_clamps_instead_of_collapsing(cx: &mut TestAppContext) {
         with_workspace(cx, vec![space_with("A", &[])], 0, |ws, _, cx| {
-            ws.tab_layout = TabLayout::Vertical;
+            ws.set_tab_layout(TabLayout::Vertical, cx);
             ws.sidebar_compact = false;
             ws.resize_tab_sidebar(50., cx);
             // Dragging never collapses or reorients: it clamps at the minimum.
@@ -1170,7 +1170,7 @@ mod tests {
     #[gpui::test]
     fn hiding_and_reopening_preserves_width_active_tab_and_orientation(cx: &mut TestAppContext) {
         with_workspace(cx, vec![space_with("A", &[1, 2, 3])], 0, |ws, _, cx| {
-            ws.tab_layout = TabLayout::Vertical;
+            ws.set_tab_layout(TabLayout::Vertical, cx);
             ws.sidebar_compact = false;
             ws.tabs_sidebar_hidden = false;
             ws.resize_tab_sidebar(345., cx);
@@ -1215,7 +1215,7 @@ mod tests {
     #[gpui::test]
     fn hidden_panel_stays_hidden_across_orientation_round_trip(cx: &mut TestAppContext) {
         with_workspace(cx, vec![space_with("A", &[1])], 0, |ws, _, cx| {
-            ws.tab_layout = TabLayout::Vertical;
+            ws.set_tab_layout(TabLayout::Vertical, cx);
             ws.set_tabs_sidebar_hidden(true, cx);
             assert!(!ws.tabs_sidebar_visible());
 
@@ -1239,7 +1239,7 @@ mod tests {
         let captured = Rc::new(RefCell::new(None));
         let out = captured.clone();
         with_workspace(cx, vec![space_with("A", &[1])], 0, move |ws, window, cx| {
-            ws.tab_layout = TabLayout::Vertical;
+            ws.set_tab_layout(TabLayout::Vertical, cx);
             ws.sidebar_compact = true;
             ws.tabs_sidebar_hidden = false;
             ws.sidebar_visible = true;
@@ -1280,7 +1280,7 @@ mod tests {
     #[gpui::test]
     fn compact_and_hidden_are_independent(cx: &mut TestAppContext) {
         with_workspace(cx, vec![space_with("A", &[1])], 0, |ws, _, cx| {
-            ws.tab_layout = TabLayout::Vertical;
+            ws.set_tab_layout(TabLayout::Vertical, cx);
             // Compact leaves the panel visible as the rail.
             ws.set_sidebar_compact(true, cx);
             assert!(ws.sidebar_compact);

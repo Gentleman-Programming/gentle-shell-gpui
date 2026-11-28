@@ -183,7 +183,8 @@ impl Render for Workspace {
         let has_right_panel = self.right_sidebar_view().is_some();
         let profile = self.layout_profiles.current();
         let tabs_visible = profile.tabs_visible;
-        let vertical_tabs = self.tab_layout == TabLayout::Vertical;
+        let vertical_tabs = profile.vertical_tabs();
+        let horizontal_tabs = profile.horizontal_tabs();
         let left_rail = profile.has(ToolPlacement::Left);
         let right_rail = profile.has(ToolPlacement::Right);
         let title_utilities = profile.title_utilities;
@@ -332,7 +333,7 @@ impl Render for Workspace {
                                     .when(tabs_visible || navigation_visible, |row| {
                                         row.child(self.render_workspace_chip(cx))
                                     })
-                                    .when(tabs_visible && vertical_tabs, |row| {
+                                    .when(vertical_tabs, |row| {
                                         row.child(self.new_tab_button("title-new-tab", None, cx))
                                     })
                                     .when(!tabs_visible && !navigation_visible, |row| {
@@ -343,7 +344,7 @@ impl Render for Workspace {
                                                 .child("Gentle Shell"),
                                         )
                                     })
-                                    .when(tabs_visible && !vertical_tabs, |row| {
+                                    .when(horizontal_tabs, |row| {
                                         row.child(
                                             div()
                                                 .flex_none()

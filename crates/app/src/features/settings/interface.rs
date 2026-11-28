@@ -14,84 +14,6 @@ use crate::features::workspaces::{
 };
 use crate::shared::ui;
 
-impl SettingsView {
-    pub(super) fn legacy_panel_controls(&self, cx: &mut Context<Self>) -> Div {
-        let vertical = self.tab_layout == TabLayout::Vertical;
-        section(IconName::PanelLeft, "Panels & tabs")
-            .child(control(
-                "Tabs",
-                false,
-                h_flex()
-                    .gap_1()
-                    .child(
-                        Button::new("settings-horizontal-tabs")
-                            .ghost()
-                            .small()
-                            .selected(self.tab_layout == TabLayout::Horizontal)
-                            .icon(Icon::new(IconName::List))
-                            .label("Horizontal")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.select_tab_layout(TabLayout::Horizontal, cx)
-                            })),
-                    )
-                    .child(
-                        Button::new("settings-vertical-tabs")
-                            .ghost()
-                            .small()
-                            .selected(vertical)
-                            .icon(Icon::new(IconName::PanelLeft))
-                            .label("Vertical")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.select_tab_layout(TabLayout::Vertical, cx)
-                            })),
-                    ),
-            ))
-            .when(vertical, |card| {
-                card.child(control(
-                    "Navigator",
-                    false,
-                    ui::segmented(
-                        "settings-tabs-sidebar-hidden",
-                        &["Show", "Hide"],
-                        Some(usize::from(self.tabs_sidebar_hidden)),
-                        cx.listener(move |this, index: &usize, _, cx| {
-                            this.select_tabs_sidebar_hidden(*index == 1, cx)
-                        }),
-                    ),
-                ))
-                .child(control(
-                    "Navigator style",
-                    self.tabs_sidebar_hidden,
-                    ui::segmented(
-                        "settings-sidebar-compact",
-                        &["Expanded", "Icon rail"],
-                        Some(usize::from(self.sidebar_compact)),
-                        cx.listener(move |this, index: &usize, _, cx| {
-                            this.select_sidebar_compact(*index == 1, cx)
-                        }),
-                    ),
-                ))
-            })
-            .child(control(
-                "Files",
-                false,
-                ui::segmented(
-                    "settings-files-sidebar",
-                    &["Show", "Hide"],
-                    Some(usize::from(!self.files_sidebar)),
-                    cx.listener(move |this, index: &usize, _, cx| {
-                        this.select_files_sidebar(*index == 0, cx)
-                    }),
-                ),
-            ))
-            .child(
-                div().pt_2().text_xs().text_color(ui::faint()).child(
-                    "Tabs appear at the top or on the left. Files always opens on the right.",
-                ),
-            )
-    }
-}
-
 #[derive(Clone, Copy)]
 struct LayoutDrag(LayoutTool);
 
@@ -185,9 +107,9 @@ fn preview_rail(profile: &LayoutProfile, placement: ToolPlacement) -> Div {
 /// An intentionally schematic miniature of the workspace. It follows the
 /// same visibility rules as the window and uses only active theme tokens.
 fn layout_preview(profile: &LayoutProfile) -> Div {
-    let horizontal = profile.tabs_visible && profile.tab_layout == TabLayout::Horizontal;
-    let navigation = profile.workspace_visible
-        || (profile.tabs_visible && profile.tab_layout == TabLayout::Vertical);
+    let horizontal = profile.horizontal_tabs();
+    let vertical = profile.vertical_tabs();
+    let navigation = profile.navigation_visible();
     let has_left = profile.has(ToolPlacement::Left);
     let has_right = profile.has(ToolPlacement::Right);
 
@@ -301,7 +223,7 @@ fn layout_preview(profile: &LayoutProfile) -> Div {
                                     .gap_1()
                                     .rounded_sm()
                                     .when(index == 0, |d| d.bg(ui::accent().opacity(0.16)))
-                                    .child(preview_icon(IconName::Bot))
+                                    .child(preview_icon(if vertical { IconName::Bot } else { IconName::Layers }))
                                     .when(profile.workspace_visible, |d| {
                                         d.child(preview_line(0.50))
                                     })
@@ -582,14 +504,38 @@ impl SettingsView {
                         }),
                     )),
             )
-            .child(visibility_row(
-                "layout-workspace",
-                "Workspace navigation",
-                "Show the expanded list of workspaces and agents.",
-                profile.workspace_visible,
-                |p, visible| p.workspace_visible = visible,
-                cx,
-            ))
+            .when(profile.vertical_tabs(), |d| {
+                d.child(visibility_row(
+                    "layout-vertical-navigator",
+                    "Workspace navigation",
+                    "Show or hide the vertical tab navigator.",
+                    !profile.tabs_sidebar_hidden,
+                    |p, visible| p.tabs_sidebar_hidden = !visible,
+                    cx,
+                ))
+                .child(control(
+                    "Navigator style",
+                    profile.tabs_sidebar_hidden,
+                    ui::segmented(
+                        "layout-navigator-style",
+                        &["Expanded", "Icon rail"],
+                        Some(usize::from(profile.navigation_compact())),
+                        cx.listener(|this, index: &usize, _, cx| {
+                            this.edit_presentation(|p| p.current_mut().workspace_visible = *index == 0, cx);
+                        }),
+                    ),
+                ))
+            })
+            .when(!profile.vertical_tabs(), |d| {
+                d.child(visibility_row(
+                    "layout-workspace",
+                    "Workspace navigation",
+                    "Show workspaces without duplicating their tabs.",
+                    profile.workspace_visible,
+                    |p, visible| p.workspace_visible = visible,
+                    cx,
+                ))
+            })
             .child(visibility_row(
                 "layout-right-panel",
                 "Right panel",
@@ -734,42 +680,7 @@ impl SettingsView {
                     ),
             );
         }
-        settings.child(rows).child(self.legacy_panel_controls(cx))
+        settings.child(rows)
     }
 
-    fn select_tab_layout(&mut self, layout: TabLayout, cx: &mut Context<Self>) {
-        if self.tab_layout == layout {
-            return;
-        }
-        self.tab_layout = layout;
-        cx.emit(SettingsEvent::TabLayoutChanged(layout));
-        cx.notify();
-    }
-
-    fn select_sidebar_compact(&mut self, compact: bool, cx: &mut Context<Self>) {
-        if self.sidebar_compact == compact {
-            return;
-        }
-        self.sidebar_compact = compact;
-        cx.emit(SettingsEvent::SidebarCompactChanged(compact));
-        cx.notify();
-    }
-
-    fn select_tabs_sidebar_hidden(&mut self, hidden: bool, cx: &mut Context<Self>) {
-        if self.tabs_sidebar_hidden == hidden {
-            return;
-        }
-        self.tabs_sidebar_hidden = hidden;
-        cx.emit(SettingsEvent::TabsSidebarHidden(hidden));
-        cx.notify();
-    }
-
-    fn select_files_sidebar(&mut self, shown: bool, cx: &mut Context<Self>) {
-        if self.files_sidebar == shown {
-            return;
-        }
-        self.files_sidebar = shown;
-        cx.emit(SettingsEvent::FilesSidebarShown(shown));
-        cx.notify();
-    }
 }

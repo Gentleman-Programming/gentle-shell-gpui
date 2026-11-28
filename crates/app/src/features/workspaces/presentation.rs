@@ -178,6 +178,27 @@ impl LayoutProfile {
             files_width: width,
         }
     }
+    /// Tab rows have exactly one placement, independently of the navigator.
+    pub fn horizontal_tabs(&self) -> bool {
+        self.tabs_visible && self.tab_layout == TabLayout::Horizontal
+    }
+
+    pub fn vertical_tabs(&self) -> bool {
+        self.tabs_visible && self.tab_layout == TabLayout::Vertical
+    }
+
+    pub fn navigation_visible(&self) -> bool {
+        if self.vertical_tabs() {
+            !self.tabs_sidebar_hidden
+        } else {
+            self.workspace_visible
+        }
+    }
+
+    pub fn navigation_compact(&self) -> bool {
+        self.vertical_tabs() && !self.workspace_visible
+    }
+
     pub fn has(&self, placement: ToolPlacement) -> bool {
         self.shortcuts.iter().any(|s| s.placement == placement)
     }
@@ -305,6 +326,32 @@ impl LayoutProfiles {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tab_placement_is_exclusive_in_every_navigator_state() {
+        for preset in LayoutPreset::ALL {
+            let mut p = LayoutProfile::preset(preset);
+            for layout in [TabLayout::Horizontal, TabLayout::Vertical] {
+                p.tab_layout = layout;
+                for tabs_visible in [false, true] {
+                    p.tabs_visible = tabs_visible;
+                    for workspace_visible in [false, true] {
+                        p.workspace_visible = workspace_visible;
+                        for hidden in [false, true] {
+                            p.tabs_sidebar_hidden = hidden;
+                            let horizontal = p.horizontal_tabs();
+                            let vertical = p.vertical_tabs();
+                            assert!(!(horizontal && vertical));
+                            assert_eq!(horizontal, tabs_visible && layout == TabLayout::Horizontal);
+                            assert_eq!(vertical, tabs_visible && layout == TabLayout::Vertical);
+                            assert_eq!(p.navigation_visible(), if vertical { !hidden } else { workspace_visible });
+                            assert_eq!(p.navigation_compact(), vertical && !workspace_visible);
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn minimal_matches_original_window_defaults() {

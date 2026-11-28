@@ -228,10 +228,7 @@ impl Workspace {
     }
 
     pub(super) fn navigation_visible(&self) -> bool {
-        let profile = self.layout_profiles.current();
-        !self.tabs_sidebar_hidden
-            && (profile.workspace_visible
-                || (profile.tabs_visible && self.tab_layout == TabLayout::Vertical))
+        self.layout_profiles.current().navigation_visible()
     }
 
     /// Capture live resize/visibility changes in just the active preset.
@@ -266,7 +263,7 @@ impl Workspace {
             });
         }
         self.tab_layout = p.tab_layout;
-        self.sidebar_compact = p.tab_layout == TabLayout::Vertical && !p.workspace_visible;
+        self.sidebar_compact = p.navigation_compact();
         self.tabs_sidebar_hidden = p.tabs_sidebar_hidden;
         self.tabs_sidebar_width = p.tabs_width;
         self.files_sidebar_width = p.files_width;
@@ -317,7 +314,7 @@ impl Workspace {
             self.tabs_sidebar_hidden = false;
         }
         p.workspace_visible = p.tabs_visible && self.tab_layout == TabLayout::Vertical;
-        self.sidebar_compact = !p.workspace_visible;
+        self.sidebar_compact = p.navigation_compact();
         if was_open != self.navigation_visible() {
             self.tabs_sidebar_motion
                 .retarget(was_open, cx.reduce_motion());
