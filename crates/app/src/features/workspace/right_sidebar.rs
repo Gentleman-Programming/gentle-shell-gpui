@@ -60,14 +60,18 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self
-            .sidebar_history
-            .as_ref()
-            .is_some_and(|(path, _)| *path == cwd)
+        let integrated = self.layout_profiles.active == LayoutPreset::Expanded;
+        if let Some((path, view)) = &self.sidebar_history
+            && *path == cwd
         {
+            view.update(cx, |view, cx| view.set_integrated_git(integrated, cx));
             return;
         }
-        let view = cx.new(|cx| crate::features::history::HistoryView::new_docked(cwd.clone(), window, cx));
+        let view = cx.new(|cx| {
+            let mut view = crate::features::history::HistoryView::new_docked(cwd.clone(), window, cx);
+            view.set_integrated_git(integrated, cx);
+            view
+        });
         cx.subscribe_in(
             &view,
             window,
@@ -86,6 +90,16 @@ impl Workspace {
                 }
             },
         ).detach();
+        cx.subscribe_in(
+            &view,
+            window,
+            |this, _, section: &crate::features::history::GitSection, window, cx| {
+                if this.layout_profiles.active == LayoutPreset::Expanded {
+                    this.return_to_git_section(*section, window, cx);
+                }
+            },
+        )
+        .detach();
         self.sidebar_history = Some((cwd, view));
     }
 
@@ -109,12 +123,43 @@ impl Workspace {
         }
     }
 
+    fn return_to_git_section(
+        &mut self,
+        section: crate::features::history::GitSection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.sidebar_history_active = false;
+        self.sidebar_memory_active = false;
+        self.layout_profiles.current_mut().dock = LayoutTool::Git;
+        self.files_sidebar_motion.requested_at = Some(std::time::Instant::now());
+        if let Some(tree) = self.sidebar.clone() {
+            tree.update(cx, |tree, cx| tree.show_git_section(section, window, cx));
+        }
+        if self.sidebar_visible {
+            cx.emit(WorkspaceEvent::FilesVisibilityChanged(true));
+        } else {
+            self.toggle_sidebar(cx);
+        }
+        self.schedule_save(cx);
+        cx.notify();
+    }
+
     pub(super) fn select_right_tool(
         &mut self,
         tool: LayoutTool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // History is a section of Git in Expanded, including when the dock
+        // is closed and reopened with the Git shortcut.
+        if tool == LayoutTool::Git
+            && self.layout_profiles.active == LayoutPreset::Expanded
+            && self.sidebar_history_active
+        {
+            self.request_sidebar(cx);
+            return;
+        }
         if self.sidebar_visible && self.active_right_tool(cx) == tool {
             self.request_sidebar(cx);
             return;
@@ -259,10 +304,15 @@ impl Workspace {
         let old_dock = self.active_right_tool(cx);
         self.cancel_workspace_rename_state(cx);
         self.layout_profiles = profiles;
+        let integrated = self.layout_profiles.active == LayoutPreset::Expanded;
         if let Some(tree) = self.sidebar.clone() {
             tree.update(cx, |tree, cx| {
-                tree.set_original_tabs(p.original_controls, cx)
+                tree.set_original_tabs(p.original_controls, cx);
+                tree.set_integrated_history(integrated, cx);
             });
+        }
+        if let Some((_, view)) = &self.sidebar_history {
+            view.update(cx, |view, cx| view.set_integrated_git(integrated, cx));
         }
         self.tab_layout = p.tab_layout;
         self.sidebar_compact = p.navigation_compact();
@@ -310,9 +360,13 @@ impl Workspace {
 
     fn shortcut_selected(&self, tool: LayoutTool, cx: &App) -> bool {
         if tool.docked() {
+            let active = self.active_right_tool(cx);
+            let integrated_history = self.layout_profiles.active == LayoutPreset::Expanded
+                && tool == LayoutTool::Git
+                && active == LayoutTool::History;
             return self.sidebar_visible
                 && !self.files_sidebar_motion.suspended
-                && self.active_right_tool(cx) == tool;
+                && (active == tool || integrated_history);
         }
         match tool {
             LayoutTool::Agents => self.agents_window_open(cx),

@@ -158,7 +158,7 @@ impl LayoutProfile {
                 .into_iter()
                 .map(|tool| ToolShortcut {
                     tool,
-                    placement: if expanded {
+                    placement: if expanded && tool != LayoutTool::History {
                         ToolPlacement::Right
                     } else {
                         ToolPlacement::Hidden
@@ -255,6 +255,10 @@ impl LayoutProfile {
             if !seen.contains(&s.tool) {
                 self.shortcuts.push(s);
             }
+        }
+        // Expanded exposes History inside Git, not as a second rail shortcut.
+        if preset == LayoutPreset::Expanded {
+            self.place(LayoutTool::History, ToolPlacement::Hidden);
         }
         if !self.dock.docked() {
             self.dock = LayoutTool::Files;
@@ -460,6 +464,22 @@ mod tests {
             vec![LayoutTool::Providers]
         );
         assert!(!p.rail_tools(ToolPlacement::Right, true).any(|tool| tool == LayoutTool::Profiles));
+    }
+
+    #[test]
+    fn expanded_history_is_part_of_git_without_a_second_shortcut() {
+        let mut profiles = LayoutProfiles::default();
+        profiles.expanded.place(LayoutTool::History, ToolPlacement::Right);
+        profiles.expanded.dock = LayoutTool::History;
+        profiles.minimal.place(LayoutTool::History, ToolPlacement::Title);
+        profiles.normalize();
+        assert!(!profiles.expanded.rail_tools(ToolPlacement::Right, false)
+            .any(|tool| tool == LayoutTool::History));
+        assert!(profiles.expanded.rail_tools(ToolPlacement::Right, false)
+            .any(|tool| tool == LayoutTool::Git));
+        assert_eq!(profiles.expanded.dock, LayoutTool::History);
+        assert!(profiles.minimal.shortcuts.iter().any(|s|
+            s.tool == LayoutTool::History && s.placement == ToolPlacement::Title));
     }
 
     #[test]

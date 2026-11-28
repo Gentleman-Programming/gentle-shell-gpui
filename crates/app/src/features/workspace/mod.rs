@@ -38,7 +38,7 @@ use crate::features::tower::TowerView;
 use crate::features::usage::{UsageEvent, UsageView};
 use crate::features::welcome::{WelcomeEvent, WelcomeView};
 use crate::features::workspaces::{
-    self, Badge, LayoutProfiles, LayoutTool, SavedPane, SavedState, SavedTab, SavedWorkspace,
+    self, Badge, LayoutPreset, LayoutProfiles, LayoutTool, SavedPane, SavedState, SavedTab, SavedWorkspace,
     TabLayout, ToolPlacement,
 };
 use crate::shared::pane::{
@@ -763,8 +763,10 @@ impl Workspace {
         );
         let visible = self.files_sidebar_visible();
         let original_tabs = self.layout_profiles.current().original_controls;
+        let integrated_history = self.layout_profiles.active == LayoutPreset::Expanded;
         view.update(cx, |tree, cx| {
             tree.set_original_tabs(original_tabs, cx);
+            tree.set_integrated_history(integrated_history, cx);
             tree.select_sidebar_tool(git, window, cx);
             tree.set_visible(visible, cx);
         });
@@ -833,9 +835,9 @@ impl Workspace {
         self.place_preview(id, window, cx);
     }
 
-    /// Show the repository's Git history in the shared right sidebar.
+    /// Expanded keeps Git history inside Git; Minimal opens the original preview.
     pub fn open_history(&mut self, cwd: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
-        if self.layout_profiles.current().original_controls {
+        if self.layout_profiles.active == LayoutPreset::Minimal {
             if let Some(id) = self.new_factory_pane(PaneKind::History, cwd, window, cx) {
                 self.place_preview(id, window, cx);
             }

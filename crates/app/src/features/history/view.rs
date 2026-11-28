@@ -23,7 +23,7 @@ use gpui_kit::*;
 
 use super::graph::{self, RowGraph};
 use super::ops::Ask;
-use super::{GraphMode, HistoryView, Line, OpenFullHistory, Outcome};
+use super::{GitSection, GraphMode, HistoryView, Line, OpenFullHistory, Outcome};
 use crate::features::git::{Scope, ops::Lfs};
 use crate::platform::ides;
 use crate::shared::ui;
@@ -221,6 +221,23 @@ impl HistoryView {
                     .tooltip("Refresh")
                     .on_click(cx.listener(|this, _, _, cx| this.reload(cx))),
             )
+    }
+
+    fn render_git_sections(&self, cx: &mut Context<Self>) -> Div {
+        h_flex()
+            .flex_none()
+            .px_2()
+            .pb_1p5()
+            .gap_1()
+            .child(
+                ui::sidebar_section_tab(IconName::Diff, "Changes", 0, false)
+                    .on_click(cx.listener(|_, _, _, cx| cx.emit(GitSection::Changes))),
+            )
+            .child(
+                ui::sidebar_section_tab(IconName::GitBranch, "Branches", 0, false)
+                    .on_click(cx.listener(|_, _, _, cx| cx.emit(GitSection::Branches))),
+            )
+            .child(ui::sidebar_section_tab(IconName::GitGraph, "History", 0, true))
     }
 
     fn render_graph_modes(&self, cx: &mut Context<Self>) -> Div {
@@ -1912,6 +1929,7 @@ impl Render for HistoryView {
                 .size_full(),
             )
             .child(self.render_header(window, cx))
+            .when(self.integrated_git, |d| d.child(self.render_git_sections(cx)))
             .children(self.render_toolbar(window, cx))
             .child(self.render_graph_modes(cx))
             .children(self.render_graph_navigation(cx))

@@ -1367,6 +1367,53 @@ pub fn orbit(color: Hsla, radius: Rems) -> Div {
         .child(frames_every(SLOW_FRAME))
 }
 
+/// A sidebar section tab: inactive sections are icons, the active one has a label.
+pub(crate) fn sidebar_section_tab(
+    icon: IconName,
+    label: &'static str,
+    count: usize,
+    active: bool,
+) -> Stateful<Div> {
+    h_flex()
+        .id(label)
+        .h(rems(26. / 16.))
+        .min_w(rems(32. / 16.))
+        .px_2()
+        .gap_1()
+        .justify_center()
+        .rounded_md()
+        .cursor_pointer()
+        .when(active, |d| d.bg(surface_hover()))
+        .when(!active, |d| {
+            d.hover(|s| s.bg(surface_hover().opacity(0.6)))
+        })
+        .child(
+            Icon::new(icon)
+                .small()
+                .text_color(if active { fg() } else { faint() }),
+        )
+        // The open tab says what it is; the others keep to their icons.
+        .when(active, |d| {
+            d.child(
+                div()
+                    .text_size(rems(12.5 / 16.))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(fg())
+                    .child(label),
+            )
+        })
+        .when(count > 0, |d| {
+            d.child(
+                div()
+                    .font_family(mono())
+                    .text_size(code_rems(10.5))
+                    .text_color(warning())
+                    .child(count.to_string()),
+            )
+        })
+        .tooltip(move |window, cx| Tooltip::new(label).build(window, cx))
+}
+
 /// The running tab's loading streak. Its absolute overlay never changes row
 /// measurements or adds an interactive surface. Reduced motion uses a
 /// stationary outline rather than a moving streak.

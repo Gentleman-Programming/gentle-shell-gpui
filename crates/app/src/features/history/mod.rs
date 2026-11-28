@@ -84,11 +84,19 @@ impl GraphMode {
 
 pub struct OpenFullHistory(pub PathBuf, pub Scope);
 
+/// Return from the integrated history to a section of the same Git dock.
+#[derive(Clone, Copy)]
+pub(crate) enum GitSection {
+    Changes,
+    Branches,
+}
+
 pub struct HistoryView {
     toplevel: PathBuf,
     scope: Scope,
     mode: GraphMode,
     docked: bool,
+    integrated_git: bool,
     expanded_merges: HashSet<String>,
     folded_counts: HashMap<String, usize>,
     limit: usize,
@@ -145,6 +153,7 @@ pub struct HistoryView {
 }
 
 impl EventEmitter<OpenFullHistory> for HistoryView {}
+impl EventEmitter<GitSection> for HistoryView {}
 
 impl Focusable for HistoryView {
     fn focus_handle(&self, _: &App) -> FocusHandle {
@@ -160,6 +169,13 @@ impl HistoryView {
 
     pub fn new_docked(cwd: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
         Self::with_mode(cwd, true, window, cx)
+    }
+
+    pub(crate) fn set_integrated_git(&mut self, integrated: bool, cx: &mut Context<Self>) {
+        if self.integrated_git != integrated {
+            self.integrated_git = integrated;
+            cx.notify();
+        }
     }
 
     fn with_mode(cwd: PathBuf, docked: bool, window: &mut Window, cx: &mut Context<Self>) -> Self {
@@ -180,6 +196,7 @@ impl HistoryView {
             scope: Scope::Head,
             mode: GraphMode::Full,
             docked,
+            integrated_git: false,
             expanded_merges: HashSet::new(),
             folded_counts: HashMap::new(),
             limit: PAGE,

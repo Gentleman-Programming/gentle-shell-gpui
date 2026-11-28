@@ -189,6 +189,7 @@ pub struct FileTreeView {
     tab: Tab,
     last_git_tab: Tab,
     original_tabs: bool,
+    integrated_history: bool,
     /// Loaded listings by folder; folders load when first expanded.
     children: HashMap<PathBuf, Vec<Entry>>,
     expanded: HashSet<PathBuf>,
@@ -267,6 +268,7 @@ impl FileTreeView {
             tab: Tab::Files,
             last_git_tab: Tab::Changes,
             original_tabs: true,
+            integrated_history: false,
             children: HashMap::new(),
             expanded: HashSet::new(),
             selected: None,
@@ -353,6 +355,26 @@ impl FileTreeView {
             self.original_tabs = original;
             cx.notify();
         }
+    }
+
+    pub(crate) fn set_integrated_history(&mut self, integrated: bool, cx: &mut Context<Self>) {
+        if self.integrated_history != integrated {
+            self.integrated_history = integrated;
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn show_git_section(
+        &mut self,
+        section: crate::features::history::GitSection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let tab = match section {
+            crate::features::history::GitSection::Changes => Tab::Changes,
+            crate::features::history::GitSection::Branches => Tab::Branches,
+        };
+        self.set_tab(tab, window, cx);
     }
 
     pub fn is_git_tab(&self) -> bool {
@@ -1483,44 +1505,7 @@ impl FileTreeView {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let active = self.tab == tab;
-        h_flex()
-            .id(label)
-            .h(rems(26. / 16.))
-            .min_w(rems(32. / 16.))
-            .px_2()
-            .gap_1()
-            .justify_center()
-            .rounded_md()
-            .cursor_pointer()
-            .when(active, |d| d.bg(ui::surface_hover()))
-            .when(!active, |d| {
-                d.hover(|s| s.bg(ui::surface_hover().opacity(0.6)))
-            })
-            .child(
-                Icon::new(icon)
-                    .small()
-                    .text_color(if active { ui::fg() } else { ui::faint() }),
-            )
-            // The open tab says what it is; the others keep to their icons.
-            .when(active, |d| {
-                d.child(
-                    div()
-                        .text_size(rems(12.5 / 16.))
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(ui::fg())
-                        .child(label),
-                )
-            })
-            .when(count > 0, |d| {
-                d.child(
-                    div()
-                        .font_family(ui::mono())
-                        .text_size(ui::code_rems(10.5))
-                        .text_color(ui::warning())
-                        .child(count.to_string()),
-                )
-            })
-            .tooltip(move |window, cx| Tooltip::new(label).build(window, cx))
+        ui::sidebar_section_tab(icon, label, count, active)
             .on_click(cx.listener(move |this, _, window, cx| this.set_tab(tab, window, cx)))
     }
 }
@@ -1600,13 +1585,9 @@ impl Render for FileTreeView {
             })
             .child(self.tab_button(Tab::Changes, IconName::Diff, "Changes", change_count, cx))
             .child(self.tab_button(Tab::Branches, IconName::GitBranch, "Branches", 0, cx))
-            .when(!self.original_tabs, |d| {
+            .when(self.integrated_history || !self.original_tabs, |d| {
                 d.child(
-                    Self::header_button(
-                        "sidebar-git-history",
-                        IconName::GitGraph,
-                        "Open Git history",
-                    )
+                    ui::sidebar_section_tab(IconName::GitGraph, "History", 0, false)
                     .on_click(cx.listener(|this, _, _, cx| {
                         let repo = this
                             .git

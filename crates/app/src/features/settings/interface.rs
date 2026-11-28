@@ -556,7 +556,8 @@ impl SettingsView {
                 let count = profile
                     .shortcuts
                     .iter()
-                    .filter(|s| s.placement == placement)
+                    .filter(|s| s.placement == placement
+                        && !(active == LayoutPreset::Expanded && s.tool == LayoutTool::History))
                     .count();
                 v_flex()
                     .id(("layout-destination", placement as usize))
@@ -597,6 +598,9 @@ impl SettingsView {
         let mut rows = v_flex().gap_0p5();
         for shortcut in &profile.shortcuts {
             let tool = shortcut.tool;
+            if active == LayoutPreset::Expanded && tool == LayoutTool::History {
+                continue;
+            }
             let selected = shortcut.placement;
             rows = rows.child(
                 h_flex()
@@ -664,7 +668,13 @@ impl SettingsView {
                     ),
             );
         }
-        settings.child(rows)
+        settings
+            .when(active == LayoutPreset::Expanded, |d| {
+                d.child(div().text_xs().text_color(ui::muted()).child(
+                    "Git History is available inside the Git panel.",
+                ))
+            })
+            .child(rows)
     }
 
 }
