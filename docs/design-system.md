@@ -4,7 +4,7 @@ How the app looks and which pieces it is built from. Everything lives in `crates
 
 ## Principles
 
-These principles come from the current code. They are not aspirations.
+These principles come from the current code. They are not aspirations. The [responsive layout contract](#responsive-layout) below also defines the requirements for new and changed UI; existing views that do not meet it should be migrated when their layout is changed.
 
 | Principle | How it applies |
 | --- | --- |
@@ -210,6 +210,107 @@ Recurring sizes:
 | Chip card | 360 px wide, `p_3`, list with `max_h` 380 |
 
 Current screen widths: Providers 640, Onboarding 720, Sessions and Usage 760, Settings 960 (720 tall, with a category rail on `surface` that turns into a picker below 820 px); Profiles, Memory and Agents use `screen(None)` (Profiles caps it at 1100 × 760).
+
+## Responsive layout
+
+The desktop window is a flexible workspace, not a fixed-size screen. A view may be the only pane in a tab, one of several split panes, a docked tool, or an overlay. Its usable space also changes with interface size, sidebars and platform chrome. The following is the layout contract for new and changed UI, including both Minimal and Expanded presentations. It defines the target behavior; not every existing view implements it yet.
+
+### Measure the space the component actually has
+
+- Base a component's layout on its allocated content bounds, not monitor resolution or the total window width. A wide window can contain a narrow pane. Measure the workspace content area for global decisions and individual panes for their local decisions.
+- Use the existing [interface size](#interface-size) convention. Express text-dependent minimums and breakpoints as sizes at 100% and convert with `rems(N / 16.).to_pixels(window.rem_size())` when comparing with measured bounds. Keep user-dragged geometry and paint-only details in pixels as described above.
+- Prefer intrinsic sizing and flex layout before introducing a breakpoint. A breakpoint describes when a meaningful layout no longer fits, not an arbitrary device class. Include padding, gaps, dividers, rails, scrollbars and platform controls in the space budget.
+- Share a named layout policy where multiple features make the same decision. Keep pure width allocation and visibility decisions testable in `gentle-core`; generic GPUI measurement and presentation helpers belong in `shared/`, and workspace-specific panel coordination belongs in `features/workspace/`. Do not add a new abstraction for a single consumer.
+- Respond to resize, split changes, dock toggles and interface zoom without recreating views, resetting scroll or focus unnecessarily, or changing saved preferences. Notify only when the measured value or effective presentation changes; avoid resize feedback loops.
+
+### Header and row priorities
+
+Reserve the space for actions before distributing the remaining width. A horizontal row should have a flexible content group and a non-shrinking action group, rather than a long sequence of fixed-width siblings.
+
+| Priority (highest first) | Examples | What happens when space runs out |
+| --- | --- | --- |
+| Essential actions | Close, Save, Stop, Open externally, navigation needed to leave a view | Keep visible and usable; compact labels to icons with tooltips where appropriate. Never clip them at the edge or silently drop them. |
+| Primary content and state | File name, commit subject, session name, unsaved/error state | Give it the remaining flexible space. Truncate text with a way to read the full value; wrap or use a second line if useful. Preserve important state in a compact form. |
+| Secondary controls | Code / Preview / Diff, filters, sort, optional commands | Shorten labels or replace a wide selector with a compact menu; retain the same actions and selected state. |
+| Supplementary information | Path prefixes, change counts, language chips, timestamps, secondary labels | Truncate, collapse or move into details first. Preserve access through a tooltip, menu or details view when useful. |
+| Decoration | Nonessential icons, extra gaps, dividers | Remove or reduce first without sacrificing readable typography or hit targets. |
+
+For GPUI, the usual pattern is:
+
+```rust
+h_flex()
+    .w_full()
+    .min_w_0()
+    .gap_2()
+    .child(
+        h_flex()
+            .flex_1()
+            .min_w_0()
+            .overflow_hidden()
+            .child(div().min_w_0().truncate().child(title)),
+    )
+    .child(
+        h_flex()
+            .flex_none()
+            .gap_1()
+            .children(actions),
+    )
+```
+
+This is a composition pattern, not a new component API. Apply `min_w_0()` at each flexible ancestor that would otherwise keep its intrinsic minimum. Use `flex_none()` for genuinely fixed items, not every chip or label. A vertical equivalent uses `flex_1().min_h_0()` on the scrollable body. Clip only the intended flexible content; never hide an entire header's overflow as a substitute for layout. If even the essential actions cannot fit, use another row or enforce a usable minimum at the container; keep a reachable way to close or leave. Keyboard shortcuts supplement visible controls, not replace them.
+
+The file viewer is a concrete case: Save, Open externally and Close take precedence over change counts, language chips, the path prefix and the mode selector ([#323](https://github.com/Gentleman-Programming/gentle-shell-gpui/issues/323)). The same principle applies to toolbars, footers, cards and overlays. A disabled action may remain visible when its operation is not available.
+
+### Workspace space budget and breakpoints
+
+Compute a single effective layout from the available space, the current panes, requested docks and saved presentation. Reserve the primary workspace's usable minimum first, accounting for its split geometry; then allocate the remaining space to auxiliary surfaces. Count all visible rails, sidebars, docked browser/device panels, gaps and handles together. Independent per-panel width caps alone do not guarantee that the center fits.
+
+Use named, content-driven states instead of a different set of magic widths in every feature:
+
+| State | Entry condition | Effective behavior |
+| --- | --- | --- |
+| Spacious | Requested panels and the primary workspace fit at their preferred widths | Show the requested layout. |
+| Constrained | Preferred widths do not fit, but usable minimum widths do | Shrink flexible auxiliary panels, compact toolbars and preserve a usable workspace. |
+| Compact | The requested combination cannot fit at usable minimums | Use a compact navigator, choose a single auxiliary tool in a shared dock, or use an on-demand overlay. Keep essential actions and the primary workspace accessible. |
+
+Specific numeric thresholds must be derived from the actual component minimums and tested at the configured interface size. Do not treat 800, 1100 or 1440 physical pixels as universal breakpoints. Where a measured transition can oscillate, use a small stable threshold or hysteresis and test both resize directions.
+
+The effective layout is transient: reducing the window must not rewrite the user's preset, saved sidebar widths, tool placements or tab orientation. On expansion, restore the requested layout unless the person explicitly changed it. Preserve live agents, terminals, editors, selection, unsaved data and panel state when their surface is compacted or hidden. Manual resize follows the pointer and never silently changes unrelated preferences.
+
+### Panel coexistence and tab consistency
+
+Panel coexistence is a workspace-level decision. A tool cannot independently take another fixed-width column without accounting for the central workspace and other visible surfaces.
+
+| Surface | Coexistence rule |
+| --- | --- |
+| Activity rails | May coexist on either side if the remaining workspace fits; empty rails take no space. Keep access to tools through Commands when a rail is not shown. |
+| Workspace navigator | Owns the vertical tab presentation. May compact to a rail with usable tab entries, but must not disappear while tabs are vertical. Horizontal tabs use the title-bar workspace switcher instead. |
+| Files, Changes, Branches, Git History, Engram | The right tool dock is a shared slot; switching tools replaces the displayed view in that slot, not the underlying workspace or its sessions. |
+| Additional browser/device or other auxiliary docks | Coexist only when the total space budget permits. Define a compact or on-demand presentation rather than squeezing the primary workspace below its minimum. |
+| Overlay screens | Use the established screen/scrim pattern; fit the available bounds and keep close/back actions accessible. Do not create a second persistent dock merely to show a screen. |
+
+Tabs have exactly one effective placement: horizontal or vertical. Neither both nor neither is a valid state, including during layout transitions. Keep the existing title-bar workspace switcher in both orientations.
+
+| Requested tabs | Title-bar workspace switcher | Horizontal tab strip | Vertical navigator |
+| --- | --- | --- | --- |
+| Horizontal | Yes | Current workspace's tabs | No |
+| Vertical (expanded) | Yes | No | Workspaces grouped with their tabs |
+| Vertical (compact) | Yes | No | Workspace groups and usable compact tab entries |
+
+There is no Hidden setting for tabs. A legacy hidden preference restores its saved orientation. Compacting vertical navigation keeps access to its tabs; switching orientations replaces one presentation atomically with the other. Derive the title bar, navigator, settings preview and command state from the same presentation decision. A layout transition must not duplicate tabs, agents, panes or persisted state, or remove both tab presentations. Automatic adaptation must respect this invariant; if space is insufficient, compact the vertical navigator or use the horizontal presentation without losing access to tabs.
+
+### Dense lists, trees and graphs
+
+- Use scrolling or virtualization for long content. Keep headers and essential actions outside the scrolling body. Constrain widths and heights at the actual container, including nested scroll areas.
+- Allocate decorative or structural columns to the relevant visible data. For a Git graph, keep commit nodes readable and connections aligned across visible rows. Do not reserve the widest lane count of unrelated history for every row or compress all nodes until unreadable.
+- Preserve the underlying data and default history scope. Compacting the presentation is not a reason to hide commits, collapse branches or change filters without an explicit user choice. If a dense graph still needs more space, offer scrolling or a larger view. Retain relevant connections and avoid implying relationships that are not in the data.
+- Keep the primary label readable, align repeated metadata, and provide the full value of clipped branch names, tags and paths through a reachable detail or tooltip. Use a second line when it improves readability without making the list unstable.
+
+### Review and test responsive UI
+
+For each new or changed layout, test the smallest supported width, a typical width and a wide layout, as well as just below/at/above its breakpoints. Include narrow and nested splits, simultaneous auxiliary panels, resizing in both directions, long names and labels, empty and busy/error states, and both Minimal and Expanded presets where relevant. Test at 80%, 100% and 150% interface size and in light and dark themes.
+
+Add regression tests for pure allocation and visibility decisions (space budget, mutually exclusive tab placement, action priority and restoration of preferences). When GPUI test facilities are available, test observable action visibility and interaction, not just helper return values. Manually exercise mouse resizing, keyboard navigation, overflow controls and restoration of the previous layout in an isolated app. Attach representative narrow and wide screenshots to a visual PR and identify which platforms were tested. Document checks that could not be run.
 
 ## Surfaces and components
 
@@ -485,6 +586,9 @@ Typical screen footer: `h_flex().px_4().py_3().gap_2().border_t_1().border_color
 | Large effects in a `canvas`, without input and with a `Task` that clears them. | Wrap the window root in an animation. |
 | Test in a light theme (e.g. Catppuccin Latte) and with transparency at maximum. | Assume dark mode or an opaque background. |
 | Make a key hint that stands for one action a `key_button` with the key's handler. | Leave an `esc`/`↵` cap that looks pressable but ignores the mouse. |
+| Measure allocated bounds, reserve actions, let secondary content yield. | Base pane layout on monitor width or make every header item `flex_none()`. |
+| Derive effective visibility from one layout policy and preserve saved preferences. | Render horizontal and vertical tabs together or persist automatic compaction. |
+| Keep nodes and text legible, with overflow or larger views where needed. | Shrink a dense graph until it cannot be read, or silently filter its data. |
 
 ## Checklist for a new screen
 
@@ -497,4 +601,6 @@ Typical screen footer: `h_flex().px_4().py_3().gap_2().border_t_1().border_color
 7. New icons added to `ExtraIcons`.
 8. Animations only with `appear`/`appear_after`/`pop_in`/`popover_in`/`pulse`, with stable ids.
 9. Reviewed in a light theme, in a dark theme and with different transparencies.
-10. Sizes in rems (`rems(px / 16.)`), and checked at 80 % and 150 % interface size: nothing clips or overlaps.
+10. Sizes in rems (`rems(px / 16.)`), and checked at 80 %, 100 % and 150 % interface size: nothing clips or overlaps.
+11. Follow the [responsive layout contract](#responsive-layout): measured bounds, flexible content, reserved actions, reachable overflow and no duplicated presentations.
+12. Test narrow and wide panes, resize in both directions, long labels and relevant panel combinations; add regression tests and screenshots for changed behavior.
