@@ -244,14 +244,7 @@ impl Workspace {
             .gap_1()
             .py_2()
             .when(can_expand, |d| {
-                d.child(
-                    Button::new("compact-expand")
-                        .ghost()
-                        .xsmall()
-                        .icon(Icon::new(IconName::PanelLeftOpen))
-                        .tooltip("Expand workspace sidebar")
-                        .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar_compact(cx))),
-                )
+                d.child(self.sidebar_compact_button(true, cx))
             })
             .child(list)
             .child(

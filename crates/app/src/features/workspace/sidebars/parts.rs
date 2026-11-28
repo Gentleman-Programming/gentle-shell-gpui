@@ -13,18 +13,56 @@ pub(super) const ROW: f32 = 26.;
 pub(super) const INDENT: f32 = 22.;
 
 impl Workspace {
+    /// The navigator's own compact/expand control, mirroring the right rail.
+    pub(super) fn sidebar_compact_button(
+        &self,
+        compact: bool,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        h_flex()
+            .id("workspace-sidebar-compact-toggle")
+            .size(rems(34. / 16.))
+            .flex_none()
+            .items_center()
+            .justify_center()
+            .rounded_md()
+            .cursor_pointer()
+            .text_color(ui::muted())
+            .hover(|d| d.bg(ui::surface_hover()))
+            .tooltip(move |window, cx| {
+                Tooltip::new(if compact {
+                    "Expand workspace sidebar"
+                } else {
+                    "Compact workspace sidebar"
+                })
+                .build(window, cx)
+            })
+            .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar_compact(cx)))
+            .child(Icon::new(if compact {
+                IconName::PanelLeftOpen
+            } else {
+                IconName::PanelLeftClose
+            }))
+    }
+
     /// The search field; it filters the tabs of every workspace.
-    pub(super) fn sidebar_search(&self) -> Div {
-        h_flex().flex_none().px_2().pb_1p5().child(
-            ui::field()
-                .flex_1()
-                .min_w_0()
-                .h(rems(30. / 16.))
-                // The field's own Cut/Copy/Paste menu is the only one.
-                .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
-                .child(Icon::new(IconName::Search).small().text_color(ui::faint()))
-                .child(Input::new(&self.tab_search).appearance(false).small()),
-        )
+    pub(super) fn sidebar_search(&self, cx: &mut Context<Self>) -> Div {
+        h_flex()
+            .flex_none()
+            .px_2()
+            .pb_1p5()
+            .gap_1()
+            .child(self.sidebar_compact_button(false, cx))
+            .child(
+                ui::field()
+                    .flex_1()
+                    .min_w_0()
+                    .h(rems(30. / 16.))
+                    // The field's own Cut/Copy/Paste menu is the only one.
+                    .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
+                    .child(Icon::new(IconName::Search).small().text_color(ui::faint()))
+                    .child(Input::new(&self.tab_search).appearance(false).small()),
+            )
     }
 
     /// Workspace `index`'s tabs that match the search.
