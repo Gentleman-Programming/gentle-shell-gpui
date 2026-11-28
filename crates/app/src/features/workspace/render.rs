@@ -182,7 +182,6 @@ impl Render for Workspace {
         let has_files_sidebar = self.sidebar.is_some();
         let has_right_panel = self.right_sidebar_view().is_some();
         let profile = self.layout_profiles.current();
-        let tabs_visible = profile.tabs_visible;
         let vertical_tabs = profile.vertical_tabs();
         let horizontal_tabs = profile.horizontal_tabs();
         let left_rail = profile.has(ToolPlacement::Left);
@@ -330,19 +329,9 @@ impl Render for Workspace {
                                             this.open_empty_area_menu(event.position, window, cx);
                                         }),
                                     )
-                                    .when(tabs_visible || navigation_visible, |row| {
-                                        row.child(self.render_workspace_chip(cx))
-                                    })
+                                    .child(self.render_workspace_chip(cx))
                                     .when(vertical_tabs, |row| {
                                         row.child(self.new_tab_button("title-new-tab", None, cx))
-                                    })
-                                    .when(!tabs_visible && !navigation_visible, |row| {
-                                        row.child(
-                                            div()
-                                                .text_sm()
-                                                .text_color(ui::muted())
-                                                .child("Gentle Shell"),
-                                        )
                                     })
                                     .when(horizontal_tabs, |row| {
                                         row.child(
@@ -437,23 +426,23 @@ impl Render for Workspace {
                                                 ))
                                         })
                                     })
-                                    .when(original_controls && vertical_tabs, |d| {
+                                    .when(vertical_tabs, |d| {
                                         d.child(
                                             Button::new("toggle-tab-sidebar")
                                                 .ghost()
                                                 .xsmall()
-                                                .icon(Icon::new(if self.tabs_sidebar_visible() {
-                                                    IconName::PanelLeftClose
-                                                } else {
+                                                .icon(Icon::new(if self.sidebar_compact {
                                                     IconName::PanelLeftOpen
-                                                }))
-                                                .tooltip(if self.tabs_sidebar_visible() {
-                                                    "Hide workspace sidebar"
                                                 } else {
-                                                    "Show workspace sidebar"
+                                                    IconName::PanelLeftClose
+                                                }))
+                                                .tooltip(if self.sidebar_compact {
+                                                    "Expand workspace sidebar"
+                                                } else {
+                                                    "Compact workspace sidebar"
                                                 })
                                                 .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.toggle_tabs_sidebar(cx)
+                                                    this.toggle_sidebar_compact(cx)
                                                 })),
                                         )
                                     })
@@ -526,7 +515,7 @@ impl Render for Workspace {
                         }
                     })
                     // The vertical tab navigator remains independent of the Files panel.
-                    .when(tabs_width > 0., |row| {
+                    .when(vertical_tabs && tabs_width > 0., |row| {
                         row.child(
                             div()
                                 .id("vertical-tab-panel")

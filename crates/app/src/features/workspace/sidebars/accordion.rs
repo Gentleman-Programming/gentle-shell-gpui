@@ -8,7 +8,6 @@ use super::*;
 
 impl Workspace {
     pub(in super::super) fn render_accordion_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
-        let show_tabs = self.layout_profiles.current().vertical_tabs();
         let searching = self.searching(cx);
         let mut list = v_flex()
             .id("accordion-list")
@@ -22,23 +21,14 @@ impl Workspace {
         let query = self.tab_search.read(cx).value().trim().to_lowercase();
         let mut matches = 0;
         for space in self.sidebar_spaces() {
-            let tabs = if show_tabs {
-                self.visible_tabs(space.index, cx)
-            } else {
-                Vec::new()
-            };
+            let tabs = self.visible_tabs(space.index, cx);
             if searching && tabs.is_empty() && !space.name.to_lowercase().contains(&query) {
                 continue;
             }
             matches += 1;
             let open = searching || self.sidebar_space_open(space.index);
-            list = list.child(self.space_row(
-                &space,
-                show_tabs.then_some(open),
-                "accordion-space",
-                cx,
-            ));
-            if !show_tabs || !open {
+            list = list.child(self.space_row(&space, Some(open), "accordion-space", cx));
+            if !open {
                 continue;
             }
             // The indent guide: a tree's, under the workspace's chevron.
@@ -61,10 +51,7 @@ impl Workspace {
             list = list.child(guide);
         }
         if searching && matches == 0 {
-            list = list.child(Self::quiet_row(
-                if show_tabs { "No matching workspaces or sessions" } else { "No matching workspaces" },
-                0.,
-            ));
+            list = list.child(Self::quiet_row("No matching workspaces or sessions", 0.));
         }
         v_flex()
             .size_full()

@@ -62,7 +62,6 @@ pub enum PaletteAction {
     ToggleSidebar,
     OpenFiles,
     OpenGit,
-    ToggleNavigation,
     SetLayoutPreset(LayoutPreset),
     SetTabLayout(TabLayout),
     /// Send `/name` as a prompt in the active agent pane.

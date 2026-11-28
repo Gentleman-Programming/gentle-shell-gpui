@@ -268,8 +268,9 @@ impl Workspace {
         self.tabs_sidebar_width = p.tabs_width;
         self.files_sidebar_width = p.files_width;
         if old_nav != self.navigation_visible() {
-            self.tabs_sidebar_motion
-                .retarget(old_nav, cx.reduce_motion());
+            // Switching placement is atomic: the other tab list is already
+            // gone, so never animate the new one from zero width.
+            self.tabs_sidebar_motion.retarget(old_nav, true);
         }
         if old_dock != p.dock {
             self.sidebar_memory_active = p.dock == LayoutTool::Engram;
@@ -300,24 +301,6 @@ impl Workspace {
             cx.emit(WorkspaceEvent::FilesVisibilityChanged(
                 self.files_sidebar_visible(),
             ));
-        }
-        self.schedule_save(cx);
-        cx.notify();
-    }
-
-    pub(super) fn show_navigation(&mut self, cx: &mut Context<Self>) {
-        let was_open = self.navigation_visible();
-        let p = self.layout_profiles.current_mut();
-        p.tabs_visible = !(p.tabs_visible || p.workspace_visible);
-        if p.tabs_visible {
-            p.tabs_sidebar_hidden = false;
-            self.tabs_sidebar_hidden = false;
-        }
-        p.workspace_visible = p.tabs_visible && self.tab_layout == TabLayout::Vertical;
-        self.sidebar_compact = p.navigation_compact();
-        if was_open != self.navigation_visible() {
-            self.tabs_sidebar_motion
-                .retarget(was_open, cx.reduce_motion());
         }
         self.schedule_save(cx);
         cx.notify();

@@ -124,7 +124,6 @@ impl Workspace {
             PaletteAction::ToggleSidebar => self.toggle_sidebar(cx),
             PaletteAction::OpenFiles => self.select_right_tool(LayoutTool::Files, window, cx),
             PaletteAction::OpenGit => self.select_right_tool(LayoutTool::Git, window, cx),
-            PaletteAction::ToggleNavigation => self.show_navigation(cx),
             PaletteAction::SetLayoutPreset(preset) => {
                 let mut profiles = self.presentation_snapshot(cx);
                 profiles.active = preset;

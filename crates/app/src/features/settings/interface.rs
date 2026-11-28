@@ -156,12 +156,12 @@ fn layout_preview(profile: &LayoutProfile) -> Div {
                             )
                             .child(preview_icon(IconName::Plus))
                         })
-                        .when(!horizontal && !navigation, |d| {
+                        .when(vertical, |d| {
                             d.child(
                                 div()
                                     .text_size(rems(9. / 16.))
                                     .text_color(ui::muted())
-                                    .child("Gentle Shell"),
+                                    .child("Workspace"),
                             )
                         }),
                 )
@@ -423,6 +423,7 @@ impl SettingsView {
         cx: &mut Context<Self>,
     ) {
         edit(&mut self.layout_profiles);
+        self.layout_profiles.normalize();
         cx.emit(SettingsEvent::PresentationChanged(
             self.layout_profiles.clone(),
         ));
@@ -432,13 +433,7 @@ impl SettingsView {
     pub(super) fn interface_section(&self, cx: &mut Context<Self>) -> Div {
         let profile = self.layout_profiles.current();
         let active = self.layout_profiles.active;
-        let tab_index = if !profile.tabs_visible {
-            0
-        } else if profile.tab_layout == TabLayout::Horizontal {
-            1
-        } else {
-            2
-        };
+        let tab_index = usize::from(profile.vertical_tabs());
 
         let mut settings = section(IconName::PanelLeft, "Workspace layout")
             .gap_2()
@@ -491,31 +486,30 @@ impl SettingsView {
                     )
                     .child(ui::segmented(
                         "layout-tabs",
-                        &["Hidden", "Horizontal", "Vertical"],
+                        &["Horizontal", "Vertical"],
                         Some(tab_index),
                         cx.listener(|this, index: &usize, _, cx| {
                             this.edit_presentation(|p| {
                                 let p = p.current_mut();
-                                p.tabs_visible = *index != 0;
-                                if *index != 0 {
-                                    p.tab_layout = if *index == 1 { TabLayout::Horizontal } else { TabLayout::Vertical };
+                                let layout = if *index == 0 {
+                                    TabLayout::Horizontal
+                                } else {
+                                    TabLayout::Vertical
+                                };
+                                if p.tab_layout != layout {
+                                    p.tab_layout = layout;
+                                    p.workspace_visible = layout == TabLayout::Vertical;
                                 }
+                                p.tabs_visible = true;
+                                p.tabs_sidebar_hidden = false;
                             }, cx);
                         }),
                     )),
             )
             .when(profile.vertical_tabs(), |d| {
-                d.child(visibility_row(
-                    "layout-vertical-navigator",
-                    "Workspace navigation",
-                    "Show or hide the vertical tab navigator.",
-                    !profile.tabs_sidebar_hidden,
-                    |p, visible| p.tabs_sidebar_hidden = !visible,
-                    cx,
-                ))
-                .child(control(
+                d.child(control(
                     "Navigator style",
-                    profile.tabs_sidebar_hidden,
+                    false,
                     ui::segmented(
                         "layout-navigator-style",
                         &["Expanded", "Icon rail"],
@@ -524,16 +518,6 @@ impl SettingsView {
                             this.edit_presentation(|p| p.current_mut().workspace_visible = *index == 0, cx);
                         }),
                     ),
-                ))
-            })
-            .when(!profile.vertical_tabs(), |d| {
-                d.child(visibility_row(
-                    "layout-workspace",
-                    "Workspace navigation",
-                    "Show workspaces without duplicating their tabs.",
-                    profile.workspace_visible,
-                    |p, visible| p.workspace_visible = visible,
-                    cx,
                 ))
             })
             .child(visibility_row(

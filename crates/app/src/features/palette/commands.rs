@@ -237,12 +237,6 @@ pub(super) fn screen_rows(tab_layout: TabLayout) -> Vec<Row> {
             PaletteAction::OpenGit,
         ),
         row(
-            IconName::PanelLeft,
-            "Toggle workspace navigation",
-            "Show or hide tabs and workspace navigation",
-            PaletteAction::ToggleNavigation,
-        ),
-        row(
             IconName::PanelRight,
             "Toggle Files sidebar",
             &format!(

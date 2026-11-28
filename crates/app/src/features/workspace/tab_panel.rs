@@ -11,14 +11,13 @@ fn platform_select_modifier(event: &ClickEvent, cx: &App) -> bool {
 
 impl Workspace {
     /// The main navigator stays on the left; this button only switches
-    /// between the expanded panel and the narrow icon rail. Hiding is a
-    /// separate, persisted state.
+    /// between the expanded panel and the narrow icon rail. Tabs stay visible.
     pub(super) fn toggle_sidebar_compact(&mut self, cx: &mut Context<Self>) {
         self.set_sidebar_compact(!self.sidebar_compact, cx);
     }
 
     pub(super) fn set_sidebar_compact(&mut self, compact: bool, cx: &mut Context<Self>) {
-        if self.sidebar_compact == compact {
+        if self.tab_layout != TabLayout::Vertical || self.sidebar_compact == compact {
             return;
         }
         self.cancel_workspace_rename_state(cx);
@@ -30,7 +29,7 @@ impl Workspace {
     }
 
     /// Whether the left navigator's vertical panel is showing (expanded or
-    /// rail), independent of tab placement.
+    /// rail), only in vertical placement.
     pub(super) fn tabs_sidebar_visible(&self) -> bool {
         self.navigation_visible()
     }
@@ -49,32 +48,7 @@ impl Workspace {
         self.tabs_sidebar_hidden
     }
 
-    /// Show or hide the vertical navigator without touching tab placement,
-    /// the compact rail, the active tab or the saved width. Hiding a
-    /// horizontal layout is a no-op: the panel is already in the title bar.
-    pub(super) fn set_tabs_sidebar_hidden(&mut self, hidden: bool, cx: &mut Context<Self>) {
-        if self.tab_layout != TabLayout::Vertical || self.tabs_sidebar_hidden == hidden {
-            return;
-        }
-        self.cancel_workspace_rename_state(cx);
-        let was_open = self.navigation_visible();
-        self.tabs_sidebar_hidden = hidden;
-        self.layout_profiles.current_mut().tabs_sidebar_hidden = hidden;
-        if was_open != self.navigation_visible() {
-            self.tabs_sidebar_motion.retarget(was_open, cx.reduce_motion());
-        }
-        self.schedule_save(cx);
-        cx.notify();
-    }
-
-    pub(super) fn toggle_tabs_sidebar(&mut self, cx: &mut Context<Self>) {
-        if self.tab_layout == TabLayout::Vertical {
-            self.set_tabs_sidebar_hidden(!self.tabs_sidebar_hidden, cx);
-        }
-    }
-
-    /// Resize only the expanded navigator, keeping its width while compact
-    /// or hidden.
+    /// Resize only the expanded navigator, keeping its width while compact.
     pub(super) fn resize_tab_sidebar(&mut self, width: f32, cx: &mut Context<Self>) {
         if !self.navigation_visible() || self.sidebar_compact || !width.is_finite()
         {
@@ -90,7 +64,7 @@ impl Workspace {
 
     /// All presentation controls share one idempotent, persisted state change.
     pub(super) fn set_tab_layout(&mut self, layout: TabLayout, cx: &mut Context<Self>) {
-        if self.tab_layout == layout && self.layout_profiles.current().tabs_visible {
+        if self.tab_layout == layout {
             return;
         }
         self.cancel_workspace_rename_state(cx);
@@ -102,14 +76,14 @@ impl Workspace {
         }
         let profile = self.layout_profiles.current_mut();
         profile.tabs_visible = true;
+        profile.tabs_sidebar_hidden = false;
         profile.tab_layout = layout;
         profile.workspace_visible = layout == TabLayout::Vertical && !self.sidebar_compact;
         self.sidebar_compact = profile.navigation_compact();
         self.tab_layout = layout;
-        if was_open != self.navigation_visible() {
-            self.tabs_sidebar_motion
-                .retarget(was_open, cx.reduce_motion());
-        }
+        self.tabs_sidebar_hidden = false;
+        // Change placement atomically, without a frame with zero or two tab lists.
+        self.tabs_sidebar_motion.retarget(was_open, true);
         // File browsing is a separate right sidebar; switching tab placement
         // must neither open nor hide that independent panel.
         self.schedule_save(cx);
@@ -1168,69 +1142,24 @@ mod tests {
     }
 
     #[gpui::test]
-    fn hiding_and_reopening_preserves_width_active_tab_and_orientation(cx: &mut TestAppContext) {
+    fn orientation_round_trip_preserves_width_and_active_tab(cx: &mut TestAppContext) {
         with_workspace(cx, vec![space_with("A", &[1, 2, 3])], 0, |ws, _, cx| {
             ws.set_tab_layout(TabLayout::Vertical, cx);
-            ws.sidebar_compact = false;
-            ws.tabs_sidebar_hidden = false;
             ws.resize_tab_sidebar(345., cx);
             ws.space_mut().active = 2;
             assert!(ws.tabs_sidebar_visible());
 
-            ws.set_tabs_sidebar_hidden(true, cx);
-            assert!(!ws.tabs_sidebar_visible());
-            assert_eq!(ws.tab_layout, TabLayout::Vertical, "hiding never reorients");
-            assert_eq!(ws.space().active, 2, "hiding keeps the active tab");
-            assert_eq!(ws.tabs_sidebar_width, 345., "hiding keeps the saved width");
-
-            ws.set_tabs_sidebar_hidden(false, cx);
-            assert!(ws.tabs_sidebar_visible());
-            assert_eq!(ws.tab_layout, TabLayout::Vertical);
-            assert_eq!(ws.space().active, 2);
-            assert_eq!(
-                ws.tabs_sidebar_width, 345.,
-                "reopening restores the last width"
-            );
-        });
-    }
-
-    #[gpui::test]
-    fn hiding_a_horizontal_layout_is_a_no_op(cx: &mut TestAppContext) {
-        with_workspace(cx, vec![space_with("A", &[1, 2])], 0, |ws, _, cx| {
-            ws.tab_layout = TabLayout::Horizontal;
-            assert!(!ws.tabs_sidebar_visible());
-            ws.set_tabs_sidebar_hidden(true, cx);
-            assert!(
-                !ws.tabs_sidebar_hidden,
-                "hiding never persists for horizontal"
-            );
-            assert_eq!(
-                ws.tab_layout,
-                TabLayout::Horizontal,
-                "visibility never changes orientation"
-            );
-        });
-    }
-
-    #[gpui::test]
-    fn hidden_panel_stays_hidden_across_orientation_round_trip(cx: &mut TestAppContext) {
-        with_workspace(cx, vec![space_with("A", &[1])], 0, |ws, _, cx| {
-            ws.set_tab_layout(TabLayout::Vertical, cx);
-            ws.set_tabs_sidebar_hidden(true, cx);
-            assert!(!ws.tabs_sidebar_visible());
-
-            // Going horizontal hides the panel; coming back must not mount it.
             ws.set_tab_layout(TabLayout::Horizontal, cx);
-            ws.set_tab_layout(TabLayout::Vertical, cx);
-            assert!(
-                !ws.tabs_sidebar_visible(),
-                "hidden panel must not flash back"
-            );
-            assert!(ws.tabs_sidebar_hidden);
+            assert!(!ws.tabs_sidebar_visible());
+            assert!(ws.layout_profiles.current().horizontal_tabs());
+            assert_eq!(ws.space().active, 2);
 
-            // Only an explicit show restores it.
-            ws.set_tabs_sidebar_hidden(false, cx);
+            ws.set_tab_layout(TabLayout::Vertical, cx);
             assert!(ws.tabs_sidebar_visible());
+            assert!(ws.layout_profiles.current().vertical_tabs());
+            assert_eq!(ws.space().active, 2);
+            assert_eq!(ws.tabs_sidebar_width, 345.);
+            assert!(!ws.tabs_sidebar_hidden);
         });
     }
 
@@ -1278,24 +1207,21 @@ mod tests {
     }
 
     #[gpui::test]
-    fn compact_and_hidden_are_independent(cx: &mut TestAppContext) {
+    fn compact_toggle_never_hides_vertical_tabs(cx: &mut TestAppContext) {
         with_workspace(cx, vec![space_with("A", &[1])], 0, |ws, _, cx| {
             ws.set_tab_layout(TabLayout::Vertical, cx);
-            // Compact leaves the panel visible as the rail.
-            ws.set_sidebar_compact(true, cx);
+            ws.toggle_sidebar_compact(cx);
             assert!(ws.sidebar_compact);
             assert!(ws.tabs_sidebar_visible());
-            // Hiding removes the panel but keeps the compact choice.
-            ws.set_tabs_sidebar_hidden(true, cx);
+            ws.toggle_sidebar_compact(cx);
+            assert!(!ws.sidebar_compact);
+            assert!(ws.tabs_sidebar_visible());
+
+            ws.set_tab_layout(TabLayout::Horizontal, cx);
+            ws.toggle_sidebar_compact(cx);
+            assert!(ws.layout_profiles.current().horizontal_tabs());
             assert!(!ws.tabs_sidebar_visible());
-            assert!(
-                ws.sidebar_compact,
-                "hiding doesn't clear the compact choice"
-            );
-            // Reopening restores the rail, still compact.
-            ws.set_tabs_sidebar_hidden(false, cx);
-            assert!(ws.tabs_sidebar_visible());
-            assert!(ws.sidebar_compact);
+            assert!(!ws.sidebar_compact);
         });
     }
 

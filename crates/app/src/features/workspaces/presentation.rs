@@ -131,13 +131,16 @@ pub struct ToolShortcut {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct LayoutProfile {
     pub shortcuts: Vec<ToolShortcut>,
+    /// Legacy field retained for older snapshots; normalized to true.
     pub tabs_visible: bool,
     #[serde(default)]
     pub title_utilities: bool,
     #[serde(default)]
     pub original_controls: bool,
     pub tab_layout: TabLayout,
+    /// Legacy name: expanded (true) vs compact (false) vertical navigator.
     pub workspace_visible: bool,
+    /// Legacy field retained for older snapshots; normalized to false.
     #[serde(default)]
     pub tabs_sidebar_hidden: bool,
     pub sidebar_visible: bool,
@@ -180,19 +183,15 @@ impl LayoutProfile {
     }
     /// Tab rows have exactly one placement, independently of the navigator.
     pub fn horizontal_tabs(&self) -> bool {
-        self.tabs_visible && self.tab_layout == TabLayout::Horizontal
+        self.tab_layout == TabLayout::Horizontal
     }
 
     pub fn vertical_tabs(&self) -> bool {
-        self.tabs_visible && self.tab_layout == TabLayout::Vertical
+        self.tab_layout == TabLayout::Vertical
     }
 
     pub fn navigation_visible(&self) -> bool {
-        if self.vertical_tabs() {
-            !self.tabs_sidebar_hidden
-        } else {
-            self.workspace_visible
-        }
+        self.vertical_tabs()
     }
 
     pub fn navigation_compact(&self) -> bool {
@@ -236,6 +235,13 @@ impl LayoutProfile {
         }
     }
     pub fn normalize(&mut self, preset: LayoutPreset) {
+        // Older layouts could hide both tab presentations. Restore their
+        // selected orientation without changing sessions or saved widths.
+        self.tabs_visible = true;
+        self.tabs_sidebar_hidden = false;
+        if self.horizontal_tabs() {
+            self.workspace_visible = false;
+        }
         let mut seen = Vec::new();
         self.shortcuts.retain(|s| {
             if seen.contains(&s.tool) {
@@ -341,16 +347,43 @@ mod tests {
                             p.tabs_sidebar_hidden = hidden;
                             let horizontal = p.horizontal_tabs();
                             let vertical = p.vertical_tabs();
-                            assert!(!(horizontal && vertical));
-                            assert_eq!(horizontal, tabs_visible && layout == TabLayout::Horizontal);
-                            assert_eq!(vertical, tabs_visible && layout == TabLayout::Vertical);
-                            assert_eq!(p.navigation_visible(), if vertical { !hidden } else { workspace_visible });
+                            assert_ne!(horizontal, vertical);
+                            assert_eq!(horizontal, layout == TabLayout::Horizontal);
+                            assert_eq!(vertical, layout == TabLayout::Vertical);
+                            assert_eq!(p.navigation_visible(), vertical);
                             assert_eq!(p.navigation_compact(), vertical && !workspace_visible);
+                            let mut normalized = p.clone();
+                            normalized.normalize(preset);
+                            assert!(normalized.tabs_visible);
+                            assert!(!normalized.tabs_sidebar_hidden);
+                            assert_eq!(normalized.tab_layout, layout);
+                            assert_eq!(normalized.navigation_visible(), vertical);
                         }
                     }
                 }
             }
         }
+    }
+
+    #[test]
+    fn saved_hidden_presets_restore_their_selected_orientation() {
+        let mut profiles = LayoutProfiles::default();
+        for p in [&mut profiles.minimal, &mut profiles.expanded] {
+            p.tabs_visible = false;
+            p.tabs_sidebar_hidden = true;
+            p.tabs_width = 345.;
+        }
+        let saved = SavedState {
+            presentation: Some(profiles),
+            ..SavedState::default()
+        };
+        let restored = LayoutProfiles::from_saved(&saved);
+        assert!(restored.minimal.horizontal_tabs());
+        assert!(!restored.minimal.navigation_visible());
+        assert!(restored.expanded.vertical_tabs());
+        assert!(restored.expanded.navigation_visible());
+        assert_eq!(restored.expanded.tabs_width, 345.);
+        assert!(!restored.expanded.tabs_sidebar_hidden);
     }
 
     #[test]

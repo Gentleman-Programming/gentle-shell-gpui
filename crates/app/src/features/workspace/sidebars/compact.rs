@@ -69,9 +69,6 @@ impl Workspace {
                     )
                 });
             list = list.child(row);
-            if !self.layout_profiles.current().vertical_tabs() {
-                continue;
-            }
             // The compact rail deliberately ignores the expanded sidebar's
             // folding state. Every workspace exposes every session.
             let mut number = 0;
